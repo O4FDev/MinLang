@@ -11,6 +11,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,7 @@ void minyar_print_stack_trace(void);
 struct MinyarFile { int unused; };
 static FILE serial_file;
 FILE *stdin = &serial_file, *stdout = &serial_file, *stderr = &serial_file;
+int errno;
 
 /* ----- Serial output ----- */
 
@@ -512,8 +514,9 @@ double strtod(const char *text, char **end) {
 /* ----- Mathematics ----- */
 
 double fabs(double x) { return __builtin_fabs(x); }
-/* The libc-style builtin may lower to a call to sqrt itself when math errno
- * is enabled. This intrinsic always performs the floating-point operation. */
+/* __builtin_sqrt may lower to a call to this very symbol under -ffreestanding
+ * when math errno is enabled, which LTO turns into recursive undefined
+ * behaviour. The elementwise intrinsic always performs the operation. */
 double sqrt(double x) { return __builtin_elementwise_sqrt(x); }
 double trunc(double x) {
     if (!(fabs(x) < 4503599627370496.0)) return x;

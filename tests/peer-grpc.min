@@ -12,7 +12,36 @@ let server = grpc.create(); grpc.transportTick(server, 1000)
 let input = io.readBytesFile(processInfo.argument(0)); let mode = processInfo.argument(2)
 let result = grpc.receive(server, input)
 if !errors.booleanOk(result) { print("ERROR " + Text(errors.code(errors.booleanError(result)))) }
-else if mode == "timeout" || mode == "timeout-wall" {
+else if mode == "backpressure-error" {
+    let ping = Bytes(); for i in 0..9 { ping.add(0) }; ping[2] = 8; ping[3] = 6; ping.addBytes(Bytes("12345678"))
+    for i in 0..61677 { grpc.receive(server, ping) }
+    let blocked = grpc.requests(server, 1000000)
+    if grpc.openOk(blocked) || !errors.isWouldBlock(grpc.openError(blocked)) { fail("full output did not defer gRPC request parsing") }
+    grpc.takeOutgoing(server, 1048576)
+    let rejected = grpc.requests(server, 1000000)
+    if grpc.openOk(rejected) || errors.code(grpc.openError(rejected)) != errors.protocolCode() { fail("deferred malformed gRPC request was not rejected") }
+    grpc.takeOutgoing(server, 1048576)
+    let closed = grpc.closed(server)
+    if !grpc.closedOk(closed) { fail("rejected gRPC call did not close after output drained") }
+    let released = grpc.release(server, grpc.closedStreamID(closed))
+    if !errors.booleanOk(released) || grpc.retainedCalls(server) != 0 { fail("rejected gRPC call remained retained") }
+    print("BACKPRESSURE OK")
+} else if mode == "backpressure-timeout" {
+    let open = grpc.requests(server, 1000000)
+    if !grpc.openOk(open) { fail("deadline backpressure open rejected") }
+    let ping = Bytes(); for i in 0..9 { ping.add(0) }; ping[2] = 8; ping[3] = 6; ping.addBytes(Bytes("12345678"))
+    for i in 0..61675 { grpc.receive(server, ping) }
+    grpc.tick(server, 1000500)
+    if grpc.closedOk(grpc.closed(server)) { fail("backpressured deadline reported closed before trailers queued") }
+    grpc.takeOutgoing(server, 1048576)
+    grpc.tick(server, 1000500)
+    grpc.takeOutgoing(server, 1048576)
+    let closed = grpc.closed(server)
+    if !grpc.closedOk(closed) || errors.code(grpc.closedCause(closed)) != errors.timedOutCode() { fail("retried deadline close lost typed cause") }
+    let released = grpc.release(server, grpc.closedStreamID(closed))
+    if !errors.booleanOk(released) || grpc.retainedCalls(server) != 0 { fail("deadline call remained retained") }
+    print("BACKPRESSURE TIMEOUT OK")
+} else if mode == "timeout" || mode == "timeout-wall" {
     let open = grpc.requests(server, 1000000)
     if !grpc.openOk(open) { fail("valid 500ms deadline open rejected") }
     if grpc.openDeadlineSeconds(open) != 1001 || grpc.openDeadlineMilliseconds(open) != 1000500 || grpc.openMonotonicDeadlineMillis(open) != 1500 { fail("deadline lost exact relative milliseconds") }
@@ -26,6 +55,21 @@ else if mode == "timeout" || mode == "timeout-wall" {
     let read = grpc.read(server, grpc.openStreamID(open), 1)
     if errors.code(errors.bytesError(read)) != errors.timedOutCode() { fail("exact monotonic millisecond deadline not enforced") }
     print("TIMEOUT OK")
+} else if mode == "churn" {
+    let id = report(server)
+    if id == 0 || !errors.booleanOk(grpc.sendStatus(server, id, "ok")) { fail("churn admission failed") }
+    if !errors.booleanOk(grpc.receive(server, io.readBytesFile(processInfo.argument(3)))) { fail("churn DATA rejected") }
+    let count = 0
+    let read = grpc.read(server, id, 1)
+    while errors.bytesStatus(read) == errors.successStatus() {
+        let bytes = errors.bytesValue(read)
+        if bytes.length != 1 { fail("churn read width " + Text(bytes.length) + " at " + Text(count)) }
+        if bytes[0] != count % 256 { fail("churn byte " + Text(bytes[0]) + " differs at " + Text(count)) }
+        count += 1
+        read = grpc.read(server, id, 1)
+    }
+    if count != 4096 || errors.bytesStatus(read) != errors.endOfStreamStatus() || grpc.bufferedBytes(server) != 0 { fail("churn queues did not drain") }
+    print("CHURN OK")
 } else if mode == "echo" {
     let id = report(server)
     if id != 0 {

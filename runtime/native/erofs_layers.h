@@ -111,6 +111,9 @@ static int e_tar_mtime(EWriter *w, uint64_t start, uint64_t end, uint64_t positi
     }
     return ELOOP;
 }
+static int e_spool_room(EWriter *w, uint64_t size) {
+    return w->spool_size > w->maximum || size > w->maximum - w->spool_size ? EFBIG : 0;
+}
 static int e_spool_tar(EWriter *w, const char *path, uint64_t *start, uint64_t *end) {
     struct archive *raw = archive_read_new(); if (!raw) return ENOMEM;
     int fd = open(path,O_RDONLY | O_CLOEXEC);
@@ -125,7 +128,8 @@ static int e_spool_tar(EWriter *w, const char *path, uint64_t *start, uint64_t *
     *start = w->spool_size;
     int direct = !error && S_ISREG(before.st_mode) && archive_filter_code(raw,0) == ARCHIVE_FILTER_NONE;
     if (direct) {
-        if (before.st_size < 0 || (uint64_t)before.st_size > 17592186040320ull - w->spool_size) error = EFBIG;
+        if (before.st_size < 0) error = EFBIG;
+        else error = e_spool_room(w, (uint64_t)before.st_size);
         off_t input = 0, output = (off_t)w->spool_size;
         uint64_t remaining = before.st_size < 0 ? 0 : (uint64_t)before.st_size;
         int fallback = 0;
@@ -149,7 +153,7 @@ static int e_spool_tar(EWriter *w, const char *path, uint64_t *start, uint64_t *
         la_ssize_t n = archive_read_data(raw,buffer,1048576);
         if (n < 0) { error = EINVAL; break; }
         if (!n) break;
-        if ((uint64_t)n > 17592186040320ull - w->spool_size) { error = EFBIG; break; }
+        if ((error = e_spool_room(w, (uint64_t)n))) break;
         error = e_write(w->data_fd,buffer,(size_t)n,w->spool_size); w->spool_size += (uint64_t)n;
     }
     *end = w->spool_size; free(buffer);
@@ -478,7 +482,7 @@ static int e_apply_layer(EWriter *w, const char *path, uint64_t generation) {
                         else inode->data_offset = start + (uint64_t)offset;
                         if (!error && archive_entry_sparse_count(entry) > 0) {
                             inode->data_offset = w->spool_size;
-                            if (inode->size > 17592186040320ull - w->spool_size) error = EFBIG;
+                            error = e_spool_room(w, inode->size);
                             uint64_t copied = 0;
                             while (!error && copied < inode->size) {
                                 size_t want = inode->size - copied > 1048576 ? 1048576 : (size_t)(inode->size - copied);

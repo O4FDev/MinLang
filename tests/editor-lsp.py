@@ -294,11 +294,32 @@ def protocol_controls(server, compiler):
         responses.append(json.loads(body[:size]))
         rest = body[size:]
     assert [message["error"]["code"] for message in responses if "error" in message] == [-32700, -32700, -32600, -32600], responses
-    for malformed in (b"Content-Length: -1\r\n\r\n", b"Content-Length: 16777217\r\n\r\n", b"Content-Length: 4\r\nContent-Length: 4\r\n\r\n{}", b"Content-Length: 8\r\n\r\n{}"):
+    for malformed in (
+        b"Content-Length: -1\r\n\r\n", b"Content-Length: 16777217\r\n\r\n",
+        b"Content-Length: 4\r\nContent-Length: 4\r\n\r\n{}", b"Content-Length: 8\r\n\r\n{}",
+        b"Content-Length: 2\r\n\x00\r\n\r\n{}", b"Content-Length: 2\r\nX-Other: a\nb\r\n\r\n{}",
+    ):
         result = subprocess.run([server], input=malformed, capture_output=True, timeout=10)
         assert result.returncode == 1 and not result.stdout and b"invalid or truncated" in result.stderr, result
     result = subprocess.run([server], input=frame({"jsonrpc": "2.0", "method": "exit"}), capture_output=True, timeout=10)
     assert result.returncode == 1 and not result.stdout, result
+    with tempfile.TemporaryDirectory(prefix="minyar-lsp-index-growth-") as temporary:
+        root = Path(temporary)
+        source = "".join(f"record R{index} {{ field: Integer }}\n" for index in range(40000)) + "}\n"
+        uri = (root / "growth.min").as_uri()
+        oversized = root / "oversized.min"
+        with oversized.open("wb") as file:
+            file.truncate(16 * 1024 * 1024 + 1)
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"rootUri": root.as_uri()}},
+            {"jsonrpc": "2.0", "id": 2, "method": "textDocument/documentSymbol", "params": {"textDocument": {"uri": Path("/dev/zero").as_uri()}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "textDocument/documentSymbol", "params": {"textDocument": {"uri": oversized.as_uri()}}},
+            {"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri, "version": 1, "text": source}}},
+            {"jsonrpc": "2.0", "id": 4, "method": "shutdown"},
+            {"jsonrpc": "2.0", "method": "exit"},
+        ]
+        result = subprocess.run([server, "--compiler", compiler], input=b"".join(map(frame, messages)), capture_output=True, timeout=10)
+        assert result.returncode == 0 and not result.stderr and b'"id":2,"error"' in result.stdout and b'"id":3,"error"' in result.stdout and b"opening bracket" in result.stdout, result
     print("LSP malformed JSON/UTF-8, frame limits, truncation and lifecycle controls passed")
 
 
@@ -350,6 +371,19 @@ sys.exit(1 if found else 0)
         errors = client.diagnostics(path.as_uri(), 1)
         assert errors and "not valid UTF-8" in errors[0]["message"], errors
         client.close()
+        for stream, descriptor in (("output", 1), ("error", 2)):
+            compiler.write_text(f'''#!/usr/bin/env python3
+import os
+chunk = b"x" * 1048576
+for _ in range(17):
+    os.write({descriptor}, chunk)
+''')
+            client = Client([server, "--compiler", str(compiler)])
+            client.request("initialize", {"rootUri": root.as_uri(), "capabilities": {}})
+            client.send("textDocument/didOpen", {"textDocument": {"uri": path.as_uri(), "version": 1, "text": "print(42)\n"}})
+            errors = client.diagnostics(path.as_uri(), 1)
+            assert errors and errors[0]["message"] == f"The compiler wrote more than 16 MiB to standard {stream} while checking this document.", errors
+            client.close()
         compiler.write_text('''#!/usr/bin/env python3
 import pathlib, sys
 if "--error-format" in sys.argv:

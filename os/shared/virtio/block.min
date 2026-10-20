@@ -4,6 +4,7 @@
 use "device" as device
 use "../pci.min" as pci
 use "./virtio.min" as virtio
+use "./used.min" as used
 
 constant SECTOR = 512
 // Sectors per request: the data buffer is 64 KiB.
@@ -42,21 +43,28 @@ public function open(devices: List<pci.Device>): Drive {
 
 // Read `count` sectors from `sector`.
 public function read(drive: Drive, sector: Integer, count: Integer): Bytes {
+    if sector < 0 || count < 0 || sector > drive.sectors || count > drive.sectors - sector {
+        fail("virtio disk read is outside the device capacity")
+    }
     let result = Bytes()
     let done = 0
     while done < count {
         let chunk = min(BATCH, count - done)
+        let bytes = chunk * SECTOR
         device.store32(drive.request, 0, 0)
         device.store32(drive.request, 4, 0)
         device.store64(drive.request, 8, sector + done)
         device.store8(drive.request, STATUS, 0xFF)
-        virtio.describe(drive.requests, 1, device.addressOf(drive.request, DATA), chunk * SECTOR, virtio.NEXT | virtio.WRITE, 2)
+        virtio.describe(drive.requests, 1, device.addressOf(drive.request, DATA), bytes, virtio.NEXT | virtio.WRITE, 2)
         virtio.complete(drive.requests, 0)
+        if !used.validLength(drive.requests.length, bytes + 1, bytes + 1) {
+            fail("virtio disk reported an invalid read length")
+        }
         let status = device.load8(drive.request, STATUS)
         if status != 0 {
             fail("the disk reported error " + Text(status) + " reading sector " + Text(sector + done))
         }
-        result.addBytes(device.read(drive.request, DATA, chunk * SECTOR))
+        result.addBytes(device.read(drive.request, DATA, bytes))
         done += chunk
     }
     return result

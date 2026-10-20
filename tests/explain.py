@@ -24,7 +24,7 @@ repository = Path(__file__).resolve().parents[1]
 # message, help note or example must not renumber an existing error family.
 CODES = (
     "E0001",
-    "E0101", "E0102", "E0103", "E0104",
+    "E0101", "E0102", "E0103", "E0104", "E0105",
     "E0201", "E0202", "E0203", "E0204", "E0205", "E0206",
     "E0301", "E0302", "E0303", "E0304", "E0305", "E0306", "E0307",
     "E0401", "E0402", "E0403", "E0404", "E0405", "E0406", "E0407",
@@ -272,6 +272,12 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         path = root / f"followup-{name}.min"
         path.write_text(source, encoding="utf-8")
         diagnostic(path, code, expected_source_lines=source.splitlines())
+
+    # The text excerpt escapes the rejected control, so only JSON keeps the raw line.
+    bidi = root / "followup-bidi-comment.min"
+    bidi.write_text("print(1) // \u202e\n", encoding="utf-8")
+    value = diagnostic(bidi, "E0105")
+    assert (value["line"], value["column"]) == (1, 13) and value["sourceLine"] == "print(1) // \u202e", value
 
     # Logical type failures use the offending operand's first token. Compound
     # operands retain the single-token presentation, on their first source line.

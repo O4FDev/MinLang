@@ -740,25 +740,21 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
     let currentLargest = space.recoveryLargestAck
     let sampleAt = -1; let eliciting = false; let cachedAck = false; let deliveryChanged = false
     for sent in space.sent {
-        for range in frame.ranges {
-            if sent.number >= range.first && sent.number <= range.last && currentRecovery(connection,sent.path,sent.recoveryGeneration) { eliciting = true; currentLargest = max(currentLargest,sent.number); if sent.number == frame.value { sampleAt = sent.time } }
+        if wire.acknowledged(frame.ranges,sent.number) && currentRecovery(connection,sent.path,sent.recoveryGeneration) {
+            eliciting = true; currentLargest = max(currentLargest,sent.number); if sent.number == frame.value { sampleAt = sent.time }
         }
     }
     for at in space.lostStreamsAt..space.lostStreams.length {
         let packet = space.lostStreams[at]
-        for range in frame.ranges {
-            if packet.number >= range.first && packet.number <= range.last {
-                cachedAck = true
-                if currentRecovery(connection,packet.path,packet.recoveryGeneration) { eliciting = true; currentLargest = max(currentLargest,packet.number); if packet.number == frame.value { sampleAt = packet.time } }
-            }
+        if wire.acknowledged(frame.ranges,packet.number) {
+            cachedAck = true
+            if currentRecovery(connection,packet.path,packet.recoveryGeneration) { eliciting = true; currentLargest = max(currentLargest,packet.number); if packet.number == frame.value { sampleAt = packet.time } }
         }
     }
     let retainedTimes: List<SentTime> = []
     for time in space.ackTimes {
         if currentRecovery(connection,time.path,time.recoveryGeneration) {
-            for range in frame.ranges {
-                if time.number >= range.first && time.number <= range.last { currentLargest = max(currentLargest,time.number) }
-            }
+            if wire.acknowledged(frame.ranges,time.number) { currentLargest = max(currentLargest,time.number) }
             if time.number == frame.value { sampleAt = time.time }
         }
     }
@@ -781,8 +777,7 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
     }
     let remaining: List<Sent> = []
     for sent in space.sent {
-        let acknowledged = false
-        for range in frame.ranges { if sent.number >= range.first && sent.number <= range.last { acknowledged = true } }
+        let acknowledged = wire.acknowledged(frame.ranges,sent.number)
         if acknowledged {
             let frames = wire.frames(sent.payload)
             for item in frames.frames {
@@ -810,14 +805,15 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
     }
     if (cachedAck || deliveryChanged) && space.lostStreamsAt < space.lostStreams.length {
         let lost: List<LostStreams> = []
+        let acknowledgedHistory = Map<Integer, Set<Integer>>()
         for at in space.lostStreamsAt..space.lostStreams.length {
-            let packet = space.lostStreams[at]; let acknowledged = false
-            for range in frame.ranges { if packet.number >= range.first && packet.number <= range.last { acknowledged = true } }
+            let packet = space.lostStreams[at]; let acknowledged = wire.acknowledged(frame.ranges,packet.number)
             if acknowledged {
                 // Late ACKs break future persistent-loss intervals, without
                 // removing flight bytes or growing congestion twice.
                 if currentRecovery(connection,packet.path,packet.recoveryGeneration) && packet.measured && connection.lossFirst >= 0 && packet.time >= connection.lossFirst { connection.lossFirst = -1; connection.lossLast = -1 }
-                for known in connection.history { if known.level == packet.level && known.number == packet.number && known.status == 2 { known.status = 1 } }
+                if !acknowledgedHistory.has(packet.level) { acknowledgedHistory[packet.level] = Set<Integer>() }
+                acknowledgedHistory[packet.level].add(packet.number)
                 if currentRecovery(connection,packet.path,packet.recoveryGeneration) && (!connection.clientRole || connection.confirmed || connection.handshakeAcknowledged) { connection.congestion.probes = 0 }
                 for item in packet.streams {
                     let index = streamIndex(connection,item.id)
@@ -829,10 +825,15 @@ function processAck(connection: Connection, space: Space, frame: wire.Frame, lev
                 }
             }
         }
+        // Resolve every late ACK against retained history in one pass.
+        if acknowledgedHistory.length > 0 {
+            for known in connection.history {
+                if known.status == 2 && acknowledgedHistory.has(known.level) && acknowledgedHistory[known.level].contains(known.number) { known.status = 1 }
+            }
+        }
         // Apply every delivery first: a newer lost retry can cover older ones.
         for at in space.lostStreamsAt..space.lostStreams.length {
-            let packet = space.lostStreams[at]; let acknowledged = false
-            for range in frame.ranges { if packet.number >= range.first && packet.number <= range.last { acknowledged = true } }
+            let packet = space.lostStreams[at]; let acknowledged = wire.acknowledged(frame.ranges,packet.number)
             if !acknowledged {
                 let delivery = lostReferenceNeeded(connection,packet)
                 // Delivered data no longer owns references, but its original

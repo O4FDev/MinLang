@@ -7,6 +7,24 @@ use "system" as system
 use "io" as io
 use "files" as files
 
+if process.argumentCount() == 2 && process.argument(0) == "--bounded-timeout-helper" {
+    let timeoutRoot = process.argument(1)
+    let timeoutScript = "printf timeout-output; printf timeout-error >&2; /bin/sleep 5; exit 25"
+    let timeoutStatus = host.spawnBounded(["/bin/sh", "-c", timeoutScript], [], true, timeoutRoot + "/timeout-stdout", timeoutRoot + "/timeout-stderr", 1, 200000, 200000)
+    host.leave(timeoutStatus)
+}
+
+if process.argumentCount() == 7 && process.argument(0) == "--reference-race-helper" {
+    packages.remember(process.argument(1), process.argument(2), packages.Source {
+        repository: process.argument(3);
+        revision: process.argument(4);
+        commit: process.argument(5);
+        checksum: process.argument(6);
+        root: "";
+    })
+    host.leave(0)
+}
+
 record Fixture { launcher: Text; root: Text; environment: List<Text>; serial: Integer }
 function command(fixture: Fixture, arguments: List<Text>, directory: Text): test.Result {
     fixture.serial += 1
@@ -47,14 +65,40 @@ function mirror(fixture: Fixture, name: Text, root: Text) {
 function dependency(name: Text, revision: Text): Text { return name + " = { git = \"github.com/O4FDev/" + name + "\", rev = \"" + revision + "\" }\n" }
 let root = test.scratch()
 let environment: List<Text> = []
+let inheritedPath = system.getenv("PATH")
 for entry in system.environment() {
-    if !entry.startsWith("MINYAR_HOME=") && !entry.startsWith("MINYAR_GIT_MIRROR=") && !entry.startsWith("MINYAR_REGISTRY=") && !entry.startsWith("GIT_") { environment.add(entry) }
+    if !entry.startsWith("MINYAR_HOME=") && !entry.startsWith("MINYAR_GIT_MIRROR=") && !entry.startsWith("MINYAR_REGISTRY=") && !entry.startsWith("MINYAR_TEST_REAL_GIT=") && !entry.startsWith("GIT_") && !entry.startsWith("PATH=") { environment.add(entry) }
 }
+let realGit = host.which("git")
+test.check(realGit != "", "package Git tests require Git")
+let gitShimRoot = root + "/git-shim"
+let gitShim = gitShimRoot + "/git"
+host.makeDirectories(gitShimRoot)
+io.writeTextFile(gitShim, "#!/bin/sh\nis_fetch=0\nis_package_git=0\nhas_unpack_limit=0\nhas_no_maintenance=0\nhas_no_commit_graph=0\nfor argument in \"$@\"; do\n  case \"$argument\" in\n    fetch) is_fetch=1 ;;\n    credential.helper=) is_package_git=1 ;;\n    fetch.unpackLimit=0) has_unpack_limit=1 ;;\n    --no-auto-maintenance) has_no_maintenance=1 ;;\n    --no-write-commit-graph) has_no_commit_graph=1 ;;\n  esac\ndone\nif [ \"$is_fetch\" = 1 ] && [ \"$is_package_git\" = 1 ]; then\n  [ \"$(ulimit -f)\" = 524288 ] || { echo \"Git fetch file limit was not inherited\" >&2; exit 96; }\n  [ \"$has_unpack_limit\" = 1 ] || { echo \"Git fetch may create loose objects\" >&2; exit 97; }\n  [ \"$has_no_maintenance\" = 1 ] || { echo \"Git fetch may run maintenance\" >&2; exit 98; }\n  [ \"$has_no_commit_graph\" = 1 ] || { echo \"Git fetch may write a commit graph\" >&2; exit 99; }\nfi\nexec \"$MINYAR_TEST_REAL_GIT\" \"$@\"\n")
+let gitShimMode = test.run(["/bin/chmod", "755", gitShim], environment, root, root + "/git-shim-mode", 10)
+test.require(gitShimMode, "make the Git test shim executable")
+environment.add("PATH=" + gitShimRoot + ":" + inheritedPath)
+environment.add("MINYAR_TEST_REAL_GIT=" + realGit)
 environment.add("MINYAR_HOME=" + root + "/home with spaces")
 environment.add("MINYAR_GIT_MIRROR=" + root + "/mirror")
 environment.add("GIT_CONFIG_NOSYSTEM=1")
 environment.add("GIT_CONFIG_GLOBAL=/dev/null")
+let timeoutResult = test.run([host.selfPath(), "--bounded-timeout-helper", root], environment, root, root + "/bounded-timeout", 10)
+test.check(timeoutResult.status == 1 && test.contains(timeoutResult.errorOutput, "timed out after 1 seconds") && io.readTextFile(root + "/timeout-stdout") == "timeout-output" && io.readTextFile(root + "/timeout-stderr") == "timeout-error", "bounded Git capture preserves timeout handling while draining both output streams")
 let fixture = Fixture { launcher: process.argument(0); root: root; environment: environment; serial: 0 }
+let dualOutput = root + "/dual-stdout"
+let dualErrors = root + "/dual-stderr"
+let dualScript = "index=0; while [ \"$index\" -lt 20000 ]; do printf 12345678; index=$((index + 1)); done; index=0; while [ \"$index\" -lt 20000 ]; do printf 87654321 >&2; index=$((index + 1)); done; exit 23"
+let dualStatus = host.spawnBounded(["/bin/sh", "-c", dualScript], [], true, dualOutput, dualErrors, 10, 200000, 200000)
+test.check(dualStatus == 23 && files.pathSize(dualOutput) == 160000 && files.pathSize(dualErrors) == 160000, "bounded Git capture drains both pipes beyond pipe capacity and preserves timeout execution")
+let boundedOutput = root + "/bounded-stdout"
+let fastOutputScript = "index=0; while [ \"$index\" -lt 625 ]; do printf 12345678; index=$((index + 1)); done; exit 22"
+let outputStatus = host.spawnBounded(["/bin/sh", "-c", fastOutputScript], [], true, boundedOutput, root + "/bounded-stdout-errors", 10, 4096, 200000)
+test.check(outputStatus == host.OUTPUT_LIMIT && files.pathSize(boundedOutput) == 4096, "an immediate producer cannot exit successfully after crossing the stdout cap")
+let boundedErrors = root + "/bounded-stderr"
+let errorScript = "index=0; while [ \"$index\" -lt 20000 ]; do printf 87654321 >&2; index=$((index + 1)); done; exit 24"
+let errorStatus = host.spawnBounded(["/bin/sh", "-c", errorScript], [], true, root + "/bounded-stderr-output", boundedErrors, 10, 200000, 4096)
+test.check(errorStatus == host.ERROR_LIMIT && files.pathSize(boundedErrors) == 4096, "bounded Git capture stops promptly at the stderr cap")
 test.check(packages.semver("v0.10.0") && !packages.semver("v01.0.0") && !packages.semver("v1.0.0-beta"), "canonical stable semver")
 test.check(packages.compare("v0.10.0", "v0.2.0") > 0, "numeric version comparison")
 for path in ["../escape", "/escape", "src/../escape", "src//file", "src/.git/config", "src/.GIT/config", "src\\escape", "src/\nfile", "C:escape"] { test.check(!packages.safePath(path), "reject unsafe source path " + path) }
@@ -90,6 +134,24 @@ commit(fixture, leaf, "0.10.0")
 git(fixture, leaf, ["tag", "v99.0.0-preview"])
 let head = host.strip(git(fixture, leaf, ["rev-parse", "HEAD"]))
 let older = host.strip(git(fixture, leaf, ["rev-parse", "refs/tags/v0.2.0^{commit}"]))
+let witnessStore = root + "/witness-race"
+host.makeDirectories(witnessStore + "/refs")
+let witnessRepository = "github.com/O4FDev/concurrent"
+let witnessRevision = "v1.0.0"
+let witnessReference = witnessStore + "/refs/" + host.hashBytes(Bytes(witnessRepository + "\n" + witnessRevision))
+let oldChecksum = host.hashBytes(Bytes("old witness"))
+let newChecksum = host.hashBytes(Bytes("new witness"))
+let witnessLock = host.lockExclusive(witnessReference + ".lock")
+test.check(witnessLock >= 0, "cannot hold package witness lock")
+let witnessArguments = [host.selfPath(), "--reference-race-helper", witnessStore, witnessRevision, witnessRepository, witnessRevision, head, newChecksum]
+let witnessChild = system.spawn(host.selfPath(), witnessArguments, system.environment(), root)
+test.check(witnessChild > 0, "cannot start concurrent package witness writer")
+test.require(test.run(["/bin/sleep", "1"], system.environment(), root, root + "/witness-race-delay", 5), "wait for the competing witness writer")
+io.writeTextFile(witnessReference, older + "\n" + oldChecksum + "\n" + witnessRevision + "\n")
+test.check(files.close(witnessLock) == 0, "cannot release package witness lock")
+let witnessStatus = system.wait(witnessChild)
+test.check(witnessStatus.state == system.EXITED && witnessStatus.exitCode != 0, "concurrent moved release replaced the first package witness")
+test.check(io.readTextFile(witnessReference) == older + "\n" + oldChecksum + "\n" + witnessRevision + "\n", "concurrent moved release preserved the first package witness")
 let prefix = host.textSlice(head, 0, 12)
 git(fixture, leaf, ["tag", head, "v0.2.0"])
 git(fixture, leaf, ["tag", prefix, "v0.2.0"])
@@ -125,6 +187,12 @@ test.check(!io.fileExists(application + "/SHOULD_NOT_EXIST") && !io.fileExists(l
 let original = io.readTextFile(application + "/Minyar.toml")
 cli(fixture, ["add", "https://github.com/O4FDev/leaf.git"], application)
 test.check(test.contains(io.readTextFile(application + "/Minyar.toml"), "rev = \"v0.10.0\""), "latest stable tag uses numeric semver ordering")
+let rollback = root + "/rollback"
+cli(fixture, ["new", rollback], root)
+git(fixture, leafMirror, ["update-ref", "-d", "refs/tags/v0.10.0"])
+rejected(fixture, ["add", "github.com/O4FDev/leaf"], rollback, "latest Git release moved backwards from v0.10.0 to v0.2.0")
+test.check(!test.contains(io.readTextFile(rollback + "/Minyar.toml"), "github.com/O4FDev/leaf") && !io.fileExists(rollback + "/Minyar.lock"), "latest release rollback preserves the manifest and lock")
+git(fixture, leafMirror, ["update-ref", "refs/tags/v0.10.0", head])
 let pinned = root + "/pinned"
 cli(fixture, ["new", pinned], root)
 cli(fixture, ["add", "github.com/O4FDev/leaf@" + head], pinned)
@@ -140,14 +208,33 @@ rejected(fixture, ["add", "github.com/O4FDev/leaf@" + head, "--offline"], pinned
 cli(fixture, ["tree", "--locked", "--offline"], pinned)
 cli(fixture, ["add", "github.com/O4FDev/leaf@" + head], pinned)
 test.check(test.contains(io.readTextFile(pinned + "/Minyar.lock"), "commit = \"" + head + "\""), "incorrect cache hints never override a full commit ID")
-cli(fixture, ["add", "github.com/O4FDev/leaf@" + prefix], pinned)
-test.check(test.contains(io.readTextFile(pinned + "/Minyar.lock"), "commit = \"" + head + "\""), "object prefixes take precedence over similarly named tags")
+rejected(fixture, ["add", "github.com/O4FDev/leaf@" + prefix], pinned, "use the full 40-character commit ID")
 rejected(fixture, ["add", "github.com/O4FDev/leaf@" + fakeCommit], pinned, "revision not found")
-cli(fixture, ["add", "github.com/O4FDev/leaf@" + hidden], pinned)
+let hiddenReference = root + "/home with spaces/packages/refs/" + host.hashBytes(Bytes("github.com/O4FDev/leaf\n" + hidden))
+let referenceVictim = root + "/reference-victim"
+let referenceWrapper = root + "/reference-wrapper"
+io.writeTextFile(referenceVictim, "SAFE reference\n")
+io.writeTextFile(referenceWrapper, "#!/bin/sh\nlauncher=$1\nvictim=$2\ntemporary=$3\nshift 3\n/bin/ln -s \"$victim\" \"$temporary.$$\" || exit 91\nexec \"$launcher\" \"$@\"\n")
+test.require(test.run(["/bin/chmod", "+x", referenceWrapper], fixture.environment, root, root + "/reference-wrapper-mode", 10), "package reference attack wrapper permission")
+require(fixture, [referenceWrapper, fixture.launcher, referenceVictim, hiddenReference, "add", "github.com/O4FDev/leaf@" + hidden], pinned)
+test.check(io.readTextFile(referenceVictim) == "SAFE reference\n" && io.fileExists(hiddenReference), "package references use private unpredictable staging")
 test.check(test.contains(io.readTextFile(pinned + "/Minyar.lock"), "commit = \"" + hidden + "\""), "full commits may be fetched directly when no advertised ref reaches them")
 cli(fixture, ["tree", "--locked", "--offline"], pinned)
-let addedBranch = cli(fixture, ["add", "github.com/O4FDev/leaf@main"], pinned)
+let gitPath = host.which("git")
+let tracedGit = root + "/traced-git"
+host.makeDirectories(tracedGit)
+io.writeTextFile(tracedGit + "/git", "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$MINYAR_TEST_GIT_TRACE\"\nexec \"$MINYAR_TEST_REAL_GIT\" \"$@\"\n")
+require(fixture, ["chmod", "755", tracedGit + "/git"], root)
+let branchEnvironment: List<Text> = []
+for entry in fixture.environment { if !entry.startsWith("PATH=") { branchEnvironment.add(entry) } }
+branchEnvironment.add("PATH=" + tracedGit + ":" + system.getenv("PATH"))
+branchEnvironment.add("MINYAR_TEST_REAL_GIT=" + gitPath)
+branchEnvironment.add("MINYAR_TEST_GIT_TRACE=" + root + "/branch-git.log")
+let branchFixture = Fixture { launcher: fixture.launcher; root: root; environment: branchEnvironment; serial: fixture.serial + 1000 }
+let addedBranch = cli(branchFixture, ["add", "github.com/O4FDev/leaf@main"], pinned)
 test.check(host.countText(addedBranch.errorOutput, "  Fetching  github.com/O4FDev/leaf@") == 1, "refreshing a branch fetches once and locks that exact discovery")
+let branchTrace = io.readTextFile(root + "/branch-git.log")
+test.check(test.contains(branchTrace, "+refs/heads/main:refs/heads/main") && !test.contains(branchTrace, "+refs/heads/*:refs/heads/*"), "branch fetch must not download unrelated refs")
 cli(fixture, ["tree", "--locked", "--offline"], pinned)
 cli(fixture, ["remove", "leaf", "--offline"], pinned)
 cli(fixture, ["tree", "--locked", "--offline"], pinned)
@@ -228,6 +315,9 @@ rejected(fixture, ["add", "github.com/O4FDev/raw_escape"], moved, "cannot declar
 let multilineEscape = makePackage(fixture, "multiline_escape", "0.1.0", multilinePrefix + nativeBody, "")
 commit(fixture, multilineEscape, "0.1.0"); mirror(fixture, "multiline_escape", multilineEscape)
 rejected(fixture, ["add", "github.com/O4FDev/multiline_escape"], moved, "cannot declare native")
+let bidi = makePackage(fixture, "bidi", "0.1.0", "// " + Text(Character(8238)) + "\npublic function answer(): Integer { return 1 }\n", "")
+commit(fixture, bidi, "0.1.0"); mirror(fixture, "bidi", bidi)
+rejected(fixture, ["add", "github.com/O4FDev/bidi"], moved, "bidirectional formatting controls")
 let local = makePackage(fixture, "escape", "0.1.0", "public function answer(): Integer { return 1 }\n", "leaf = { path = \"../../outside\" }\n")
 commit(fixture, local, "0.1.0"); mirror(fixture, "escape", local)
 rejected(fixture, ["add", "github.com/O4FDev/escape"], moved, "local path dependency")

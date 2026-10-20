@@ -19,6 +19,11 @@ static void pause_ms(long milliseconds) {
     nanosleep(&pause, NULL);
 }
 
+static void pause_us(long microseconds) {
+    struct timespec pause = {microseconds / 1000000, (microseconds % 1000000) * 1000};
+    nanosleep(&pause, NULL);
+}
+
 static void send_all(int fd, const char *data, size_t length) {
     while (length > 0) {
         ssize_t sent = send(fd, data, length, MSG_NOSIGNAL);
@@ -54,6 +59,17 @@ static int field(const char *request, const char *name, char *value, size_t size
 }
 
 static void bounded(int fd, const char *path) {
+    if (strcmp(path, "/header-drip") == 0) {
+        const char *prefix = "HTTP/1.0 200 OK\r\nX-Fill: ";
+        const char *suffix = "\r\nContent-Length: 0\r\n\r\n";
+        send_all(fd, prefix, strlen(prefix));
+        for (int index = 0; index < 16000; index++) {
+            send_all(fd, "a", 1);
+            pause_us(20);
+        }
+        send_all(fd, suffix, strlen(suffix));
+        return;
+    }
     int huge = strcmp(path, "/huge") == 0;
     char head[256];
     snprintf(head, sizeof head, "HTTP/1.0 200 OK\r\nContent-Length: %s\r\n\r\n", huge ? "999999999999999999999" : "4");
@@ -145,6 +161,11 @@ static void *serve(void *argument) {
         }
         char method[16], path[8192], host[1024], length_text[32];
         if (sscanf(request, "%15s %8191s", method, path) != 2) { close(fd); return NULL; }
+        if (strcmp(path, "/upload-stall") == 0) {
+            pause_ms(1500);
+            close(fd);
+            return NULL;
+        }
         field(request, "Host", host, sizeof host);
         size_t head_length = (size_t)(end - request) + 4;
         size_t body_length = field(request, "Content-Length", length_text, sizeof length_text) ? (size_t)strtoul(length_text, NULL, 10) : 0;

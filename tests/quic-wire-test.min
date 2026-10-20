@@ -3,6 +3,7 @@ use "process" as processInfo
 use "../tools/testing.min" as test
 use "./quic-test-support.min" as quic
 use "./cpython-random.min" as random
+use "quicwire" as wire
 use "system" as system
 use "json" as json
 
@@ -85,6 +86,20 @@ let state = random.seeded("9000")
 let work = test.scratch()
 let binary = quic.program("tests/quic-wire.min", work + "/wire.exe", sanitize)
 
+// A maximum-size parsed ACK has 257 descending ranges. Compare the lookup
+// used by the connection ledger with a simple scan at every boundary and gap.
+let ackRanges: List<wire.Range> = []
+for index in 0..257 {
+    let first = (256 - index) * 4
+    ackRanges.add(wire.Range { first: first; last: first + 1 })
+}
+test.check(!wire.acknowledged([], 0), "empty ACK range list matched a packet")
+for number in 0..1030 {
+    let expected = false
+    for range in ackRanges { if number >= range.first && number <= range.last { expected = true } }
+    test.check(wire.acknowledged(ackRanges, number) == expected, "ACK lookup disagreed at packet " + Text(number))
+}
+
 let ints = [0, 1, 63, 64, 16383, 16384, 1073741823, 1073741824, 4611686018427387903]
 for unused in 0..2000 { ints.add(large(state, 4611686018427387904)) }
 let cases = [WireCase { data: Bytes(); wanted: "rejected" }]
@@ -127,6 +142,11 @@ let invalid = [join([byte(2), byte(0), byte(0), byte(0), byte(1)]), join([byte(2
     join([byte(24), byte(1), byte(2), byte(8), Bytes("abcdefgh"), Bytes(16)]), join([byte(24), byte(1), byte(0), byte(0), Bytes(16)]),
     join([byte(7), byte(0)]), byte(31)]
 for data in invalid { cases.add(WireCase { data: data; wanted: "rejected" }) }
+let repeatedAcks = Bytes()
+for index in 0..64 { repeatedAcks.addBytes(join([byte(2), byte(0), byte(0), byte(0), byte(0)])) }
+cases.add(WireCase { data: repeatedAcks.slice(0, repeatedAcks.length); wanted: "accepted" })
+repeatedAcks.addBytes(join([byte(2), byte(0), byte(0), byte(0), byte(0)]))
+cases.add(WireCase { data: repeatedAcks; wanted: "rejected" })
 for unused in 0..10000 { cases.add(WireCase { data: noise(state, 512); wanted: "" }) }
 cases.add(WireCase { data: Bytes(65535); wanted: "ok 0:0:0:false:0:;" })
 cases.add(WireCase { data: Bytes(65536); wanted: "rejected" })

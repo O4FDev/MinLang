@@ -3,7 +3,7 @@ use "http2" as h2
 use "errors" as errors
 record Cursor { bytes: Bytes; at: Integer; bad: Boolean }
 record Call {
-    id: Integer; buffer: Bytes; data: Bytes; opened: Boolean; notified: Boolean
+    id: Integer; buffer: Bytes; bufferAt: Integer; data: Bytes; dataAt: Integer; opened: Boolean; notified: Boolean
     token: Bytes; exit: Text; connection: Text; deadline: Integer; due: Integer; monoDue: Integer
     timeout: Integer; acceptedWall: Integer; acceptedMono: Integer; status: Boolean; accepted: Boolean; ended: Boolean
     explicitTimeout: Boolean; deadlineActive: Boolean
@@ -18,6 +18,21 @@ public record OpenResult {
 public record ClosedResult { private error: errors.Error; private stream: Integer; private cause: errors.Error }
 constant LIMIT = 1048576
 constant MAX_MESSAGE = 65540
+function bufferBytes(call: Call): Integer { return call.buffer.length - call.bufferAt }
+function dataBytes(call: Call): Integer { return call.data.length - call.dataAt }
+function queuedBytes(call: Call): Integer { return bufferBytes(call) + dataBytes(call) }
+function clearQueued(call: Call) { call.buffer = Bytes(); call.bufferAt = 0; call.data = Bytes(); call.dataAt = 0 }
+function compactBuffer(call: Call) {
+    if call.bufferAt > 0 && (call.bufferAt >= 65536 || call.bufferAt == call.buffer.length) {
+        call.buffer = call.buffer.slice(call.bufferAt, call.buffer.length); call.bufferAt = 0
+    }
+}
+function compactData(call: Call) {
+    if call.dataAt > 0 && (call.dataAt >= 65536 || call.dataAt == call.data.length) {
+        call.data = call.data.slice(call.dataAt, call.data.length); call.dataAt = 0
+    }
+}
+function responseOutputFull(server: Server): Boolean { return h2.bufferedOutput(server.transport) > LIMIT - 8192 }
 public function path(): Text { return "/PeerEdgeDial/OpenExitStream" }
 function problem(code: Integer, message: Text): errors.Error { return errors.make(code, 0, message) }
 function failure(code: Integer, message: Text): errors.BooleanResult { return errors.booleanFailure(problem(code, message)) }
@@ -36,7 +51,7 @@ public function activeStreamIDs(server: Server): List<Integer> {
 }
 public function closed(server: Server): ClosedResult {
     for call in server.calls {
-        if !call.closedNotified && (call.ended || errors.isError(call.error)) {
+        if !call.closedNotified && call.ended {
             call.closedNotified = true; return ClosedResult { error: errors.none(); stream: call.id; cause: call.error }
         }
     }
@@ -51,7 +66,7 @@ public function release(server: Server, id: Integer): errors.BooleanResult {
     let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown gRPC call") }; let call = server.calls[at]
     if !call.ended || !call.closedNotified { return failure(errors.wouldBlockCode(), "gRPC close not observed or trailers not queued") }
     let result = h2.release(server.transport, id); if !errors.booleanOk(result) { return result }
-    server.held = server.held - call.buffer.length - call.data.length
+    server.held = server.held - queuedBytes(call)
     let kept: List<Call> = []; for old in server.calls { if old.id != id { kept.add(old) } }; server.calls = kept
     return errors.boolean(true)
 }
@@ -117,7 +132,7 @@ function terminate(server: Server, call: Call, code: Integer, message: Text): er
 }
 function abandon(server: Server, call: Call, message: Text): errors.BooleanResult {
     call.error = problem(errors.protocolCode(), message)
-    server.held = server.held - call.buffer.length - call.data.length; call.buffer = Bytes(); call.data = Bytes()
+    server.held = server.held - queuedBytes(call); clearQueued(call)
     let result = terminate(server, call, 13, message)
     if !errors.booleanOk(result) && !errors.isWouldBlock(errors.booleanError(result)) { call.ended = true }
     return errors.booleanFailure(call.error)
@@ -151,51 +166,58 @@ function drain(server: Server, call: Call): errors.BooleanResult {
     if call.ended { return errors.boolean(true) }
     let reading = true
     while reading {
+        // Keep enough transport output room for a bounded gRPC error response.
+        // Flow-control updates emitted by h2.read must not consume that reserve
+        // after hostile input has already made the call unrecoverable.
+        if responseOutputFull(server) { return failure(errors.wouldBlockCode(), "gRPC response output full") }
         let capacity = LIMIT - server.held
         if capacity == 0 { return failure(errors.wouldBlockCode(), "gRPC receive queues full") }
         let result = h2.read(server.transport, call.id, min(capacity, 16384))
         if errors.bytesStatus(result) == errors.wouldBlockStatus() { reading = false }
         else if errors.bytesStatus(result) == errors.endOfStreamStatus() {
-            if call.buffer.length != 0 || !call.opened { return abandon(server, call, "truncated gRPC request message") }
+            if bufferBytes(call) != 0 || !call.opened { return abandon(server, call, "truncated gRPC request message") }
             reading = false
         } else if !errors.bytesOk(result) {
-            call.error = errors.bytesError(result); server.held = server.held - call.buffer.length - call.data.length
-            call.buffer = Bytes(); call.data = Bytes(); call.ended = true; return errors.booleanFailure(call.error)
+            call.error = errors.bytesError(result); server.held = server.held - queuedBytes(call)
+            clearQueued(call); call.ended = true; return errors.booleanFailure(call.error)
         } else {
-            let bytes = errors.bytesValue(result); call.buffer.addBytes(bytes); server.held = server.held + bytes.length
+            let bytes = errors.bytesValue(result); compactBuffer(call); call.buffer.addBytes(bytes); server.held = server.held + bytes.length
             if call.opened && !call.accepted && bytes.length > 0 { return abandon(server, call, "client DATA arrived before status OK") }
         }
-        while call.buffer.length >= 5 {
+        while bufferBytes(call) >= 5 {
             let bytes = call.buffer
-            let size = (bytes[1] << 24) | (bytes[2] << 16) | (bytes[3] << 8) | bytes[4]
-            if bytes[0] != 0 || size > MAX_MESSAGE || (!call.opened && size > 16384) { return abandon(server, call, "unsupported compression or gRPC message limit") }
-            if size > bytes.length - 5 { break }
-            let body = bytes.slice(5, 5 + size); call.buffer = bytes.slice(5 + size, bytes.length)
+            let at = call.bufferAt
+            let size = (bytes[at + 1] << 24) | (bytes[at + 2] << 16) | (bytes[at + 3] << 8) | bytes[at + 4]
+            if bytes[at] != 0 || size > MAX_MESSAGE || (!call.opened && size > 16384) { return abandon(server, call, "unsupported compression or gRPC message limit") }
+            if size > bytes.length - at - 5 { break }
+            let body = bytes.slice(at + 5, at + 5 + size); call.bufferAt = at + 5 + size
             server.held = server.held - size - 5
             if !call.opened {
                 if !openMessage(server, call, body) { return abandon(server, call, "invalid protobuf gRPC open") }
-                if call.buffer.length > 0 { return abandon(server, call, "client DATA arrived before status OK") }
+                if bufferBytes(call) > 0 { return abandon(server, call, "client DATA arrived before status OK") }
             } else {
                 if !call.accepted { return abandon(server, call, "client DATA arrived before status OK") }
                 let cursor = Cursor { bytes: body; at: 0; bad: false }
                 if varint(cursor) != 26 { return abandon(server, call, "gRPC open/status repeated or invalid data variant") }
                 let data = blob(cursor)
                 if cursor.bad || cursor.at != body.length || data.length > 65536 { return abandon(server, call, "invalid protobuf data message") }
-                call.data.addBytes(data); server.held = server.held + data.length
+                compactData(call); call.data.addBytes(data); server.held = server.held + data.length
             }
         }
     }
     return errors.boolean(true)
 }
 function acceptHeaders(server: Server, nowMillis: Integer) {
+    if responseOutputFull(server) { return }
     let request = h2.requests(server.transport)
     while h2.requestOk(request) {
         if server.calls.length >= 64 {
             h2.resetStream(server.transport, h2.streamID(request), 7)
+            if responseOutputFull(server) { return }
             request = h2.requests(server.transport); continue
         }
         let fields = h2.headers(request); let timeout = timeoutMillis(h2.headerValue(fields, "grpc-timeout"))
-        let call = Call { id: h2.streamID(request); buffer: Bytes(); data: Bytes(); opened: false; notified: false
+        let call = Call { id: h2.streamID(request); buffer: Bytes(); bufferAt: 0; data: Bytes(); dataAt: 0; opened: false; notified: false
             token: Bytes(); exit: ""; connection: ""; deadline: 0; due: 0; monoDue: 0; timeout: timeout
             acceptedWall: nowMillis; acceptedMono: server.mono; status: false; accepted: false; ended: false; error: errors.none()
             explicitTimeout: h2.headerValue(fields, "grpc-timeout") != ""; deadlineActive: true; closedNotified: false }
@@ -212,6 +234,7 @@ function acceptHeaders(server: Server, nowMillis: Integer) {
         if server.calls.length > 64 || duplicate || timeout < 0 || h2.headerValue(fields, ":method") != "POST" || h2.headerValue(fields, ":path") != path() || !(content == "application/grpc" || content == "application/grpc+proto") || h2.headerValue(fields, "te") != "trailers" || (encoding != "" && encoding != "identity") {
             abandon(server, call, "invalid gRPC request headers")
         }
+        if responseOutputFull(server) { return }
         request = h2.requests(server.transport)
     }
 }
@@ -262,7 +285,7 @@ public function sendStatusDetail(server: Server, id: Integer, status: Text, deta
         call.status = true; call.accepted = value == 0
         if value == 0 && !call.explicitTimeout { call.deadlineActive = false }
         if value != 0 {
-            server.held = server.held - call.buffer.length - call.data.length; call.buffer = Bytes(); call.data = Bytes()
+            server.held = server.held - queuedBytes(call); clearQueued(call)
             return terminate(server, call, 0, "")
         }
     }
@@ -275,14 +298,16 @@ public function read(server: Server, id: Integer, maximum: Integer): errors.Byte
     if !call.opened || !call.accepted { return errors.bytesFailure(problem(errors.protocolCode(), "gRPC relay status not accepted")) }
     drain(server, call)
     if errors.isError(call.error) { return errors.bytesFailure(call.error) }
-    if call.data.length == 0 {
+    if dataBytes(call) == 0 {
         if call.ended { return errors.endOfStream() }
         let result = h2.read(server.transport, id, 1)
         if errors.bytesStatus(result) == errors.endOfStreamStatus() { return errors.endOfStream() }
-        if errors.bytesOk(result) { let bytes = errors.bytesValue(result); call.buffer.addBytes(bytes); server.held = server.held + bytes.length }
+        if errors.bytesOk(result) { let bytes = errors.bytesValue(result); compactBuffer(call); call.buffer.addBytes(bytes); server.held = server.held + bytes.length }
         return errors.wouldBlock(0)
     }
-    let end = min(maximum, call.data.length); let bytes = call.data.slice(0, end); call.data = call.data.slice(end, call.data.length); server.held = server.held - end
+    let end = min(maximum, dataBytes(call)); let bytes = call.data.slice(call.dataAt, call.dataAt + end)
+    call.dataAt = call.dataAt + end; server.held = server.held - end
+    if call.dataAt == call.data.length { call.data = Bytes(); call.dataAt = 0 }
     return errors.bytes(bytes)
 }
 public function write(server: Server, id: Integer, bytes: Bytes): errors.BooleanResult {
@@ -303,7 +328,7 @@ function expire(server: Server, call: Call) {
     if call.ended { return }
     if !errors.isError(call.error) {
         call.error = problem(errors.timedOutCode(), "gRPC deadline exceeded")
-        server.held = server.held - call.buffer.length - call.data.length; call.buffer = Bytes(); call.data = Bytes()
+        server.held = server.held - queuedBytes(call); clearQueued(call)
         h2.discardPendingData(server.transport, call.id)
     }
     let result = terminate(server, call, 4, "deadline exceeded")

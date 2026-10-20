@@ -16,6 +16,7 @@ public constant INITIAL_KEYS = 0
 public constant HANDSHAKE_KEYS = 1
 constant AES128_GCM = 0x1301
 constant CHACHA20_POLY1305 = 0x1303
+constant RECORD_KEY_LIMIT = 16777216
 
 public record Session {
     state: Integer; stage: Integer; error: Text; cipherSuite: Integer; allowedSuites: List<Integer>
@@ -130,6 +131,10 @@ function nonce(iv: Bytes, sequence: Integer): Bytes {
 function encrypt(session: Session, type: Integer, content: Bytes) {
     let offset = 0
     while offset < content.length || content.length == 0 {
+        if session.writeSequence >= RECORD_KEY_LIMIT {
+            abandon(session, "TLS record key usage limit reached")
+            return
+        }
         let size = min(16384, content.length - offset)
         let inner = content.slice(offset, offset + size); inner.add(type)
         let header = Bytes(); header.add(23); add16(header, 0x0303); add16(header, inner.length + 16)
@@ -446,12 +451,17 @@ function messages(session: Session) {
         if session.handshake.length < length + 4 { return }
         let item = session.handshake.slice(0, length + 4); session.handshake = session.handshake.slice(length + 4, session.handshake.length)
         let type = item[0]
+        let state = session.state
         if session.quic && ((type == 1 && session.incomingLevel != INITIAL_KEYS) || (type != 1 && session.incomingLevel != HANDSHAKE_KEYS)) { abandon(session, "wrong QUIC TLS encryption level"); return }
         if type == 1 && session.stage == 0 { clientHello(session, item) }
         else if type == 11 && session.stage == 1 { clientCertificate(session, item) }
         else if type == 15 && session.stage == 2 { clientVerify(session, item) }
         else if type == 20 && session.stage == 3 { clientFinished(session, item) }
         else { abandon(session, "unexpected or out-of-order client handshake message"); return }
+        if !session.quic && session.state != FAILED && session.state != state && session.handshake.length > 0 {
+            abandon(session, "TLS key change is not aligned to a record boundary")
+            return
+        }
     }
 }
 public function receiveHandshake(session: Session, data: Bytes, level: Integer) {
@@ -470,6 +480,7 @@ function record(session: Session, header: Bytes, body: Bytes) {
     }
     if type == 22 && session.state == STARTING { session.handshake.addBytes(body); messages(session); return }
     if type != 23 || session.readKey.length == 0 { abandon(session, "unexpected client TLS record"); return }
+    if session.readSequence >= RECORD_KEY_LIMIT { abandon(session, "TLS record key usage limit reached"); return }
     let iv = nonce(session.readIv, session.readSequence)
     let opened = crypto.Opened { valid: false; plaintext: Bytes() }
     if session.cipherSuite == AES128_GCM {
@@ -494,14 +505,16 @@ public function receive(session: Session, data: Bytes) {
     if session.state == FAILED || session.state == CLOSED { return }
     if session.quic || data.length > 1048576 || session.received.length + data.length > 1048576 { abandon(session, "invalid TLS server transport input"); return }
     session.received.addBytes(data)
-    while session.state != FAILED && session.state != CLOSED && session.received.length >= 5 {
-        let size = get16(session.received, 3); let version = get16(session.received, 1)
+    let received = session.received; let consumed = 0
+    while session.state != FAILED && session.state != CLOSED && received.length - consumed >= 5 {
+        let size = get16(received, consumed + 3); let version = get16(received, consumed + 1)
         if size > 16640 || (version != 0x0303 && !(session.state == STARTING && version == 0x0301)) { abandon(session, "invalid client TLS record version or size"); return }
-        if session.received.length < size + 5 { return }
-        let header = session.received.slice(0, 5); let body = session.received.slice(5, size + 5)
-        session.received = session.received.slice(size + 5, session.received.length)
+        if received.length - consumed < size + 5 { break }
+        let header = received.slice(consumed, consumed + 5); let body = received.slice(consumed + 5, consumed + size + 5)
+        consumed += size + 5
         record(session, header, body)
     }
+    if session.state != FAILED && consumed > 0 { session.received = received.slice(consumed, received.length) }
 }
 public function takeOutgoing(session: Session): Bytes { let result = session.outgoing; session.outgoing = Bytes(); return result }
 // TCP EOF requires close_notify. A QUIC CRYPTO stream has no TLS record EOF;
@@ -522,6 +535,6 @@ public function send(session: Session, data: Bytes) {
 public function close(session: Session) {
     if session.state == ESTABLISHED {
         if !session.quic { encrypt(session, 21, crypto.fromHex("0100")) }
-        session.state = CLOSED
+        if session.state != FAILED { session.state = CLOSED }
     }
 }

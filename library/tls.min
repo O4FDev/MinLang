@@ -31,6 +31,7 @@ public constant APPLICATION_KEYS = 2
 constant CHACHA20_POLY1305 = 0x1303
 constant AES128_GCM = 0x1301
 constant X25519 = 0x001d
+constant RECORD_KEY_LIMIT = 16777216
 
 public record Session {
     cipherSuite: Integer; allowedSuites: List<Integer>
@@ -376,6 +377,10 @@ function recordOpen(session: Session, iv: Bytes, header: Bytes, ciphertext: Byte
 function encrypt(session: Session, type: Integer, content: Bytes) {
     let offset = 0
     while offset < content.length || content.length == 0 {
+        if session.writeSequence >= RECORD_KEY_LIMIT {
+            abandon(session, "TLS record key usage limit reached")
+            return
+        }
         let size = min(content.length - offset, 16384)
         let inner = content.slice(offset, offset + size)
         inner.add(type)
@@ -405,18 +410,21 @@ public function receive(session: Session, data: Bytes) {
         return
     }
     session.received.addBytes(data)
-    while session.state != FAILED && session.state != CLOSED && session.received.length >= 5 {
-        let length = get16(session.received, 3)
-        if length > 16640 || get16(session.received, 1) != 0x0303 {
+    let received = session.received
+    let consumed = 0
+    while session.state != FAILED && session.state != CLOSED && received.length - consumed >= 5 {
+        let length = get16(received, consumed + 3)
+        if length > 16640 || get16(received, consumed + 1) != 0x0303 {
             abandon(session, "invalid TLS record version or length")
             return
         }
-        if session.received.length < 5 + length { return }
-        let header = session.received.slice(0, 5)
-        let body = session.received.slice(5, 5 + length)
-        session.received = session.received.slice(5 + length, session.received.length)
+        if received.length - consumed < 5 + length { break }
+        let header = received.slice(consumed, consumed + 5)
+        let body = received.slice(consumed + 5, consumed + 5 + length)
+        consumed += 5 + length
         readRecord(session, header, body)
     }
+    if session.state != FAILED && consumed > 0 { session.received = received.slice(consumed, received.length) }
 }
 
 function readRecord(session: Session, header: Bytes, body: Bytes) {
@@ -442,6 +450,10 @@ function readRecord(session: Session, header: Bytes, body: Bytes) {
     }
     if type != 23 || session.readKey.length == 0 {
         abandon(session, "unexpected record type " + Text(type))
+        return
+    }
+    if session.readSequence >= RECORD_KEY_LIMIT {
+        abandon(session, "TLS record key usage limit reached")
         return
     }
     let opened = recordOpen(session, nonce(session.readIv, session.readSequence), header, body)
@@ -499,16 +511,19 @@ function alert(session: Session, body: Bytes) {
 // ----- Handshake -----
 
 function handshakeMessages(session: Session) {
-    while session.state != FAILED && session.handshake.length >= 4 {
-        let length = get24(session.handshake, 1)
+    let handshake = session.handshake
+    let consumed = 0
+    while session.state != FAILED && handshake.length - consumed >= 4 {
+        let length = get24(handshake, consumed + 1)
         if length > 1048576 {
             abandon(session, "TLS handshake message exceeds its size limit")
             return
         }
-        if session.handshake.length < 4 + length { return }
-        let message = session.handshake.slice(0, 4 + length)
-        session.handshake = session.handshake.slice(4 + length, session.handshake.length)
+        if handshake.length - consumed < 4 + length { break }
+        let message = handshake.slice(consumed, consumed + 4 + length)
+        consumed += 4 + length
         let type = message[0]
+        let state = session.state
         if session.quic && ((type == 2 && session.incomingLevel != INITIAL_KEYS) ||
            (type == 4 && session.incomingLevel != APPLICATION_KEYS) ||
            (type != 2 && type != 4 && session.incomingLevel != HANDSHAKE_KEYS)) {
@@ -532,7 +547,12 @@ function handshakeMessages(session: Session) {
         } else {
             abandon(session, "unexpected or out-of-order TLS handshake message")
         }
+        if !session.quic && session.state != FAILED && session.state != state && consumed != handshake.length {
+            abandon(session, "TLS key change is not aligned to a record boundary")
+            return
+        }
     }
+    if session.state != FAILED && consumed > 0 { session.handshake = handshake.slice(consumed, handshake.length) }
 }
 
 function newSessionTicket(session: Session, message: Bytes) {
@@ -975,7 +995,7 @@ public function send(session: Session, data: Bytes) {
 public function close(session: Session) {
     if session.state == ESTABLISHED {
         if !session.quic { encrypt(session, 21, crypto.fromHex("0100")) }
-        session.state = CLOSED
+        if session.state != FAILED { session.state = CLOSED }
     }
 }
 

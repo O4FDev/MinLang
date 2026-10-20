@@ -7,17 +7,20 @@ they are found. Each report records the input an attacker controls, the exact
 code path, impact, a safe reproduction, whether the behavior was reproduced or
 inferred, and the regression that will close it. Keep unverified suspicions in
 a separate section. The dated audit in `docs/security-audit-2026-10-19.md`
-tracks the current review and its remaining gaps.
+tracks the earlier review and its remaining gaps. The current scan categories
+and threat boundaries are in `docs/security-review-plan-2026-10-19.md`.
 
 ## Gates and timing
 
 | When | Gate | Purpose |
 | --- | --- | --- |
 | Individual commit | Existing `check-commit` selection | Fast checks for edited code; no new security scan was added here. |
-| Pull request | `.github/workflows/security-pr.yml`: `sh scripts/security-static-analysis.sh` | Pinned Clang 23 analysis of the native runtime, 13 C entry points, and macOS HTTP Objective-C with core, Unix, and security checkers; diagnostics fail the job. |
-| Pull request | `.github/workflows/security-pr.yml`: `make check-security-os` | Compile the x86-64 kernel and loader plus the Arm64 kernel through the self-hosted compiler after parser changes. |
+| Pull request | `.github/workflows/security-pr.yml`: `sh scripts/security-static-analysis.sh` | Pinned Clang 23 on macOS and Clang 18 on Linux analyze native runtime entry points, including Linux EROFS, TAR, and zstd parsing and macOS HTTP Objective-C; diagnostics fail the job. |
+| Pull request | `.github/workflows/security-pr.yml`: `make check-security-os` | Compile the x86-64 kernel and loader plus the Arm64 kernel through the self-hosted compiler, then check that freestanding square root lowers to an LLVM intrinsic. |
 | Pull request | `.github/workflows/security-pr.yml`: `make check-security-os-http check-security-os-http-sanitize` | Run hostile HTTP response bytes through the same pure parser used by the guest, normally and with ASan/UBSan. |
 | Pull request | `.github/workflows/security-pr.yml`: `make check-os-net-stack check-os-net-stack-sanitize` | Exercise the guest's UDP, DHCP, DNS, ARP, and TCP receive guards with malformed packets and boundary lengths. |
+| Pull request | `.github/workflows/security-pr.yml`: `make check-virtio-used-ring` | Reject forged, replayed, or out-of-range virtio completions before device metadata becomes an offset. |
+| Pull request | `.github/workflows/security-pr.yml`: `make check-minyar-lsp` | Exercise LSP framing, malformed input, and bounded compiler diagnostics. |
 | Pull request | Existing `.github/workflows/ci.yml` | Platform matrix, sanitizer tests, short AFL++ run, protocol and integration checks. |
 | Pull request | `.github/workflows/security-pr.yml`: vendored SHA-256 check | Detect byte changes to the checked-in C sources and license copies so each change receives explicit review. |
 | Nightly | Existing `.github/workflows/fuzz-nightly.yml` | Longer AFL++ compiler campaign and generated-program differential fuzzing, with retained corpus and evidence. |

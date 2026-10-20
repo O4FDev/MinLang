@@ -274,9 +274,9 @@ long long minyar_net_localPort(long long connection) {
         remember_code("localPort", socket_error());
         return -1;
     }
-    if (address.ss_family == AF_INET)
+    if (address.ss_family == AF_INET && length >= sizeof(struct sockaddr_in))
         return ntohs(((struct sockaddr_in *)&address)->sin_port);
-    if (address.ss_family == AF_INET6)
+    if (address.ss_family == AF_INET6 && length >= sizeof(struct sockaddr_in6))
         return ntohs(((struct sockaddr_in6 *)&address)->sin6_port);
     remember_code("localPort", BAD_ARGUMENT);
     return -1;

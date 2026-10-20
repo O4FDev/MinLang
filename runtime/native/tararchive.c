@@ -418,7 +418,7 @@ static int pax_encode(Attrs *m,unsigned char **output,size_t *length) {
     for (size_t i=0;i<m->count;i++) {
         Attr *a=m->a+i; size_t size=a->kn+a->vn+4,next; char count[32];
         do { snprintf(count,sizeof(count),"%zu",size); next=strlen(count)+a->kn+a->vn+3; if (next==size) break; size=next; } while (1);
-        if (size>1048576-*length || !grow(output,&capacity,*length+size,1048576)) { free(*output); *output=NULL; return 0; }
+        if (size>1048576-*length || !grow(output,&capacity,*length+size,1048576) || !*output) { free(*output); *output=NULL; return 0; }
         unsigned char *p=*output+*length; size_t at=strlen(count); memcpy(p,count,at); p[at++]=' ';
         memcpy(p+at,a->key,a->kn); at+=a->kn; p[at++]='='; if (a->vn) memcpy(p+at,a->value,a->vn); at+=a->vn; p[at]='\n'; *length+=size;
     }

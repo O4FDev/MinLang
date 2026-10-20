@@ -19,7 +19,8 @@ global CASES: List<Text> = [
     "late-reinspection-failure", "foreign-network-mode", "host-pid-mode", "host-ipc-mode", "extra-network-membership", "wrong-network-id", "raw-cli-exited-descendant",
     "raw-cli-delayed-create", "retention-stream-bound", "retention-lazy-file-bound", "retention-final-deadline", "copy-size-bound",
     "raw-cli-escaped-descendant", "admission-kill-before-create", "admission-kill-partial-create", "admission-kill-before-retention", "admission-kill-after-criterion",
-    "admission-quiet-inflight", "admission-foreign-intent", "raw-stream-overlimit", "copy-safe-archive", "copy-unsafe-archive",
+    "admission-quiet-inflight", "admission-foreign-intent", "raw-stream-overlimit", "copy-safe-archive", "copy-unsafe-archive", "copy-symlink-escape",
+    "copy-malformed-pax", "copy-base256-overflow",
     "raw-partial-initialization", "raw-escaped-timeout", "raw-foreign-child-boundary", "startup-server-compliance", "startup-client-compliance", "watch-primary-cleanup-secondary",
     "raw-restoration-failure", "retention-manifest-deadline", "copy-official-fixture-layout",
     "up-status-one", "up-status-unsupported", "created-declared-networks", "stopped-declared-networks", "admission-not-opened-revoked", "admission-closed-revoked",
@@ -1059,25 +1060,51 @@ function rawStream(context: Context, root: Text): Result<support.Outcome, common
     support.check(found, "raw_failure_ledger", common.isFile(path(root, "commands/commands.json")))
     return Ok<support.Outcome, common.Failure>(found)
 }
+function overflowHeader(): Bytes {
+    let header = support.tarHeader("huge", 0, 48)
+    header[124] = 128
+    for index in 125..136 { header[index] = 255 }
+    for index in 148..156 { header[index] = 32 }
+    let total = 0
+    for byte in header { total += byte }
+    let position = 154
+    while total > 0 { header[position] = 48 + total % 8; total = total / 8; position -= 1 }
+    return header
+}
 function archiveControl(context: Context, name: Text, root: Text): Result<support.Outcome, common.Failure> {
     let setup = try support.setup(root)
     let daemon = shellDaemon(setup)
     let member = "log.txt"
     if name == "copy-unsafe-archive" { member = "../foreign" }
+    let target = path(root, "copy")
+    if name == "copy-symlink-escape" {
+        let made = try common.makeDirectory(target)
+        let linked = try support.capture(["/bin/ln", "-s", "../foreign", path(target, "log.txt")], root, "archive-link", 2000)
+        if linked.status != 0 { return Err<support.Outcome, common.Failure>(common.failure("OSError", "cannot create archive escape control")) }
+    }
     let raw = path(root, "archive.tar")
-    let wrote = try common.writeBytes(raw, support.tarArchive([member], [Bytes("log")]))
+    let archive = support.tarArchive([member], [Bytes("log")])
+    if name == "copy-malformed-pax" {
+        archive = support.tarHeader("pax", 2, 120)
+        archive.addBytes(Bytes("1 "))
+        archive.addBytes(Bytes(510))
+        archive.addBytes(Bytes(1024))
+    }
+    if name == "copy-base256-overflow" { archive = overflowHeader(); archive.addBytes(Bytes(1024)) }
+    let wrote = try common.writeBytes(raw, archive)
     daemon.commandHook.add(function(args: List<Text>, settings: process.RunOptions): Result<process.Output, common.Failure> {
         return Ok<process.Output, common.Failure>(process.Output { payload: Bytes(); path: raw })
     })
     let rejected = false
-    match adapter.copyBounded(daemon, two(), "/logs/.", path(root, "copy")) {
+    match adapter.copyBounded(daemon, two(), "/logs/.", target) {
         Ok(value) {}
         Err(problem) { rejected = problem.kind == "OwnershipError" }
     }
     let found = support.outcome("passed", "passed")
-    support.check(found, "archive_expected_result", rejected == (name == "copy-unsafe-archive"))
+    support.check(found, "archive_expected_result", rejected == common.member(["copy-unsafe-archive", "copy-symlink-escape", "copy-malformed-pax", "copy-base256-overflow"], name))
     support.check(found, "no_foreign_write", !common.exists(path(root, "foreign")))
     support.check(found, "positive_exact_bytes", name != "copy-safe-archive" || Text(common.readOr(path(root, "copy/log.txt"))) == "log")
+    if name == "copy-symlink-escape" { support.check(found, "escape_fixture_removed", common.removeFile(path(target, "log.txt")) == 0) }
     return Ok<support.Outcome, common.Failure>(found)
 }
 function partialCli(context: Context, root: Text): Result<support.Outcome, common.Failure> {
@@ -2390,7 +2417,7 @@ function runCase(context: Context, name: Text, root: Text): Result<support.Outco
     if name.startsWith("raw-cli-") { return cliDescendant(context, name, root) }
     if name.startsWith("admission-") { return admissionControl(context, name, root) }
     if name == "raw-stream-overlimit" { return rawStream(context, root) }
-    if name == "copy-safe-archive" || name == "copy-unsafe-archive" { return archiveControl(context, name, root) }
+    if common.member(["copy-safe-archive", "copy-unsafe-archive", "copy-symlink-escape", "copy-malformed-pax", "copy-base256-overflow"], name) { return archiveControl(context, name, root) }
     if name.startsWith("watch-") { return watchFault(context, name, root) }
     if name == "author-registry-primary" { return registryPrimary(context, root) }
     if name == "late-reinspection-failure" { return reinspect(context, root) }

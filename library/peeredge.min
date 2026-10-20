@@ -22,6 +22,10 @@ use "peerlive" as live
 use "redis" as redis
 use "resp2" as resp
 
+constant OUTPUT_LIMIT = 1048576
+constant OUTPUT_COMPACT_AFTER = 65536
+constant OUTPUT_WRITE_LIMIT = 65536
+
 record Configuration {
     valid: Boolean; host: Text; devicePort: Integer; gatewayPort: Integer
     redisHost: Text; redisPort: Integer; instance: Text; region: Text; maximum: Integer
@@ -129,6 +133,15 @@ record Peer {
     paths: List<Address>; routed: Bytes; routedIds: List<Bytes>; routingVersion: Integer; output: Bytes; outputAt: Integer; since: Integer
     bound: Boolean; device: Text; exit: Text; epoch: Text; health: live.Health; heartbeatAt: Integer
     control: Integer; published: Boolean; publicationPending: Boolean; redisQueued: Boolean; admitted: Integer
+}
+function outputBytes(peer: Peer): Integer { return peer.output.length - peer.outputAt }
+function appendOutput(peer: Peer, bytes: Bytes): Boolean {
+    if bytes.length > OUTPUT_LIMIT - outputBytes(peer) { return false }
+    if bytes.length == 0 { return true }
+    if peer.outputAt >= OUTPUT_COMPACT_AFTER {
+        peer.output = peer.output.slice(peer.outputAt,peer.output.length); peer.outputAt = 0
+    }
+    peer.output.addBytes(bytes); return true
 }
 record Publication { peer: Integer; epoch: Text; operation: Integer }
 record Core {
@@ -446,8 +459,7 @@ function gatewayService(core: Core, id: Integer) {
     }
     peer.finalizations = pending
     for relay in core.relays { if relay.live && relay.gateway == id { serviceRelay(core,relay) } }
-    if peer.outputAt > 0 { peer.output = peer.output.slice(peer.outputAt,peer.output.length); peer.outputAt = 0 }
-    if peer.output.length < 1048576 - 32768 {
+    if outputBytes(peer) < OUTPUT_LIMIT - 32768 {
         let outgoing = grpc.takeOutgoing(peer.grpc,16384)
         if outgoing.length > 0 { tls.send(peer.gateway,outgoing); mark(core,id) }
     }
@@ -594,9 +606,7 @@ function peerTick(core: Core, id: Integer) {
             }
         } else {
             let bytes = transport.pollTCP(peer.connection,core.now)
-            if bytes.length > 1048576 - (peer.output.length-peer.outputAt) { drop(core,id); return }
-            if peer.outputAt > 0 { peer.output = peer.output.slice(peer.outputAt,peer.output.length); peer.outputAt = 0 }
-            peer.output.addBytes(bytes)
+            if !appendOutput(peer,bytes) { drop(core,id); return }
         }
         if (peer.connection.state == transport.FAILED || peer.connection.state == transport.CLOSED) && !peer.connection.udp.closing && !peer.connection.udp.draining { drop(core,id); return }
     } else {
@@ -619,15 +629,13 @@ function peerTick(core: Core, id: Integer) {
         if peer.bound { gatewayService(core,id) }
         if !peer.live { return }
         let outgoing = tls.takeOutgoing(peer.gateway)
-        if outgoing.length > 1048576 - (peer.output.length-peer.outputAt) { drop(core,id); return }
-        if peer.outputAt > 0 { peer.output = peer.output.slice(peer.outputAt,peer.output.length); peer.outputAt = 0 }
-        peer.output.addBytes(outgoing)
+        if !appendOutput(peer,outgoing) { drop(core,id); return }
     }
-    if peer.socket >= 0 && peer.outputAt < peer.output.length {
+    if peer.socket >= 0 && outputBytes(peer) > 0 {
         for writes in 0..16 {
-            let data = peer.output.slice(peer.outputAt,min(peer.output.length,peer.outputAt+65536)); let written = net.write(peer.socket,data)
-            if errors.integerOk(written) { let count = errors.integerValue(written); if count == 0 { drop(core,id); return }; peer.outputAt += count; if peer.outputAt == peer.output.length { peer.output = Bytes(); peer.outputAt = 0; break } }
-            else if errors.isWouldBlock(errors.integerError(written)) { break }
+            let count = net.writeRange(peer.socket,peer.output,peer.outputAt,min(OUTPUT_WRITE_LIMIT,outputBytes(peer)))
+            if count > 0 { peer.outputAt += count; if outputBytes(peer) == 0 { peer.output = Bytes(); peer.outputAt = 0; break } }
+            else if count == -1 { break }
             else { drop(core,id); return }
         }
         interests(core,peer)

@@ -25,6 +25,7 @@ enum { MHWakeSubtype = 0x4D59 };
 @property(nonatomic, strong) NSURLCredential *clientCredential;
 @property(nonatomic, strong) NSURL *credentialOrigin;
 @property(nonatomic, strong) NSURLSession *identitySession;
+@property(nonatomic, copy) NSArray<NSString *> *callerHeaderNames;
 @end
 @implementation MHRequest
 @end
@@ -58,11 +59,42 @@ static void finish(MHRequest *r, NSString *error) {
     wake();
 }
 
+static BOOL http_valid_url(NSURL *url) {
+    NSString *scheme=url.scheme.lowercaseString;
+    return url.host.length && ([scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"]) &&
+        !url.user && !url.password;
+}
+static NSInteger http_origin_port(NSURL *url) {
+    if (url.port) return url.port.integerValue;
+    return [url.scheme.lowercaseString isEqualToString:@"https"]?443:80;
+}
+static BOOL http_origin_equal(NSURL *a, NSURL *b) {
+    return http_valid_url(a) && http_valid_url(b) &&
+        [a.scheme caseInsensitiveCompare:b.scheme]==NSOrderedSame &&
+        [a.host caseInsensitiveCompare:b.host]==NSOrderedSame && http_origin_port(a)==http_origin_port(b);
+}
 static BOOL http_same_origin(NSURL *a, NSURL *b) {
-    return a.host.length && b.host.length && [a.scheme.lowercaseString isEqualToString:@"https"] &&
-        [b.scheme.lowercaseString isEqualToString:@"https"] &&
-        [a.host caseInsensitiveCompare:b.host]==NSOrderedSame &&
-        (a.port?a.port.integerValue:443)==(b.port?b.port.integerValue:443) && !b.user && !b.password;
+    return [a.scheme.lowercaseString isEqualToString:@"https"] && http_origin_equal(a,b);
+}
+static NSURLRequest *http_redirect_request(MHRequest *r, NSHTTPURLResponse *response,
+                                           NSURLRequest *request, NSString **failure) {
+    *failure=nil;
+    if (!http_valid_url(request.URL)) {
+        *failure=@"HTTP redirects need a valid http:// or https:// URL"; return nil;
+    }
+    if (r.clientCredential && !http_same_origin(r.credentialOrigin,request.URL)) {
+        *failure=@"client certificate requests cannot redirect to another origin"; return nil;
+    }
+    if (http_origin_equal(response.URL,request.URL)) return request;
+    /* A 307/308 proposed request stores its preserved body as a stream. Never
+     * send that caller-controlled secret to a different scheme, host or port. */
+    if (request.HTTPBody.length || request.HTTPBodyStream) {
+        *failure=@"HTTP redirects cannot forward a request body to another origin"; return nil;
+    }
+    if (!r.callerHeaderNames.count) return request;
+    NSMutableURLRequest *sanitized=[request mutableCopy];
+    for (NSString *name in r.callerHeaderNames) [sanitized setValue:nil forHTTPHeaderField:name];
+    return sanitized;
 }
 static NSURLCredential *http_identity_credential(const MinyarBytes *reference, const MinyarBytes *chain) {
     SecIdentityRef identity=identity_value(reference);
@@ -113,10 +145,10 @@ static void http_authenticate(MHRequest *r, NSURLAuthenticationChallenge *challe
 }
 - (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)task willPerformHTTPRedirection:(NSHTTPURLResponse *)response
     newRequest:(NSURLRequest *)request completionHandler:(void (^)(NSURLRequest *))handler {
-    (void)s; (void)response; MHRequest *r=requestFor(task);
-    if (r.clientCredential && !http_same_origin(r.credentialOrigin,request.URL)) {
-        finish(r,@"client certificate requests cannot redirect to another origin"); handler(nil);
-    } else handler(request);
+    (void)s; MHRequest *r=requestFor(task); NSString *failure=nil;
+    NSURLRequest *redirect=http_redirect_request(r,response,request,&failure);
+    if (!redirect) finish(r,failure);
+    handler(redirect);
 }
 - (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)task didReceiveResponse:(NSURLResponse *)response
     completionHandler:(void (^)(NSURLSessionResponseDisposition))handler {
@@ -282,6 +314,7 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:address];
     request.HTTPMethod = verb;
     request.mainDocumentURL = address;
+    NSMutableArray<NSString *> *callerHeaderNames=[NSMutableArray new];
     for (NSString *line in [string(headers) componentsSeparatedByString:@"\n"]) {
         if (!line.length) continue;
         NSRange colon = [line rangeOfString:@":"];
@@ -293,7 +326,9 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
         }
         NSString *value = [rawValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         [request addValue:value forHTTPHeaderField:name];
+        [callerHeaderNames addObject:name];
     }
+    r.callerHeaderNames=callerHeaderNames;
     if (body && body->byte_length) request.HTTPBody = [NSData dataWithBytes:body->bytes length:(NSUInteger)body->byte_length];
     if (requiresIdentity && (!credential || ![address.scheme isEqualToString:@"https"] || address.user || address.password)) {
         finish(r,@"an HTTPS request requires an accessible Keychain identity and valid intermediate certificates"); return handle;

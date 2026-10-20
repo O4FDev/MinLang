@@ -125,7 +125,22 @@ def main():
             finally:
                 first_sums.write_bytes(original_sums)
                 first_signature.write_bytes(original_signature)
+            conflicting_root = root / "conflicting release"
+            conflicting_root.mkdir()
+            conflicting_archive = archive(conflicting_root, installer, "1.0.0", broken=True)
+            published_archive = first_sums.parent / first_archive.name
+            original_archive = published_archive.read_bytes()
+            published_archive.unlink()
+            try:
+                release("1.0.0", conflicting_archive, expected="existing signed checksum differs")
+                assert not published_archive.exists()
+                assert first_sums.read_bytes() == original_sums and first_signature.read_bytes() == original_signature
+                assert (public / "install").read_bytes() == bootstrap
+            finally:
+                published_archive.write_bytes(original_archive)
             release("1.0.0", first_archive)
+            first_latest = (public / "latest").read_bytes()
+            first_latest_signature = (public / "latest.sig").read_bytes()
             # Exercise the actual one-line installation shape against loopback.
             output = run(["bash", "-o", "pipefail", "-c", 'curl -q -fsSL "$1/install" | sh', "minyar", url], environment=environment)
             assert "Ed25519 signature + SHA-256" in output and "Minyar is ready." in output
@@ -134,6 +149,7 @@ def main():
             assert str(command) in run(["sh", "-c", path_command + "\ncommand -v minyar"], environment=environment)
             assert "Minyar 1.0.0" in run([command, "--version"], environment=environment)
             assert "1.0.0 (default)" in run([command, "toolchain", "list"], environment=environment)
+            assert (home / "update-floor").read_text() == "1.0.0\n"
             source_launcher = installer.parent / "minyar"
             assert "1.0.0 (default)" in run([source_launcher, "toolchain", "current"], environment=environment)
             extra_home = root / "explicit home"
@@ -144,6 +160,8 @@ def main():
                 run(["sh", public / "install"], environment=dict(environment, MINYAR_HOME=str(missing_sdk_home), SDKROOT=str(root / "no sdk")), expected="Apple SDK is unavailable")
                 assert not missing_sdk_home.exists()
             prepare("2.0.0")
+            second_latest = (public / "latest").read_bytes()
+            second_latest_signature = (public / "latest.sig").read_bytes()
             run([command, "toolchain", "install", "2.0.0"], environment=environment)
             assert (home / "default").read_text() == "1.0.0\n"
             project = root / "a project"
@@ -172,9 +190,20 @@ def main():
                 archive_record.write_text(recorded_hash)
                 unavailable_archive.rename(installed_archive)
             assert (home / "default").read_text() == "2.0.0\n"
+            assert (home / "update-floor").read_text() == "2.0.0\n"
             assert "Minyar 1.0.0" in run([command, "--version"], environment=environment, directory=project)
             run([command, "toolchain", "default", "1.0.0"], environment=environment)
             assert (home / "default").read_text() == "1.0.0\n"
+            assert (home / "update-floor").read_text() == "2.0.0\n"
+            try:
+                (public / "latest").write_bytes(first_latest)
+                (public / "latest.sig").write_bytes(first_latest_signature)
+                run([command, "self", "update"], environment=environment, expected="older than accepted update floor")
+                assert (home / "default").read_text() == "1.0.0\n"
+                assert (home / "update-floor").read_text() == "2.0.0\n"
+            finally:
+                (public / "latest").write_bytes(second_latest)
+                (public / "latest.sig").write_bytes(second_latest_signature)
             # A nested Minyar invocation may inherit the selected-toolchain marker.
             assert "Minyar 1.0.0" in run([command, "--version"], environment=dict(environment, MINYAR_TOOLCHAIN_ACTIVE="1.0.0"))
 

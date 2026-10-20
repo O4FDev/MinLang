@@ -38,9 +38,10 @@ public record Connection {
     // Sequence numbers: the first unacknowledged byte, and the next to receive.
     sendUnacked: Integer
     receiveNext: Integer
-    // Bytes from sendUnacked onwards that are not yet acknowledged; `sent` of
-    // them have been transmitted.
+    // Bytes from outgoingAt onwards are not yet acknowledged; `sent` of them
+    // have been transmitted. Compact only after a substantial prefix is spent.
     outgoing: Bytes
+    outgoingAt: Integer
     sent: Integer
     peerWindow: Integer
     incoming: Bytes
@@ -51,6 +52,15 @@ public record Connection {
     finSent: Boolean
     error: Text
     opened: Integer
+}
+
+public record DnsQuery {
+    name: Text
+    id: Integer
+    port: Integer
+    answer: Integer
+    sent: Integer
+    completed: Integer
 }
 
 public record Network {
@@ -64,6 +74,7 @@ public record Network {
     dhcpTransaction: Integer
     dhcpServer: Integer
     dhcpOffer: Integer
+    dhcpSource: Integer
     dhcpSent: Integer
     dhcpTries: Integer
     started: Integer
@@ -75,9 +86,7 @@ public record Network {
     connections: List<Connection>
     nextConnection: Integer
     nextPort: Integer
-    dnsNames: List<Text>
-    dnsIds: List<Integer>
-    dnsAnswers: List<Integer>
+    dnsQueries: List<DnsQuery>
     pings: Integer
     log: List<Text>
 }
@@ -150,6 +159,13 @@ function sequenceAfter(a: Integer, b: Integer): Boolean {
     return difference != 0 && difference < 0x80000000
 }
 
+function randomNonzero32(): Integer {
+    let entropy = secureRandom.bytes(4)
+    let value = get32(entropy, 0)
+    if value == 0 { return 1 }
+    return value
+}
+
 function note(network: Network, line: Text) {
     print("net: " + line)
     network.log.add(line)
@@ -161,11 +177,11 @@ public function create(adapter: e1000.Adapter): Network {
     let portSeed = secureRandom.bytes(2)
     let network = Network {
         adapter: adapter; ip: 0; mask: 0; gateway: 0; dns: 0; configured: false
-        dhcpState: 0; dhcpTransaction: 0x4D494E59; dhcpServer: 0; dhcpOffer: 0; dhcpSent: -100000; dhcpTries: 0
+        dhcpState: 0; dhcpTransaction: randomNonzero32(); dhcpServer: 0; dhcpOffer: 0; dhcpSource: 0; dhcpSent: -100000; dhcpTries: 0
         started: interrupts.milliseconds()
         arpAddresses: []; arpMacs: []; arpAsked: []; waitingFor: []; waiting: []
         connections: []; nextConnection: 1; nextPort: 49152 + get16(portSeed, 0) % 15849
-        dnsNames: []; dnsIds: []; dnsAnswers: []; pings: 0; log: []
+        dnsQueries: []; pings: 0; log: []
     }
     return network
 }
@@ -346,8 +362,12 @@ function sendUdp(network: Network, destination: Integer, sourcePort: Integer, de
 function handleUdp(network: Network, source: Integer, packet: Bytes) {
     let datagram = wire.udp(packet)
     if !datagram.valid { return }
-    if datagram.sourcePort == 67 && datagram.destinationPort == 68 { handleDhcp(network, datagram.payload) }
-    if source == network.dns && datagram.sourcePort == 53 && datagram.destinationPort == 5353 { handleDns(network, datagram.payload) }
+    if datagram.sourcePort == 67 && datagram.destinationPort == 68 {
+        handleDhcp(network, source, datagram.sourcePort, datagram.destinationPort, datagram.payload)
+    }
+    if datagram.sourcePort == 53 {
+        handleDns(network, source, datagram.sourcePort, datagram.destinationPort, datagram.payload)
+    }
 }
 
 function dhcpMessage(network: Network, kind: Integer): Bytes {
@@ -383,12 +403,14 @@ function dhcpMessage(network: Network, kind: Integer): Bytes {
     return message
 }
 
-function handleDhcp(network: Network, message: Bytes) {
-    let parsed = wire.dhcp(message, network.dhcpTransaction)
-    if !parsed.valid { return }
+function handleDhcp(network: Network, source: Integer, sourcePort: Integer, destinationPort: Integer, message: Bytes) {
+    let parsed = wire.dhcp(message, network.dhcpTransaction, network.adapter.mac)
+    if !wire.dhcpReplyAccepted(parsed, network.dhcpState, source, sourcePort, destinationPort,
+                               network.dhcpServer, network.dhcpOffer, network.dhcpSource) { return }
     if parsed.kind == 2 && network.dhcpState == 1 {
         network.dhcpOffer = parsed.offered
         network.dhcpServer = parsed.server
+        network.dhcpSource = source
         network.dhcpState = 2
         note(network, "DHCP offer " + ipText(parsed.offered) + " from " + ipText(parsed.server))
         sendUdp(network, 0xFFFFFFFF, 68, 67, dhcpMessage(network, 3))
@@ -404,52 +426,72 @@ function handleDhcp(network: Network, message: Bytes) {
     }
 }
 
+function expireDns(network: Network, now: Integer) {
+    let live: List<DnsQuery> = []
+    for query in network.dnsQueries {
+        if wire.dnsTimedOut(query.answer, query.sent, now) {
+            query.answer = 0
+            query.completed = now
+        }
+        if wire.retainDnsQuery(query.answer, query.sent, query.completed, now) { live.add(query) }
+    }
+    network.dnsQueries = live
+}
+
+function dnsCoordinates(network: Network): List<Integer> {
+    let entropy = secureRandom.bytes(4)
+    let id = get16(entropy, 0)
+    let port = 49152 + get16(entropy, 2) % 16384
+    while true {
+        let collision = false
+        for query in network.dnsQueries {
+            if query.answer < 0 && query.id == id && query.port == port { collision = true }
+        }
+        if !collision { return [id, port] }
+        id = (id + 1) & 0xFFFF
+        port = 49152 + (port - 49151) % 16384
+    }
+    return [id, port]
+}
+
 // Ask DNS for the IPv4 address of `name`. Poll `resolved` for the answer.
 public function resolve(network: Network, name: Text) {
-    let id = (network.dnsIds.length + 1) * 7919 & 0xFFFF
-    network.dnsNames.add(name)
-    network.dnsIds.add(id)
-    network.dnsAnswers.add(-1)
-    let query = Bytes(12)
-    put16(query, 0, id)
-    put16(query, 2, 0x0100)
-    put16(query, 4, 1)
-    let label = Bytes()
-    for character in name {
-        if character == '.' {
-            query.add(label.length)
-            query.addBytes(label)
-            label = Bytes()
-        } else {
-            label.add(Integer(character))
-        }
+    let now = interrupts.milliseconds()
+    expireDns(network, now)
+    for query in network.dnsQueries { if query.name == name { return } }
+    if network.dnsQueries.length >= wire.MAX_DNS_QUERIES {
+        let room: List<DnsQuery> = []
+        for index in 1..network.dnsQueries.length { room.add(network.dnsQueries[index]) }
+        network.dnsQueries = room
     }
-    query.add(label.length)
-    query.addBytes(label)
-    query.add(0)
-    let tail = Bytes(4)
-    put16(tail, 0, 1)
-    put16(tail, 2, 1)
-    query.addBytes(tail)
-    sendUdp(network, network.dns, 5353, 53, query)
+    let coordinates = dnsCoordinates(network)
+    let packet = wire.dnsQuery(name, coordinates[0])
+    if packet.length == 0 {
+        network.dnsQueries.add(DnsQuery { name: name; id: coordinates[0]; port: coordinates[1]; answer: 0; sent: now; completed: now })
+        return
+    }
+    network.dnsQueries.add(DnsQuery { name: name; id: coordinates[0]; port: coordinates[1]; answer: -1; sent: now; completed: -1 })
+    sendUdp(network, network.dns, coordinates[1], 53, packet)
 }
 
 // The address found for `name`: -1 while waiting, 0 if not found.
 public function resolved(network: Network, name: Text): Integer {
-    for index in 0..network.dnsNames.length {
-        if network.dnsNames[index] == name {
-            return network.dnsAnswers[index]
-        }
-    }
+    expireDns(network, interrupts.milliseconds())
+    for query in network.dnsQueries { if query.name == name { return query.answer } }
     return -1
 }
 
-function handleDns(network: Network, message: Bytes) {
-    let parsed = wire.dns(message)
-    if !parsed.valid { return }
-    for index in 0..network.dnsIds.length {
-        if network.dnsIds[index] == parsed.id {
-            network.dnsAnswers[index] = parsed.address
+function handleDns(network: Network, source: Integer, sourcePort: Integer, destinationPort: Integer, message: Bytes) {
+    let now = interrupts.milliseconds()
+    expireDns(network, now)
+    for query in network.dnsQueries {
+        if query.answer < 0 && wire.dnsTupleAccepted(source, sourcePort, destinationPort, network.dns, query.port) {
+            let parsed = wire.dns(message, query.id, query.name)
+            if parsed.valid {
+                query.answer = parsed.address
+                query.completed = now
+                return
+            }
         }
     }
 }
@@ -484,7 +526,7 @@ function sendSegment(network: Network, connection: Connection, flags: Integer, s
 public function placeholder(): Connection {
     return Connection {
         id: 0; state: CLOSED; remoteIp: 0; remotePort: 0; localPort: 0; sendUnacked: 0; receiveNext: 0
-        outgoing: Bytes(); sent: 0; peerWindow: 0; incoming: Bytes(); lastSend: 0; retries: 0
+        outgoing: Bytes(); outgoingAt: 0; sent: 0; peerWindow: 0; incoming: Bytes(); lastSend: 0; retries: 0
         finReceived: false; finQueued: false; finSent: false; error: ""; opened: 0
     }
 }
@@ -495,7 +537,7 @@ public function connect(network: Network, ip: Integer, port: Integer): Connectio
     let connection = Connection {
         id: network.nextConnection; state: CONNECTING; remoteIp: ip; remotePort: port; localPort: network.nextPort
         sendUnacked: get32(sequenceSeed, 0); receiveNext: 0
-        outgoing: Bytes(); sent: 0; peerWindow: 8192; incoming: Bytes(); lastSend: 0; retries: 0
+        outgoing: Bytes(); outgoingAt: 0; sent: 0; peerWindow: 8192; incoming: Bytes(); lastSend: 0; retries: 0
         finReceived: false; finQueued: false; finSent: false; error: ""; opened: interrupts.milliseconds()
     }
     network.nextConnection += 1
@@ -529,13 +571,15 @@ public function abort(network: Network, connection: Connection) {
 // Transmit whatever the peer's window allows.
 function pump(network: Network, connection: Connection) {
     if connection.state != OPEN { return }
-    while connection.sent < connection.outgoing.length && connection.sent < connection.peerWindow {
-        let size = min(MSS, connection.outgoing.length - connection.sent)
-        let payload = connection.outgoing.slice(connection.sent, connection.sent + size)
+    let pending = connection.outgoing.length - connection.outgoingAt
+    while connection.sent < pending && connection.sent < connection.peerWindow {
+        let size = min(MSS, pending - connection.sent)
+        let begin = connection.outgoingAt + connection.sent
+        let payload = connection.outgoing.slice(begin, begin + size)
         sendSegment(network, connection, TCP_ACK | TCP_PSH, connection.sendUnacked + connection.sent, payload)
         connection.sent += size
     }
-    if connection.finQueued && !connection.finSent && connection.sent == connection.outgoing.length {
+    if connection.finQueued && !connection.finSent && connection.sent == pending {
         sendSegment(network, connection, TCP_FIN | TCP_ACK, connection.sendUnacked + connection.sent, Bytes())
         connection.finSent = true
     }
@@ -609,7 +653,13 @@ function handleTcp(network: Network, source: Integer, segment: Bytes) {
                                                                connection.finSent, acknowledgment) {
         let advanced = (acknowledgment - connection.sendUnacked) & 0xFFFFFFFF
         let dataAcknowledged = min(advanced, connection.sent)
-        connection.outgoing = connection.outgoing.slice(dataAcknowledged, connection.outgoing.length)
+        connection.outgoingAt += dataAcknowledged
+        if connection.outgoingAt == connection.outgoing.length {
+            connection.outgoing = Bytes(); connection.outgoingAt = 0
+        } else if connection.outgoingAt >= 65536 && connection.outgoingAt * 2 >= connection.outgoing.length {
+            connection.outgoing = connection.outgoing.slice(connection.outgoingAt, connection.outgoing.length)
+            connection.outgoingAt = 0
+        }
         connection.sent -= dataAcknowledged
         connection.sendUnacked = acknowledgment
         connection.retries = 0
@@ -701,12 +751,17 @@ public function poll(network: Network) {
                 note(network, "DHCP did not answer; using 10.0.2.15")
             } else {
                 network.dhcpState = 1
+                network.dhcpTransaction = randomNonzero32()
+                network.dhcpServer = 0
+                network.dhcpOffer = 0
+                network.dhcpSource = 0
                 network.dhcpTries += 1
                 network.dhcpSent = now
                 sendUdp(network, 0xFFFFFFFF, 68, 67, dhcpMessage(network, 1))
             }
         }
     }
+    expireDns(network, now)
     retransmit(network, now)
     // Forget finished connections nobody is holding.
     let live: List<Connection> = []

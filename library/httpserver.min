@@ -65,6 +65,7 @@ record Connection {
     // 0 reading, 1 application (unwatched), 2 writing.
     phase: Integer
     input: Bytes
+    inputStart: Integer
     scan: Integer
     headerBytes: Integer
     parsed: Head
@@ -162,7 +163,7 @@ function badHead(status: Integer): Head {
 }
 function newConnection(socket: Integer, deadline: Integer): Connection {
     return Connection { active: true; socket: socket; registration: -1; phase: 0; input: Bytes();
-        scan: 0; headerBytes: 0; parsed: badHead(0); deadline: deadline; started: false;
+        inputStart: 0; scan: 0; headerBytes: 0; parsed: badHead(0); deadline: deadline; started: false;
         needsParse: false; eof: false; ticket: 0; count: 0; output: Bytes(); body: Bytes();
         sent: 0; bodySent: 0; closing: false; writeHup: false; writeProbeAt: -1 }
 }
@@ -323,17 +324,17 @@ function connectionClose(data: Bytes): Integer {
     if data.length == 0 { return -1 }
     return closing
 }
-function parseHead(data: Bytes, end: Integer, limits: Limits): Head {
-    let lineEnd = findByte(data, 13, 0, end)
+function parseHead(data: Bytes, start: Integer, end: Integer, limits: Limits): Head {
+    let lineEnd = findByte(data, 13, start, end)
     if lineEnd < 0 { return badHead(400) }
-    let first = findByte(data, 32, 0, lineEnd)
-    if first <= 0 { return badHead(400) }
+    let first = findByte(data, 32, start, lineEnd)
+    if first <= start { return badHead(400) }
     let second = findByte(data, 32, first + 1, lineEnd)
     if second <= first + 1 { return badHead(400) }
-    for at in 0..first { if !tokenByte(data[at]) { return badHead(400) } }
+    for at in start..first { if !tokenByte(data[at]) { return badHead(400) } }
     for at in first + 1..second { if data[at] <= 32 || data[at] >= 127 || data[at] == 35 { return badHead(400) } }
     if Text(data.slice(second + 1, lineEnd)) != "HTTP/1.1" { return badHead(400) }
-    let method = Text(data.slice(0, first))
+    let method = Text(data.slice(start, first))
     let target = Text(data.slice(first + 1, second))
     if method == "CONNECT" { return badHead(405) }
     if data[first + 1] != 47 && !(target == "*" && method == "OPTIONS") { return badHead(400) }
@@ -346,18 +347,18 @@ function parseHead(data: Bytes, end: Integer, limits: Limits): Head {
     let closing = false
     let expectation = false
     let upgrade = false
-    let start = lineEnd + 2
-    while start < end - 2 {
-        let stop = findByte(data, 13, start, end)
+    let fieldStart = lineEnd + 2
+    while fieldStart < end - 2 {
+        let stop = findByte(data, 13, fieldStart, end)
         if stop < 0 { return badHead(400) }
-        let colon = findByte(data, 58, start, stop)
-        if colon <= start { return badHead(400) }
-        for at in start..colon { if !tokenByte(data[at]) { return badHead(400) } }
+        let colon = findByte(data, 58, fieldStart, stop)
+        if colon <= fieldStart { return badHead(400) }
+        for at in fieldStart..colon { if !tokenByte(data[at]) { return badHead(400) } }
         let from = colon + 1
         let to = stop
         while from < to && (data[from] == 32 || data[from] == 9) { from += 1 }
         while to > from && (data[to - 1] == 32 || data[to - 1] == 9) { to -= 1 }
-        let name = lowercase(data.slice(start, colon))
+        let name = lowercase(data.slice(fieldStart, colon))
         let raw = data.slice(from, to)
         let value = Text(raw)
         if fields.length >= limits.maxHeaders { return badHead(431) }
@@ -377,7 +378,7 @@ function parseHead(data: Bytes, end: Integer, limits: Limits): Head {
             if result < 0 { return badHead(400) }
             if result == 1 { closing = true }
         }
-        start = stop + 2
+        fieldStart = stop + 2
     }
     if hostCount != 1 || lengthCount > 1 || transferCount > 1 || transferCount > 0 && lengthCount > 0 {
         return badHead(400)
@@ -439,9 +440,16 @@ function flush(server: Server, slot: Integer, now: Integer) {
     connection.output.clear(); connection.body = Bytes()
     if connection.closing { drop(server, slot); return }
     connection.phase = 0
-    connection.started = connection.input.length > 0
+    let unread = connection.input.length - connection.inputStart
+    // Keep retained storage bounded without copying the unread pipeline after
+    // every request. Copy only when the consumed prefix can pay for the tail.
+    if connection.inputStart >= 65536 && connection.inputStart >= unread {
+        connection.input = connection.input.slice(connection.inputStart, connection.input.length)
+        connection.inputStart = 0
+    }
+    connection.started = connection.inputStart < connection.input.length
     connection.needsParse = connection.started
-    connection.scan = 0; connection.headerBytes = 0; connection.parsed = badHead(0)
+    connection.scan = connection.inputStart; connection.headerBytes = 0; connection.parsed = badHead(0)
     connection.deadline = now + server.limits.idleMilliseconds
     if connection.started { connection.deadline = now + server.limits.headerMilliseconds }
     watch(server, slot, loop.readableInterest())
@@ -479,17 +487,19 @@ function startResponse(server: Server, slot: Integer, response: Response, head: 
 function reject(server: Server, slot: Integer, status: Integer) {
     let connection = server.connections[slot]
     let head = false
-    if connection.input.length >= 5 {
-        head = connection.input[0] == 72 && connection.input[1] == 69 && connection.input[2] == 65 &&
-            connection.input[3] == 68 && connection.input[4] == 32
+    let start = connection.inputStart
+    if connection.input.length - start >= 5 {
+        head = connection.input[start] == 72 && connection.input[start + 1] == 69 && connection.input[start + 2] == 65 &&
+            connection.input[start + 3] == 68 && connection.input[start + 4] == 32
     }
-    connection.input.clear(); connection.parsed = badHead(0)
+    connection.input.clear(); connection.inputStart = 0; connection.parsed = badHead(0)
     startResponse(server, slot, response(status, "text/plain", Bytes(reason(status))), head, true)
 }
 function parseReady(server: Server, slot: Integer, now: Integer, ready: List<Request>) {
     let connection = server.connections[slot]
     connection.needsParse = false
     let data = connection.input
+    let start = connection.inputStart
     if connection.headerBytes == 0 {
         let at = connection.scan
         while at < data.length {
@@ -505,31 +515,31 @@ function parseReady(server: Server, slot: Integer, now: Integer, ready: List<Req
                     if (byte < 32 && byte != 9) || byte >= 127 { reject(server, slot, 400); return }
                 }
             }
-            if at >= 3 && byte == 10 && data[at - 1] == 13 && data[at - 2] == 10 && data[at - 3] == 13 {
-                connection.headerBytes = at + 1; break
+            if at >= start + 3 && byte == 10 && data[at - 1] == 13 && data[at - 2] == 10 && data[at - 3] == 13 {
+                connection.headerBytes = at + 1 - start; break
             }
             at += 1
-            if at >= server.limits.maxHeaderBytes { reject(server, slot, 431); return }
+            if at - start >= server.limits.maxHeaderBytes { reject(server, slot, 431); return }
         }
         connection.scan = at
         if connection.headerBytes == 0 {
             if connection.eof { reject(server, slot, 400) }
             return
         }
-        connection.parsed = parseHead(data, connection.headerBytes, server.limits)
+        connection.parsed = parseHead(data, start, start + connection.headerBytes, server.limits)
         if connection.parsed.status != 0 { reject(server, slot, connection.parsed.status); return }
         connection.deadline = now + server.limits.bodyMilliseconds
     }
-    let total = connection.headerBytes + connection.parsed.length
+    let total = start + connection.headerBytes + connection.parsed.length
     if data.length < total {
         if connection.eof { reject(server, slot, 400) }
         return
     }
     let body = Bytes()
-    if connection.parsed.length > 0 { body = data.slice(connection.headerBytes, total) }
+    if connection.parsed.length > 0 { body = data.slice(start + connection.headerBytes, total) }
     let parsed = connection.parsed
-    if total == data.length { connection.input.clear() }
-    else { connection.input = data.slice(total, data.length) }
+    if total == data.length { connection.input.clear(); connection.inputStart = 0 }
+    else { connection.inputStart = total }
     if server.nextTicket == 9223372036854775807 { drop(server, slot); return }
     connection.ticket = server.nextTicket; server.nextTicket += 1
     connection.count += 1
@@ -542,14 +552,15 @@ function parseReady(server: Server, slot: Integer, now: Integer, ready: List<Req
 function readReady(server: Server, slot: Integer, now: Integer, ready: List<Request>) {
     let connection = server.connections[slot]
     let capacity = server.limits.maxHeaderBytes + server.limits.maxBodyBytes
+    let buffered = connection.input.length - connection.inputStart
     // A single bounded native read per readiness turn; cached headers avoid rescans.
     let count = net.readInto(connection.socket, connection.input,
-        min(server.limits.ioBudget, capacity - connection.input.length))
+        min(server.limits.ioBudget, capacity - buffered))
     if count == -1 { return }
     if count == -2 { drop(server, slot); return }
     if count == 0 {
         connection.eof = true
-        if connection.input.length == 0 { drop(server, slot); return }
+        if connection.inputStart == connection.input.length { drop(server, slot); return }
     }
     if !connection.started {
         connection.started = true; connection.deadline = now + server.limits.headerMilliseconds
@@ -586,7 +597,7 @@ public function respond(server: Server, request: Request, response: Response): B
     if !requestActive(server, request) || !validResponse(response, server.limits) { return false }
     let connection = server.connections[request.slot]
     let closing = server.draining || !connection.parsed.keepAlive || connection.count >= server.limits.maxRequestsPerConnection ||
-        connection.eof && connection.input.length == 0
+        connection.eof && connection.inputStart == connection.input.length
     return startResponse(server, request.slot, response, connection.parsed.method == "HEAD", closing)
 }
 

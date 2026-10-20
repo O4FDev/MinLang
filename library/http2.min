@@ -7,7 +7,7 @@ record HPack { table: List<Entry>; size: Integer; limit: Integer; nodes: List<No
 record Cursor { bytes: Bytes; at: Integer; bad: Boolean }
 record QueuedFrame { id: Integer; bytes: Bytes; at: Integer; flow: Integer }
 record Stream {
-    id: Integer; fields: List<Header>; incoming: Bytes; pending: Bytes
+    id: Integer; fields: List<Header>; incoming: Bytes; pending: Bytes; pendingAt: Integer
     recvWindow: Integer; sendWindow: Integer; recvEnded: Boolean; sendEnded: Boolean
     response: Boolean; ending: Boolean; trailers: List<Header>; error: errors.Error
     contentLength: Integer; received: Integer
@@ -16,7 +16,7 @@ public record Server {
     private error: errors.Error; private input: Bytes; private output: List<QueuedFrame>; private outputBytes: Integer
     private preface: Boolean; private firstSettings: Boolean; private ack: Boolean
     private hpack: HPack; private streams: List<Stream>; private ready: List<Integer>
-    private lastID: Integer; private continuation: Integer; private block: Bytes; private blockEnd: Boolean
+    private lastID: Integer; private continuation: Integer; private block: Bytes; private blockBytes: Integer; private blockEnd: Boolean
     private recvWindow: Integer; private sendWindow: Integer; private initialSend: Integer
     private maxFrame: Integer; private goaway: Boolean; private pendingBytes: Integer
     private settingsDue: Integer
@@ -242,7 +242,7 @@ function connectionFailure(server: Server, h2code: Integer, message: Text): erro
         // Preserve only a partially drained frame, then send GOAWAY.
         dropOutput(server, 0, false)
         server.error = problem(errors.protocolCode(), h2code, message); server.input = Bytes()
-        for stream in server.streams { stream.incoming = Bytes(); stream.pending = Bytes(); stream.error = server.error }
+        for stream in server.streams { stream.incoming = Bytes(); stream.pending = Bytes(); stream.pendingAt = 0; stream.error = server.error }
         server.pendingBytes = 0
         if !queue(server, frame(7, 0, 0, body)) { fail("HTTP/2 terminal control reserve invariant") }
     }
@@ -255,34 +255,37 @@ public function create(): Server {
     let initial = frame(4, 0, 0, settings)
     return Server { error: errors.none(); input: Bytes(); output: [QueuedFrame { id: 0; bytes: initial; at: 0; flow: 0 }]; outputBytes: initial.length; preface: false; firstSettings: false; ack: false
         hpack: HPack { table: []; size: 0; limit: 4096; nodes: trie(); bad: false; invalidField: false }; streams: []; ready: []; lastID: 0
-        continuation: 0; block: Bytes(); blockEnd: false; recvWindow: 65535; sendWindow: 65535; initialSend: 65535
+        continuation: 0; block: Bytes(); blockBytes: 0; blockEnd: false; recvWindow: 65535; sendWindow: 65535; initialSend: 65535
         maxFrame: 16384; goaway: false; pendingBytes: 0; settingsDue: -1; ended: false }
 }
+function pendingLength(stream: Stream): Integer { return stream.pending.length - stream.pendingAt }
 public function resetStream(server: Server, id: Integer, h2code: Integer): errors.BooleanResult {
     let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown HTTP/2 stream") }
     if !dropOutput(server, id, false) { return connectionFailure(server, 3, "cancelled output flow window overflow") }
     let body = Bytes(); add32(body, h2code)
     if !queue(server, frame(3, 0, id, body)) { return connectionFailure(server, 11, "HTTP/2 control output limit") }
     let stream = server.streams[at]
-    server.pendingBytes = server.pendingBytes - stream.pending.length
+    server.pendingBytes = server.pendingBytes - pendingLength(stream)
     // Return connection credit for discarded application bytes; stream is reset.
     if stream.incoming.length > 0 { let credit = Bytes(); add32(credit, stream.incoming.length); server.recvWindow = server.recvWindow + stream.incoming.length; if !queue(server, frame(8, 0, 0, credit)) { return connectionFailure(server, 11, "HTTP/2 control output limit") } }
-    stream.incoming = Bytes(); stream.pending = Bytes(); stream.recvEnded = true; stream.sendEnded = true
+    stream.incoming = Bytes(); stream.pending = Bytes(); stream.pendingAt = 0; stream.recvEnded = true; stream.sendEnded = true
     stream.error = problem(errors.cancelledCode(), h2code, "HTTP/2 stream reset")
     return errors.boolean(true)
 }
 function pump(server: Server) {
     for stream in server.streams {
         if !errors.isError(stream.error) && stream.response && !stream.sendEnded {
-            while stream.pending.length > 0 && stream.sendWindow > 0 && server.sendWindow > 0 {
-                let size = min(min(stream.pending.length, 16384), min(stream.sendWindow, server.sendWindow))
+            while pendingLength(stream) > 0 && stream.sendWindow > 0 && server.sendWindow > 0 {
+                let size = min(min(pendingLength(stream), 16384), min(stream.sendWindow, server.sendWindow))
                 if size + 9 > LIMIT - server.outputBytes - server.pendingBytes + size { return }
-                let bytes = stream.pending.slice(0, size); stream.pending = stream.pending.slice(size, stream.pending.length)
+                let bytes = stream.pending.slice(stream.pendingAt, stream.pendingAt + size)
+                stream.pendingAt += size
+                if stream.pendingAt == stream.pending.length { stream.pending = Bytes(); stream.pendingAt = 0 }
                 server.pendingBytes = server.pendingBytes - size
                 if !queue(server, frame(0, 0, stream.id, bytes)) { fail("HTTP/2 output accounting invariant") }
                 stream.sendWindow = stream.sendWindow - size; server.sendWindow = server.sendWindow - size
             }
-            if stream.ending && stream.pending.length == 0 {
+            if stream.ending && pendingLength(stream) == 0 {
                 let bytes = compress(stream.trailers)
                 if bytes.length + 9 <= LIMIT - server.outputBytes - server.pendingBytes {
                     queue(server, frame(1, 5, stream.id, bytes)); stream.sendEnded = true
@@ -308,7 +311,7 @@ public function dynamicTableBytes(server: Server): Integer { return server.hpack
 public function discardPendingData(server: Server, id: Integer): errors.BooleanResult {
     let at = position(server, id); if at < 0 { return failure(errors.closedCode(), "unknown HTTP/2 stream") }
     if !dropOutput(server, id, true) { return connectionFailure(server, 3, "cancelled output flow window overflow") }
-    let stream = server.streams[at]; server.pendingBytes = server.pendingBytes - stream.pending.length; stream.pending = Bytes()
+    let stream = server.streams[at]; server.pendingBytes = server.pendingBytes - pendingLength(stream); stream.pending = Bytes(); stream.pendingAt = 0
     return errors.boolean(true)
 }
 public function release(server: Server, id: Integer): errors.BooleanResult {
@@ -316,7 +319,7 @@ public function release(server: Server, id: Integer): errors.BooleanResult {
     let at = position(server, id)
     if at < 0 { if id > 0 && id <= server.lastID { return errors.boolean(true) }; return failure(errors.closedCode(), "unknown HTTP/2 stream") }
     let stream = server.streams[at]
-    if !stream.sendEnded || stream.pending.length > 0 { return failure(errors.wouldBlockCode(), "HTTP/2 stream response not ended") }
+    if !stream.sendEnded || pendingLength(stream) > 0 { return failure(errors.wouldBlockCode(), "HTTP/2 stream response not ended") }
     // RFC9113 8.1: after a complete response, stop an unfinished request
     // with NO_ERROR so a client keeps the authenticated response/trailers.
     if !stream.recvEnded { let result = resetStream(server, id, 0); if !errors.booleanOk(result) { return result } }
@@ -354,7 +357,7 @@ public function requests(server: Server): RequestResult {
 }
 function completeHeaders(server: Server): errors.BooleanResult {
     let id = server.continuation; let fields = decompress(server.hpack, server.block)
-    server.continuation = 0; server.block = Bytes()
+    server.continuation = 0; server.block = Bytes(); server.blockBytes = 0
     if server.hpack.bad { return connectionFailure(server, 9, "invalid HPACK block or header limit") }
     let at = position(server, id)
     if at >= 0 {
@@ -369,14 +372,14 @@ function completeHeaders(server: Server): errors.BooleanResult {
     if server.goaway { return connectionFailure(server, 1, "new HEADERS after GOAWAY") }
     server.lastID = id
     let kept: List<Stream> = []
-    for old in server.streams { if !(old.recvEnded && old.sendEnded && old.incoming.length == 0 && old.pending.length == 0 && !outputFor(server, old.id)) { kept.add(old) } }
+    for old in server.streams { if !(old.recvEnded && old.sendEnded && old.incoming.length == 0 && pendingLength(old) == 0 && !outputFor(server, old.id)) { kept.add(old) } }
     server.streams = kept
     if server.streams.length >= MAX_STREAMS || server.ready.length >= MAX_STREAMS {
         let body = Bytes(); add32(body, 7)
         if !queue(server, frame(3, 0, id, body)) { return connectionFailure(server, 11, "HTTP/2 control output limit") }
         return errors.boolean(true)
     }
-    let stream = Stream { id: id; fields: fields; incoming: Bytes(); pending: Bytes(); recvWindow: 65535; sendWindow: server.initialSend
+    let stream = Stream { id: id; fields: fields; incoming: Bytes(); pending: Bytes(); pendingAt: 0; recvWindow: 65535; sendWindow: server.initialSend
         recvEnded: server.blockEnd; sendEnded: false; response: false; ending: false; trailers: []; error: errors.none(); contentLength: -1; received: 0 }
     server.streams.add(stream)
     if server.hpack.invalidField || !validFields(fields, false) { return resetStream(server, id, 1) }
@@ -406,17 +409,23 @@ function process(server: Server, type: Integer, flags: Integer, id: Integer, bod
         }
         if body.length % 6 != 0 { return connectionFailure(server, 6, "invalid SETTINGS size") }
         let at = 0
+        let previousInitial = server.initialSend; let nextInitial = previousInitial
+        let hasStreams = false; let largestWindow = 0
+        for stream in server.streams { if !hasStreams || stream.sendWindow > largestWindow { largestWindow = stream.sendWindow }; hasStreams = true }
         while at < body.length {
             let setting = (body[at] << 8) | body[at + 1]; let value = get32(body, at + 2); at = at + 6
             if setting == 2 && value > 1 { return connectionFailure(server, 1, "invalid ENABLE_PUSH") }
             if setting == 4 {
                 if value > 2147483647 { return connectionFailure(server, 3, "invalid initial flow window") }
-                let difference = value - server.initialSend
-                for stream in server.streams { if stream.sendWindow + difference > 2147483647 { return connectionFailure(server, 3, "stream flow window overflow") }; stream.sendWindow = stream.sendWindow + difference }
-                server.initialSend = value
+                let increase = value - previousInitial
+                if hasStreams && increase > 0 && largestWindow > 2147483647 - increase { return connectionFailure(server, 3, "stream flow window overflow") }
+                nextInitial = value
             }
             if setting == 5 { if value < 16384 || value > 16777215 { return connectionFailure(server, 1, "invalid maximum frame size") }; server.maxFrame = value }
         }
+        let difference = nextInitial - previousInitial
+        if difference != 0 { for stream in server.streams { stream.sendWindow = stream.sendWindow + difference } }
+        server.initialSend = nextInitial
         if !queue(server, frame(4, 1, 0, Bytes())) { return connectionFailure(server, 11, "HTTP/2 control output limit") }; pump(server); return errors.boolean(true)
     }
     if type == 6 {
@@ -458,13 +467,15 @@ function process(server: Server, type: Integer, flags: Integer, id: Integer, bod
             if end - begin < 5 { return connectionFailure(server, 6, "invalid HEADERS priority") }
             if (get32(body, begin) & 2147483647) == id { return connectionFailure(server, 1, "self-dependent HEADERS") }; begin = begin + 5
         }
-        server.continuation = id; server.block = body.slice(begin, end); server.blockEnd = (flags & 1) != 0
+        server.continuation = id; server.block = body.slice(begin, end); server.blockBytes = body.length + 9; server.blockEnd = (flags & 1) != 0
         if (flags & 4) != 0 { return completeHeaders(server) }; return errors.boolean(true)
     }
     if type == 9 {
         if server.continuation == 0 || id == 0 { return connectionFailure(server, 1, "unexpected CONTINUATION") }
+        if body.length + 9 > LIMIT - server.blockBytes { return connectionFailure(server, 11, "header block frame limit") }
         if body.length > HEADERS_LIMIT - server.block.length { return connectionFailure(server, 11, "header block limit") }
-        server.block.addBytes(body); if (flags & 4) != 0 { return completeHeaders(server) }; return errors.boolean(true)
+        server.block.addBytes(body); server.blockBytes = server.blockBytes + body.length + 9
+        if (flags & 4) != 0 { return completeHeaders(server) }; return errors.boolean(true)
     }
     if type == 3 {
         if id == 0 { return connectionFailure(server, 1, "RST_STREAM stream must be nonzero") }
@@ -473,9 +484,9 @@ function process(server: Server, type: Integer, flags: Integer, id: Integer, bod
         if at < 0 { if id > server.lastID { return connectionFailure(server, 1, "RST_STREAM on idle stream") }; return errors.boolean(true) }
         if server.streams[at].recvEnded && server.streams[at].sendEnded && !outputFor(server, id) { return errors.boolean(true) }
         if !dropOutput(server, id, false) { return connectionFailure(server, 3, "cancelled output flow window overflow") }
-        let stream = server.streams[at]; server.pendingBytes = server.pendingBytes - stream.pending.length
+        let stream = server.streams[at]; server.pendingBytes = server.pendingBytes - pendingLength(stream)
         if stream.incoming.length > 0 { let result = windowUpdate(server, 0, stream.incoming.length); if !errors.booleanOk(result) { return result } }
-        stream.incoming = Bytes(); stream.pending = Bytes(); stream.recvEnded = true; stream.sendEnded = true
+        stream.incoming = Bytes(); stream.pending = Bytes(); stream.pendingAt = 0; stream.recvEnded = true; stream.sendEnded = true
         stream.error = problem(errors.cancelledCode(), get32(body, 0), "peer reset HTTP/2 stream"); return errors.boolean(true)
     }
     if type == 0 {
@@ -517,14 +528,21 @@ public function receive(server: Server, bytes: Bytes): errors.BooleanResult {
         if server.input.length < expected.length { return errors.boolean(true) }
         server.input = server.input.slice(expected.length, server.input.length); server.preface = true
     }
-    while server.input.length >= 9 {
-        let input = server.input; let size = (input[0] << 16) | (input[1] << 8) | input[2]
+    let input = server.input
+    let at = 0
+    while input.length - at >= 9 {
+        let size = (input[at] << 16) | (input[at + 1] << 8) | input[at + 2]
         if size > 16384 { return connectionFailure(server, 6, "incoming HTTP/2 frame exceeds advertised maximum") }
-        if input.length - 9 < size { return errors.boolean(true) }
-        let type = input[3]; let flags = input[4]; let id = get32(input, 5) & 2147483647; let body = input.slice(9, 9 + size)
-        server.input = input.slice(9 + size, input.length)
-        let result = process(server, type, flags, id, body); if !errors.booleanOk(result) { return result }
+        if input.length - at - 9 < size { break }
+        let type = input[at + 3]; let flags = input[at + 4]; let id = get32(input, at + 5) & 2147483647; let body = input.slice(at + 9, at + 9 + size)
+        at += 9 + size
+        let result = process(server, type, flags, id, body)
+        if !errors.booleanOk(result) {
+            if !errors.isError(server.error) { server.input = input.slice(at, input.length) }
+            return result
+        }
     }
+    if at > 0 { server.input = input.slice(at, input.length) }
     return errors.boolean(true)
 }
 public function finish(server: Server): errors.BooleanResult {
@@ -563,6 +581,9 @@ public function write(server: Server, id: Integer, bytes: Bytes): errors.Boolean
     if !stream.response || stream.sendEnded || stream.ending { return failure(errors.protocolCode(), "HTTP/2 stream is not writable") }
     if bytes.length > 65545 { return failure(errors.invalidDataCode(), "HTTP/2 write exceeds bounded chunk") }
     if bytes.length > LIMIT - 4096 - server.outputBytes - server.pendingBytes { return failure(errors.wouldBlockCode(), "HTTP/2 output full") }
+    if stream.pendingAt >= 65536 {
+        stream.pending = stream.pending.slice(stream.pendingAt, stream.pending.length); stream.pendingAt = 0
+    }
     stream.pending.addBytes(bytes); server.pendingBytes = server.pendingBytes + bytes.length; pump(server); return errors.boolean(true)
 }
 public function closeStream(server: Server, id: Integer, trailers: List<Header>): errors.BooleanResult {

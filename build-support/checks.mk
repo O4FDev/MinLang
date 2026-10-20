@@ -918,13 +918,13 @@ check-transport-go: build/minyarc build/yamux-peer build/tooling/tests/transport
 	@set -e; cache=$$(mktemp -d "$(abspath build)/transport-go-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer; \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --streams 1536; \
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule
+	MINYAR_MAX_MEMORY_MIB=2048 MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule
 
 check-transport-go-sanitize: build/minyarc build/yamux-peer build/tooling/tests/transport-go-test | build
 	@set -e; cache=$$(mktemp -d "$(abspath build)/transport-go-sanitize-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --sanitize; \
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --streams 1536 --sanitize; \
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule --sanitize
+	MINYAR_MAX_MEMORY_MIB=2048 $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule --sanitize
 
 check check-portable: check-yamux-churn check-transport-cancel
 check: check-transport-go

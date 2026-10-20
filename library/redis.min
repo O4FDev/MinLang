@@ -4,10 +4,16 @@
 use "resp2" as resp
 use "errors" as errors
 
+constant COMPACT_THRESHOLD = 65536
+constant REPLY_WORK_LIMIT = 134217728
+
 public record Client {
     private output: Bytes
     private outputAt: Integer
     private input: Bytes
+    private inputAt: Integer
+    private replyWork: Integer
+    private waitingAt: Integer
     private count: Integer
     private ready: Integer
     private writeLengths: List<Integer>
@@ -18,7 +24,7 @@ public record Client {
 }
 public record Reply { private value: resp.Value; private error: errors.Error }
 public function create(): Client {
-    return Client { output: Bytes(); outputAt: 0; input: Bytes(); count: 0; ready: 0; writeLengths: []; writeHead: 0; ended: false; closed: false; error: errors.none() }
+    return Client { output: Bytes(); outputAt: 0; input: Bytes(); inputAt: 0; replyWork: 0; waitingAt: -1; count: 0; ready: 0; writeLengths: []; writeHead: 0; ended: false; closed: false; error: errors.none() }
 }
 public function pending(client: Client): Integer { return client.count }
 public function closed(client: Client): Boolean { return client.closed }
@@ -33,7 +39,8 @@ function failed(error: errors.Error): Reply { return Reply { value: absent(); er
 function stop(client: Client, error: errors.Error) {
     if client.closed { return }
     client.error = error; client.closed = true; client.count = 0
-    client.input = Bytes(); client.output = Bytes(); client.outputAt = 0
+    client.input = Bytes(); client.inputAt = 0; client.replyWork = 0; client.waitingAt = -1
+    client.output = Bytes(); client.outputAt = 0
     client.ready = 0; client.writeLengths = []; client.writeHead = 0
 }
 public function abort(client: Client, error: errors.Error) {
@@ -49,7 +56,7 @@ public function queue(client: Client, arguments: List<Bytes>): errors.BooleanRes
     if client.count >= 4096 || data.length > 1048576 - (client.output.length - client.outputAt) {
         return errors.booleanFailure(errors.make(errors.wouldBlockCode(),0,"Redis pipeline backpressure"))
     }
-    if client.outputAt > 0 {
+    if client.outputAt >= COMPACT_THRESHOLD && client.outputAt * 2 >= client.output.length {
         client.output = client.output.slice(client.outputAt,client.output.length); client.outputAt = 0
     }
     // Amortized compaction keeps the write ledger bounded even when an owner
@@ -85,11 +92,15 @@ public function sent(client: Client, count: Integer) {
 public function feed(client: Client, data: Bytes): errors.BooleanResult {
     if client.closed { return errors.booleanFailure(client.error) }
     if client.ended { return errors.booleanFailure(errors.make(errors.closedCode(),0,"Redis input ended")) }
-    if data.length > 2097152 - client.input.length {
+    if data.length > 2097152 - (client.input.length - client.inputAt) {
         stop(client,errors.make(errors.invalidDataCode(),0,"Redis reply buffer limit exceeded"))
         return errors.booleanFailure(client.error)
     }
+    if client.inputAt >= COMPACT_THRESHOLD && client.inputAt * 2 >= client.input.length {
+        client.input = client.input.slice(client.inputAt,client.input.length); client.inputAt = 0
+    }
     client.input.addBytes(data)
+    if data.length > 0 { client.waitingAt = -1 }
     return errors.boolean(true)
 }
 // Complete replies already received remain readable after EOF. A partial
@@ -97,12 +108,23 @@ public function feed(client: Client, data: Bytes): errors.BooleanResult {
 public function endInput(client: Client) { client.ended = true }
 public function reply(client: Client): Reply {
     if client.closed { return failed(client.error) }
-    let parsed = resp.parse(client.input)
+    if !client.ended && client.waitingAt == client.input.length {
+        return failed(errors.make(errors.wouldBlockCode(),0,"incomplete RESP reply"))
+    }
+    let parsed = resp.parseFrom(client.input, client.inputAt)
+    if resp.work(parsed) > REPLY_WORK_LIMIT - client.replyWork {
+        stop(client,errors.make(errors.invalidDataCode(),0,"Redis reply parse work limit exceeded"))
+        return failed(client.error)
+    }
+    client.replyWork += resp.work(parsed)
     if !resp.ok(parsed) {
-        if resp.incomplete(parsed) && !client.ended { return failed(resp.error(parsed)) }
+        if resp.incomplete(parsed) && !client.ended {
+            client.waitingAt = client.input.length
+            return failed(resp.error(parsed))
+        }
         let error = resp.error(parsed)
         if client.ended && resp.incomplete(parsed) {
-            let code = errors.closedCode(); if client.input.length > 0 { code = errors.truncatedCode() }
+            let code = errors.closedCode(); if client.input.length - client.inputAt > 0 { code = errors.truncatedCode() }
             error = errors.make(code,0,"Redis reply ended before completion")
         }
         stop(client,error); return failed(error)
@@ -110,7 +132,8 @@ public function reply(client: Client): Reply {
     if client.ready == 0 {
         stop(client,errors.make(errors.protocolCode(),0,"unsolicited Redis reply")); return failed(client.error)
     }
-    client.input = client.input.slice(resp.consumed(parsed),client.input.length)
+    client.inputAt += resp.consumed(parsed); client.replyWork = 0; client.waitingAt = -1
+    if client.inputAt == client.input.length { client.input = Bytes(); client.inputAt = 0 }
     client.count -= 1; client.ready -= 1
     return Reply { value: resp.value(parsed); error: errors.none() }
 }

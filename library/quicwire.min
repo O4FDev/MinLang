@@ -147,6 +147,21 @@ public function header(data: Bytes, start: Integer, shortDestinationLength: Inte
 }
 
 public record Range { first: Integer; last: Integer }
+// Parsed ACK ranges are disjoint and ordered from the largest packet number
+// down. Search them logarithmically: a peer can send 257 ranges while we keep
+// thousands of outstanding sent and lost packet records.
+public function acknowledged(ranges: List<Range>, number: Integer): Boolean {
+    let first = 0
+    let end = ranges.length
+    while first < end {
+        let middle = first + (end - first) / 2
+        let range = ranges[middle]
+        if number > range.last { end = middle }
+        else if number < range.first { first = middle + 1 }
+        else { return true }
+    }
+    return false
+}
 public record Frame {
     start: Integer; end: Integer
     type: Integer
@@ -168,6 +183,7 @@ public function frames(data: Bytes): Frames {
     if data.length > 65535 { return badFrames("QUIC payload exceeds maximum datagram size") }
     let cursor = Cursor { data: data; at: 0; bad: false }
     let result: List<Frame> = []
+    let acknowledgements = 0
     while cursor.at < data.length && !cursor.bad {
         if result.length >= 4096 { return badFrames("too many QUIC frames in one packet") }
         let start = cursor.at
@@ -178,6 +194,8 @@ public function frames(data: Bytes): Frames {
         if type == 0 {
             while cursor.at < data.length && data[cursor.at] == 0 { cursor.at += 1 }
         } else if type == 2 || type == 3 {
+            acknowledgements += 1
+            if acknowledgements > 64 { return badFrames("too many ACK frames in one packet") }
             let largest = integer(cursor); let delay = integer(cursor); let count = integer(cursor); let range = integer(cursor)
             if cursor.bad || range > largest || count > 256 { return badFrames("invalid ACK range or count") }
             frame.value = largest; frame.values.add(delay)

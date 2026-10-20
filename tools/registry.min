@@ -4,6 +4,7 @@ use "./package-git.min" as git
 use "json" as json
 use "system" as system
 use "files" as files
+use "process" as processInfo
 
 public record Entry { name: Text; repository: Text; version: Text; description: Text; commit: Text; checksum: Text }
 public record Index { entries: List<Entry>; origin: Text }
@@ -22,7 +23,9 @@ public function entry(value: json.Value): Entry {
         let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
         if !letter && !(index > 0 && (host.isDigit(byte) || byte == 45)) { host.stop("invalid registry package name") }
     }
-    for byte in Bytes(result.description) { if byte < 32 || byte == 127 { host.stop("registry descriptions must fit on one line") } }
+    if host.terminalText(result.description) != result.description {
+        host.stop("registry descriptions cannot contain terminal controls or bidi formatting")
+    }
     return result
 }
 public function renderEntry(value: Entry): Text {
@@ -97,6 +100,97 @@ function fetch(location: Text): Bytes {
 public function load(location: Text): Index {
     return loadWith(location, false)
 }
+function addWitness(entries: List<Entry>, positions: Map<Text, Integer>, value: Entry) {
+    let name = key(value)
+    if positions.has(name) {
+        if renderEntry(entries[positions[name]]) != renderEntry(value) { host.stop("registry has conflicting witnessed release: " + name) }
+        return
+    }
+    if entries.length >= 10000 { host.stop("registry witness cache exceeds the 10000-release limit") }
+    positions[name] = entries.length
+    entries.add(value)
+}
+function cached(directory: Text, origin: Text): Index {
+    let entries: List<Entry> = []
+    let positions = Map<Text, Integer>()
+    let present = false
+    let legacy = directory + "/index.json"
+    if host.isFile(legacy) {
+        if host.resolveName(legacy) != legacy { host.stop("invalid registry witness cache entry") }
+        present = true
+        for value in decode(host.readBytes(legacy), origin).entries { addWitness(entries, positions, value) }
+    }
+    let witnesses = directory + "/witnesses"
+    if host.exists(witnesses) && (!host.isDirectory(witnesses) || host.resolveName(witnesses) != witnesses) { host.stop("invalid registry witness cache entry") }
+    if host.isDirectory(witnesses) {
+        let keys = files.list(witnesses)
+        if files.lastError() != 0 { host.stop("cannot read registry witness cache") }
+        if keys.length > 10000 { host.stop("registry witness cache exceeds the 10000-release limit") }
+        keys.sort()
+        for name in keys {
+            let group = witnesses + "/" + name
+            if !git.hexadecimal(name, 64) || !host.isDirectory(group) || host.resolveName(group) != group { host.stop("invalid registry witness cache entry") }
+            let versions = files.list(group)
+            if files.lastError() != 0 { host.stop("cannot read registry witness cache") }
+            if versions.length > 16 { host.stop("invalid registry witness cache entry") }
+            versions.sort()
+            for version in versions {
+                let path = group + "/" + version
+                if !git.hexadecimal(version, 64) || !host.isFile(path) || host.resolveName(path) != path || files.pathSize(path) > 2048 { host.stop("invalid registry witness cache entry") }
+                let source = host.readBytes(path)
+                if host.hashBytes(source) != version { host.stop("registry witness cache checksum mismatch") }
+                let parsed = json.parseUniqueBytesWithin(source, 2048, 64, 8)
+                if parsed.kind == json.INVALID { host.stop("cannot read registry witness: " + parsed.text) }
+                let value = entry(parsed)
+                if host.hashBytes(Bytes(key(value))) != name || renderEntry(value) != Text(source) { host.stop("invalid registry witness cache entry") }
+                addWitness(entries, positions, value)
+                present = true
+            }
+        }
+    }
+    let resolvedOrigin = ""
+    if present { resolvedOrigin = origin }
+    return Index { entries: entries; origin: resolvedOrigin }
+}
+function preserves(index: Index, previous: Index) {
+    let positions = Map<Text, Integer>()
+    for position in 0..index.entries.length { positions[key(index.entries[position])] = position }
+    for old in previous.entries {
+        if !positions.has(key(old)) { host.stop("registry removed an already witnessed release: " + key(old)) }
+        if renderEntry(old) != renderEntry(index.entries[positions[key(old)]]) { host.stop("registry changed an already witnessed release: " + key(old)) }
+    }
+}
+function testWitnessBarrier() {
+    let barrier = system.getenv("MINYAR_TEST_REGISTRY_WITNESS_BARRIER")
+    if barrier == "" { return }
+    host.makeDirectories(barrier)
+    host.writeBytes(barrier + "/" + Text(system.processId()), Bytes("ready\n"))
+    let deadline = system.monotonicNanoseconds() + 30000000000
+    let ready = files.list(barrier)
+    while ready.length < 2 && system.monotonicNanoseconds() < deadline {
+        if processInfo.sleepNanoseconds(1000000) != 0 { host.stop("registry witness test barrier could not wait") }
+        ready = files.list(barrier)
+    }
+    if files.lastError() != 0 || ready.length < 2 { host.stop("registry witness test barrier timed out") }
+}
+function publishWitness(directory: Text, value: Entry) {
+    let source = Bytes(renderEntry(value))
+    let group = directory + "/witnesses/" + host.hashBytes(Bytes(key(value)))
+    host.makeDirectories(group)
+    if host.resolveName(group) != group { host.stop("invalid registry witness cache entry") }
+    let digest = host.hashBytes(source)
+    let path = group + "/" + digest
+    if host.isFile(path) {
+        if host.resolveName(path) != path || host.hashBytes(host.readBytes(path)) != digest { host.stop("registry witness cache checksum mismatch") }
+        return
+    }
+    let temporary = directory + "/.witness-" + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
+    host.writeBytes(temporary, source)
+    if files.rename(temporary, path) != 0 {
+        if !host.isFile(path) || host.hashBytes(host.readBytes(path)) != digest { host.stop("cannot cache a verified registry witness") }
+        files.remove(temporary)
+    }
+}
 public function loadWith(location: Text, offline: Boolean): Index {
     if location == "" { host.stop("no package index configured; set MINYAR_REGISTRY to an HTTPS URL or local index directory") }
     let remote = remoteLocation(location)
@@ -104,25 +198,20 @@ public function loadWith(location: Text, offline: Boolean): Index {
     let directory = git.cache() + "/indexes/" + host.hashBytes(Bytes(location))
     let path = directory + "/index.json"
     if offline {
-        if !host.isFile(path) { host.stop("package index is not cached; run minyar search once without --offline") }
-        return decode(host.readBytes(path), location)
+        let index = cached(directory, location)
+        if index.origin == "" { host.stop("package index is not cached; run minyar search once without --offline") }
+        return index
     }
     let source = fetch(location)
     let index = decode(source, location)
-    if host.isFile(path) {
-        let previous = decode(host.readBytes(path), location)
-        let positions = Map<Text, Integer>()
-        for position in 0..index.entries.length { positions[key(index.entries[position])] = position }
-        for old in previous.entries {
-            if !positions.has(key(old)) { host.stop("registry removed an already witnessed release: " + key(old)) }
-            if renderEntry(old) != renderEntry(index.entries[positions[key(old)]]) { host.stop("registry changed an already witnessed release: " + key(old)) }
-        }
-    }
     host.makeDirectories(directory)
-    let temporary = path + "." + Text(system.processId())
+    preserves(index, cached(directory, location))
+    testWitnessBarrier()
+    for value in index.entries { publishWitness(directory, value) }
+    let temporary = path + "." + Text(system.processId()) + "-" + Text(system.monotonicNanoseconds())
     host.writeBytes(temporary, source)
     if files.rename(temporary, path) != 0 { host.stop("cannot cache the verified package index") }
-    return index
+    return cached(directory, location)
 }
 public function optional(offline: Boolean): Index {
     let location = system.getenv("MINYAR_REGISTRY")

@@ -9,11 +9,14 @@ function statusNative(path: Text): Text { native "driverhost" }
 public function executable(path: Text): Boolean { native "driverhost" }
 public function selfPath(): Text { native "driverhost" }
 function makeTemporary(directory: Text, prefix: Text): Text { native "driverhost" }
+public function copyExclusive(source: Text, destination: Text): Integer { native "driverhost" }
+public function lockExclusive(path: Text): Integer { native "driverhost" }
 public function makeDirectory(path: Text): Integer { native "driverhost" }
 public function guard(enabled: Boolean): Integer { native "driverhost" }
 public function pendingSignal(): Integer { native "driverhost" }
 function execute(arguments: Bytes, environment: Bytes, inherit: Boolean, output: Text, errors: Text, timeout: Integer): Integer { native "driverhost" }
 function executeBoundedErrors(arguments: Bytes, environment: Bytes, inherit: Boolean, output: Text, errors: Text, timeout: Integer, errorLimit: Integer): Integer { native "driverhost" }
+function executeBounded(arguments: Bytes, environment: Bytes, inherit: Boolean, output: Text, errors: Text, timeout: Integer, outputLimit: Integer, errorLimit: Integer): Integer { native "driverhost" }
 public function hashBytes(data: Bytes): Text { native "driverhost" }
 function hashFileNative(path: Text): Text { native "driverhost" }
 public function errorText(code: Integer): Text { native "driverhost" }
@@ -25,7 +28,10 @@ function captureDirectoryNative(): Text { native "driverhost" }
 function rememberCapture(path: Text): Integer { native "driverhost" }
 
 public constant LLVM_VERSION = "23.1.2"
+constant CAPTURE_LIMIT = 16777216
 public constant TIMED_OUT = -100000
+public constant OUTPUT_LIMIT = -100001
+public constant ERROR_LIMIT = -100002
 public constant INTERRUPTED = -200000
 public function hostName(): Text {
     let selected = setting("MINYAR_TEST_HOST_SYSTEM", "")
@@ -481,8 +487,11 @@ public function which(command: Text): Text {
     }
     let path = setting("PATH", "/bin:/usr/bin")
     for directory in path.split(":") {
-        let candidate = command
-        if directory != "" { candidate = joinPath(directory, command) }
+        let raw = Bytes(directory)
+        let drive = raw.length >= 3 && ((raw[0] >= 65 && raw[0] <= 90) || (raw[0] >= 97 && raw[0] <= 122)) && raw[1] == 58 && (raw[2] == 47 || raw[2] == 92)
+        let network = raw.length >= 2 && raw[0] == 92 && raw[1] == 92
+        if !directory.startsWith("/") && !drive && !network { continue }
+        let candidate = joinPath(directory, command)
         if executable(candidate) { return candidate }
     }
     return ""
@@ -509,6 +518,12 @@ public function spawn(command: List<Text>, environment: List<Text>, inherit: Boo
     if status < 0 && status > TIMED_OUT { stop(osError(status, command[0])) }
     return status
 }
+public function spawnBounded(command: List<Text>, environment: List<Text>, inherit: Boolean, output: Text, errors: Text, seconds: Integer, outputLimit: Integer, errorLimit: Integer): Integer {
+    let status = executeBounded(vector(command), vector(environment), inherit, output, errors, seconds * 1000, outputLimit, errorLimit)
+    if status == TIMED_OUT { stop("Command '" + commandText(command) + "' timed out after " + Text(seconds) + " seconds") }
+    if status < 0 && status > TIMED_OUT { stop(osError(status, command[0])) }
+    return status
+}
 public function run(command: List<Text>) {
     let status = spawn(command, [], true, "", "", 0)
     if status <= INTERRUPTED { leave(128 + INTERRUPTED - status) }
@@ -525,7 +540,7 @@ function captureDirectory(): Text {
 }
 public function capture(command: List<Text>, seconds: Integer): Captured {
     let directory = captureDirectory()
-    let status = spawn(command, [], true, directory + "/stdout", directory + "/stderr", seconds)
+    let status = spawnBounded(command, [], true, directory + "/stdout", directory + "/stderr", seconds, CAPTURE_LIMIT, CAPTURE_LIMIT)
     return Captured { status: status; output: readText(directory + "/stdout"); errors: readText(directory + "/stderr") }
 }
 function structuredDiagnostics(command: List<Text>): Boolean {

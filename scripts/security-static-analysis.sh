@@ -29,7 +29,10 @@ for source in \
     runtime/native/update.c \
     runtime/native/update_ed25519.c \
     runtime/native/update_monocypher.c \
-    runtime/native/workers.c
+    runtime/native/workers.c \
+    tools/clang-driver-host.c \
+    tools/testing-host.c \
+    tools/editor-host.c
 do
     log="$scratch/diagnostics"
     if ! "$compiler" "$@" "$source" >"$log" 2>&1; then
@@ -44,6 +47,23 @@ do
     fi
     checked=$((checked + 1))
 done
+
+if [ "$(uname -s)" = Linux ]; then
+    for source in runtime/native/erofs.c runtime/native/tararchive.c runtime/native/zstd.c; do
+        log="$scratch/diagnostics"
+        if ! "$compiler" "$@" "$source" >"$log" 2>&1; then
+            cat "$log" >&2
+            echo "Clang analysis failed for $source" >&2
+            exit 1
+        fi
+        if grep -Eq 'warning:|error:' "$log"; then
+            cat "$log" >&2
+            echo "Clang analysis found diagnostics in $source" >&2
+            exit 1
+        fi
+        checked=$((checked + 1))
+    done
+fi
 
 if [ "$(uname -s)" = Darwin ]; then
     source=runtime/native/http.m

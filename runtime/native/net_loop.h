@@ -21,14 +21,20 @@ enum {
     NET_LOOP_CLOSED = 4,
     NET_LOOP_ERROR = 8,
     NET_LOOP_TIMER = 16,
-    NET_LOOP_MAX_BATCH = 65536
+    NET_LOOP_MAX_BATCH = 65536,
+    NET_LOOP_REGISTRATION_SLOT_BITS = 23
 };
+#define NET_LOOP_REGISTRATION_SLOT_LIMIT                                                      \
+    ((UINT32_C(1) << NET_LOOP_REGISTRATION_SLOT_BITS) - UINT32_C(1))
+#define NET_LOOP_REGISTRATION_GENERATION_LIMIT                                                \
+    ((UINT64_C(1) << (63 - NET_LOOP_REGISTRATION_SLOT_BITS)) - UINT64_C(1))
 typedef struct {
     socket_t socket;
     uint64_t deadline, period;
     long long token;
-    uint32_t generation, next_free;
+    uint64_t generation;
     size_t heap_index;
+    uint32_t next_free;
     unsigned interest, active, timer;
 } NetLoopEntry;
 typedef struct {
@@ -75,7 +81,7 @@ typedef struct {
 } NetLoopSlot;
 static NetLoopSlot *net_loop_slots;
 static size_t net_loop_slot_count, net_loop_slot_capacity;
-static uint32_t net_loop_registration_generation;
+static uint64_t net_loop_registration_generation;
 
 static uint64_t net_loop_now(void) {
 #ifdef _WIN32
@@ -89,6 +95,9 @@ static uint64_t net_loop_now(void) {
 }
 static uint64_t net_loop_handle(uint32_t slot, uint32_t generation) {
     return ((uint64_t)generation << 32) | ((uint64_t)slot + 1);
+}
+static uint64_t net_loop_registration_handle(uint32_t slot, uint64_t generation) {
+    return (generation << NET_LOOP_REGISTRATION_SLOT_BITS) | ((uint64_t)slot + 1);
 }
 static uint32_t net_loop_next_generation(uint32_t previous) {
     /* Never wrap: retiring an exhausted slot avoids resurrecting an old ID. */
@@ -157,11 +166,11 @@ static void net_app_polled(long long handle, MinyarBytes *result) {
 #endif
 static NetLoopEntry *net_loop_entry(NetLoop *loop, long long handle, uint32_t *index) {
     uint64_t value = (uint64_t)handle;
-    uint32_t low = (uint32_t)value;
+    uint32_t low = (uint32_t)(value & NET_LOOP_REGISTRATION_SLOT_LIMIT);
     if (handle <= 0 || !low || low > loop->entry_count)
         return NULL;
     NetLoopEntry *entry = &loop->entries[low - 1];
-    if (!entry->active || entry->generation != (uint32_t)(value >> 32))
+    if (!entry->active || entry->generation != value >> NET_LOOP_REGISTRATION_SLOT_BITS)
         return NULL;
     *index = low - 1;
     return entry;
@@ -251,28 +260,36 @@ static void net_loop_hash_insert(NetLoop *loop, socket_t socket, uint32_t slot) 
     loop->hash[at] = (NetLoopHash){(uint64_t)socket, slot, 1};
     loop->hash_count++;
 }
-static bool net_loop_allocate_entry(NetLoop *loop, uint32_t *index) {
-    if (net_loop_registration_generation == INT32_MAX)
-        return false;
+static int net_loop_entry_capacity_error(NetLoop *loop) {
+    return net_loop_registration_generation == NET_LOOP_REGISTRATION_GENERATION_LIMIT ||
+                   (!loop->free_entry &&
+                    loop->entry_count == NET_LOOP_REGISTRATION_SLOT_LIMIT)
+               ? EOVERFLOW
+               : 0;
+}
+static int net_loop_allocate_entry(NetLoop *loop, uint32_t *index) {
+    int code = net_loop_entry_capacity_error(loop);
+    if (code)
+        return code;
     if (loop->free_entry) {
         *index = loop->free_entry - 1;
         NetLoopEntry *entry = &loop->entries[*index];
         loop->free_entry = entry->next_free;
-        uint32_t generation = ++net_loop_registration_generation;
+        uint64_t generation = ++net_loop_registration_generation;
         memset(entry, 0, sizeof(*entry));
         entry->generation = generation;
         entry->active = 1;
-        return true;
+        return 0;
     }
-    if (loop->entry_count == UINT32_MAX)
-        return false;
     if (loop->entry_count == loop->entry_capacity) {
         size_t capacity = loop->entry_capacity ? loop->entry_capacity * 2 : 16;
-        if (capacity > UINT32_MAX || capacity > SIZE_MAX / sizeof(NetLoopEntry))
-            return false;
+        if (capacity > NET_LOOP_REGISTRATION_SLOT_LIMIT)
+            capacity = NET_LOOP_REGISTRATION_SLOT_LIMIT;
+        if (capacity > SIZE_MAX / sizeof(NetLoopEntry))
+            return net_loop_memory_error();
         NetLoopEntry *entries = realloc(loop->entries, capacity * sizeof(*entries));
         if (!entries)
-            return false;
+            return net_loop_memory_error();
         loop->entries = entries;
         loop->entry_capacity = capacity;
     }
@@ -280,12 +297,12 @@ static bool net_loop_allocate_entry(NetLoop *loop, uint32_t *index) {
     memset(&loop->entries[*index], 0, sizeof(loop->entries[*index]));
     loop->entries[*index].generation = ++net_loop_registration_generation;
     loop->entries[*index].active = 1;
-    return true;
+    return 0;
 }
 static void net_loop_retire_entry(NetLoop *loop, uint32_t index) {
     NetLoopEntry *entry = &loop->entries[index];
     entry->active = 0;
-    if (entry->generation < INT32_MAX) {
+    if (entry->generation < NET_LOOP_REGISTRATION_GENERATION_LIMIT) {
         entry->next_free = loop->free_entry;
         loop->free_entry = index + 1;
     }
@@ -357,14 +374,14 @@ static int net_loop_selector_update(NetLoop *loop, uint32_t index, unsigned inte
         event.events |= EPOLLIN;
     if (interest & NET_LOOP_WRITE)
         event.events |= EPOLLOUT;
-    event.data.u64 = net_loop_handle(index, entry->generation);
+    event.data.u64 = net_loop_registration_handle(index, entry->generation);
     return epoll_ctl(loop->selector, add ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, entry->socket, &event)
                ? errno
                : 0;
 #else
     (void)add;
     struct kevent changes[2];
-    void *identity = (void *)(uintptr_t)net_loop_handle(index, entry->generation);
+    void *identity = (void *)(uintptr_t)net_loop_registration_handle(index, entry->generation);
     EV_SET(&changes[0], (uintptr_t)entry->socket, EVFILT_READ,
            EV_ADD | (interest & NET_LOOP_READ ? EV_ENABLE : EV_DISABLE), 0, 0, identity);
     EV_SET(&changes[1], (uintptr_t)entry->socket, EVFILT_WRITE,
@@ -475,14 +492,18 @@ MinyarBytes *minyar_net_loopWatch(long long handle, long long connection, long l
 #endif
     if (net_loop_hash_find(loop, socket))
         return net_loop_result(BAD_ARGUMENT, -1);
-    int code = net_loop_nonblocking(socket);
+    int code = net_loop_entry_capacity_error(loop);
+    if (code)
+        return net_loop_result(code, -1);
+    code = net_loop_nonblocking(socket);
     if (code)
         return net_loop_result(code, -1);
     if (!net_loop_hash_reserve(loop))
         return net_loop_result(net_loop_memory_error(), -1);
     uint32_t index;
-    if (!net_loop_allocate_entry(loop, &index))
-        return net_loop_result(net_loop_memory_error(), -1);
+    code = net_loop_allocate_entry(loop, &index);
+    if (code)
+        return net_loop_result(code, -1);
     NetLoopEntry *entry = &loop->entries[index];
     entry->socket = socket;
     entry->interest = (unsigned)interest;
@@ -495,7 +516,8 @@ MinyarBytes *minyar_net_loopWatch(long long handle, long long connection, long l
     }
     net_loop_hash_insert(loop, socket, index);
     NET_APP_CHANGED(handle);
-    return net_loop_result(0, (long long)net_loop_handle(index, entry->generation));
+    return net_loop_result(0,
+                           (long long)net_loop_registration_handle(index, entry->generation));
 }
 MinyarBytes *minyar_net_loopUpdate(long long handle, long long registration, long long interest,
                                    long long token) {
@@ -549,9 +571,14 @@ MinyarBytes *minyar_net_loopTimer(long long handle, long long delay, long long p
     uint64_t now = net_loop_now();
     if ((uint64_t)delay > UINT64_MAX - now)
         return net_loop_result(BAD_ARGUMENT, -1);
+    int code = net_loop_entry_capacity_error(loop);
+    if (code)
+        return net_loop_result(code, -1);
     if (loop->timer_count == loop->timer_capacity) {
         size_t capacity = loop->timer_capacity ? loop->timer_capacity * 2 : 16;
-        uint32_t *timers = capacity <= UINT32_MAX && capacity <= SIZE_MAX / sizeof(*timers)
+        if (capacity > NET_LOOP_REGISTRATION_SLOT_LIMIT)
+            capacity = NET_LOOP_REGISTRATION_SLOT_LIMIT;
+        uint32_t *timers = capacity <= SIZE_MAX / sizeof(*timers)
                                ? realloc(loop->timers, capacity * sizeof(*timers))
                                : NULL;
         if (!timers)
@@ -560,8 +587,9 @@ MinyarBytes *minyar_net_loopTimer(long long handle, long long delay, long long p
         loop->timer_capacity = capacity;
     }
     uint32_t index;
-    if (!net_loop_allocate_entry(loop, &index))
-        return net_loop_result(net_loop_memory_error(), -1);
+    code = net_loop_allocate_entry(loop, &index);
+    if (code)
+        return net_loop_result(code, -1);
     NetLoopEntry *entry = &loop->entries[index];
     entry->timer = 1;
     entry->deadline = now + (uint64_t)delay;
@@ -571,7 +599,8 @@ MinyarBytes *minyar_net_loopTimer(long long handle, long long delay, long long p
     loop->timers[loop->timer_count++] = index;
     net_loop_heap_up(loop, entry->heap_index);
     NET_APP_CHANGED(handle);
-    return net_loop_result(0, (long long)net_loop_handle(index, entry->generation));
+    return net_loop_result(0,
+                           (long long)net_loop_registration_handle(index, entry->generation));
 }
 static void net_loop_event(MinyarBytes *result, uint64_t identity, long long token, unsigned flags,
                            int code, unsigned kind) {
@@ -590,7 +619,7 @@ static size_t net_loop_emit_timers(NetLoop *loop, MinyarBytes *result, size_t li
         NetLoopEntry *entry = &loop->entries[index];
         if (entry->deadline > now)
             break;
-        net_loop_event(result, net_loop_handle(index, entry->generation), entry->token,
+        net_loop_event(result, net_loop_registration_handle(index, entry->generation), entry->token,
                        NET_LOOP_TIMER, 0, 1);
         count++;
         if (entry->period) {
@@ -670,8 +699,8 @@ static int net_loop_poll(NetLoop *loop, MinyarBytes *result, size_t limit, int t
             flags |= NET_LOOP_CLOSED | NET_LOOP_READ;
         if (ready & (POLLERR | POLLNVAL))
             flags |= NET_LOOP_ERROR;
-        net_loop_event(result, net_loop_handle(index, entry->generation), entry->token, flags,
-                       ready & POLLNVAL ? WSAEBADF : 0, 0);
+        net_loop_event(result, net_loop_registration_handle(index, entry->generation), entry->token,
+                       flags, ready & POLLNVAL ? WSAEBADF : 0, 0);
         emitted++;
         loop->windows_cursor = (index + 1) % loop->entry_count;
     }

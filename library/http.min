@@ -17,6 +17,7 @@ use "random" as secureRandom
 // Minyar OS uses
 // its own client in os/kernel/net/http.min over its own TCP/IP stack.
 use "net" as net
+use "eventloop" as loop
 use "tls" as tls
 use "text" as text
 use "errors" as errors
@@ -178,8 +179,9 @@ public function requestBounded(method: Text, url: Text, headers: List<Text>, bod
     return requestBoundedWithin(method, url, headers, body, limit, 30000)
 }
 
-// One absolute read deadline prevents a slow peer resetting a timeout forever.
-// Name resolution and initial blocking connect still use platform timeouts.
+// One absolute I/O deadline covers upload, TLS handshake and response reads, so
+// a slow peer cannot reset a timeout forever. Name resolution and the initial
+// blocking connect still use platform timeouts.
 public function getBoundedWithin(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer): Response {
     return requestBoundedWithin("GET", url, headers, "", limit, timeoutMs)
 }
@@ -197,6 +199,56 @@ public function requestBoundedWithin(method: Text, url: Text, headers: List<Text
 function ready(connection: Integer, deadline: Integer): Boolean {
     let remaining = deadline - net.monotonicMilliseconds()
     return remaining > 0 && net.ready(connection, remaining)
+}
+
+// Writes share the request's absolute deadline. Watching makes the socket
+// non-blocking, so a peer that stops reading cannot hold the caller in send.
+function writeWithin(connection: Integer, data: Bytes, deadline: Integer, operation: Text): Text {
+    if data.length == 0 { return "" }
+    if deadline <= 0 {
+        if net.send(connection, data) == data.length { return "" }
+        return operation + " failed: " + net.lastError()
+    }
+    let created = loop.create()
+    if !errors.integerOk(created) { return operation + " failed: " + errors.message(errors.integerError(created)) }
+    let handle = errors.integerValue(created)
+    let watched = loop.watch(handle, connection, loop.writableInterest(), 0)
+    if !errors.integerOk(watched) {
+        loop.close(handle)
+        return operation + " failed: " + errors.message(errors.integerError(watched))
+    }
+    let registration = errors.integerValue(watched)
+    let sent = 0
+    while sent < data.length {
+        let remaining = deadline - net.monotonicMilliseconds()
+        if remaining <= 0 {
+            loop.remove(handle, registration); loop.close(handle)
+            return operation + " timed out"
+        }
+        let count = net.writeRange(connection, data, sent, min(16777216, data.length - sent))
+        if count > 0 { sent += count; continue }
+        if count == 0 {
+            loop.remove(handle, registration); loop.close(handle)
+            return operation + " failed: the connection closed while sending"
+        }
+        if count != -1 {
+            let detail = net.lastError()
+            loop.remove(handle, registration); loop.close(handle)
+            return operation + " failed: " + detail
+        }
+        let batch = loop.wait(handle, remaining, 1)
+        if errors.isError(loop.batchError(batch)) {
+            let detail = errors.message(loop.batchError(batch))
+            loop.remove(handle, registration); loop.close(handle)
+            return operation + " failed: " + detail
+        }
+        if loop.events(batch).length == 0 {
+            loop.remove(handle, registration); loop.close(handle)
+            return operation + " timed out"
+        }
+    }
+    loop.remove(handle, registration); loop.close(handle)
+    return ""
 }
 
 function requestFramingError(method: Text, headers: List<Text>): Text {
@@ -248,13 +300,13 @@ function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limi
     if address.secure {
         return secureExchange(connection, address.host, method, message, limit, deadline)
     }
-    if net.send(connection, message) != message.length {
-        let message = net.lastError()
+    let sendError = writeWithin(connection, message, deadline, "HTTP upload")
+    if sendError != "" {
         net.close(connection)
-        return failed("HTTP send failed: " + message)
+        return failed(sendError)
     }
     let received = Bytes()
-    let reader = chunkReader()
+    let responseState = newResponseState()
     while true {
         if limit > 0 && !ready(connection, deadline) { net.close(connection); return failed("download timed out") }
         let capacity = 65536
@@ -266,10 +318,10 @@ function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limi
             let code = net.lastErrorCode()
             net.close(connection)
             if code != 0 { return failed("HTTP receive failed: " + error) }
-            return readResponseWith(received, method, limit, true, 0, 0, reader)
+            return readResponse(received, method, limit, true, responseState)
         }
         received.addBytes(chunk)
-        let response = readResponseWith(received, method, limit, false, 0, 0, reader)
+        let response = readResponse(received, method, limit, false, responseState)
         if response.status >= 0 { net.close(connection); return response }
     }
 }
@@ -277,7 +329,8 @@ function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limi
 function secureExchange(connection: Integer, host: Text, method: Text, message: Bytes, limit: Integer, deadline: Integer): Response {
     let session = tls.client(host, secureRandom.bytes(64))
     let hello = tls.takeOutgoing(session)
-    if net.send(connection, hello) != hello.length { net.close(connection); return failed("TLS handshake send failed") }
+    let helloError = writeWithin(connection, hello, deadline, "TLS handshake send")
+    if helloError != "" { net.close(connection); return failed(helloError) }
     let handshakeBytes = 0
     while session.state == tls.HELLO_SENT || session.state == tls.HANDSHAKE {
         if limit > 0 && !ready(connection, deadline) { net.close(connection); return failed("TLS handshake timed out") }
@@ -290,7 +343,8 @@ function secureExchange(connection: Integer, host: Text, method: Text, message: 
         if limit > 0 && handshakeBytes > 1048576 { net.close(connection); return failed("TLS handshake exceeds its size limit") }
         tls.receive(session, chunk)
         let reply = tls.takeOutgoing(session)
-        if reply.length > 0 && net.send(connection, reply) != reply.length { net.close(connection); return failed("TLS handshake send failed") }
+        let replyError = writeWithin(connection, reply, deadline, "TLS handshake send")
+        if replyError != "" { net.close(connection); return failed(replyError) }
     }
     if !tls.established(session) {
         net.close(connection)
@@ -298,9 +352,10 @@ function secureExchange(connection: Integer, host: Text, method: Text, message: 
     }
     tls.send(session, message)
     let outgoing = tls.takeOutgoing(session)
-    if net.send(connection, outgoing) != outgoing.length { net.close(connection); return failed("TLS request send failed") }
+    let requestError = writeWithin(connection, outgoing, deadline, "TLS upload")
+    if requestError != "" { net.close(connection); return failed(requestError) }
     let received = Bytes()
-    let reader = chunkReader()
+    let responseState = newResponseState()
     while session.state == tls.ESTABLISHED {
         if limit > 0 && !ready(connection, deadline) { net.close(connection); return failed("download timed out") }
         let chunk = net.receive(connection, 65536)
@@ -317,7 +372,7 @@ function secureExchange(connection: Integer, host: Text, method: Text, message: 
             net.close(connection); return failed("download exceeds its size limit")
         }
         if session.state == tls.FAILED { break }
-        let response = readResponseWith(received, method, limit, false, 0, 0, reader)
+        let response = readResponse(received, method, limit, false, responseState)
         if response.status >= 0 { net.close(connection); return response }
     }
     received.addBytes(tls.takeIncoming(session))
@@ -325,7 +380,7 @@ function secureExchange(connection: Integer, host: Text, method: Text, message: 
     if session.state == tls.FAILED {
         return failed("TLS failed: " + session.error)
     }
-    return readResponseWith(received, method, limit, true, 0, 0, reader)
+    return readResponse(received, method, limit, true, responseState)
 }
 
 function headerEnd(data: Bytes, offset: Integer): Integer {
@@ -521,112 +576,130 @@ function readChunked(data: Bytes, limit: Integer, ended: Boolean, reader: ChunkR
     return pending()
 }
 
+// One exchange's parser progress: header scan state, then chunk progress once
+// a chunked response head has been accepted.
+record ResponseState {
+    scan: Integer; offset: Integer; informational: Integer; parsed: Boolean
+    end: Integer; status: Integer; reason: Text; headers: List<Text>; length: Integer
+    chunk: ChunkReader
+}
+function newResponseState(): ResponseState {
+    return ResponseState { scan: 0; offset: 0; informational: 0; parsed: false; end: -1; status: 0; reason: ""; headers: []; length: -1;
+        chunk: chunkReader() }
+}
+
 // A negative status is private parser state: more bytes are needed. Headers
 // include at most 16 informational responses. A chunked response shares the
 // 32 KiB framing cap across headers, sizes, extensions, CRLF and trailers.
-function readResponse(data: Bytes, method: Text, limit: Integer, ended: Boolean, informational: Integer, offset: Integer): Response {
-    return readResponseWith(data, method, limit, ended, informational, offset, chunkReader())
-}
-function readResponseWith(data: Bytes, method: Text, limit: Integer, ended: Boolean, informational: Integer, offset: Integer, reader: ChunkReader): Response {
-    if reader.status > 0 { return readChunked(data, limit, ended, reader) }
-    let end = headerEnd(data, offset)
-    if end < 0 {
-        if data.length > 32768 { return failed("HTTP headers exceed 32 KiB") }
-        if ended { return failed("the server's response was incomplete") }
-        return pending()
-    }
-    if end + 4 > 32768 { return failed("HTTP headers exceed 32 KiB") }
-    let raw = data.slice(offset, end)
-    if !text.validUTF8(raw) { return failed("invalid UTF-8 in HTTP headers") }
-    for index in 0..raw.length {
-        let byte = raw[index]
-        if byte == 13 && (index + 1 >= raw.length || raw[index + 1] != 10) { return failed("invalid HTTP header line ending") }
-        if byte == 10 && (index == 0 || raw[index - 1] != 13) { return failed("invalid HTTP header line ending") }
-        if (byte < 32 && byte != 9 && byte != 10 && byte != 13) || byte == 127 { return failed("invalid control in HTTP headers") }
-    }
-    let head = Text(raw)
-    let lines: List<Text> = []
-    let start = 0
-    for position in 0..head.length {
-        if head[position] == '\n' {
-            let stop = position
-            if stop > start && head[stop - 1] == '\r' { stop -= 1 }
-            lines.add(head.slice(start, stop))
-            start = position + 1
+// Scan and parsed-header state advance with appended network data so bytewise
+// delivery cannot repeatedly parse the same prefix.
+function readResponse(data: Bytes, method: Text, limit: Integer, ended: Boolean, state: ResponseState): Response {
+    if state.chunk.status > 0 { return readChunked(data, limit, ended, state.chunk) }
+    if !state.parsed {
+        let end = headerEnd(data, state.scan)
+        if end < 0 {
+            state.scan = max(state.offset, data.length - 3)
+            if data.length > 32768 { return failed("HTTP headers exceed 32 KiB") }
+            if ended { return failed("the server's response was incomplete") }
+            return pending()
         }
-    }
-    lines.add(head.slice(start, head.length))
-    let first = lines[0]
-    if first.length < 12 { return failed("invalid HTTP status line") }
-    if first.slice(0, 9) != "HTTP/1.0 " && first.slice(0, 9) != "HTTP/1.1 " { return failed("invalid HTTP status line") }
-    if first.length > 12 && first[12] != ' ' { return failed("invalid HTTP status line") }
-    let status = 0
-    for character in first.slice(9, 12) {
-        if character < '0' || character > '9' { return failed("invalid HTTP status code") }
-        status = status * 10 + Integer(character) - 48
-    }
-    if status < 100 || status > 599 { return failed("invalid HTTP status code") }
-    let reason = first.slice(min(13, first.length), first.length)
-    let headers: List<Text> = []
-    let length = -1
-    let transfer = 0
-    let coding = ""
-    for index in 1..lines.length {
-        let line = lines[index]
-        let colon = -1
-        for position in 0..line.length {
-            if line[position] == ':' { colon = position; break }
-            if !headerToken(line[position]) { return failed("invalid HTTP header name") }
+        if end + 4 > 32768 { return failed("HTTP headers exceed 32 KiB") }
+        let raw = data.slice(state.offset, end)
+        if !text.validUTF8(raw) { return failed("invalid UTF-8 in HTTP headers") }
+        for index in 0..raw.length {
+            let byte = raw[index]
+            if byte == 13 && (index + 1 >= raw.length || raw[index + 1] != 10) { return failed("invalid HTTP header line ending") }
+            if byte == 10 && (index == 0 || raw[index - 1] != 13) { return failed("invalid HTTP header line ending") }
+            if (byte < 32 && byte != 9 && byte != 10 && byte != 13) || byte == 127 { return failed("invalid control in HTTP headers") }
         }
-        if colon < 1 { return failed("invalid HTTP header") }
-        let name = lowerASCII(line.slice(0, colon))
-        let value = trimSpace(line.slice(colon + 1, line.length))
-        if name == "content-length" {
-            if value == "" { return failed("invalid HTTP Content-Length") }
-            let count = 0
-            for character in value {
-                let digit = Integer(character) - 48
-                if digit < 0 || digit > 9 || count > (9223372036854775807 - digit) / 10 { return failed("invalid HTTP Content-Length") }
-                count = count * 10 + digit
+        let head = Text(raw)
+        let lines: List<Text> = []
+        let start = 0
+        for position in 0..head.length {
+            if head[position] == '\n' {
+                let stop = position
+                if stop > start && head[stop - 1] == '\r' { stop -= 1 }
+                lines.add(head.slice(start, stop))
+                start = position + 1
             }
-            if length >= 0 && length != count { return failed("conflicting HTTP Content-Length headers") }
-            length = count
         }
-        if name == "transfer-encoding" { transfer += 1; coding = lowerASCII(value) }
-        headers.add(line)
+        lines.add(head.slice(start, head.length))
+        let first = lines[0]
+        if first.length < 12 { return failed("invalid HTTP status line") }
+        if first.slice(0, 9) != "HTTP/1.0 " && first.slice(0, 9) != "HTTP/1.1 " { return failed("invalid HTTP status line") }
+        if first.length > 12 && first[12] != ' ' { return failed("invalid HTTP status line") }
+        let status = 0
+        for character in first.slice(9, 12) {
+            if character < '0' || character > '9' { return failed("invalid HTTP status code") }
+            status = status * 10 + Integer(character) - 48
+        }
+        if status < 100 || status > 599 { return failed("invalid HTTP status code") }
+        let reason = first.slice(min(13, first.length), first.length)
+        let headers: List<Text> = []
+        let length = -1
+        let transfer = 0
+        let coding = ""
+        for index in 1..lines.length {
+            let line = lines[index]
+            let colon = -1
+            for position in 0..line.length {
+                if line[position] == ':' { colon = position; break }
+                if !headerToken(line[position]) { return failed("invalid HTTP header name") }
+            }
+            if colon < 1 { return failed("invalid HTTP header") }
+            let name = lowerASCII(line.slice(0, colon))
+            let value = trimSpace(line.slice(colon + 1, line.length))
+            if name == "content-length" {
+                if value == "" { return failed("invalid HTTP Content-Length") }
+                let count = 0
+                for character in value {
+                    let digit = Integer(character) - 48
+                    if digit < 0 || digit > 9 || count > (9223372036854775807 - digit) / 10 { return failed("invalid HTTP Content-Length") }
+                    count = count * 10 + digit
+                }
+                if length >= 0 && length != count { return failed("conflicting HTTP Content-Length headers") }
+                length = count
+            }
+            if name == "transfer-encoding" { transfer += 1; coding = lowerASCII(value) }
+            headers.add(line)
+        }
+        if status < 200 {
+            if status == 101 { return failed("HTTP protocol upgrades are unsupported") }
+            if state.informational >= 16 { return failed("too many informational HTTP responses") }
+            state.informational += 1; state.offset = end + 4; state.scan = state.offset
+            return readResponse(data, method, limit, ended, state)
+        }
+        let noBody = method == "HEAD" || status == 204 || status == 304
+        if noBody { return Response { status: status; reason: reason; headers: headers; body: Bytes(); error: "" } }
+        if transfer > 0 {
+            if length >= 0 { return failed("HTTP Transfer-Encoding conflicts with Content-Length") }
+            if transfer != 1 || coding != "chunked" { return failed("unsupported HTTP Transfer-Encoding") }
+            if first.slice(0, 8) != "HTTP/1.1" { return failed("HTTP/1.0 Transfer-Encoding is unsupported") }
+            state.parsed = true; state.end = end; state.status = status; state.reason = reason; state.headers = headers
+            let reader = state.chunk
+            reader.status = status; reader.reason = reason; reader.headers = headers
+            reader.cursor = end + 4; reader.scan = reader.cursor; reader.framing = reader.cursor
+            return readChunked(data, limit, ended, reader)
+        }
+        state.parsed = true; state.end = end; state.status = status; state.reason = reason; state.headers = headers; state.length = length
     }
-    if status < 200 {
-        if status == 101 { return failed("HTTP protocol upgrades are unsupported") }
-        if informational >= 16 { return failed("too many informational HTTP responses") }
-        return readResponseWith(data, method, limit, ended, informational + 1, end + 4, reader)
-    }
-    let noBody = method == "HEAD" || status == 204 || status == 304
-    if noBody { return Response { status: status; reason: reason; headers: headers; body: Bytes(); error: "" } }
-    if transfer > 0 {
-        if length >= 0 { return failed("HTTP Transfer-Encoding conflicts with Content-Length") }
-        if transfer != 1 || coding != "chunked" { return failed("unsupported HTTP Transfer-Encoding") }
-        if first.slice(0, 8) != "HTTP/1.1" { return failed("HTTP/1.0 Transfer-Encoding is unsupported") }
-        reader.status = status; reader.reason = reason; reader.headers = headers
-        reader.cursor = end + 4; reader.scan = reader.cursor; reader.framing = reader.cursor
-        return readChunked(data, limit, ended, reader)
-    }
-    let available = data.length - end - 4
-    if status == 205 && (length > 0 || available > 0) { return failed("HTTP 205 responses cannot contain content") }
-    if limit > 0 && (available > limit || length > limit) { return failed("download exceeds its size limit") }
-    if length >= 0 {
-        if available > length { return failed("HTTP body exceeds its Content-Length") }
-        if available < length {
+    let available = data.length - state.end - 4
+    if state.status == 205 && (state.length > 0 || available > 0) { return failed("HTTP 205 responses cannot contain content") }
+    if limit > 0 && (available > limit || state.length > limit) { return failed("download exceeds its size limit") }
+    if state.length >= 0 {
+        if available > state.length { return failed("HTTP body exceeds its Content-Length") }
+        if available < state.length {
             if ended { return failed("HTTP body is shorter than its Content-Length") }
             return pending()
         }
     } else if !ended { return pending() }
-    let body = data.slice(end + 4, data.length)
-    return Response { status: status; reason: reason; headers: headers; body: body; error: "" }
+    let body = data.slice(state.end + 4, data.length)
+    return Response { status: state.status; reason: state.reason; headers: state.headers; body: body; error: "" }
 }
 
 test "chunked response exposes application bytes" {
     let wire = Bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n")
-    let response = readResponse(wire, "GET", 9, true, 0, 0)
+    let response = readResponse(wire, "GET", 9, true, newResponseState())
     expect(response.status == 200)
     expect(response.error == "")
     expect(Text(response.body) == "Wikipedia")
@@ -635,24 +708,24 @@ test "chunked response exposes application bytes" {
 test "chunk metadata survives every split and one byte reads" {
     let wire = Bytes("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: ChUnKeD\r\nX-Original: keep\r\n\r\n4 ; foo = \"a\\\"b\"; bare\r\nWiki\r\n5;v=token\r\npedia\r\n000;last=\"\"\r\nX-Trailer: ignored\r\nSet-Cookie: ignored=1\r\nContent-Length: 999\r\n\r\n")
     for cut in 0..wire.length {
-        let reader = chunkReader()
+        let reader = newResponseState()
         let prefix = wire.slice(0, cut)
-        let first = readResponseWith(prefix, "GET", 9, false, 0, 0, reader)
+        let first = readResponse(prefix, "GET", 9, false, reader)
         expect(first.status == -1)
         expect(first.body.length == 0)
-        let response = readResponseWith(wire, "GET", 9, false, 0, 0, reader)
+        let response = readResponse(wire, "GET", 9, false, reader)
         expect(response.status == 200)
         expect(Text(response.body) == "Wikipedia")
         expect(response.headers.length == 2)
         expect(response.headers[1] == "X-Original: keep")
-        expect(readResponse(prefix, "GET", 9, true, 0, 0).status == 0)
+        expect(readResponse(prefix, "GET", 9, true, newResponseState()).status == 0)
     }
-    let reader = chunkReader()
+    let reader = newResponseState()
     for count in 1..(wire.length + 1) {
-        let previous = reader.cursor
-        let response = readResponseWith(wire.slice(0, count), "GET", 9, false, 0, 0, reader)
-        expect(reader.cursor >= previous)
-        expect(reader.body.length <= 9)
+        let previous = reader.chunk.cursor
+        let response = readResponse(wire.slice(0, count), "GET", 9, false, reader)
+        expect(reader.chunk.cursor >= previous)
+        expect(reader.chunk.body.length <= 9)
         if count == wire.length { expect(response.status == 200) }
         else { expect(response.status == -1) }
     }
@@ -662,7 +735,7 @@ test "chunked body preserves arbitrary bytes" {
     let wire = Bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n")
     for byte in [0, 255, 13, 10] { wire.add(byte) }
     wire.addBytes(Bytes("\r\n0\r\n\r\n"))
-    let response = readResponse(wire, "GET", 4, true, 0, 0)
+    let response = readResponse(wire, "GET", 4, true, newResponseState())
     expect(response.status == 200)
     expect(response.body.length == 4)
     for index in 0..4 { expect(response.body[index] == [0, 255, 13, 10][index]) }
@@ -680,14 +753,14 @@ test "invalid chunk framing never publishes a partial body" {
         "0\r\nMissing\r\n\r\n", "0\r\nBad Name: x\r\n\r\n", "0\r\nX: " + Text(Character(0)) + "\r\n\r\n",
         "0\r\nX: " + Text(Character(127)) + "\r\n\r\n", "0\r\nX: x\n\r\n", "0\r\n\r\nextra"]
     for body in bodies {
-        let response = readResponse(Bytes(head + body), "GET", 1024, true, 0, 0)
+        let response = readResponse(Bytes(head + body), "GET", 1024, true, newResponseState())
         expect(response.status == 0)
         expect(response.error != "")
         expect(response.body.length == 0)
     }
     let wire = Bytes(head + "0\r\nX: ")
     wire.add(255); wire.addBytes(Bytes("\r\n\r\n"))
-    expect(readResponse(wire, "GET", 1024, true, 0, 0).status == 0)
+    expect(readResponse(wire, "GET", 1024, true, newResponseState()).status == 0)
 }
 
 test "ambiguous transfer framing is rejected" {
@@ -695,35 +768,35 @@ test "ambiguous transfer framing is rejected" {
         "Transfer-Encoding: chunked, gzip", "Transfer-Encoding: chunked, chunked", "Transfer-Encoding: chunked; a=b",
         "Transfer-Encoding:", "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked",
         "Transfer-Encoding: chunked\r\nContent-Length: 0", "Content-Length: 1\r\nTransfer-Encoding: chunked"] {
-        let response = readResponse(Bytes("HTTP/1.1 200 OK\r\n" + headers + "\r\n\r\n0\r\n\r\n"), "GET", 1024, true, 0, 0)
+        let response = readResponse(Bytes("HTTP/1.1 200 OK\r\n" + headers + "\r\n\r\n0\r\n\r\n"), "GET", 1024, true, newResponseState())
         expect(response.status == 0)
         expect(response.error != "")
         expect(response.body.length == 0)
     }
-    expect(readResponse(Bytes("HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"), "GET", 1024, true, 0, 0).status == 0)
+    expect(readResponse(Bytes("HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"), "GET", 1024, true, newResponseState()).status == 0)
 }
 
 test "decoded and framing limits are independent" {
     let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
     let small = Bytes(head + "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n")
-    expect(readResponse(small, "GET", 9, true, 0, 0).status == 200)
-    expect(readResponse(small, "GET", 8, true, 0, 0).status == 0)
-    expect(readResponse(Bytes(head + "7fffffffffffffff\r\n"), "GET", 9, false, 0, 0).status == 0)
+    expect(readResponse(small, "GET", 9, true, newResponseState()).status == 200)
+    expect(readResponse(small, "GET", 8, true, newResponseState()).status == 0)
+    expect(readResponse(Bytes(head + "7fffffffffffffff\r\n"), "GET", 9, false, newResponseState()).status == 0)
     let padding = Bytes()
     for index in 0..(32768 - head.byteLength - 10) { padding.add(120) }
     let bounded = Bytes(head + "0\r\nX: ")
     bounded.addBytes(padding); bounded.addBytes(Bytes("\r\n\r\n"))
     expect(bounded.length == 32768)
-    expect(readResponse(bounded, "GET", 1, true, 0, 0).status == 200)
+    expect(readResponse(bounded, "GET", 1, true, newResponseState()).status == 200)
     let excess = Bytes(head + "0\r\nX: x")
     excess.addBytes(padding); excess.addBytes(Bytes("\r\n\r\n"))
-    expect(readResponse(excess, "GET", 1, true, 0, 0).status == 0)
+    expect(readResponse(excess, "GET", 1, true, newResponseState()).status == 0)
     let many = Bytes(head)
     for index in 0..2048 { many.addBytes(Bytes("1\r\nx\r\n")) }
     many.addBytes(Bytes("0\r\n\r\n"))
-    let reader = chunkReader()
+    let reader = newResponseState()
     for count in 1..(many.length + 1) {
-        let response = readResponseWith(many.slice(0, count), "GET", 2048, false, 0, 0, reader)
+        let response = readResponse(many.slice(0, count), "GET", 2048, false, reader)
         if count == many.length { expect(response.status == 200); expect(response.body.length == 2048) }
         else { expect(response.status == -1); expect(response.body.length == 0) }
     }
@@ -731,13 +804,13 @@ test "decoded and framing limits are independent" {
 
 test "bodyless and reset statuses retain their framing rules" {
     for status in [204, 304] {
-        let response = readResponse(Bytes("HTTP/1.1 " + Text(status) + " Empty\r\nTransfer-Encoding: chunked\r\n\r\n"), "GET", 1, false, 0, 0)
+        let response = readResponse(Bytes("HTTP/1.1 " + Text(status) + " Empty\r\nTransfer-Encoding: chunked\r\n\r\n"), "GET", 1, false, newResponseState())
         expect(response.status == status); expect(response.body.length == 0)
     }
-    let head = readResponse(Bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 500\r\n\r\n"), "HEAD", 1, false, 0, 0)
+    let head = readResponse(Bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 500\r\n\r\n"), "HEAD", 1, false, newResponseState())
     expect(head.status == 200); expect(head.body.length == 0)
     let reset = "HTTP/1.1 205 Reset\r\nTransfer-Encoding: chunked\r\n\r\n"
-    expect(readResponse(Bytes(reset + "0\r\n\r\n"), "GET", 1, false, 0, 0).status == 205)
-    expect(readResponse(Bytes(reset + "1\r\nx\r\n0\r\n\r\n"), "GET", 1, true, 0, 0).status == 0)
-    expect(readResponse(Bytes("HTTP/1.1 101 Switching\r\n\r\n"), "GET", 1, true, 0, 0).status == 0)
+    expect(readResponse(Bytes(reset + "0\r\n\r\n"), "GET", 1, false, newResponseState()).status == 205)
+    expect(readResponse(Bytes(reset + "1\r\nx\r\n0\r\n\r\n"), "GET", 1, true, newResponseState()).status == 0)
+    expect(readResponse(Bytes("HTTP/1.1 101 Switching\r\n\r\n"), "GET", 1, true, newResponseState()).status == 0)
 }

@@ -7,6 +7,7 @@
 .PHONY: bench-formats bench-compression bench-sha256 bench-tar
 
 build/tooling/tests/compression-provider build/tooling/tests/compression-codecs build/tooling/tests/format-provider build/tooling/tests/tar-test build/tooling/tests/tar-review-test build/tooling/tests/tar-copy-count build/tooling/tests/formats-test build/tooling/benchmarks/compression-bench build/tooling/benchmarks/tar/run: build/tooling/tools/clang-driver
+build/tooling/tests/tar-test.ll build/tooling/tests/tar-review-test.ll build/tooling/tests/tar-copy-count.ll build/tooling/benchmarks/tar/run.ll: tests/tar-test-support.min
 build/tooling/tests/compression-codecs: TOOL_NATIVE = tests/compression-codecs-oracle-runtime.c runtime/native/sha256.c
 build/tooling/tests/compression-codecs: TOOL_LIBS = -lz -ldl $(TOOL_CRYPTO)
 build/tooling/tests/compression-codecs: tests/compression-codecs-oracle-runtime.c

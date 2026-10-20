@@ -5,6 +5,7 @@
 #endif
 #include "../runtime/minyar_native.h"
 #include <errno.h>
+#include <stdint.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -82,6 +83,25 @@ MinyarText *minyar_testinghost_resolvePath(const MinyarText *path) {
     free(resolved);
     return result;
 }
+
+MinyarText *minyar_testinghost_privateDirectory(const MinyarText *directory) {
+    static const char suffix[] = "/minyar-tests-XXXXXX";
+    if (!directory || directory->byte_length <= 0 ||
+        (unsigned long long)directory->byte_length > (unsigned long long)SIZE_MAX - sizeof(suffix) ||
+        memchr(directory->bytes, 0, (size_t)directory->byte_length))
+        return testing_text("");
+    size_t length = (size_t)directory->byte_length;
+    char *pattern = malloc(length + sizeof(suffix));
+    if (!pattern)
+        return testing_text("");
+    memcpy(pattern, directory->bytes, length);
+    memcpy(pattern + length, suffix, sizeof(suffix));
+    char *created = mkdtemp(pattern);
+    MinyarText *result = testing_text(created ? created : "");
+    free(pattern);
+    return result;
+}
+
 MinyarText *minyar_testinghost_selfPath(void) {
 #ifdef __APPLE__
     uint32_t size = 0;

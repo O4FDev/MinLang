@@ -91,8 +91,8 @@ check-clang-cache: build/tooling/tests/clang-cache build/tooling/tools/clang-cac
 
 check: check-clang-cache
 
-build/tooling/tools/clang-cache: build/tooling/tools/clang-cache.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c
-	"$(LLVM_CC)" $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@
+build/tooling/tools/clang-cache: build/tooling/tools/clang-cache.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c tools/clang-driver-host.c runtime/minyar_native.h
+	"$(LLVM_CC)" $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c tools/clang-driver-host.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@
 
 build/tooling/tests/mutation-score build/tooling/tests/mutation-score-harness: build/tooling/%: build/tooling/%.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c
 	"$(LLVM_CC)" $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@

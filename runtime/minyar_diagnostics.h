@@ -95,6 +95,9 @@ long long minyar_runtime_compilerKernelTarget(void) { return minyar_compiler_ker
 /* This private boundary is used by the compiler, never emitted into a user
  * program. Only an explicit diagnostic can jump here; runtime faults remain
  * fatal. Unwind ownership while callback stack storage is still live. */
+/* Freestanding runtimes are always compiled with -ffreestanding and have no
+ * setjmp.h; they get the fail-closed stubs below. Hosted tests that define
+ * MINYAR_FREESTANDING (parallel-backend) keep the real boundary. */
 #if defined(__STDC_HOSTED__) && __STDC_HOSTED__
 #include <setjmp.h>
 typedef struct MinyarDiagnosticBoundary {
