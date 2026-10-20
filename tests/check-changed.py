@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Check real Git diffs, exported inputs and stale-input rejection."""
+import errno
 import importlib.util
 import json
 import os
@@ -15,6 +16,10 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parent.parent / "tools/check-changed.py"
 
 
+def write_lf(path, contents):
+    path.write_bytes(contents.encode("utf-8"))
+
+
 class ChangedInputs(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="Minyar changed 'inputs' ")
@@ -28,12 +33,12 @@ class ChangedInputs(unittest.TestCase):
         (self.root / "library/text.min").write_text('use "math" as math\n')
         (self.root / "deleted.txt").write_text("deleted\n")
         (self.root / "old name.txt").write_text("renamed\n")
-        (self.root / "tools/toolchain.sh").write_text("printf 'fixture-clang\\n'\n")
-        (self.root / "Makefile").write_text(
+        write_lf(self.root / "tools/toolchain.sh", "printf 'fixture-clang\\n'\n")
+        write_lf(self.root / "Makefile",
             "build/tooling/tools/check-commit: tools/fake-checker.py\n"
             "\t@mkdir -p build/tooling/tools\n"
             "\t@cp tools/fake-checker.py $@\n\t@chmod 755 $@\n")
-        (self.root / "tools/fake-checker.py").write_text(
+        write_lf(self.root / "tools/fake-checker.py",
             "#!" + sys.executable + "\n"
             "import json, os, pathlib, sys\n"
             "args = sys.argv[1:]; data = {}\n"
@@ -50,6 +55,22 @@ class ChangedInputs(unittest.TestCase):
             "if os.environ.get('CHANGE_DURING_CHECK'):\n"
             "    pathlib.Path('library/math.min').write_text('changed during check')\n"
             "sys.exit(int(os.environ.get('CHECKER_EXIT', '0')))\n")
+        write_lf(self.root / "tools/check-changed-entry.py",
+            "import pathlib, runpy, subprocess, sys\n"
+            "root = pathlib.Path(__file__).resolve().parent.parent\n"
+            "checker = str(root / 'build/tooling/tools/check-commit')\n"
+            "original_run = subprocess.run; adapted = 0\n"
+            "def fixture_run(command, *arguments, **options):\n"
+            "    global adapted\n"
+            "    if isinstance(command, (list, tuple)) and command and command[0] == checker:\n"
+            "        adapted += 1\n"
+            "        command = [sys.executable, *command]\n"
+            "    return original_run(command, *arguments, **options)\n"
+            "subprocess.run = fixture_run\n"
+            "try:\n"
+            "    runpy.run_path(str(root / 'tools/check-changed.py'), run_name='__main__')\n"
+            "finally:\n"
+            "    sys.stderr.write('fixture checker adapter calls: ' + str(adapted) + '\\n')\n")
         self.environment = os.environ.copy()
         for name in list(self.environment):
             if name.startswith("GIT_") or name in ("CHECK_CHANGED_INPUT", "CHECK_CHANGED_BASE", "MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEFILES", "GNUMAKEFLAGS"):
@@ -72,8 +93,11 @@ class ChangedInputs(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 
-    def invoke(self, *arguments, expected=0, environment=None):
-        result = self.run_command([sys.executable, "tools/check-changed.py", *arguments], environment=environment)
+    def invoke(self, *arguments, expected=0, environment=None, fixture_adapter=False):
+        # Native Windows cannot directly execute the Python text fake checker.
+        # The exact fixture path is adapted in a child; production stays unchanged.
+        entry = "tools/check-changed-entry.py" if os.name == "nt" or fixture_adapter else "tools/check-changed.py"
+        result = self.run_command([sys.executable, entry, *arguments], environment=environment)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
 
@@ -92,18 +116,40 @@ class ChangedInputs(unittest.TestCase):
         (self.root / "library/math.min").write_text("unstaged\n")
         (self.root / "library/text.min").write_text("removed import\n")
         self.git("rm", "deleted.txt")
-        renamed = "new name\nwith newline.txt"
+        renamed = "new name with spaces.txt"
         self.git("mv", "old name.txt", renamed)
-        (self.root / "untracked\nfile.min").write_text("untracked\n")
+        (self.root / "untracked file.min").write_text("untracked\n")
         index = (self.root / ".git/index").read_bytes()
         result = self.invoke("--plan")
         data = json.loads(result.stdout)
-        self.assertEqual(set(data["paths"]), {"library/math.min", "library/text.min", "deleted.txt", "old name.txt", renamed, "untracked\nfile.min"})
+        self.assertEqual(set(data["paths"]), {"library/math.min", "library/text.min", "deleted.txt", "old name.txt", renamed, "untracked file.min"})
         self.assertEqual(data["previous"], 'use "math" as math\n')
         self.assertTrue(data["plan"])
         self.assertEqual(data["make_environment"], [])
         self.assertEqual((self.root / ".git/index").read_bytes(), index)
         self.assertEqual((self.root / "library/math.min").read_text(), "unstaged\n")
+
+    @unittest.skipIf(os.name == "nt", "native Windows reserves newline (U+000A) in filenames")
+    def test_newline_paths_preserve_nul_delimiting(self):
+        renamed = "new name\nwith newline.txt"
+        untracked = "untracked\nfile.min"
+        self.git("mv", "old name.txt", renamed)
+        (self.root / untracked).write_text("untracked\n")
+        index = (self.root / ".git/index").read_bytes()
+        data = json.loads(self.invoke("--plan").stdout)
+        self.assertEqual(set(data["paths"]), {"old name.txt", renamed, untracked})
+        self.assertEqual((self.root / ".git/index").read_bytes(), index)
+        self.assertEqual((self.root / untracked).read_text(), "untracked\n")
+
+    def test_forced_checker_adapter_preserves_arguments_and_failure(self):
+        result = self.invoke("--plan", "--jobs", "3", expected=37, fixture_adapter=True,
+                             environment=dict(self.environment, CHECKER_EXIT="37"))
+        data = json.loads(result.stdout)
+        self.assertEqual(data["--root"], str(self.root.resolve()))
+        self.assertEqual(data["--jobs"], "3")
+        self.assertTrue(data["plan"])
+        self.assertEqual(data["paths"], [])
+        self.assertEqual(result.stderr.splitlines().count(b"fixture checker adapter calls: 1"), 1)
 
     def test_explicit_base_includes_committed_work_and_export_ignores_attributes(self):
         base = self.git("rev-parse", "HEAD").decode().strip()
@@ -178,7 +224,11 @@ class ChangedInputs(unittest.TestCase):
     def test_changed_executable_mode_is_rejected(self):
         self.export()
         path = self.root / "library/math.min"
-        path.chmod(path.stat().st_mode | 0o111)
+        mode = path.stat().st_mode
+        executable = bool(mode & 0o111)
+        path.chmod(mode & ~0o111 if executable else mode | 0o111)
+        if bool(path.stat().st_mode & 0o111) == executable:
+            self.skipTest("this filesystem/Python exposes no executable-bit transition")
         self.rejection("source differs")
 
     def test_changed_path_list_is_rejected(self):
@@ -231,7 +281,18 @@ class ChangedInputs(unittest.TestCase):
     def test_external_source_symlinks_are_rejected(self):
         external = Path(self.temporary.name) / "external.min"
         external.write_text("untracked external source\n")
-        (self.root / "library/external.min").symlink_to(external)
+        link = self.root / "library/external.min"
+        try:
+            link.symlink_to(external)
+        except NotImplementedError as error:
+            self.skipTest("real symlink creation is unavailable: " + str(error))
+        except OSError as error:
+            unsupported = {getattr(errno, name, None) for name in ("ENOSYS", "ENOTSUP", "EOPNOTSUPP")}
+            unsupported.discard(None)
+            if error.errno in unsupported or (os.name == "nt" and getattr(error, "winerror", None) == 1314):
+                self.skipTest("real symlink creation is unsupported or lacks Windows privilege: " + str(error))
+            raise
+        self.assertTrue(link.is_symlink(), "the fixture must create a genuine symlink, not a copy")
         result = self.invoke("--export", "target/changes", expected=1)
         self.assertIn("source symlinks require explicit checks", result.stderr.decode())
 
