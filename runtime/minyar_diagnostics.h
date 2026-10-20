@@ -98,6 +98,7 @@ typedef struct MinyarDiagnosticBoundary {
     size_t depth, limit;
 #ifndef MINYAR_COMPILER_ARENA
     RcFrame *frames;
+    MinyarRcScope *scopes;
 #endif
 } MinyarDiagnosticBoundary;
 static MinyarDiagnosticBoundary *minyar_diagnostic_boundary;
@@ -108,7 +109,7 @@ _Bool minyar_compiler_try(void (*compile)(void *), void *job) {
     MinyarDiagnosticBoundary boundary = {&jump, minyar_diagnostic_boundary, job,
                                         minyar_call_depth, minyar_depth_limit
 #ifndef MINYAR_COMPILER_ARENA
-                                        , rc_frames
+                                        , rc_frames, rc_scopes
 #endif
     };
     minyar_diagnostic_boundary = &boundary;
@@ -122,6 +123,7 @@ static MINYAR_NORETURN void minyar_diagnostic_jump(int reason) {
     MinyarDiagnosticBoundary *boundary = minyar_diagnostic_boundary;
     if (!boundary) exit(1);
 #ifndef MINYAR_COMPILER_ARENA
+    rc_scope_unwind(boundary->scopes);
 #ifdef MINYAR_BOUNDED_RC
     if (!minyar_stack_bounds_ready) minyar_find_stack_bounds();
 #endif

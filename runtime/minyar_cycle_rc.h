@@ -391,7 +391,7 @@ void minyar_rc_leave(void) {
     rc_frames = frame->previous;
     frame->previous = rc_free_frames;
     rc_free_frames = frame;
-    if (!rc_frames) rc_cycle_eager_service(SIZE_MAX);
+    if (!rc_frames && !rc_scopes) rc_cycle_eager_service(SIZE_MAX);
 #endif
 }
 

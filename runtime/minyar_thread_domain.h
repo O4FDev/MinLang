@@ -2,7 +2,7 @@
 static inline void rc_thread_domain_init(void) {
     /* A managed worker always begins on a fresh native thread. Never reset an
      * existing domain's live ownership/collector state to simulate isolation. */
-    if (rc_frames || rc_free_frames || rc_pending_count)
+    if (rc_frames || rc_scopes || rc_free_frames || rc_pending_count)
         minyar_stop("a thread domain was already initialized.");
 }
 
@@ -15,7 +15,7 @@ static inline void rc_thread_domain_drain(void) {
 }
 
 static inline void rc_thread_domain_dispose(void) {
-    if (rc_frames) minyar_stop("a thread returned with live ownership frames.");
+    if (rc_frames || rc_scopes) minyar_stop("a thread returned with live ownership frames.");
     /* Retired frames, dead aggregate fields and view backings can still name
      * immortal integer cache headers. Finish that debt while caches are live. */
     rc_thread_domain_drain();

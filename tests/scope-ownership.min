@@ -1,0 +1,450 @@
+use "io" as io
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "../tools/test-runtime.min" as runtime
+use "../tools/check-runner.min" as runner
+use "./frontend-fixtures.min" as fixtures
+use "system" as system
+
+function program(lines: List<Text>): Text {
+    let pieces: List<Text> = []
+    for line in lines { pieces.add(line + "\n") }
+    return joinText(pieces)
+}
+
+function body(llvm: Text, name: Text): Text {
+    let pieces: List<Text> = []
+    let found = false
+    let complete = false
+    for line in test.lines(llvm) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.contains(line, "@.minyar.fn.minyar_module_0_" + name + "(") || test.contains(line, "@\".minyar.fn.minyar.module|" + name + "|")) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            pieces.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing scope ownership function " + name)
+    return joinText(pieces)
+}
+
+function checkLowered(llvm: Text, name: Text) {
+    let emitted = body(llvm, name)
+    test.check(test.contains(emitted, "call void @minyar_rc_scope_enter_v1("), "missing scope entry in " + name)
+    test.check(test.contains(emitted, "call void @minyar_rc_scope_leave_v1("), "missing scope leave in " + name)
+    for legacy in ["enter", "leave", "keep", "borrow", "borrow_traced", "local", "local_traced", "local_take", "local_move", "local_move_owner", "step", "enter_stack_v1", "leave_stack_v1"] {
+        test.check(!test.contains(emitted, "call void @minyar_rc_" + legacy + "("), "legacy ownership call in lowered " + name + ": " + legacy)
+    }
+}
+
+function buildRuntime(compiler: test.Compiler, cycle: Boolean, environment: List<Text>): Text {
+    let engine = io.readTextFile("runtime/minyar_runtime.c")
+    let name = "scope-eager"
+    if cycle { engine = runtime.cycleSource(engine); name = "scope-cycle" }
+    let source = "#define MINYAR_RC_TESTING 1\n#define MINYAR_INTEGER_TEXT_CACHE_LIMIT 0\n" + engine
+    source += "\n#include <assert.h>\n__attribute__((destructor)) static void check_scope_cleanup(void) {\n"
+    source += "  assert(rc_scopes == NULL);\n  assert(rc_frames == NULL);\n  assert(rc_pending_count == 0);\n"
+    source += "  assert(rc_object_count == 0);\n  assert(rc_immortal_object_count == 0);\n  assert(rc_bytes == 0);\n}\n"
+    let path = compiler.directory + "/" + name
+    io.writeTextFile(path + ".c", source)
+    let command = [compiler.clang, "-O1"]
+    for flag in compiler.flags { command.add(flag) }
+    for item in ["-iquote", "runtime", "-c", path + ".c", "-o", path + ".o"] { command.add(item) }
+    test.require(test.run(command, environment, "", path + ".build", 120), "compile scope allocation oracle " + name)
+    return path + ".o"
+}
+
+function executesLLVM(compiler: test.Compiler, path: Text, expected: Text, environment: List<Text>, ordinary: Text, cycle: Text): Text {
+    let llvm = io.readTextFile(path + ".ll")
+    if test.addressEnabled(compiler.flags) { io.writeTextFile(path + ".ll", test.instrument(llvm)) }
+    let object = ordinary
+    if test.contains(llvm, "; minyar-cycle-runtime: 1") || test.contains(llvm, "@minyar_callback_domain(") || test.contains(llvm, "; minyar-calldepth-policy:") { object = cycle }
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        let executable = path + optimization + ".exe"
+        for item in [path + ".ll", object, "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, environment, "", executable + ".link", compiler.linkTimeout), "link scope fixture " + optimization)
+        let observed = test.run([executable], environment, "", executable + ".run", compiler.runTimeout)
+        test.require(observed, "execute scope fixture " + optimization)
+        test.check(observed.errorOutput == "", "scope fixture diagnostics " + optimization + "\n" + observed.errorOutput)
+        test.check(observed.output == expected, "scope fixture output " + optimization + "\n" + observed.output + "expected\n" + expected)
+    }
+    return llvm
+}
+
+function executes(compiler: test.Compiler, source: Text, expected: Text, environment: List<Text>, ordinary: Text, cycle: Text): Text {
+    compiler.serial += 1
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    io.writeTextFile(path + ".min", test.sourceModules(source))
+    let compiled = test.run([compiler.executable, path + ".min", path + ".ll", "--scope-owners", "--library", "library"], environment, "", path + ".compile", compiler.compileTimeout)
+    test.require(compiled, "compile scope ownership fixture")
+    test.check(compiled.output == "" && compiled.errorOutput == "", "unexpected scope compiler output\n" + compiled.output + compiled.errorOutput)
+    return executesLLVM(compiler, path, expected, environment, ordinary, cycle)
+}
+
+let names = ["test_direct_owners_and_borrowed_parameter_moves", "test_condition_owners_on_both_branches", "test_loop_false_exit_break_continue_and_nested_loops", "test_early_return_and_try_cleanup", "test_aliases_survive_later_argument_mutation", "test_escaping_closure_and_cycle_owners", "test_repeated_and_nested_diagnostic_unwind", "test_large_function_keeps_legacy_fallback", "test_scope_modes_and_private_symbols", "test_mixed_scoped_and_legacy_diagnostic_unwind", "test_module_state_replay_lowers_cached_owners", "test_recoverable_call_depth_cleans_scope_owners", "test_large_cycle_drains_at_final_scope"]
+fixtures.validate("ScopeOwnership", names)
+let compiler = test.compiler()
+compiler.compileTimeout = 30
+compiler.linkTimeout = 120
+compiler.runTimeout = 30
+let environment = runner.environment(system.environment(), "ASAN_OPTIONS", "detect_leaks=0:detect_stack_use_after_return=1:halt_on_error=1")
+environment = runner.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
+let ordinary = buildRuntime(compiler, false, environment)
+let cycle = buildRuntime(compiler, true, environment)
+
+if fixtures.selected("ScopeOwnership", "test_direct_owners_and_borrowed_parameter_moves") {
+    let source = program([
+        "function decorate(value: Text): Text {",
+        "value = value + \"!\"",
+        "let alias = value",
+        "value = value + \"?\"",
+        "value = value",
+        "return alias + \"/\" + value",
+        "}",
+        "function append(values: List<Text>): List<Text> {",
+        "values = values.appended(\"next\" + \"!\")",
+        "return values",
+        "}",
+        "let original = \"root\" + \".\"",
+        "print(decorate(original))",
+        "print(original)",
+        "let values = [\"base\" + \"!\"]",
+        "let extended = append(values)",
+        "print(values[0])",
+        "print(values.length)",
+        "print(extended.length)",
+        "print(extended[1])"
+    ])
+    let llvm = executes(compiler, source, "root.!/root.!?\nroot.\nbase!\n1\n2\nnext!\n", environment, ordinary, cycle)
+    checkLowered(llvm, "decorate")
+    checkLowered(llvm, "append")
+    test.check(test.contains(body(llvm, "decorate"), "call void @minyar_rc_scope_move_v1("), "self-consuming assignment must move its local owner")
+}
+
+let condition = program([
+    "function condition(good: Boolean): List<Integer> {",
+    "if good { return [1] }",
+    "return []",
+    "}"
+])
+
+if fixtures.selected("ScopeOwnership", "test_condition_owners_on_both_branches") {
+    let source = condition + program([
+        "function choose(good: Boolean): Text {",
+        "let result = \"start\" + \".\"",
+        "if condition(good).length > 0 { result = result + \"then\" }",
+        "else { result = result + \"else\" }",
+        "if condition(good).length > 0 { if true {} } else {}",
+        "if good && condition(true).length > 0 { result = result + \"!\" }",
+        "if good || condition(false).length > 0 {} else { result = result + \"?\" }",
+        "return result",
+        "}",
+        "print(choose(true))",
+        "print(choose(false))"
+    ])
+    let llvm = executes(compiler, source, "start.then!\nstart.else?\n", environment, ordinary, cycle)
+    checkLowered(llvm, "choose")
+}
+
+if fixtures.selected("ScopeOwnership", "test_loop_false_exit_break_continue_and_nested_loops") {
+    let source = condition + program([
+        "function countRows(good: Boolean): Integer {",
+        "let index = 0",
+        "while condition(good && index < 3).length > 0 {",
+        "let guard = Bytes(\"owned\")",
+        "index = index + guard.length - 4",
+        "}",
+        "return index",
+        "}",
+        "function nested(): Integer {",
+        "let total = 0",
+        "let row = 0",
+        "while condition(row < 3).length > 0 {",
+        "let rowText = \"row\" + Text(row)",
+        "let column = 0",
+        "while condition(column < 4).length > 0 {",
+        "let cell = rowText + Text(column)",
+        "column = column + 1",
+        "if column == 2 { continue }",
+        "if column == 4 { break }",
+        "total = total + cell.length",
+        "}",
+        "row = row + 1",
+        "}",
+        "return total",
+        "}",
+        "function counted(): Integer {",
+        "let total = 0",
+        "for index in 0..5 {",
+        "let guard = Bytes(\"for\")",
+        "if index == 1 { continue }",
+        "if index == 4 { break }",
+        "total = total + guard.length",
+        "}",
+        "return total",
+        "}",
+        "print(countRows(true))",
+        "print(countRows(false))",
+        "print(nested())",
+        "print(counted())"
+    ])
+    let llvm = executes(compiler, source, "3\n0\n30\n9\n", environment, ordinary, cycle)
+    for name in ["countRows", "nested", "counted"] { checkLowered(llvm, name) }
+}
+
+if fixtures.selected("ScopeOwnership", "test_early_return_and_try_cleanup") {
+    let source = program([
+        "function leaf(index: Integer): Result<Text, Text> {",
+        "let local = Bytes(\"owned\")",
+        "if index == 2 { return Err<Text, Text>(\"error\" + Text(index)) }",
+        "return Ok<Text, Text>(\"value\" + Text(index) + Text(local.length))",
+        "}",
+        "function outer(index: Integer): Result<Text, Text> {",
+        "let locals = [Bytes(\"a\"), Bytes(\"b\")]",
+        "for candidate in 0..4 {",
+        "if candidate == index {",
+        "let value = try leaf(index)",
+        "if value.length > 0 { return Ok<Text, Text>(value + Text(locals.length)) }",
+        "}",
+        "}",
+        "return Err<Text, Text>(\"missing\" + \"!\")",
+        "}",
+        "for index in 0..5 {",
+        "match outer(index) { Ok(value) { print(value) } Err(error) { print(error) } }",
+        "}"
+    ])
+    let llvm = executes(compiler, source, "value052\nvalue152\nerror2\nvalue352\nmissing!\n", environment, ordinary, cycle)
+    checkLowered(llvm, "leaf")
+    checkLowered(llvm, "outer")
+}
+
+if fixtures.selected("ScopeOwnership", "test_aliases_survive_later_argument_mutation") {
+    let source = program([
+        "record Box { text: Text }",
+        "function replace(values: List<Box>): Text {",
+        "values[0] = Box { text: \"changed\" + \"!\" }",
+        "return \"right\" + \"!\"",
+        "}",
+        "function change(values: List<Box>): Integer {",
+        "values[0] = Box { text: \"last\" + \"!\" }",
+        "return 0",
+        "}",
+        "function keep(value: Text, ignored: Integer): Text { return value }",
+        "let values = [Box { text: \"left\" + \"!\" }]",
+        "let alias = values[0]",
+        "print(values[0].text + (\"/\" + replace(values)))",
+        "print(alias.text)",
+        "print(values[0].text)",
+        "print(keep(values[0].text, change(values)))",
+        "print(values[0].text)"
+    ])
+    executes(compiler, source, "left!/right!\nleft!\nchanged!\nchanged!\nlast!\n", environment, ordinary, cycle)
+}
+
+if fixtures.selected("ScopeOwnership", "test_escaping_closure_and_cycle_owners") {
+    let source = program([
+        "record State { callbacks: List<Callback<Integer, Text>>; label: Text }",
+        "function make(): Callback<Integer, Text> {",
+        "let state = State { callbacks: []; label: \"saved\" + \"!\" }",
+        "let callback = function(value: Integer): Text {",
+        "let result = state.label + Text(value)",
+        "return result",
+        "}",
+        "state.callbacks.add(callback)",
+        "return callback",
+        "}",
+        "let callback = make()",
+        "print(callback(7))",
+        "let alias = callback",
+        "callback = make()",
+        "print(alias(8))",
+        "print(callback(9))"
+    ])
+    let llvm = executes(compiler, source, "saved!7\nsaved!8\nsaved!9\n", environment, ordinary, cycle)
+    checkLowered(llvm, "make")
+    test.check(test.contains(llvm, "; minyar-cycle-runtime: 1"), "callback ownership fixture must select the cycle engine")
+    test.check(test.contains(llvm, "call void @minyar_rc_retain_traced("), "cyclic alias acquisition must keep its traced retain barrier")
+}
+
+if fixtures.selected("ScopeOwnership", "test_repeated_and_nested_diagnostic_unwind") {
+    let source = program([
+        "record Job { text: Text; mode: Integer }",
+        "function diagnosticRun(job: Job): Boolean { native \"diagnostics\" }",
+        "function diagnosticDiscard() { native \"runtime\" }",
+        "function discard(value: Text): Integer {",
+        "let owned = Bytes(value)",
+        "diagnosticDiscard()",
+        "return owned.length",
+        "}",
+        "function keepArgument(value: Text, ignored: Integer): Text { return value }",
+        "function diagnosticCompileJob(job: Job) {",
+        "let held = [job.text + \"!\"]",
+        "if job.mode == 2 {",
+        "let child = Job { text: \"child\" + \"!\"; mode: 1 }",
+        "print(diagnosticRun(child))",
+        "print(held[0])",
+        "diagnosticDiscard()",
+        "}",
+        "if job.mode == 1 {",
+        "print(keepArgument(job.text + \" temporary\", discard(held[0])))",
+        "}",
+        "print(held[0])",
+        "}",
+        "let saved = Job { text: \"safe\" + \"\"; mode: 0 }",
+        "for index in 0..3 { print(diagnosticRun(Job { text: \"lost\" + Text(index); mode: 1 })) }",
+        "print(diagnosticRun(Job { text: \"outer\" + \"\"; mode: 2 }))",
+        "print(diagnosticRun(saved))",
+        "print(saved.text)"
+    ])
+    let llvm = executes(compiler, source, "false\nfalse\nfalse\nfalse\nouter!\nfalse\nsafe!\ntrue\nsafe\n", environment, ordinary, cycle)
+    checkLowered(llvm, "discard")
+    checkLowered(llvm, "diagnosticCompileJob")
+}
+
+if fixtures.selected("ScopeOwnership", "test_large_function_keeps_legacy_fallback") {
+    let lines = ["function wide(seed: Text): Text {"]
+    for index in 0..260 { lines.add("let value" + Text(index) + " = seed + Text(" + Text(index) + ")") }
+    lines.add("return value259")
+    lines.add("}")
+    lines.add("print(wide(\"wide\"))")
+    let llvm = executes(compiler, program(lines), "wide259\n", environment, ordinary, cycle)
+    let emitted = body(llvm, "wide")
+    test.check(test.contains(emitted, "call void @minyar_rc_enter("), "oversized ownership function must retain its safe legacy fallback")
+    test.check(!test.contains(emitted, "call void @minyar_rc_scope_enter_v1("), "oversized ownership function must not partially lower")
+}
+
+if fixtures.selected("ScopeOwnership", "test_scope_modes_and_private_symbols") {
+    let path = compiler.directory + "/modes"
+    io.writeTextFile(path + ".min", "print(42)\n")
+    for budget in ["1", "32"] {
+        for reverse in [false, true] {
+            let command = [compiler.executable, path + ".min", path + ".ll"]
+            if reverse { command.add("--scope-owners") }
+            command.add("--bounded-owners")
+            command.add(budget)
+            if !reverse { command.add("--scope-owners") }
+            let observed = test.run(command, environment, "", path + ".reject", compiler.compileTimeout)
+            test.check(observed.status == 1 && observed.output == "" && test.contains(observed.errorOutput, "scope ownership cannot be combined with bounded ownership"), "scope/bounded modes must reject every budget and flag order")
+        }
+    }
+    for name in ["enter", "leave", "move", "poll", "release"] {
+        let symbol = name + "_v1"
+        io.writeTextFile(path + ".min", "function " + symbol + "() { native \"rc_scope\" }\n")
+        let observed = test.run([compiler.executable, path + ".min", path + ".ll", "--scope-owners"], environment, "", path + ".native", compiler.compileTimeout)
+        test.check(observed.status == 1 && observed.output == "" && test.contains(observed.errorOutput, "native symbol conflicts with scope ownership"), "scope private native symbol must be rejected: " + symbol)
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_mixed_scoped_and_legacy_diagnostic_unwind") {
+    let lines = [
+        "record Job { text: Text; mode: Integer }",
+        "function diagnosticRun(job: Job): Boolean { native \"diagnostics\" }",
+        "function diagnosticDiscard() { native \"runtime\" }",
+        "function scopeDiscard(value: Text): Integer {",
+        "let owned = Bytes(value)",
+        "diagnosticDiscard()",
+        "return owned.length",
+        "}",
+        "function wideAbort(job: Job): Integer {"
+    ]
+    for index in 0..260 { lines.add("let value" + Text(index) + " = job.text + Text(" + Text(index) + ")") }
+    for line in ["return scopeDiscard(value259)", "}", "function wideResume(job: Job): Text {"] { lines.add(line) }
+    for index in 0..260 { lines.add("let value" + Text(index) + " = job.text + Text(" + Text(index) + ")") }
+    for line in [
+        "let child = Job { text: value0; mode: 1 }",
+        "print(diagnosticRun(child))",
+        "return value259 + \"/\" + value0",
+        "}",
+        "function diagnosticCompileJob(job: Job) {",
+        "let held = [job.text + \" scoped\"]",
+        "if job.mode == 0 { wideAbort(job) }",
+        "if job.mode == 1 { scopeDiscard(held[0]) }",
+        "if job.mode == 2 { print(wideResume(job)) }",
+        "}",
+        "let saved = Job { text: \"root\" + \"!\"; mode: 0 }",
+        "for index in 0..3 { print(diagnosticRun(saved)) }",
+        "saved.mode = 2",
+        "print(diagnosticRun(saved))",
+        "print(saved.text)"
+    ] { lines.add(line) }
+    let llvm = executes(compiler, program(lines), "false\nfalse\nfalse\nfalse\nroot!259/root!0\ntrue\nroot!\n", environment, ordinary, cycle)
+    checkLowered(llvm, "scopeDiscard")
+    checkLowered(llvm, "diagnosticCompileJob")
+    for name in ["wideAbort", "wideResume"] {
+        let emitted = body(llvm, name)
+        test.check(test.contains(emitted, "call void @minyar_rc_enter("), "mixed diagnostic fixture must exercise legacy frame " + name)
+        test.check(!test.contains(emitted, "call void @minyar_rc_scope_enter_v1("), "wide diagnostic fixture must not partially lower " + name)
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_module_state_replay_lowers_cached_owners") {
+    let entry = compiler.directory + "/scope-cache-main.min"
+    io.writeTextFile(compiler.directory + "/scope-cache-owner.min", program([
+        "public function decorated(seed: Text): Text {",
+        "let value = seed + \"!\"",
+        "value = value + \"?\"",
+        "return value",
+        "}"
+    ]))
+    io.writeTextFile(entry, program([
+        "use \"./scope-cache-owner.min\" as owner",
+        "function caller(): Text {",
+        "let retained = owner.decorated(\"cached\")",
+        "return retained",
+        "}",
+        "print(caller())"
+    ]))
+    let previous = compiler.directory + "/scope-cache-empty.state"
+    io.writeTextFile(previous, "")
+    let cold = ""
+    for stage in ["cold", "warm"] {
+        let path = compiler.directory + "/scope-cache-" + stage
+        let command = [compiler.executable, entry, path + ".ll", "--module-state", previous, path + ".state", path + ".stats", "--scope-owners", "--library", "library"]
+        let compiled = test.run(command, environment, "", path + ".compile", compiler.compileTimeout)
+        test.require(compiled, "compile scope module cache " + stage)
+        test.check(compiled.output == "" && compiled.errorOutput == "", "unexpected scope module cache diagnostics " + stage)
+        let fields = test.words(io.readTextFile(path + ".stats"))
+        let reused = 0
+        if stage == "warm" { reused = 2 }
+        test.check(fields.length >= 2 && Integer(fields[0]) == reused && Integer(fields[1]) == 2 - reused, "scope module cache must really reuse both modules on the warm pass")
+        let update = io.readTextFile(path + ".state")
+        if stage == "cold" { test.check(update != "", "scope module cache must produce reusable cold state") }
+        else { test.check(update == "", "unchanged scope module replay must not produce a state delta") }
+        let llvm = executesLLVM(compiler, path, "cached!?\n", environment, ordinary, cycle)
+        checkLowered(llvm, "decorated")
+        checkLowered(llvm, "caller")
+        if stage == "cold" { cold = llvm }
+        else { test.check(llvm == cold, "cold and replayed scope module LLVM must match byte-for-byte") }
+        previous = path + ".state"
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_recoverable_call_depth_cleans_scope_owners") {
+    let llvm = executes(compiler, io.readTextFile("tests/calldepth/ownership.min"), "0\nfresh text\n3\n", environment, ordinary, cycle)
+    test.check(test.contains(llvm, "; minyar-calldepth-policy: cooperative-v1-full-program"), "scope recovery fixture must retain cooperative call-depth lowering")
+    checkLowered(llvm, "deepText")
+    test.check(test.contains(body(llvm, "deepText"), "@minyar_recovery_pending("), "scope reference return must preserve the recovery checkpoint")
+}
+
+if fixtures.selected("ScopeOwnership", "test_large_cycle_drains_at_final_scope") {
+    let source = program([
+        "record Link { next: List<Link>; value: Integer }",
+        "let first = Link { next: []; value: 0 }",
+        "let last = first",
+        "for index in 1..512 {",
+        "let node = Link { next: []; value: index }",
+        "last.next.add(node)",
+        "last = node",
+        "}",
+        "last.next.add(first)",
+        "print(first.next[0].value)",
+        "print(last.value)"
+    ])
+    let llvm = executes(compiler, source, "1\n511\n", environment, ordinary, cycle)
+    test.check(test.contains(llvm, "; minyar-cycle-runtime: 1"), "large ring fixture must select the cycle engine")
+    test.check(test.contains(llvm, "call void @minyar_rc_scope_enter_v1("), "large ring must exercise the final scope drain")
+}
+
+test.removeTree(compiler.directory)
+print("Scope ownership: O0/O2 behavior, allocation cleanup, cycles and diagnostic unwind passed")

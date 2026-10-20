@@ -251,7 +251,9 @@ static MINYAR_COLD MINYAR_NORETURN void out_of_memory(void) {
     minyar_stop("the computer ran out of memory.");
 }
 
+#include "minyar_scope_types.h"
 #include "minyar_rc.h"
+#include "minyar_scope_ownership.h"
 
 #ifdef MINYAR_COMPILER_ARENA
 /*

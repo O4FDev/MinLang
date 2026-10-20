@@ -87,6 +87,38 @@ the compiler cannot consume a value while another live alias exists. The new
 direct Text self-replacement transfer is a deliberately narrow reuse inference;
 broader borrow and last-use inference remains a measured optimization target.
 
+## Scope ownership experiment
+
+The direct compiler's `--scope-owners` mode removes all legacy ownership-frame
+calls from the measured 721-function compiler. On Linux x86_64 with LLVM 23.1.2,
+seven retained hardware-counter samples per executable measured 3,726,245,596
+median eager instructions versus 4,710,602,580 for the same-source legacy
+control: a 20.90% reduction. The corresponding incremental experiment fell from
+8,692,398,963 to 3,436,339,021 instructions, a 60.47% reduction. Its explicit
+per-cell release sequence has the different cleanup contract documented in
+[runtime memory](runtime-memory.md#scope-ownership-lowering); it is not the
+launcher's default bounded lowering.
+
+Arena measured 1,188,040,017 instructions with scope lowering. Eager remains
+3.1365 times arena, so the 1.2-times target is not met. These current-source
+Linux counts cannot be compared directly to earlier ARM compiler campaigns.
+All 48 executions, including warmups and legacy controls, produced exactly the
+frozen original compiler's LLVM bytes. Source, LLVM, runtime and executable
+hashes, every observation and the complete flags are retained in
+[`frames-ownership.json`](../experiments/memory/frames-ownership.json).
+
+[`frames-instructions.py`](../experiments/memory/frames-instructions.py) measures
+Linux x86_64 user-space hardware instructions through `perf_event_open`. It
+attaches to a stopped child, enables at exec, excludes the Python parent and
+kernel, drops inherited sudo privileges in the compiler child, and rejects
+multiplexed or unavailable counters. Permission to open hardware counters is
+required; the study used `sudo -n` without changing kernel settings. One warmup
+precedes retained samples and execution order alternates. Link identical legacy
+and scope compiler LLVM against each runtime with the recorded ThinLTO flags,
+freeze one input and library, then supply the executables as repeated
+`--profile NAME=PATH` arguments. The directory must contain the measured
+`compiler-stage2.ll`; `--input`, `--library` and `--report` select the artifacts.
+
 ## Modules
 
 ```sh

@@ -187,6 +187,32 @@ and the independent review.
   Their stack storage never enters a deferred queue or cache. Other ownership
   frames use pooled heap storage; K1 keeps that ordinary representation.
 
+## Scope ownership lowering
+
+The direct compiler accepts `--scope-owners` for an experimental eager ownership
+lowering. It replaces local-frame lookups with explicit retain, store and release
+operations. Each remaining expression producer receives an initialized-null stack
+cell. A control-flow walk places its release at the first statement cleanup or
+return on every reachable path, including both sides of a conditional and loop
+exits. Cleanup visits only cells that can be live there. A producer that could
+repeat before cleanup, or a function needing more than 256 cells, keeps the
+ordinary frame representation.
+
+A 24-byte stack header links the cells for compiler diagnostics. Diagnostics
+release these roots before jumping back to their native recovery boundary;
+normal returns clear cells explicitly and unlink the header. Neither the header
+nor its cells enter a heap queue or cache. Traced retains and cycle service points
+remain present, and the final cycle drain waits for both kinds of ownership root.
+Reference arguments still borrow their callers; consuming an unowned parameter
+first creates the consumer's count.
+
+This mode is explicit and cannot be combined with `--bounded-owners`. The launcher
+continues to select the ordinary bounded lowering. Linking scope output against
+an incremental runtime preserves ownership but performs a separately budgeted
+release for each live cell, followed by a service batch. The ordinary frame's
+single K-total limit for statement cleanup or frame exit therefore does not apply
+to this experimental sequence. It is not a replacement for that bounded contract.
+
 ## Scalar record replacement
 
 The compiler can eliminate a directly constructed local record whose fields
