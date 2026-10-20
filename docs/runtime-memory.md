@@ -190,6 +190,10 @@ and the independent review.
   in the same return expression. Existing consuming runtime operations check
   dynamic uniqueness and copy when aliases remain; traced Lists keep their
   edge bookkeeping. No runtime ABI or reference semantics change.
+  Direct reassignment can use the same proof when the named receiver is the
+  target binding, including grouped receivers and RHS reads of that binding.
+  The old owner ends after all RHS evaluation and before the consuming call;
+  assignment roots the new result in its place.
   `minyar_rc_leave` retires that function's expression and local owners; the
   incremental profiles can complete their reclamation at later service points.
 - Functions using only scalars and borrowed parameters can omit ownership frames. Local stack slots are

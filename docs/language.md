@@ -563,6 +563,8 @@ When returning `words + suffix` or `values.appended(item)`, the compiler can
 transfer a local's ownership after evaluating the other operand. The runtime
 reuses storage when that value has no other owner; shared values keep the
 copying behavior. Parentheses do not change this rule.
+The same applies when replacing the local itself, such as
+`values = (values).appended(values[0])`: the index is read before storage reuse.
 
 Recursive records support construction, sharing and mutation:
 

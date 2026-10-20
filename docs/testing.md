@@ -857,6 +857,12 @@ recursive List elements. Negative descendant cases keep their source alive for
 later reads. Native and sanitized O0/O2 runs use the complete-cleanup graph
 runtime; emitted LLVM separately identifies the consuming calls and owner moves.
 
+`make check-typed-assignment-reuse` checks grouped and same-source Text/List
+self-assignment, argument order, aliases and traced elements at O0/O2 with
+native/sanitized complete cleanup. Other-local destinations, inner consumers
+and compound assignment retain their existing ownership paths; older lexical
+chain optimizations remain covered.
+
 `make check-mutable-scalar-records` checks direct scalar field updates without
 managed record calls. Integer, Float, Boolean and Character storage, compound
 updates, branch merges, loop initialization and match-expression initializers

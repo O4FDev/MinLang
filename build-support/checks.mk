@@ -38,6 +38,12 @@ check-mutable-scalar-records: build/minyarc build/minyarc-sanitize build/tooling
 	$(LIMITED) ./build/tooling/tests/mutable-scalar-records
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/mutable-scalar-records
 
+.PHONY: check-typed-assignment-reuse
+check: check-typed-assignment-reuse
+check-typed-assignment-reuse: build/minyarc build/minyarc-sanitize build/tooling/tests/typed-assignment-reuse
+	$(LIMITED) ./build/tooling/tests/typed-assignment-reuse
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/typed-assignment-reuse
+
 check-smoke: build/minyarc build/minyar-runtime.o
 	$(LIMITED) sh tests/smoke.sh
 

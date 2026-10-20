@@ -19,10 +19,14 @@ transfer its local owner. A complete return of a Text join or List `appended`
 can also consume a named local left operand or receiver, after all arguments
 have run. Other member, index and call receivers keep their existing rules.
 These proofs need no future-token scan and do not assume heap uniqueness.
+Direct local reassignment uses the same completed-root proof when the receiver
+is the binding being replaced. Same-source RHS reads finish before the move;
+assignments to another binding and implicit compound-assignment roots do not
+use this proof. The older lexical chain fast path remains available.
 
 One `TerminalReuseSite` per compiler context remembers the most recently emitted
 ordinary join or append: its typed node, receiver SSA value and two stable output
-fragment indexes. The final return root must match that exact node, ignoring
+fragment indexes. The final eligible root must match that exact node, ignoring
 groups. Inner expressions and stale sites cannot match. Filling a reserved
 fragment inserts the local-owner move immediately before the consumer; changing
 its callee fragment selects the existing uniqueness-checked runtime operation.
