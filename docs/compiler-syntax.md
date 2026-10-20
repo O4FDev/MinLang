@@ -156,8 +156,10 @@ Boolean, Character and payload-free enum payloads regardless of declaration
 order. Nested scalar niches and recursive choices stay boxed in this slice.
 No repeated graph rescans or late pointer-to-i64 reclassification occur.
 
-Cached interfaces use `minyar-module-interface-v10` and deltas use
-`minyar-module-delta-v8`, so earlier record/enum escape codecs and pointer-ABI artifacts are rebuilt.
+Cached interfaces use `minyar-module-interface-v11` and deltas use
+`minyar-module-delta-v9`, so earlier record/enum escape codecs, scalar-choice
+and nullable-Set ABI artifacts are rebuilt. This Set ABI revision follows
+scalar-choice interface10/delta8.
 Choice-bearing module graphs retain whole-program compilation, including when
 restored logical choice metadata is the only evidence in a warm state.
 
@@ -309,17 +311,23 @@ positions remain scalar offsets and preserve the original valid source line.
 
 Choice declarations retain every logical payload field for type checking and
 cycle reachability. `choiceLayoutKind(context, type)` identifies an ordinary
-type (0), integer choice (1), tagged union (2), or nullable record choice (3).
+type (0), pure enum (1), tagged union (2), nullable managed choice (3), or
+scalar payload niche (4).
 `choiceStorageCount` reports slots owned by the choice itself; integer and
-nullable choices own no slots. `choiceStorageField` maps a union's logical field to its physical
+nullable and scalar choices own no slots. `choiceStorageField` maps a union's logical field to its physical
 slot. Debug readers must inspect the layout kind before using an offset.
 
-For nullable choices, `choiceNicheType` identifies the underlying record and
+For nullable choices, `choiceNicheType` identifies the actual managed payload
+type, including structural Lists and Sets. The runtime value is a nullable
+pointer to that payload's header; readers must not assume record fields.
 `choiceNicheTag` gives the non-null case's zero-based tag. The empty case has
 the other tag. `readChoiceMatchTag` and `readChoiceMatchPayload` generate the
 representation-specific projections, shared by matches and test diagnostics.
 Cycle analysis retains the logical graph and projects nullable aliases only
-when selecting the runtime ownership entry points.
+when selecting the runtime ownership entry points. Nullable Set equality delegates
+to `minyar_maps_are_equal` with Boolean value kind 4; its null check distinguishes
+an absent choice from a present empty Set. Set payloads remain unsupported for
+ordering, hashing and key snapshots. Maps retain tagged choice storage.
 
 ## Debugger metadata
 

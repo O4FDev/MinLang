@@ -1,8 +1,8 @@
 // A two-case choice with one non-null managed payload has a spare null pointer.
-// Eligible payloads are Text, Bytes, Lists or ordinary managed records.
+// Eligible payloads are Text, Bytes, Lists, Sets or ordinary managed records.
 // Keep the full logical field graph, including nullable List SCC endpoints.
 // Layout kinds: 0 ordinary, 1 pure enum, 2 tagged, 3 null niche, 4 scalar niche.
-// For kind 3, choiceNicheType returns the payload type (including structural Lists),
+// For kind 3, choiceNicheType returns the payload type (including Lists and Sets),
 // not necessarily a record. choiceStorageCount counts only choice-owned slots.
 function choiceLayoutKind(context: CompilerContext, type: Integer): Integer {
     if isPureEnumChoice(context, type) { return 1 }
@@ -42,7 +42,7 @@ function choiceNicheType(context: CompilerContext, type: Integer): Integer {
     if cases.length != 3 { return 0 }
     let first = functionParameterOffset(context.functionParameterCounts, record)
     let payload = context.functionParameterTypes[first + 1]
-    if payload == 2 || payload == 8 || isListType(payload) { return payload }
+    if payload == 2 || payload == 8 || isListType(payload) || isSetType(payload) { return payload }
     if !isRecordType(payload) || isScalarChoiceType(payload) || isCallbackType(payload, context.functionNames) || isCRecord(context, payload) { return 0 }
     // A nested optional may already use null, so Some(None) needs its own tag.
     if choiceCases(context, payload).length > 0 { return 0 }
@@ -140,8 +140,16 @@ function parseNicheChoice(context: CompilerContext, localNames: List<Text>, loca
 
 function derivedNicheChoice(context: CompilerContext, type: Integer, operation: Text, globals: List<Text>, name: Text): Text {
     let payload = choiceNicheType(context, type)
-    // Capability checking rejects mutable containers before derivation. Never
-    // interpret their headers as records or retain them as key snapshots.
+    if isSetType(payload) {
+        if operation != "equal" { failCompiler("this nullable Set payload only supports equality") }
+        let declaration = "declare zeroext i1 @minyar_maps_are_equal(ptr, ptr, i64)\n"
+        if findText(globals, declaration) < 0 { globals.add(declaration) }
+        // The runtime checks null before reading a header; Set values are Boolean.
+        globals.add("define internal zeroext i1 " + name + "(ptr %left, ptr %right) {\nentry:\n  %result = call zeroext i1 @minyar_maps_are_equal(ptr %left, ptr %right, i64 4)\n  ret i1 %result\n}\n")
+        return name
+    }
+    // Lists and Bytes have no implicit operation. Never interpret their
+    // headers as records or retain them as key snapshots.
     if payload != 2 && !isRecordType(payload) { failCompiler("this nullable payload needs an explicit operation") }
     let child = ""
     if payload != 2 { child = derivedRecordFunction(context, payload, operation, globals) }

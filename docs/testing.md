@@ -298,6 +298,26 @@ physical List self-edges, optional roots and edge replacement; a missing-barrier
 control must fail before temporary cleanup can mask it. Both targets have
 ASan/UBSan counterparts ending in `-sanitize`.
 
+`make check-choice-set-niche` covers nullable Set choices, content equality
+through mutable aliases, retained key snapshots, native owned-header/null ABI,
+generic records, callbacks, propagation and a separate record self-cycle owning
+an optional Set. It rejects ordering, hashing, natural sorting, unsupported Map
+value equality and cyclic Map mutation, and checks cold/warm/edited choice
+fallback plus stale scalar schemas. O0/O2 cleanup requires zero remaining
+objects and bytes. The scalar-key follow-up requires the scalar-choice
+predecessor; this Set checkpoint does not implement scalar lowering.
+`check-choice-set-niche-sanitize` instruments the compiler, generated LLVM and
+runtime with ASan/UBSan. These Set targets are prepared source and have not yet
+been compiled or run.
+
+The Set allocation fixture preallocates one payload before constructing 10,000
+alternating `Some(payload)`/`None` values. It asserts zero generated wrapper
+records/slots. `MINYAR_CHOICE_SET_BASELINE=/path/to/saved-pre-set-compiler`
+runs only the counter fixture and requires the previous 10,000 records/20,000
+slots. Save that genuine compiler before rebuilding. Runtime Set headers,
+bucket Lists and storage are outside this wrapper counter; it makes no claim
+of zero collection allocations. Prior-compiler replay is also unexecuted.
+
 `make check-choice-runtime-profiles` runs the combined choice-cycle and
 container fixtures at O0/O2 across eager, system K32, plain-system K1,
 fixed 1 MiB K1/K1024 and POSIX lazy 1 MiB K32 runtimes. Each profile rejects

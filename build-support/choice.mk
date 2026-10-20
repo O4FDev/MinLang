@@ -120,3 +120,15 @@ check-choice-scalar-niche-sanitize: build/minyarc-sanitize build/minyar-runtime-
 
 check check-portable: check-choice-scalar-niche
 check-sanitize: check-choice-scalar-niche-sanitize
+
+.PHONY: check-choice-set-niche check-choice-set-niche-sanitize
+build/tooling/tests/choice-set-niche-check.ll: tests/choice-set-niche.min tests/choice-set-niche.expected tests/choice-set-niche-ownership.min tests/choice-set-niche-ownership.expected tests/choice-set-scalar-keys.min tests/choice-set-scalar-keys.expected tests/choice-set-niche-native.c tests/choice-set-niche-runtime.c tests/frontend-fixtures.min tests/memory-contracts-runtime.c
+
+check-choice-set-niche: build/minyarc build/minyar-runtime.o build/tooling/tests/choice-set-niche-check
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/choice-set-niche-check"
+
+check-choice-set-niche-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/choice-set-niche-check
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) "./build/tooling/tests/choice-set-niche-check"
+
+check check-portable: check-choice-set-niche
+check-sanitize: check-choice-set-niche-sanitize
