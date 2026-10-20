@@ -163,6 +163,18 @@ POLICIES = {
         "Only describe is declared. The function is never called, and neither its arms nor the top level contain a print call, so the unchanged program produces no output.",
         reason="A standalone function declaration using the automatically available Maybe type. Running it does not call describe().",
     ),
+    "a8d60c1082b7": standalone(
+        "Compile-time hardware register fields", "15\nfalse\n",
+        "The threshold payload is 15 and the enabled bit does not overlap it. A ten-bit distance cannot hold 1024, so fieldFits returns false. These compile-time layouts use scalar shifts and masks without a native module.",
+    ),
+    "a9bf683289ee": contextual(
+        "An interrupt handler", "unsupported-host",
+        "Interrupt handlers require a freestanding x86_64 or arm64 kernel target. The playground uses a hosted WASI target and cannot supply hardware interrupt entry points.",
+    ),
+    "a73ef813f422": contextual(
+        "DMA ownership with a device model", "unsupported-host",
+        "The dma and dma_model modules require the native DMA registry and are not included in the browser library bundle.",
+    ),
     "a84bd499c698": contextual(
         "Hardware register fields", "unsupported-host",
         "This complete program imports device, whose register types depend on the native machine module. The browser bundle does not include device or machine, so it cannot run here yet; its field arithmetic is covered by the native osdev checks.",
