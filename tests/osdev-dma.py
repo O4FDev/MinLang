@@ -28,7 +28,7 @@ GROUPS = ("compile", "control", "runtime", "sanitizer", "artifacts")
 TIMEOUT = 60
 MAX_CAPTURE = 1024 * 1024
 LEVELS = ("-O0", "-O2")
-IMPORTS = 'use "dma" as dma\nuse "dma/model" as model\n'
+IMPORTS = 'use "dma" as dma\nuse "dma_model" as model\n'
 CHECK = '''
 function check(condition: Boolean, message: Text) {
     if !condition { fail(message) }

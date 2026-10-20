@@ -1786,7 +1786,7 @@ The `dma` module separates CPU access from a device-owned pending request:
 
 ```minyar
 use "dma" as dma
-use "dma/model" as model
+use "dma_model" as model
 
 let queue = model.modelQueue()
 let cpu = dma.allocate(16, 16)
