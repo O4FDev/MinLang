@@ -801,8 +801,6 @@ def main():
     if args.phase == "matrix":
         print(json.dumps(dict(status="DESIGN ONLY; no compiler/ABI test executed", cases=[asdict(case) for case in cases], provenance=PROVENANCE), indent=2))
         return 0
-    if sys.platform != "linux":
-        raise Failure("qualification phases run only on BX Linux; no laptop execution")
     if args.phase in ("parser", "ir", "assembly", "host-flags"):
         parser_controls()
     if args.phase == "parser":

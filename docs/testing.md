@@ -269,6 +269,21 @@ the actual freestanding allocator in a fixed hosted heap and checks overflow,
 size-class boundaries and failure preservation at O0/O2 with UBSan. Guest startup,
 linker heap bounds and actual Virtio completion require their own finite guests.
 
+`make check-osdev-seeds` applies paired register, port, interrupt and DMA
+mistakes to the Minyar and C drivers, retaining the first detection stage and
+requiring clean baselines. RTC seeds reach real x86 QEMU; DMA seeds use host
+models; IRQ seeds are compile-only. The read-only CMOS register write is a
+permission-coverage probe, not an assumed compile-time rejection.
+`check-osdev-seeds-host` runs the available host stages in the portable gate;
+QEMU-only classifications require the explicit full target. C host programs
+run at O2, then O0 with ASan/UBSan if still passing. Timeouts, compiler crashes,
+wrong diagnostic families and later build/link failures invalidate the study.
+Nested RTC events and guest serial evidence distinguish real oracle failures
+from infrastructure failures. Both targets first run `check-osdev-seeds-harness`,
+whose independent child processes test those evidence boundaries without LLVM
+or QEMU. Results and retained execution artifacts are written outside the
+checkout; `--output` selects a fresh evidence directory.
+
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.

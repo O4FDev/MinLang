@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux/BX unit regression for the extracted production freestanding allocator.
+"""Hosted unit regression for the extracted production freestanding allocator.
 
 This isolates allocator code with a fixed hosted heap. It does not exercise the
 whole freestanding runtime, linker script, guest startup or hardware allocator.
@@ -313,8 +313,6 @@ def main():
     parser.add_argument("--timeout", type=float, default=10, help="deadline per executed probe")
     parser.add_argument("--compile-timeout", type=float, default=60)
     args = parser.parse_args()
-    if sys.platform != "linux":
-        parser.error("run this harness on BX/Linux; laptop execution is unsupported")
     if not args.clang or not shutil.which(args.clang):
         parser.error("select the pinned Clang with --clang or MINYAR_TEST_CLANG")
     if not (0 < args.timeout <= 600 and 0 < args.compile_timeout <= 600):

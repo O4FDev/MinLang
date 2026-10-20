@@ -63,7 +63,12 @@ build/testing/cycle-runtime-sanitize.o: build/testing/cycle-runtime.c $(wildcard
 # Seeded-mistake study: the same driver mistakes applied to Minyar and C, each
 # classified by the first stage that notices. The QEMU variant is explicit;
 # the host variant runs in check-portable.
-.PHONY: check-osdev-seeds check-osdev-seeds-host
+.PHONY: check-osdev-seeds check-osdev-seeds-host check-osdev-seeds-harness
+check-osdev-seeds-harness:
+	python3 tests/osdev-seeds-harness.py
+
+check-osdev-seeds check-osdev-seeds-host: check-osdev-seeds-harness
+
 check-osdev-seeds: build/minyarc build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/osdev-seeds.py
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kernel inline assembly: compile checks for both targets, then a live x86 guest (BX only).
+"""Kernel inline assembly: portable compile checks, then an optional live x86 guest.
 
 Positive programs must lower to exactly the expected LLVM inline-assembly call;
 rejections must name the problem; `assembly` stays an ordinary name elsewhere.
@@ -9,6 +9,7 @@ The QEMU guest writes a serial line through `outb` written in Minyar assembly.
 
 import argparse
 import os
+import platform
 from pathlib import Path
 import re
 import shutil
@@ -128,8 +129,8 @@ def main():
     parser.add_argument("--clang", default=os.environ.get("MINYAR_TEST_CLANG", "clang"))
     parser.add_argument("--no-qemu", action="store_true")
     args = parser.parse_args()
-    if sys.platform != "linux":
-        parser.error("run this test on the BX Linux box")
+    if not args.no_qemu and sys.platform != "linux":
+        parser.error("run the live QEMU check on the BX Linux box; --no-qemu is portable")
     failures = []
     scratch = Path(tempfile.mkdtemp(prefix="osdev-assembly-"))
     for index, (target, source, pattern) in enumerate(POSITIVES):
@@ -157,8 +158,12 @@ def main():
             failures.append("an ordinary name 'assembly' must keep working")
     else:
         failures.append("an ordinary name 'assembly' must keep working: " + result.stderr.strip()[:300])
-    check_mutable_input(args, scratch, failures)
-    print(f"assembly: {len(POSITIVES)} lowerings, {len(REJECTIONS)} rejections, ordinary names and O0/O2 input mutation checked", flush=True)
+    if sys.platform == "linux" and platform.machine().lower() in ("x86_64", "amd64"):
+        check_mutable_input(args, scratch, failures)
+        print("assembly: live Minyar input values preserved at O0/O2 on x86-64 Linux", flush=True)
+    else:
+        print("assembly: live input-mutation execution requires x86-64 Linux; cross-assembly remains checked", flush=True)
+    print(f"assembly: {len(POSITIVES)} lowerings, {len(REJECTIONS)} rejections and ordinary names checked", flush=True)
     if not args.no_qemu and not failures:
         llvm = Path(shutil.which(args.clang) or args.clang).resolve().parent
         mkimage = ROOT / "build/os/mkimage"
