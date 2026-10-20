@@ -87,6 +87,11 @@ static _Bool minyar_diagnostic_json;
 void minyar_runtime_diagnosticSetJSON(_Bool enabled) { minyar_diagnostic_json = enabled; }
 _Bool minyar_runtime_diagnosticJSON(void) { return minyar_diagnostic_json; }
 
+/* Compilation configuration, never emitted into the compiled kernel. */
+static long long minyar_compiler_kernel_target;
+void minyar_runtime_compilerSetKernelTarget(long long target) { minyar_compiler_kernel_target = target; }
+long long minyar_runtime_compilerKernelTarget(void) { return minyar_compiler_kernel_target; }
+
 /* This private boundary is used by the compiler, never emitted into a user
  * program. Only an explicit diagnostic can jump here; runtime faults remain
  * fatal. Unwind ownership while callback stack storage is still live. */

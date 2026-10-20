@@ -230,6 +230,28 @@ The contextual `at(first, width)` metadata is consumed by module/generic/header
 readers before typed layout validation. Declaration-operand operations emit
 scalar IR and never create a runtime record, field-name literal or initializer.
 
+Interrupt contexts use contextual `interrupt function` and header
+`handles(vector)`, with the existing modifier feature bit 16. An explicit
+`--freestanding --kernel-target x86_64|arm64` selects the compilation context;
+module-state compilation is excluded. The handler signature is
+`(Integer): Nothing`. The first binding domain is maskable PIC vectors 32..47
+or GIC IDs 16..1019. Ordinary identifiers retain their normal lookup rules.
+
+The effects stage audits the complete final module, walks every reached typed
+source subtree and parses each reached LLVM definition. Its initial accepted
+set is scalar, acyclic code with fixed local storage and resolved direct calls.
+Managed values, Float, loops, recursion, indirect/native/runtime calls, mutable
+globals, failure paths and unknown instructions reject. Separate internal IRQ
+clones omit only proved compiler frame instrumentation; ordinary bodies remain
+intact. The clones are parsed and checked again before publication. This proves
+context properties, not a physical target stack bound or hardware entry ABI.
+
+The compiler owns one private zeroed 256-byte pending array. Contextual
+`signalInterrupt(slot)` emits a release byte store of one; ordinary-context
+`takeInterrupt(slot)` exchanges zero with acquire ordering and returns Boolean.
+Slots are literal or module-constant Integers in 0..255. Repeated signals
+coalesce. These flags carry no event count or DMA ownership permission.
+
 ## Node kinds
 
 `syntaxKindName` is the central catalogue. The ranges are registered in the

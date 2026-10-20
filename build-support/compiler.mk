@@ -12,6 +12,7 @@ COMPILER_SOURCES = build/choice-builtins.min build/capability-builtins.min \
 	compiler/stages/runtime-abi.min \
 	compiler/stages/types.min $(wildcard compiler/stages/c-layout.min) \
 	compiler/register-constants.min compiler/register-layouts.min \
+	compiler/interrupt-compiler.min compiler/interrupt-audit.min \
 	compiler/stages/ownership.min \
 	compiler/stages/scope-ownership.min \
 	compiler/stages/operators.min \

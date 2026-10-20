@@ -1,0 +1,117 @@
+// Interrupt is a contextual function modifier, never a runtime callable type.
+function isInterruptFunctionAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    if position < 1 || kinds[position] != 1 || texts[position] != "function" { return false }
+    let previous = position - 1
+    if texts[previous] == "public" { previous = previous - 1 }
+    return previous >= 0 && kinds[previous] == 6 && texts[previous] == "interrupt"
+}
+
+function skipInterruptBinding(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>) {
+    let location = cursor[0]
+    expectToken(kinds, texts, lines, cursor, "handles")
+    expectToken(kinds, texts, lines, cursor, "(")
+    let round = 1
+    let square = 0
+    let operand = false
+    while round > 0 {
+        let position = cursor[0]
+        let word = texts[position]
+        if kinds[position] == 0 || word == "{" || word == "}" { failAtToken(lines, location, "an interrupt handler needs handles(vector)") }
+        if kinds[position] == 4 && word == ")" {
+            if round == 1 && (!operand || square != 0) { failAtToken(lines, location, "handles needs one compile-time Integer vector") }
+            round = round - 1
+        } else {
+            if kinds[position] == 4 && word == "," && round == 1 && square == 0 { failAtToken(lines, position, "handles needs one compile-time Integer vector") }
+            if kinds[position] != 6 { operand = true }
+            if kinds[position] == 4 && word == "(" { round = round + 1 }
+            if kinds[position] == 4 && word == "[" { square = square + 1 }
+            if kinds[position] == 4 && word == "]" {
+                if square == 0 { failAtToken(lines, position, "unexpected ']' in interrupt binding") }
+                square = square - 1
+            }
+        }
+        cursor[0] = position + 1
+    }
+}
+
+function collectInterruptBindings(context: CompilerContext, roots: List<Integer>, vectors: List<Integer>, origins: List<Integer>) {
+    if context.tokenLines.features / 16 % 2 == 0 { return }
+    let kinds = context.tokenKinds
+    let texts = context.tokenTexts
+    let lines = context.tokenLines
+    let position = 0
+    while position < kinds.length {
+        if isInterruptFunctionAt(kinds, texts, position) {
+            let target = compilerKernelTarget()
+            if target != 1 && target != 2 { failAtToken(lines, position, "interrupt handlers require --freestanding --kernel-target x86_64 or arm64") }
+            let name = texts[position + 1]
+            if name == "main" { failAtToken(lines, position + 1, "main cannot be an interrupt handler") }
+            let symbol = findCompiledSymbol(context.functionNames, context.symbolKinds, lines.symbolLookup, name, 1)
+            if symbol < 0 { failAtToken(lines, position + 1, "an interrupt handler needs its own ordinary function declaration") }
+            if context.functionParameterCounts[symbol] != 1 || context.functionReturnTypes[symbol] != 5 {
+                failAtToken(lines, position + 1, "an interrupt handler needs one Integer vector parameter and returns Nothing")
+            }
+            let first = functionParameterOffset(context.functionParameterCounts, symbol)
+            if context.functionParameterTypes[first] != 1 { failAtToken(lines, position + 1, "an interrupt handler's vector parameter must be Integer") }
+            let cursor: List<Integer> = [position + 2]
+            expectToken(kinds, texts, lines, cursor, "(")
+            while kinds[cursor[0]] != 0 && texts[cursor[0]] != ")" { cursor[0] = cursor[0] + 1 }
+            expectToken(kinds, texts, lines, cursor, ")")
+            if tokenIs(kinds, texts, cursor, ":") {
+                cursor[0] = cursor[0] + 1
+                expectToken(kinds, texts, lines, cursor, "Nothing")
+            }
+            expectToken(kinds, texts, lines, cursor, "handles")
+            expectToken(kinds, texts, lines, cursor, "(")
+            let vector = takeDeclarationInteger(context, cursor, "interrupt vectors")
+            expectToken(kinds, texts, lines, cursor, ")")
+            expectToken(kinds, texts, lines, cursor, "{")
+            if target == 1 && (vector < 32 || vector > 47) { failAtToken(lines, position, "x86_64 interrupt handlers support maskable PIC vectors 32 through 47") }
+            if target == 2 && (vector < 16 || vector > 1019) { failAtToken(lines, position, "arm64 interrupt handlers support GIC interrupt IDs 16 through 1019") }
+            let previous = 0
+            while previous < roots.length {
+                if roots[previous] == symbol { failAtToken(lines, position, "this interrupt handler is declared twice") }
+                if vectors[previous] == vector { failAtToken(lines, position, "this interrupt vector already has a handler") }
+                previous = previous + 1
+            }
+            roots.add(symbol)
+            vectors.add(vector)
+            origins.add(position)
+        }
+        position = position + 1
+    }
+}
+
+function isInterruptSignalBuiltin(name: Text): Boolean { return name == "signalInterrupt" || name == "takeInterrupt" }
+
+function interruptPendingDeclaration(): Text { return "@.minyar.irq.pending = internal global [256 x i8] zeroinitializer, align 1\n" }
+
+function parseInterruptSignalBuiltin(context: CompilerContext, localNames: List<Text>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let kinds = context.tokenKinds
+    let texts = context.tokenTexts
+    let lines = context.tokenLines
+    let location = state[0]
+    let name = texts[location]
+    if compilerKernelTarget() == 0 { failAtToken(lines, location, name + " requires --freestanding --kernel-target x86_64 or arm64") }
+    state[0] = location + 1
+    expectToken(kinds, texts, lines, state, "(")
+    skipTerminators(kinds, state)
+    if kinds[state[0]] == 1 && findLocal(localNames, localLengths, state, texts[state[0]]) >= 0 {
+        failAtToken(lines, state[0], "interrupt signal slots require a module constant or literal, not a local value")
+    }
+    let slot = takeDeclarationInteger(context, state, "interrupt signal slots")
+    expectToken(kinds, texts, lines, state, ")")
+    if slot < 0 || slot > 255 { failAtToken(lines, location, "interrupt signal slots must be from 0 through 255") }
+    let declaration = interruptPendingDeclaration()
+    if findText(globals, declaration) < 0 { globals.add(declaration) }
+    let pointer = emitInstruction(output, textState, state, "getelementptr [256 x i8], ptr @.minyar.irq.pending, i64 0, i64 " + Text(slot))
+    if name == "signalInterrupt" {
+        setType(resultType, 5)
+        output.add("  store atomic i8 1, ptr " + pointer + " release, align 1\n")
+        return ""
+    }
+    if name != "takeInterrupt" { failCompiler("internal unknown interrupt signal operation") }
+    setType(resultType, 4)
+    let pending = emitInstruction(output, textState, state, "atomicrmw xchg ptr " + pointer + ", i8 0 acquire, align 1")
+    return emitInstruction(output, textState, state, "icmp ne i8 " + pending + ", 0")
+}

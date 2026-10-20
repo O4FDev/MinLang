@@ -1,0 +1,1135 @@
+// This deliberately small grammar proves scalar source/IR context properties.
+// Target stack bounds, register preservation and hardware entry are separate.
+record InterruptAuditDefinition {
+    name: Text
+    symbol: Integer
+    first: Integer
+    nameToken: Integer
+    body: Integer
+    after: Integer
+}
+
+record InterruptAuditUse {
+    name: Text
+    width: Integer
+    block: Integer
+    step: Integer
+    predecessor: Text
+}
+
+record InterruptAuditEdge {
+    from: Integer
+    name: Text
+    target: Integer
+}
+
+record InterruptAuditMemory {
+    slot: Integer
+    block: Integer
+    write: Boolean
+}
+
+record InterruptAuditPhi {
+    block: Integer
+    predecessors: List<Text>
+}
+
+record InterruptAuditFrame {
+    names: List<Text>
+    widths: List<Integer>
+    blocks: List<Integer>
+    steps: List<Integer>
+    extents: List<Integer>
+    accessTypes: List<Integer>
+    uses: List<InterruptAuditUse>
+    memory: List<InterruptAuditMemory>
+    labels: List<Text>
+    edges: List<InterruptAuditEdge>
+    phis: List<InterruptAuditPhi>
+    calls: List<Integer>
+    unreachableEnds: List<Integer>
+    code: List<Text>
+    block: Integer
+    step: Integer
+    terminated: Boolean
+    nonPhi: Boolean
+}
+
+record InterruptAuditState {
+    context: CompilerContext
+    tokens: List<Text>
+    definitions: List<InterruptAuditDefinition>
+    definitionOf: List<Integer>
+    roots: List<Integer>
+    vectors: List<Integer>
+    origins: List<Integer>
+    owners: List<Integer>
+    parents: List<Integer>
+    current: Integer
+    site: Integer
+    pending: Boolean
+}
+
+function interruptCloneName(symbol: Integer): Text {
+    return ".minyar.irq.body." + Text(symbol)
+}
+
+function interruptAuditSource(audit: InterruptAuditState): Integer {
+    if audit.site >= 0 { return audit.site }
+    let symbol = audit.current
+    if symbol >= 0 && symbol < audit.context.syntax.symbolNodes.length {
+        let node = audit.context.syntax.symbolNodes[symbol]
+        if node >= 0 { return audit.context.syntax.nodes[node].start + 1 }
+    }
+    return audit.origins[0]
+}
+
+function interruptAuditReject(audit: InterruptAuditState, detail: Text) {
+    let chain: List<Text> = []
+    let symbol = audit.current
+    let remaining = audit.parents.length + 1
+    while symbol >= 0 && symbol < audit.parents.length && remaining > 0 {
+        chain.add(readableDeclarationName(audit.context.functionNames[symbol]))
+        symbol = audit.parents[symbol]
+        remaining = remaining - 1
+    }
+    let message = "interrupt context"
+    let owner = 0
+    if audit.current >= 0 && audit.current < audit.owners.length && audit.owners[audit.current] >= 0 { owner = audit.owners[audit.current] }
+    message = message + " handles(" + Text(audit.vectors[owner]) + "): "
+    let index = chain.length
+    while index > 0 {
+        index = index - 1
+        message = message + chain[index] + " -> "
+    }
+    failAtToken(audit.context.tokenLines, interruptAuditSource(audit), message + detail)
+}
+
+function interruptAuditPunctuation(ch: Character): Boolean {
+    return ch == '(' || ch == ')' || ch == '{' || ch == '}' || ch == '[' || ch == ']' || ch == ',' || ch == '=' || ch == ':' || ch == '<' || ch == '>' || ch == '*' || ch == '!'
+}
+
+// Preserve @"quoted identifiers" as a single token; comments/strings cannot
+// manufacture calls or references. The retained newline delimits our grammar.
+function interruptAuditTokens(text: Text): List<Text> {
+    let result: List<Text> = []
+    let position = 0
+    while position < text.length {
+        let ch = text[position]
+        if ch == ' ' || ch == '\t' || ch == '\r' { position = position + 1 }
+        else {
+            if ch == '\n' { result.add("\n"); position = position + 1 }
+            else {
+                if ch == ';' {
+                    while position < text.length && text[position] != '\n' { position = position + 1 }
+                } else {
+                    let first = position
+                    if ch == '@' || ch == '%' { position = position + 1 }
+                    if position < text.length && text[position] == '"' {
+                        position = position + 1
+                        let closed = false
+                        while position < text.length && !closed {
+                            if text[position] == '"' { position = position + 1; closed = true }
+                            else {
+                                if text[position] == '\n' { failCompiler("interrupt audit: multiline LLVM string") }
+                                if text[position] == '\\' {
+                                    if position + 2 >= text.length || !characterIsHexDigit(text[position + 1]) || !characterIsHexDigit(text[position + 2]) { failCompiler("interrupt audit: malformed LLVM escape") }
+                                    position = position + 3
+                                } else { position = position + 1 }
+                            }
+                        }
+                        if !closed { failCompiler("interrupt audit: unterminated LLVM string") }
+                    } else {
+                        if position == first && interruptAuditPunctuation(ch) { position = position + 1 }
+                        else {
+                            while position < text.length && text[position] != ' ' && text[position] != '\t' && text[position] != '\r' && text[position] != '\n' && text[position] != ';' && text[position] != '"' && !interruptAuditPunctuation(text[position]) { position = position + 1 }
+                            if position == first { failCompiler("interrupt audit: invalid LLVM token") }
+                        }
+                    }
+                    result.add(text.slice(first, position))
+                }
+            }
+        }
+    }
+    result.add("\n")
+    return result
+}
+
+function interruptAuditPeek(tokens: List<Text>, cursor: List<Integer>): Text {
+    if cursor[0] >= cursor[1] { return "" }
+    return tokens[cursor[0]]
+}
+
+function interruptAuditExpect(audit: InterruptAuditState, cursor: List<Integer>, wanted: Text) {
+    if interruptAuditPeek(audit.tokens, cursor) != wanted { interruptAuditReject(audit, "unsupported LLVM form; expected '" + wanted + "'") }
+    cursor[0] = cursor[0] + 1
+}
+
+function interruptAuditEnd(audit: InterruptAuditState, cursor: List<Integer>) {
+    if cursor[0] != cursor[1] { interruptAuditReject(audit, "unparsed LLVM operand '" + audit.tokens[cursor[0]] + "'") }
+}
+
+function interruptAuditWidth(word: Text): Integer {
+    if word == "i1" { return 1 }
+    if word == "i32" { return 32 }
+    if word == "i64" { return 64 }
+    return -1
+}
+
+function interruptAuditSourceWidth(type: Integer): Integer {
+    if type == 1 { return 64 }
+    if type == 3 { return 32 }
+    if type == 4 { return 1 }
+    if type == 5 { return 0 }
+    return -1
+}
+
+function interruptAuditType(audit: InterruptAuditState, cursor: List<Integer>): Integer {
+    let result = interruptAuditWidth(interruptAuditPeek(audit.tokens, cursor))
+    if result < 0 { interruptAuditReject(audit, "non-scalar or unknown LLVM type") }
+    cursor[0] = cursor[0] + 1
+    return result
+}
+
+function interruptAuditNumber(word: Text, width: Integer): Boolean {
+    if word == "true" || word == "false" { return width == 1 }
+    if word.length == 0 { return false }
+    let first = 0
+    let bound = "18446744073709551615"
+    if width == 1 { bound = "1" }
+    if width == 32 { bound = "4294967295" }
+    if word[0] == '-' {
+        first = 1
+        bound = "9223372036854775808"
+        if width == 1 { bound = "1" }
+        if width == 32 { bound = "2147483648" }
+    }
+    if first == word.length { return false }
+    let index = first
+    while index < word.length {
+        if word[index] < '0' || word[index] > '9' { return false }
+        index = index + 1
+    }
+    let digits = word.slice(first, word.length)
+    if digits.length > 1 && digits[0] == '0' { return false }
+    return digits.length < bound.length || (digits.length == bound.length && compareText(digits, bound) <= 0)
+}
+
+function interruptAuditSmall(word: Text, limit: Integer): Integer {
+    if word.length == 0 || word.length > 3 { return -1 }
+    let result = 0
+    let index = 0
+    while index < word.length {
+        if word[index] < '0' || word[index] > '9' { return -1 }
+        result = result * 10 + Integer(word[index]) - 48
+        index = index + 1
+    }
+    if result >= limit { return -1 }
+    return result
+}
+
+// Normalize ASCII quoted/escaped identifiers for use checks, never string data.
+// Non-ASCII spellings stay exact rather than guessing byte/Unicode equivalence.
+function interruptAuditIdentifier(word: Text, prefix: Character): Text {
+    if word.length < 2 || word[0] != prefix { return "" }
+    let name = word.slice(1, word.length)
+    if name[0] != '"' { return name }
+    let pieces: List<Text> = []
+    let index = 1
+    while index < name.length - 1 {
+        if name[index] == '\\' {
+            let byte = hexDigitValue(name[index + 1]) * 16 + hexDigitValue(name[index + 2])
+            if byte > 127 { return name }
+            pieces.add(Text(Character(byte)))
+            index = index + 3
+        } else {
+            if Integer(name[index]) > 127 { return name }
+            pieces.add(Text(name[index]))
+            index = index + 1
+        }
+    }
+    return joinText(pieces)
+}
+
+function interruptAuditResolve(audit: InterruptAuditState, name: Text, cloned: Boolean): Integer {
+    let symbol = 0
+    while symbol < audit.context.functionNames.length {
+        if audit.context.symbolKinds[symbol] == 1 {
+            let expected = "@" + audit.context.functionIRNames[symbol]
+            if cloned { expected = "@" + interruptCloneName(symbol) }
+            if interruptAuditIdentifier(name, '@') == interruptAuditIdentifier(expected, '@') { return symbol }
+        }
+        symbol = symbol + 1
+    }
+    return -1
+}
+
+function interruptAuditIndex(audit: InterruptAuditState, cloned: Boolean) {
+    let tokens = audit.tokens
+    let position = 0
+    while position < tokens.length {
+        if tokens[position] == "define" {
+            let first = position
+            position = position + 1
+            while position < tokens.length && (tokens[position].length == 0 || tokens[position][0] != '@') && tokens[position] != "\n" { position = position + 1 }
+            if position >= tokens.length || tokens[position] == "\n" { interruptAuditReject(audit, "malformed LLVM function header") }
+            let nameToken = position
+            let name = tokens[position]
+            let prior = 0
+            while prior < audit.definitions.length {
+                if interruptAuditIdentifier(audit.definitions[prior].name, '@') == interruptAuditIdentifier(name, '@') { interruptAuditReject(audit, "duplicate LLVM definition " + name) }
+                prior = prior + 1
+            }
+            position = position + 1
+            if position >= tokens.length || tokens[position] != "(" { interruptAuditReject(audit, "malformed LLVM function arguments") }
+            let depth = 1
+            position = position + 1
+            while position < tokens.length && depth > 0 {
+                if tokens[position] == "(" { depth = depth + 1 }
+                if tokens[position] == ")" { depth = depth - 1 }
+                position = position + 1
+            }
+            while position < tokens.length && tokens[position] != "{" && tokens[position] != "\n" { position = position + 1 }
+            if position >= tokens.length || tokens[position] != "{" { interruptAuditReject(audit, "missing LLVM function body") }
+            let body = position + 1
+            depth = 1
+            position = position + 1
+            while position < tokens.length && depth > 0 {
+                if tokens[position] == "{" { depth = depth + 1 }
+                if tokens[position] == "}" { depth = depth - 1 }
+                position = position + 1
+            }
+            if depth != 0 { interruptAuditReject(audit, "unterminated LLVM function body") }
+            let symbol = interruptAuditResolve(audit, name, cloned)
+            let definition = audit.definitions.length
+            audit.definitions.add(InterruptAuditDefinition { name: name, symbol: symbol, first: first, nameToken: nameToken, body: body, after: position })
+            if symbol >= 0 {
+                if audit.definitionOf[symbol] >= 0 { interruptAuditReject(audit, "ambiguous compiled function identity") }
+                audit.definitionOf[symbol] = definition
+            }
+        } else { position = position + 1 }
+    }
+}
+
+function interruptAuditLineEnd(tokens: List<Text>, first: Integer): Integer {
+    let end = first
+    while end < tokens.length && tokens[end] != "\n" { end = end + 1 }
+    return end
+}
+
+function interruptAuditContaining(audit: InterruptAuditState, token: Integer): Integer {
+    let index = 0
+    while index < audit.definitions.length {
+        if token >= audit.definitions[index].body && token < audit.definitions[index].after - 1 { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+function interruptAuditGEP(audit: InterruptAuditState, cursor: List<Integer>): Integer {
+    interruptAuditExpect(audit, cursor, "getelementptr")
+    if interruptAuditPeek(audit.tokens, cursor) == "inbounds" { cursor[0] = cursor[0] + 1 }
+    interruptAuditExpect(audit, cursor, "[")
+    interruptAuditExpect(audit, cursor, "256")
+    interruptAuditExpect(audit, cursor, "x")
+    interruptAuditExpect(audit, cursor, "i8")
+    interruptAuditExpect(audit, cursor, "]")
+    interruptAuditExpect(audit, cursor, ",")
+    interruptAuditExpect(audit, cursor, "ptr")
+    interruptAuditExpect(audit, cursor, "@.minyar.irq.pending")
+    interruptAuditExpect(audit, cursor, ",")
+    interruptAuditExpect(audit, cursor, "i64")
+    interruptAuditExpect(audit, cursor, "0")
+    interruptAuditExpect(audit, cursor, ",")
+    interruptAuditExpect(audit, cursor, "i64")
+    let slot = interruptAuditSmall(interruptAuditPeek(audit.tokens, cursor), 256)
+    if slot < 0 { interruptAuditReject(audit, "pending flag slot must be a literal in 0..255") }
+    cursor[0] = cursor[0] + 1
+    interruptAuditEnd(audit, cursor)
+    return slot
+}
+
+function interruptAuditPendingOperation(audit: InterruptAuditState, first: Integer, end: Integer, pointer: Text, take: Boolean) {
+    let cursor: List<Integer> = [first, end]
+    if take {
+        if interruptAuditPeek(audit.tokens, cursor).length > 0 && interruptAuditPeek(audit.tokens, cursor)[0] == '%' {
+            cursor[0] = cursor[0] + 1
+            interruptAuditExpect(audit, cursor, "=")
+        }
+        interruptAuditExpect(audit, cursor, "atomicrmw")
+        interruptAuditExpect(audit, cursor, "xchg")
+        interruptAuditExpect(audit, cursor, "ptr")
+        interruptAuditExpect(audit, cursor, pointer)
+        interruptAuditExpect(audit, cursor, ",")
+        interruptAuditExpect(audit, cursor, "i8")
+        interruptAuditExpect(audit, cursor, "0")
+        interruptAuditExpect(audit, cursor, "acquire")
+    } else {
+        interruptAuditExpect(audit, cursor, "store")
+        interruptAuditExpect(audit, cursor, "atomic")
+        interruptAuditExpect(audit, cursor, "i8")
+        interruptAuditExpect(audit, cursor, "1")
+        interruptAuditExpect(audit, cursor, ",")
+        interruptAuditExpect(audit, cursor, "ptr")
+        interruptAuditExpect(audit, cursor, pointer)
+        interruptAuditExpect(audit, cursor, "release")
+    }
+    interruptAuditExpect(audit, cursor, ",")
+    interruptAuditExpect(audit, cursor, "align")
+    interruptAuditExpect(audit, cursor, "1")
+    interruptAuditEnd(audit, cursor)
+}
+
+// Storage and every address use are checked, including ordinary take sites.
+// A source global cannot borrow permission merely by resembling this name.
+function interruptAuditPending(audit: InterruptAuditState) {
+    let tokens = audit.tokens
+    let declarations = 0
+    let pointers: List<Text> = []
+    let owners: List<Integer> = []
+    let starts: List<Integer> = []
+    let first = 0
+    while first < tokens.length {
+        let end = interruptAuditLineEnd(tokens, first)
+        let index = first
+        while index < end {
+            if interruptAuditIdentifier(tokens[index], '@') == ".minyar.irq.pending" {
+                let definition = interruptAuditContaining(audit, index)
+                if definition < 0 {
+                    let cursor: List<Integer> = [first, end]
+                    interruptAuditExpect(audit, cursor, "@.minyar.irq.pending")
+                    interruptAuditExpect(audit, cursor, "=")
+                    let linkage = interruptAuditPeek(tokens, cursor)
+                    if linkage != "internal" && linkage != "private" { interruptAuditReject(audit, "pending storage must be compiler private") }
+                    cursor[0] = cursor[0] + 1
+                    interruptAuditExpect(audit, cursor, "global")
+                    interruptAuditExpect(audit, cursor, "[")
+                    interruptAuditExpect(audit, cursor, "256")
+                    interruptAuditExpect(audit, cursor, "x")
+                    interruptAuditExpect(audit, cursor, "i8")
+                    interruptAuditExpect(audit, cursor, "]")
+                    interruptAuditExpect(audit, cursor, "zeroinitializer")
+                    interruptAuditExpect(audit, cursor, ",")
+                    interruptAuditExpect(audit, cursor, "align")
+                    interruptAuditExpect(audit, cursor, "1")
+                    interruptAuditEnd(audit, cursor)
+                    declarations = declarations + 1
+                } else {
+                    let cursor: List<Integer> = [first, end]
+                    let pointer = interruptAuditPeek(tokens, cursor)
+                    if pointer.length < 2 || pointer[0] != '%' || pointer[1] == '"' { interruptAuditReject(audit, "pending address must be a private SSA slot") }
+                    cursor[0] = cursor[0] + 1
+                    interruptAuditExpect(audit, cursor, "=")
+                    interruptAuditGEP(audit, cursor)
+                    pointers.add(pointer); owners.add(definition); starts.add(first)
+                }
+            }
+            index = index + 1
+        }
+        first = end + 1
+    }
+    if declarations > 1 || (pointers.length > 0 && declarations != 1) { interruptAuditReject(audit, "missing or duplicate private pending storage") }
+    audit.pending = declarations == 1
+    let pointer = 0
+    while pointer < pointers.length {
+        let definition = audit.definitions[owners[pointer]]
+        first = definition.body
+        while first < definition.after - 1 {
+            let end = interruptAuditLineEnd(tokens, first)
+            let used = false
+            let index = first
+            while index < end {
+                if interruptAuditIdentifier(tokens[index], '%') == interruptAuditIdentifier(pointers[pointer], '%') { used = true }
+                index = index + 1
+            }
+            if used && first != starts[pointer] {
+                let operation = first
+                if operation + 1 < end && tokens[operation + 1] == "=" { operation = operation + 2 }
+                let take = operation < end && tokens[operation] == "atomicrmw"
+                interruptAuditPendingOperation(audit, first, end, pointers[pointer], take)
+            }
+            first = end + 1
+        }
+        pointer = pointer + 1
+    }
+}
+
+function interruptAuditRootUses(audit: InterruptAuditState) {
+    let root = 0
+    while root < audit.roots.length {
+        let symbol = audit.roots[root]
+        let definition = audit.definitionOf[symbol]
+        if definition < 0 { interruptAuditReject(audit, "interrupt root has no emitted body") }
+        let wanted = interruptAuditIdentifier("@" + audit.context.functionIRNames[symbol], '@')
+        let index = 0
+        while index < audit.tokens.length {
+            if interruptAuditIdentifier(audit.tokens[index], '@') == wanted && index != audit.definitions[definition].nameToken {
+                audit.current = symbol
+                let caller = interruptAuditContaining(audit, index)
+                let detail = "ordinary call or address escape of interrupt root"
+                if caller >= 0 { detail = detail + " from " + audit.definitions[caller].name }
+                interruptAuditReject(audit, detail)
+            }
+            index = index + 1
+        }
+        root = root + 1
+    }
+}
+
+function interruptAuditTyped(audit: InterruptAuditState, symbol: Integer) {
+    let context = audit.context
+    if symbol < 0 || symbol >= context.syntax.symbolNodes.length || context.symbolKinds[symbol] != 1 { interruptAuditReject(audit, "missing resolved source function") }
+    if context.functionNames[symbol] == "main" { interruptAuditReject(audit, "main is not an interrupt helper") }
+    let declaration = context.syntax.symbolNodes[symbol]
+    if declaration < 0 || context.syntax.nodes[declaration].kind != 1 { interruptAuditReject(audit, "unknown generated body has no typed function") }
+    if interruptAuditSourceWidth(context.functionReturnTypes[symbol]) < 0 { interruptAuditReject(audit, "managed, Float or unknown return type") }
+    let offset = functionParameterOffset(context.functionParameterCounts, symbol)
+    let parameter = 0
+    while parameter < context.functionParameterCounts[symbol] {
+        if interruptAuditSourceWidth(context.functionParameterTypes[offset + parameter]) <= 0 { interruptAuditReject(audit, "managed, Float or unknown parameter type") }
+        parameter = parameter + 1
+    }
+    let queue: List<Integer> = [declaration]
+    let index = 0
+    while index < queue.length {
+        if index > context.syntax.nodes.length { interruptAuditReject(audit, "cyclic typed syntax") }
+        let node = context.syntax.nodes[queue[index]]
+        audit.site = node.start
+        let kind = node.kind
+        let allowed = kind == 1 || kind == 6 || kind == 100 || kind == 101 || kind == 104 || kind == 105 || kind == 110 || kind == 111 || kind == 200 || kind == 201 || kind == 203 || kind == 205 || kind == 207 || kind == 209 || kind == 214 || kind == 220 || kind == 221
+        if !allowed { interruptAuditReject(audit, "forbidden source node " + Text(kind) + " (loop, native, managed, closure or unknown operation)") }
+        if interruptAuditSourceWidth(node.type) < 0 { interruptAuditReject(audit, "managed, Float or unproved source value") }
+        if kind == 200 && node.symbol >= 0 {
+            if node.symbol >= context.syntax.symbolNodes.length { interruptAuditReject(audit, "unresolved source value") }
+            let source = context.syntax.symbolNodes[node.symbol]
+            if source < 0 || context.syntax.nodes[source].kind == 4 { interruptAuditReject(audit, "mutable global or initializer read") }
+            if context.symbolKinds[node.symbol] == 3 && context.functionParameterCounts[node.symbol] < 0 { interruptAuditReject(audit, "lazy initializer read") }
+        }
+        let child = node.firstChild
+        let siblings = 0
+        while child >= 0 {
+            if child >= context.syntax.nodes.length || siblings > context.syntax.nodes.length { interruptAuditReject(audit, "invalid typed subtree") }
+            queue.add(child)
+            child = context.syntax.nodes[child].nextSibling
+            siblings = siblings + 1
+        }
+        index = index + 1
+    }
+    audit.site = -1
+}
+
+function interruptAuditNewFrame(): InterruptAuditFrame {
+    let names: List<Text> = []
+    let widths: List<Integer> = []
+    let blocks: List<Integer> = []
+    let steps: List<Integer> = []
+    let extents: List<Integer> = []
+    let accessTypes: List<Integer> = []
+    let uses: List<InterruptAuditUse> = []
+    let memory: List<InterruptAuditMemory> = []
+    let labels: List<Text> = []
+    let edges: List<InterruptAuditEdge> = []
+    let phis: List<InterruptAuditPhi> = []
+    let calls: List<Integer> = []
+    let unreachableEnds: List<Integer> = []
+    let code: List<Text> = []
+    return InterruptAuditFrame { names: names, widths: widths, blocks: blocks, steps: steps, extents: extents, accessTypes: accessTypes, uses: uses, memory: memory, labels: labels, edges: edges, phis: phis, calls: calls, unreachableEnds: unreachableEnds, code: code, block: -1, step: 0, terminated: true, nonPhi: false }
+}
+
+function interruptAuditDefine(audit: InterruptAuditState, frame: InterruptAuditFrame, name: Text, width: Integer, extent: Integer) {
+    if name.length < 2 || name[0] != '%' || name[1] == '"' || findText(frame.names, name) >= 0 { interruptAuditReject(audit, "missing, quoted or duplicate SSA definition") }
+    if findText(frame.labels, name.slice(1, name.length)) >= 0 { interruptAuditReject(audit, "SSA name collides with a block label") }
+    frame.names.add(name); frame.widths.add(width); frame.blocks.add(frame.block); frame.steps.add(frame.step); frame.extents.add(extent); frame.accessTypes.add(0)
+}
+
+function interruptAuditOperand(audit: InterruptAuditState, frame: InterruptAuditFrame, cursor: List<Integer>, width: Integer, predecessor: Text): Text {
+    let value = interruptAuditPeek(audit.tokens, cursor)
+    if value.length > 1 && value[0] == '%' {
+        if value[1] == '"' { interruptAuditReject(audit, "quoted local SSA operand is outside the scalar subset") }
+        frame.uses.add(InterruptAuditUse { name: value, width: width, block: frame.block, step: frame.step, predecessor: predecessor })
+    } else {
+        if !interruptAuditNumber(value, width) { interruptAuditReject(audit, "unknown, poison or non-scalar LLVM operand '" + value + "'") }
+    }
+    cursor[0] = cursor[0] + 1
+    return value
+}
+
+function interruptAuditAlign(audit: InterruptAuditState, cursor: List<Integer>, width: Integer) {
+    if interruptAuditPeek(audit.tokens, cursor) == "," {
+        interruptAuditExpect(audit, cursor, ",")
+        interruptAuditExpect(audit, cursor, "align")
+        let word = interruptAuditPeek(audit.tokens, cursor)
+        let alignment = interruptAuditSmall(word, 9)
+        let natural = 1
+        if width == 32 { natural = 4 }
+        if width == 64 { natural = 8 }
+        if (alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8) || alignment > natural { interruptAuditReject(audit, "unsupported scalar memory alignment") }
+        cursor[0] = cursor[0] + 1
+    }
+}
+
+function interruptAuditEdgeTo(audit: InterruptAuditState, frame: InterruptAuditFrame, cursor: List<Integer>) {
+    interruptAuditExpect(audit, cursor, "label")
+    let label = interruptAuditPeek(audit.tokens, cursor)
+    if label.length < 2 || label[0] != '%' { interruptAuditReject(audit, "unresolved branch label") }
+    label = label.slice(1, label.length)
+    cursor[0] = cursor[0] + 1
+    let index = 0
+    while index < frame.edges.length {
+        if frame.edges[index].from == frame.block && frame.edges[index].name == label { return }
+        index = index + 1
+    }
+    frame.edges.add(InterruptAuditEdge { from: frame.block, name: label, target: -1 })
+}
+
+function interruptAuditRender(tokens: List<Text>, first: Integer, end: Integer, old: Text, replacement: Text): Text {
+    let pieces: List<Text> = []
+    let index = first
+    while index < end {
+        if index > first {
+            let token = tokens[index]
+            let previous = tokens[index - 1]
+            if token != "," && token != ")" && token != "]" && token != "(" && previous != "(" && previous != "[" { pieces.add(" ") }
+        }
+        if tokens[index] == old && old != "" { pieces.add(replacement) } else { pieces.add(tokens[index]) }
+        index = index + 1
+    }
+    pieces.add("\n")
+    return joinText(pieces)
+}
+
+function interruptAuditGuard(audit: InterruptAuditState, cursor: List<Integer>, callee: Text): Boolean {
+    let empty = callee == "@minyar_stack_enter" || callee == "@minyar_stack_leave" || callee == "@minyar_rc_step" || callee == "@minyar_rc_leave"
+    if empty {
+        interruptAuditExpect(audit, cursor, "(")
+        interruptAuditExpect(audit, cursor, ")")
+        interruptAuditEnd(audit, cursor)
+        return true
+    }
+    if callee == "@minyar_rc_enter" {
+        interruptAuditExpect(audit, cursor, "(")
+        interruptAuditExpect(audit, cursor, "i64")
+        let owners = interruptAuditPeek(audit.tokens, cursor)
+        if !interruptAuditNumber(owners, 64) || owners[0] == '-' { interruptAuditReject(audit, "unexpected RC frame operand") }
+        cursor[0] = cursor[0] + 1
+        interruptAuditExpect(audit, cursor, ")")
+        interruptAuditEnd(audit, cursor)
+        return true
+    }
+    return false
+}
+
+function interruptAuditInstruction(audit: InterruptAuditState, frame: InterruptAuditFrame, first: Integer, end: Integer, returned: Integer, cloned: Boolean) {
+    let tokens = audit.tokens
+    let cursor: List<Integer> = [first, end]
+    let assigned = ""
+    if first + 1 < end && tokens[first + 1] == "=" {
+        assigned = tokens[first]
+        cursor[0] = first + 2
+    }
+    let opcode = interruptAuditPeek(tokens, cursor)
+    cursor[0] = cursor[0] + 1
+    let width = 0
+    let extent = 0
+    let result = false
+    let oldCallee = ""
+    let newCallee = ""
+    if opcode == "phi" {
+        if frame.nonPhi { interruptAuditReject(audit, "phi after a non-phi instruction") }
+    } else { frame.nonPhi = true }
+    if opcode == "unreachable" {
+        if assigned != "" { interruptAuditReject(audit, "assigned unreachable terminator") }
+        interruptAuditEnd(audit, cursor)
+        frame.unreachableEnds.add(frame.block)
+        frame.terminated = true
+        frame.code.add("unreachable\n")
+        return
+    }
+
+    if opcode == "alloca" {
+        if frame.block != 0 { interruptAuditReject(audit, "alloca outside entry") }
+        extent = interruptAuditType(audit, cursor)
+        if interruptAuditPeek(tokens, cursor) == "," {
+            interruptAuditExpect(audit, cursor, ",")
+            interruptAuditExpect(audit, cursor, "align")
+            let natural = 1
+            if extent == 32 { natural = 4 }
+            if extent == 64 { natural = 8 }
+            interruptAuditExpect(audit, cursor, Text(natural))
+        }
+        width = -1; result = true
+    } else {
+    if opcode == "load" || opcode == "store" {
+        if opcode == "store" && interruptAuditPeek(tokens, cursor) == "atomic" {
+            if assigned != "" { interruptAuditReject(audit, "assigned atomic store") }
+            let pointerAt = cursor[0] + 5
+            if pointerAt >= end { interruptAuditReject(audit, "malformed pending store") }
+            let pointer = tokens[pointerAt]
+            let slot = findText(frame.names, pointer)
+            if slot < 0 || frame.widths[slot] != -2 || !audit.pending { interruptAuditReject(audit, "atomic store is not a proved pending slot") }
+            interruptAuditPendingOperation(audit, first, end, pointer, false)
+            frame.uses.add(InterruptAuditUse { name: pointer, width: -2, block: frame.block, step: frame.step, predecessor: "" })
+            frame.code.add(interruptAuditRender(tokens, first, end, "", ""))
+            return
+        }
+        width = interruptAuditType(audit, cursor)
+        if opcode == "store" { interruptAuditOperand(audit, frame, cursor, width, ""); interruptAuditExpect(audit, cursor, ",") }
+        else { interruptAuditExpect(audit, cursor, ","); result = true }
+        interruptAuditExpect(audit, cursor, "ptr")
+        let pointer = interruptAuditPeek(tokens, cursor)
+        cursor[0] = cursor[0] + 1
+        let slot = findText(frame.names, pointer)
+        if slot < 0 || frame.widths[slot] != -1 || width > frame.extents[slot] { interruptAuditReject(audit, "load/store outside a fixed local scalar") }
+        if frame.accessTypes[slot] != 0 && frame.accessTypes[slot] != width { interruptAuditReject(audit, "inconsistent scalar slot access type") }
+        frame.accessTypes[slot] = width
+        frame.memory.add(InterruptAuditMemory { slot: slot, block: frame.block, write: opcode == "store" })
+        interruptAuditAlign(audit, cursor, width)
+    } else {
+    if opcode == "getelementptr" {
+        if !audit.pending { interruptAuditReject(audit, "unproved pending storage") }
+        cursor[0] = cursor[0] - 1
+        interruptAuditGEP(audit, cursor)
+        width = -2; result = true
+    } else {
+    if opcode == "add" || opcode == "sub" || opcode == "mul" || opcode == "and" || opcode == "or" || opcode == "xor" || opcode == "shl" || opcode == "lshr" || opcode == "ashr" {
+        width = interruptAuditType(audit, cursor)
+        interruptAuditOperand(audit, frame, cursor, width, "")
+        interruptAuditExpect(audit, cursor, ",")
+        if opcode == "shl" || opcode == "lshr" || opcode == "ashr" {
+            if interruptAuditSmall(interruptAuditPeek(tokens, cursor), width) < 0 { interruptAuditReject(audit, "unproved shift range") }
+        }
+        interruptAuditOperand(audit, frame, cursor, width, "")
+        result = true
+    } else {
+    if opcode == "icmp" {
+        let predicate = interruptAuditPeek(tokens, cursor)
+        if predicate != "eq" && predicate != "ne" && predicate != "ult" && predicate != "ule" && predicate != "ugt" && predicate != "uge" && predicate != "slt" && predicate != "sle" && predicate != "sgt" && predicate != "sge" { interruptAuditReject(audit, "unknown scalar comparison") }
+        cursor[0] = cursor[0] + 1
+        let compared = interruptAuditType(audit, cursor)
+        interruptAuditOperand(audit, frame, cursor, compared, "")
+        interruptAuditExpect(audit, cursor, ",")
+        interruptAuditOperand(audit, frame, cursor, compared, "")
+        width = 1; result = true
+    } else {
+    if opcode == "select" {
+        interruptAuditExpect(audit, cursor, "i1")
+        interruptAuditOperand(audit, frame, cursor, 1, "")
+        interruptAuditExpect(audit, cursor, ",")
+        width = interruptAuditType(audit, cursor)
+        interruptAuditOperand(audit, frame, cursor, width, "")
+        interruptAuditExpect(audit, cursor, ",")
+        if interruptAuditType(audit, cursor) != width { interruptAuditReject(audit, "select type mismatch") }
+        interruptAuditOperand(audit, frame, cursor, width, "")
+        result = true
+    } else {
+    if opcode == "trunc" || opcode == "zext" || opcode == "sext" {
+        let original = interruptAuditType(audit, cursor)
+        interruptAuditOperand(audit, frame, cursor, original, "")
+        interruptAuditExpect(audit, cursor, "to")
+        width = interruptAuditType(audit, cursor)
+        if (opcode == "trunc" && width >= original) || (opcode != "trunc" && width <= original) { interruptAuditReject(audit, "invalid scalar conversion") }
+        result = true
+    } else {
+    if opcode == "phi" {
+        width = interruptAuditType(audit, cursor)
+        let predecessors: List<Text> = []
+        let more = true
+        while more {
+            interruptAuditExpect(audit, cursor, "[")
+            let operandAt = cursor[0]
+            if operandAt + 2 >= end { interruptAuditReject(audit, "malformed phi") }
+            let predecessor = tokens[operandAt + 2]
+            if predecessor.length < 2 || predecessor[0] != '%' { interruptAuditReject(audit, "unknown phi predecessor") }
+            predecessor = predecessor.slice(1, predecessor.length)
+            if findText(predecessors, predecessor) >= 0 { interruptAuditReject(audit, "duplicate phi predecessor") }
+            predecessors.add(predecessor)
+            interruptAuditOperand(audit, frame, cursor, width, predecessor)
+            interruptAuditExpect(audit, cursor, ",")
+            interruptAuditExpect(audit, cursor, "%" + predecessor)
+            interruptAuditExpect(audit, cursor, "]")
+            more = interruptAuditPeek(tokens, cursor) == ","
+            if more { cursor[0] = cursor[0] + 1 }
+        }
+        frame.phis.add(InterruptAuditPhi { block: frame.block, predecessors: predecessors })
+        result = true
+    } else {
+    if opcode == "br" {
+        if interruptAuditPeek(tokens, cursor) == "label" { interruptAuditEdgeTo(audit, frame, cursor) }
+        else {
+            interruptAuditExpect(audit, cursor, "i1")
+            interruptAuditOperand(audit, frame, cursor, 1, "")
+            interruptAuditExpect(audit, cursor, ",")
+            interruptAuditEdgeTo(audit, frame, cursor)
+            interruptAuditExpect(audit, cursor, ",")
+            interruptAuditEdgeTo(audit, frame, cursor)
+        }
+        frame.terminated = true
+    } else {
+    if opcode == "ret" {
+        if returned == 0 { interruptAuditExpect(audit, cursor, "void") }
+        else {
+            if interruptAuditType(audit, cursor) != returned { interruptAuditReject(audit, "return type mismatch") }
+            interruptAuditOperand(audit, frame, cursor, returned, "")
+        }
+        frame.terminated = true
+    } else {
+    if opcode == "call" {
+        if interruptAuditPeek(tokens, cursor) == "zeroext" { cursor[0] = cursor[0] + 1; interruptAuditExpect(audit, cursor, "i1"); width = 1 }
+        else {
+            if interruptAuditPeek(tokens, cursor) == "void" { width = 0; cursor[0] = cursor[0] + 1 }
+            else { width = interruptAuditType(audit, cursor) }
+        }
+        let callee = interruptAuditPeek(tokens, cursor)
+        cursor[0] = cursor[0] + 1
+        if !cloned && width == 0 && assigned == "" && interruptAuditGuard(audit, cursor, callee) { return }
+        let target = interruptAuditResolve(audit, callee, cloned)
+        if target < 0 || audit.definitionOf[target] < 0 { interruptAuditReject(audit, "external, runtime, intrinsic or indirect call " + callee) }
+        if cloned && audit.owners[target] < 0 { interruptAuditReject(audit, "call outside approved clone graph") }
+        if width != interruptAuditSourceWidth(audit.context.functionReturnTypes[target]) { interruptAuditReject(audit, "callee result signature mismatch") }
+        interruptAuditExpect(audit, cursor, "(")
+        let offset = functionParameterOffset(audit.context.functionParameterCounts, target)
+        let parameter = 0
+        while parameter < audit.context.functionParameterCounts[target] {
+            if parameter > 0 { interruptAuditExpect(audit, cursor, ",") }
+            let expected = interruptAuditSourceWidth(audit.context.functionParameterTypes[offset + parameter])
+            if expected <= 0 || interruptAuditType(audit, cursor) != expected { interruptAuditReject(audit, "callee parameter signature mismatch") }
+            interruptAuditOperand(audit, frame, cursor, expected, "")
+            parameter = parameter + 1
+        }
+        interruptAuditExpect(audit, cursor, ")")
+        frame.calls.add(target)
+        oldCallee = callee
+        newCallee = "@" + interruptCloneName(target)
+        result = width != 0
+    } else { interruptAuditReject(audit, "forbidden or unknown LLVM instruction '" + opcode + "'") }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    interruptAuditEnd(audit, cursor)
+    if result { interruptAuditDefine(audit, frame, assigned, width, extent) }
+    else { if assigned != "" { interruptAuditReject(audit, "unexpected SSA result") } }
+    frame.code.add(interruptAuditRender(tokens, first, end, oldCallee, newCallee))
+}
+
+function interruptAuditControl(audit: InterruptAuditState, frame: InterruptAuditFrame) {
+    let count = frame.labels.length
+    if count == 0 || !frame.terminated { interruptAuditReject(audit, "missing terminated scalar body") }
+    let degrees: List<Integer> = []
+    let index = 0
+    while index < count { degrees.add(0); index = index + 1 }
+    index = 0
+    while index < frame.edges.length {
+        let target = findText(frame.labels, frame.edges[index].name)
+        if target < 0 { interruptAuditReject(audit, "missing CFG target") }
+        frame.edges[index].target = target
+        degrees[target] = degrees[target] + 1
+        index = index + 1
+    }
+    if degrees[0] != 0 { interruptAuditReject(audit, "entry backedge") }
+    let reachable: List<Integer> = []
+    index = 0
+    while index < count { reachable.add(0); index = index + 1 }
+    reachable[0] = 1
+    let live: List<Integer> = [0]
+    let cursor = 0
+    while cursor < live.length {
+        index = 0
+        while index < frame.edges.length {
+            let edge = frame.edges[index]
+            if edge.from == live[cursor] && reachable[edge.target] == 0 { reachable[edge.target] = 1; live.add(edge.target) }
+            index = index + 1
+        }
+        cursor = cursor + 1
+    }
+    index = 0
+    while index < frame.unreachableEnds.length {
+        if reachable[frame.unreachableEnds[index]] != 0 { interruptAuditReject(audit, "unreachable terminator is reachable from entry") }
+        index = index + 1
+    }
+    let order: List<Integer> = [0]
+    index = 1
+    while index < count { if degrees[index] == 0 { order.add(index) }; index = index + 1 }
+    cursor = 0
+    while cursor < order.length {
+        let block = order[cursor]
+        index = 0
+        while index < frame.edges.length {
+            if frame.edges[index].from == block {
+                let target = frame.edges[index].target
+                degrees[target] = degrees[target] - 1
+                if degrees[target] == 0 { order.add(target) }
+            }
+            index = index + 1
+        }
+        cursor = cursor + 1
+    }
+    if order.length != count { interruptAuditReject(audit, "loop/backedge in emitted CFG") }
+    let dominators: List<Integer> = []
+    let initialized: List<Integer> = []
+    index = 0
+    while index < count * count { dominators.add(0); index = index + 1 }
+    index = 0
+    while index < count * frame.names.length { initialized.add(0); index = index + 1 }
+    cursor = 0
+    while cursor < order.length {
+        let block = order[cursor]
+        if block != 0 {
+            let first = true
+            index = 0
+            while index < frame.edges.length {
+                if frame.edges[index].target == block {
+                    let predecessor = frame.edges[index].from
+                    let bit = 0
+                    while bit < count {
+                        if first { dominators[block * count + bit] = dominators[predecessor * count + bit] }
+                        else { if dominators[predecessor * count + bit] == 0 { dominators[block * count + bit] = 0 } }
+                        bit = bit + 1
+                    }
+                    bit = 0
+                    while bit < frame.names.length {
+                        if first { initialized[block * frame.names.length + bit] = initialized[predecessor * frame.names.length + bit] }
+                        else { if initialized[predecessor * frame.names.length + bit] == 0 { initialized[block * frame.names.length + bit] = 0 } }
+                        bit = bit + 1
+                    }
+                    first = false
+                }
+                index = index + 1
+            }
+            // A dead DAG root may still use entry parameters/fixed locals.
+            // Treat it conservatively as another successor of entry for SSA
+            // and initialization checking; its effects were audited normally.
+            if first {
+                let bit = 0
+                while bit < count { dominators[block * count + bit] = dominators[bit]; bit = bit + 1 }
+                bit = 0
+                while bit < frame.names.length { initialized[block * frame.names.length + bit] = initialized[bit]; bit = bit + 1 }
+            }
+        }
+        dominators[block * count + block] = 1
+        index = 0
+        while index < frame.memory.length {
+            let access = frame.memory[index]
+            if access.block == block {
+                let slot = block * frame.names.length + access.slot
+                if access.write { initialized[slot] = 1 }
+                else { if initialized[slot] == 0 { interruptAuditReject(audit, "local load without initialization on every incoming path") } }
+            }
+            index = index + 1
+        }
+        cursor = cursor + 1
+    }
+    index = 0
+    while index < frame.uses.length {
+        let use = frame.uses[index]
+        let value = findText(frame.names, use.name)
+        if value < 0 || frame.widths[value] != use.width { interruptAuditReject(audit, "unresolved or mistyped SSA value " + use.name) }
+        let block = use.block
+        if use.predecessor != "" {
+            block = findText(frame.labels, use.predecessor)
+            let edge = 0
+            let found = false
+            while edge < frame.edges.length {
+                if frame.edges[edge].from == block && frame.edges[edge].target == use.block { found = true }
+                edge = edge + 1
+            }
+            if block < 0 || !found { interruptAuditReject(audit, "phi input is not a CFG predecessor") }
+        }
+        let defined = frame.blocks[value]
+        if defined < 0 || dominators[block * count + defined] == 0 { interruptAuditReject(audit, "SSA definition does not dominate use") }
+        if defined == block && use.predecessor == "" && frame.steps[value] >= use.step { interruptAuditReject(audit, "SSA use before definition") }
+        index = index + 1
+    }
+    index = 0
+    while index < frame.phis.length {
+        let phi = frame.phis[index]
+        let predecessors = 0
+        let edge = 0
+        while edge < frame.edges.length {
+            if frame.edges[edge].target == phi.block {
+                predecessors = predecessors + 1
+                if findText(phi.predecessors, frame.labels[frame.edges[edge].from]) < 0 { interruptAuditReject(audit, "phi omits a CFG predecessor") }
+            }
+            edge = edge + 1
+        }
+        if phi.predecessors.length != predecessors { interruptAuditReject(audit, "phi predecessor set mismatch") }
+        index = index + 1
+    }
+}
+
+function interruptAuditBody(audit: InterruptAuditState, definition: InterruptAuditDefinition, cloned: Boolean): InterruptAuditFrame {
+    let frame = interruptAuditNewFrame()
+    let tokens = audit.tokens
+    let cursor: List<Integer> = [definition.first + 1, definition.body - 1]
+    if interruptAuditPeek(tokens, cursor) == "internal" { cursor[0] = cursor[0] + 1 }
+    let returned = interruptAuditSourceWidth(audit.context.functionReturnTypes[definition.symbol])
+    if returned == 0 { interruptAuditExpect(audit, cursor, "void") }
+    else { if interruptAuditType(audit, cursor) != returned { interruptAuditReject(audit, "definition return signature mismatch") } }
+    interruptAuditExpect(audit, cursor, definition.name)
+    interruptAuditExpect(audit, cursor, "(")
+    let header: List<Text> = ["define internal "]
+    if returned == 0 { header.add("void") } else { header.add("i" + Text(returned)) }
+    header.add(" @" + interruptCloneName(definition.symbol) + "(")
+    let offset = functionParameterOffset(audit.context.functionParameterCounts, definition.symbol)
+    let parameter = 0
+    frame.block = 0; frame.step = -1
+    while parameter < audit.context.functionParameterCounts[definition.symbol] {
+        if parameter > 0 { interruptAuditExpect(audit, cursor, ","); header.add(", ") }
+        let width = interruptAuditSourceWidth(audit.context.functionParameterTypes[offset + parameter])
+        if width <= 0 || interruptAuditType(audit, cursor) != width { interruptAuditReject(audit, "definition parameter signature mismatch") }
+        let name = interruptAuditPeek(tokens, cursor)
+        cursor[0] = cursor[0] + 1
+        interruptAuditDefine(audit, frame, name, width, 0)
+        header.add("i" + Text(width) + " " + name)
+        parameter = parameter + 1
+    }
+    interruptAuditExpect(audit, cursor, ")")
+    while cursor[0] < cursor[1] {
+        let attribute = interruptAuditPeek(tokens, cursor)
+        if attribute != "uwtable" && attribute != "alwaysinline" && attribute != "noinline" && attribute != "noredzone" && attribute != "noimplicitfloat" { interruptAuditReject(audit, "unknown function attribute '" + attribute + "'") }
+        cursor[0] = cursor[0] + 1
+    }
+    header.add(") alwaysinline noredzone noimplicitfloat {\n")
+    frame.code.add(joinText(header))
+    frame.block = -1; frame.step = 0
+    let first = definition.body
+    while first < definition.after - 1 {
+        let end = interruptAuditLineEnd(tokens, first)
+        if end > definition.after - 1 { interruptAuditReject(audit, "unterminated instruction line") }
+        if first < end {
+            if first + 2 == end && tokens[first + 1] == ":" {
+                if !frame.terminated { interruptAuditReject(audit, "block lacks terminator") }
+                let label = tokens[first]
+                if label.length == 0 || label[0] == '%' || label[0] == '@' || label[0] == '"' || findText(frame.labels, label) >= 0 { interruptAuditReject(audit, "duplicate or unsupported block label") }
+                if findText(frame.names, "%" + label) >= 0 { interruptAuditReject(audit, "block label collides with an SSA value") }
+                frame.block = frame.labels.length
+                frame.labels.add(label)
+                frame.terminated = false; frame.nonPhi = false
+                frame.code.add(label + ":\n")
+            } else {
+                if frame.block < 0 || frame.terminated { interruptAuditReject(audit, "instruction outside an unterminated block") }
+                interruptAuditInstruction(audit, frame, first, end, returned, cloned)
+                frame.step = frame.step + 1
+            }
+        }
+        first = end + 1
+    }
+    interruptAuditControl(audit, frame)
+    frame.code.add("}\n\n")
+    return frame
+}
+
+function interruptAuditCallDAG(audit: InterruptAuditState, from: List<Integer>, targets: List<Integer>) {
+    let degrees: List<Integer> = []
+    let order: List<Integer> = []
+    let index = 0
+    let reached = 0
+    while index < audit.owners.length { degrees.add(0); if audit.owners[index] >= 0 { reached = reached + 1 }; index = index + 1 }
+    index = 0
+    while index < targets.length { degrees[targets[index]] = degrees[targets[index]] + 1; index = index + 1 }
+    index = 0
+    while index < degrees.length { if audit.owners[index] >= 0 && degrees[index] == 0 { order.add(index) }; index = index + 1 }
+    let cursor = 0
+    while cursor < order.length {
+        index = 0
+        while index < targets.length {
+            if from[index] == order[cursor] {
+                let target = targets[index]
+                degrees[target] = degrees[target] - 1
+                if degrees[target] == 0 { order.add(target) }
+            }
+            index = index + 1
+        }
+        cursor = cursor + 1
+    }
+    if order.length != reached {
+        index = 0
+        while index < degrees.length {
+            if audit.owners[index] >= 0 && degrees[index] > 0 { audit.current = index; interruptAuditReject(audit, "recursive interrupt call graph") }
+            index = index + 1
+        }
+    }
+}
+
+function interruptAuditAndClone(context: CompilerContext, output: List<Text>, globals: List<Text>, roots: List<Integer>, vectors: List<Integer>, origins: List<Integer>): List<Text> {
+    let result: List<Text> = []
+    if roots.length == 0 { return result }
+    if vectors.length != roots.length || origins.length != roots.length { failCompiler("interrupt audit: inconsistent root metadata") }
+    let definitions: List<InterruptAuditDefinition> = []
+    let definitionOf: List<Integer> = []
+    let owners: List<Integer> = []
+    let parents: List<Integer> = []
+    let index = 0
+    while index < context.functionNames.length { definitionOf.add(-1); owners.add(-1); parents.add(-1); index = index + 1 }
+    // Pipeline has already appended/deduplicated globals. Do not append the
+    // producer's globals list again and accidentally accept duplicate storage.
+    let audit = InterruptAuditState { context: context, tokens: interruptAuditTokens(joinText(output)), definitions: definitions, definitionOf: definitionOf, roots: roots, vectors: vectors, origins: origins, owners: owners, parents: parents, current: -1, site: -1, pending: false }
+    let queue: List<Integer> = []
+    index = 0
+    while index < roots.length {
+        let root = roots[index]
+        if root < 0 || root >= context.functionNames.length || context.symbolKinds[root] != 1 { failCompiler("interrupt audit: unresolved root identity") }
+        if owners[root] >= 0 { failCompiler("interrupt audit: duplicate root identity") }
+        if context.functionReturnTypes[root] != 5 || context.functionParameterCounts[root] != 1 { failCompiler("interrupt audit: root must have signature (Integer): Nothing") }
+        if context.functionParameterTypes[functionParameterOffset(context.functionParameterCounts, root)] != 1 { failCompiler("interrupt audit: root parameter must be Integer") }
+        owners[root] = index
+        queue.add(root)
+        index = index + 1
+    }
+    audit.current = roots[0]
+    if context.tokenLines.features / 8 % 2 != 0 { interruptAuditReject(audit, "recoverable call-depth mode is unsupported") }
+    interruptAuditIndex(audit, false)
+    interruptAuditRootUses(audit)
+    interruptAuditPending(audit)
+    let from: List<Integer> = []
+    let targets: List<Integer> = []
+    index = 0
+    while index < queue.length {
+        let symbol = queue[index]
+        audit.current = symbol
+        let use = 0
+        while use < audit.tokens.length {
+            if interruptAuditIdentifier(audit.tokens[use], '@') == interruptCloneName(symbol) { interruptAuditReject(audit, "IRQ clone identity already exists in ordinary module") }
+            use = use + 1
+        }
+        interruptAuditTyped(audit, symbol)
+        let definition = definitionOf[symbol]
+        if definition < 0 { interruptAuditReject(audit, "resolved helper lacks an emitted definition") }
+        let frame = interruptAuditBody(audit, definitions[definition], false)
+        result.add(joinText(frame.code))
+        let call = 0
+        while call < frame.calls.length {
+            let target = frame.calls[call]
+            from.add(symbol); targets.add(target)
+            if owners[target] < 0 { owners[target] = owners[symbol]; parents[target] = symbol; queue.add(target) }
+            call = call + 1
+        }
+        index = index + 1
+    }
+    interruptAuditCallDAG(audit, from, targets)
+    // Reparse the actual candidates. This mode admits no runtime guard at all,
+    // and every direct call must resolve to an actual reached clone definition.
+    let cloneDefinitions: List<InterruptAuditDefinition> = []
+    let cloneOf: List<Integer> = []
+    index = 0
+    while index < context.functionNames.length { cloneOf.add(-1); index = index + 1 }
+    audit.tokens = interruptAuditTokens(joinText(result))
+    audit.definitions = cloneDefinitions
+    audit.definitionOf = cloneOf
+    interruptAuditIndex(audit, true)
+    index = 0
+    while index < queue.length {
+        let symbol = queue[index]
+        audit.current = symbol
+        if cloneOf[symbol] < 0 { interruptAuditReject(audit, "missing IRQ clone") }
+        interruptAuditBody(audit, cloneDefinitions[cloneOf[symbol]], true)
+        index = index + 1
+    }
+    return result
+}
