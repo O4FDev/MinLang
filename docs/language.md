@@ -1802,8 +1802,11 @@ Compile this context with `--freestanding --kernel-target x86_64` or `arm64`.
 PIC vectors 32..47 and GIC IDs 16..1019 are accepted respectively. A handler
 takes one Integer and returns Nothing. Its complete direct call graph must use
 scalar, acyclic code: allocation, managed values, Float, blocking, locks,
-native calls, indirect calls, recursion and loops reject. Ordinary functions
-keep their ordinary behavior. This context proof is separate from hardware
+native calls, indirect calls, recursion and loops reject. A handler may read and
+acknowledge its device: fixed-width MMIO (`machine.read8` to `machine.write64`),
+x86 port I/O (`machine.in8` to `machine.out32`) and `machine.fence()` are allowed,
+because each is one access or barrier. Halting, waiting, pausing and changing the
+interrupt mask are not. Ordinary functions keep their ordinary behavior. This context proof is separate from hardware
 entry, register preservation and a physical stack bound.
 
 A rejection names the path from the handler to the unsafe operation:
@@ -1815,6 +1818,16 @@ error: interrupt context handles(42): linkChanged -> waitForLink -> sleepNanosec
 The check costs nothing at run time. Programs without interrupt handlers compile
 to the same LLVM IR as before, and a handler that only signals a flag compiles
 to one release store.
+
+```minyar
+use "machine" as machine
+
+interrupt function keyboard(vector: Integer) handles(33) {
+    let key = machine.in8(0x60)
+    machine.out8(0x20, 0x20)
+    if key != 0 { signalInterrupt(1) }
+}
+```
 
 `signalInterrupt(slot)` stores a coalescing flag; ordinary code consumes it with
 `takeInterrupt(slot)`. Slots are literal or module-constant Integers in 0..255.

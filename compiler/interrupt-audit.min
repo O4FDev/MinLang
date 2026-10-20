@@ -70,6 +70,40 @@ record InterruptAuditState {
     pending: Boolean
 }
 
+// Fixed-width MMIO, x86 port I/O and fences are compiler-owned machine
+// intrinsics: one volatile access or barrier each, with no allocation, call,
+// lock or wait. A handler may use them to read and acknowledge its device.
+// The library, name and exact signature select the lowering, so a user
+// function with another name or shape stays an unknown native.
+function interruptDeviceIntrinsic(context: CompilerContext, symbol: Integer): Boolean {
+    if symbol < 0 || symbol >= context.functionNames.length || context.symbolKinds[symbol] != 1 { return false }
+    if symbol >= context.syntax.symbolNodes.length { return false }
+    let declaration = context.syntax.symbolNodes[symbol]
+    if declaration < 0 || context.syntax.nodes[declaration].kind != 1 { return false }
+    let block = context.syntax.nodes[declaration].firstChild
+    while block >= 0 && context.syntax.nodes[block].kind != 100 { block = context.syntax.nodes[block].nextSibling }
+    if block < 0 { return false }
+    let statement = context.syntax.nodes[block].firstChild
+    if statement < 0 || context.syntax.nodes[statement].kind != 109 || context.syntax.nodes[statement].nextSibling >= 0 { return false }
+    let start = context.syntax.nodes[statement].start
+    if start < 0 || start + 1 >= context.tokenTexts.length { return false }
+    let library = context.tokenTexts[start + 1]
+    if library != "machine" && library != "machine_arm64" { return false }
+    let name = readableDeclarationName(context.functionNames[symbol])
+    let count = context.functionParameterCounts[symbol]
+    let offset = functionParameterOffset(context.functionParameterCounts, symbol)
+    let result = context.functionReturnTypes[symbol]
+    if name == "fence" { return count == 0 && result == 5 }
+    let reads = name == "read8" || name == "read16" || name == "read32" || name == "read64"
+    let inputs = name == "in8" || name == "in16" || name == "in32"
+    let writes = name == "write8" || name == "write16" || name == "write32" || name == "write64"
+    let outputs = name == "out8" || name == "out16" || name == "out32"
+    if (inputs || outputs) && compilerKernelTarget() != 1 { return false }
+    if reads || inputs { return count == 1 && result == 1 && context.functionParameterTypes[offset] == 1 }
+    if writes || outputs { return count == 2 && result == 5 && context.functionParameterTypes[offset] == 1 && context.functionParameterTypes[offset + 1] == 1 }
+    return false
+}
+
 function interruptCloneName(symbol: Integer): Text {
     return ".minyar.irq.body." + Text(symbol)
 }
@@ -808,8 +842,17 @@ function interruptAuditInstruction(audit: InterruptAuditState, frame: InterruptA
         cursor[0] = cursor[0] + 1
         if !cloned && width == 0 && assigned == "" && interruptAuditGuard(audit, cursor, callee) { return }
         let target = interruptAuditResolve(audit, callee, cloned)
-        if target < 0 || audit.definitionOf[target] < 0 { interruptAuditReject(audit, "external, runtime, intrinsic or indirect call " + callee) }
-        if cloned && audit.owners[target] < 0 { interruptAuditReject(audit, "call outside approved clone graph") }
+        // Device intrinsics stay calls to their compiler-generated definition.
+        let device = false
+        if target < 0 && cloned {
+            let original = interruptAuditResolve(audit, callee, false)
+            if interruptDeviceIntrinsic(audit.context, original) { target = original; device = true }
+        }
+        if !cloned && interruptDeviceIntrinsic(audit.context, target) { device = true }
+        if !device {
+            if target < 0 || audit.definitionOf[target] < 0 { interruptAuditReject(audit, "external, runtime, intrinsic or indirect call " + callee) }
+            if cloned && audit.owners[target] < 0 { interruptAuditReject(audit, "call outside approved clone graph") }
+        }
         if width != interruptAuditSourceWidth(audit.context.functionReturnTypes[target]) { interruptAuditReject(audit, "callee result signature mismatch") }
         interruptAuditExpect(audit, cursor, "(")
         let offset = functionParameterOffset(audit.context.functionParameterCounts, target)
@@ -822,9 +865,11 @@ function interruptAuditInstruction(audit: InterruptAuditState, frame: InterruptA
             parameter = parameter + 1
         }
         interruptAuditExpect(audit, cursor, ")")
-        frame.calls.add(target)
-        oldCallee = callee
-        newCallee = "@" + interruptCloneName(target)
+        if !device {
+            frame.calls.add(target)
+            oldCallee = callee
+            newCallee = "@" + interruptCloneName(target)
+        }
         result = width != 0
     } else { interruptAuditReject(audit, "forbidden or unknown LLVM instruction '" + opcode + "'") }
     }

@@ -241,7 +241,11 @@ The effects stage audits the complete final module, walks every reached typed
 source subtree and parses each reached LLVM definition. Its initial accepted
 set is scalar, acyclic code with fixed local storage and resolved direct calls.
 Managed values, Float, loops, recursion, indirect/native/runtime calls, mutable
-globals, failure paths and unknown instructions reject. Separate internal IRQ
+globals, failure paths and unknown instructions reject. The exception is the
+compiler's own device intrinsics: `machine` / `machine_arm64` read8..64,
+write8..64, x86 in8..32/out8..32 and fence, selected by library, name and exact
+signature. Calls to them stay calls to their generated one-instruction bodies
+and are not cloned or walked. Separate internal IRQ
 clones omit only proved compiler frame instrumentation; ordinary bodies remain
 intact. The clones are parsed and checked again before publication. This proves
 context properties, not a physical target stack bound or hardware entry ABI.
