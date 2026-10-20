@@ -142,6 +142,10 @@ def qemu_command(args):
                     "-device", "virtio-tablet-pci,disable-legacy=on"]
         if replay:
             command += ["-object", "rng-builtin,id=entropy", "-device", "virtio-rng-pci,rng=entropy,disable-legacy=on"]
+        elif getattr(args, "zero_entropy", False):
+            # A known device-written value (zeros) lets a guest prove real DMA.
+            command += ["-object", "rng-random,id=zero,filename=/dev/zero",
+                        "-device", "virtio-rng-pci,rng=zero,disable-legacy=on"]
         else:
             command += ["-device", "virtio-rng-pci,disable-legacy=on"]
     if args.action == "debug":
@@ -474,6 +478,7 @@ def main(argv=None):
             journal = part.add_mutually_exclusive_group()
             journal.add_argument("--record", type=Path, help="record a deterministic replay log of this run (arm64, one CPU)")
             journal.add_argument("--replay", type=Path, help="replay a recorded run exactly; with debug, GDB can step backwards")
+            part.add_argument("--zero-entropy", action="store_true", help="Arm64: back virtio-rng with /dev/zero so a guest can check device-written bytes")
             if action == "test":
                 part.add_argument("--expect", required=True, help="nonempty exact guest serial line required for success")
             if action == "debug":
