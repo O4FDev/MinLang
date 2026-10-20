@@ -47,3 +47,12 @@ _Bool minyar_uitest_selectionKept(MinyarText *value) { @autoreleasepool {
     NSTextView *editor = (NSTextView *)field.currentEditor;
     return editor && field.window.firstResponder == editor && NSEqualRanges(editor.selectedRange, NSMakeRange(1, 2));
 } }
+static _Bool spacingIn(NSView *view, long long points) {
+    if ([view isKindOfClass:NSStackView.class] && [(NSStackView *)view spacing] == points) return 1;
+    for (NSView *child in view.subviews) if (spacingIn(child, points)) return 1;
+    return 0;
+}
+_Bool minyar_uitest_hasSpacing(long long points) { @autoreleasepool {
+    for (NSWindow *window in NSApp.windows) if (spacingIn(window.contentView, points)) return 1;
+    return 0;
+} }

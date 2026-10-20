@@ -106,7 +106,7 @@ def check_ui(clang):
             run([ROOT / "minyar", profile, "--native-source", f"uitest={ROOT / 'tests/ui-macos-events.m'}", ROOT / "tests/ui-macos.min", "-o", binary], timeout=600)
             output = run([binary]).stdout
             assert output == "Declarative AppKit events, Unicode, 200 retained updates, rebuild and closure verified\n"
-            for mode, expected in [("invalid", "control keys must be unique"), ("disposed", "has been disposed"), ("multiple", "dispose the current declarative window")]:
+            for mode, expected in [("invalid", "control keys must be unique"), ("disposed", "has been disposed"), ("multiple", "dispose the current declarative window"), ("spacing-type", "wrong object type"), ("spacing-negative", "dimensions must be"), ("spacing-large", "dimensions must be")]:
                 assert expected in run([binary, mode], status=1).stderr
         # Exercise the actual gallery entry and project demo's bounded launch.
         binary = Path(directory) / "harbour"

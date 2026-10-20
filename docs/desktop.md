@@ -43,12 +43,13 @@ empty Text for a valid description, or a readable problem. A tree may contain
 at most 1,024 view occurrences and 64 levels. The renderer validates before
 changing the existing native content.
 
-`app.update` preserves controls when kinds, keys, ordered child structure and
-spacing stay the same. An input whose text is unchanged keeps its keyboard
+`app.update` preserves controls when kinds, keys and ordered child structure
+stay the same. An input whose text is unchanged keeps its keyboard
 focus and selection. It sets changed text and checkbox values in place;
 application state remains in your own records.
-Changing structure or spacing rebuilds all content and ends the previous
-control handles. Padding changes on containers update in place. This first
+Changing structure rebuilds all content and ends the previous control handles.
+Spacing and padding changes on containers update in place. The low-level
+`macos.spacing(stack, points)` also updates existing rows or columns. This first
 renderer does not yet reconcile moved controls across structural changes.
 
 An edited input delivers `CHANGE`, its key through `eventKey`, and a copied

@@ -809,6 +809,9 @@ void minyar_macos_padding(long long handle, long long points) { @autoreleasepool
     NSStackView *s = object(handle, NSStackView.class); dimension(points); s.edgeInsets = NSEdgeInsetsMake(points,points,points,points);
     refill(s);
 } }
+void minyar_macos_spacing(long long handle, long long points) { @autoreleasepool {
+    NSStackView *s = object(handle, NSStackView.class); dimension(points); s.spacing = points;
+} }
 long long minyar_macos_label(long long parent, const MinyarText *text) { @autoreleasepool {
     ready(); NSTextField *v = [MNLabel labelWithString:string(text)]; v.selectable = YES; return append(parent,v);
 } }
