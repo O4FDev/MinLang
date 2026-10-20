@@ -20,11 +20,14 @@ if sys.platform != "linux":
 parser = argparse.ArgumentParser()
 parser.add_argument("--build", action="store_true", help="Build once on this remote box before measuring")
 parser.add_argument("--scope-owners", action="store_true", help="Compile this study with scope ownership lowering")
+parser.add_argument("--fixture", type=Path, default=Path("experiments/iteration-study/scalar.min"), metavar="PATH", help="Source fixture (custom fixtures require --output)")
 parser.add_argument("--output", type=Path, metavar="DIR", help="Artifact directory (default: build/iteration-study, or build/iteration-study-scope with --scope-owners)")
 args = parser.parse_args()
+if args.fixture != parser.get_default("fixture") and args.output is None:
+    parser.error("a custom --fixture needs --output to preserve earlier study artifacts")
 out = args.output if args.output is not None else Path("build/iteration-study-scope" if args.scope_owners else "build/iteration-study")
 out.mkdir(parents=True, exist_ok=True)
-source = Path("experiments/iteration-study/scalar.min")
+source = args.fixture
 shutil.copyfile(source, out / "source.min")
 commands = []
 
