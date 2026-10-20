@@ -345,6 +345,12 @@ each checksum and complete timing output. Timing is separate from correctness.
 
 ## Peer-derived tests and failure evidence
 
+The independent HTTP/2, gRPC, yamux and device reference peers build with
+`CGO_ENABLED=0`. Their protocol and fixture TLS paths use Go APIs, with explicit
+test certificate roots. This keeps the peers independent of the host C runtime
+while retaining the ordinary development resource limits. Changes to a cached
+peer build recipe force a fresh binary.
+
 `make check-peer-regressions` exercises checked-arithmetic traps, huge List
 indices, module aliases, terminal evaluation order, mixed-width Text access and
 growth with live aliases at O0/O2. It is included in `check-portable` and `check`.

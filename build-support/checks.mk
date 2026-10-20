@@ -898,8 +898,8 @@ check-transport-cancel: build/minyarc build/tooling/tests/transport-cancel-test
 check-transport-cancel-sanitize: build/minyarc build/tooling/tests/transport-cancel-test
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-cancel-test --sanitize
 
-build/yamux-peer: tests/interop/yamux/main.go tests/interop/yamux/go.mod tests/interop/yamux/go.sum | build
-	cd tests/interop/yamux && GOMAXPROCS=2 go build -mod=readonly -o "$(abspath $@)" .
+build/yamux-peer: tests/interop/yamux/main.go tests/interop/yamux/go.mod tests/interop/yamux/go.sum $(lastword $(MAKEFILE_LIST)) | build
+	cd tests/interop/yamux && CGO_ENABLED=0 GOMAXPROCS=2 go build -mod=readonly -o "$(abspath $@)" .
 
 # The ordinary and FIN-schedule runs share one compiled Minyar peer per recipe.
 check-transport-go: build/minyarc build/yamux-peer build/tooling/tests/transport-go-test | build
