@@ -168,6 +168,22 @@ POLICIES = {
         "field32(12, 10) describes bits 12..21. encode32 places 64 in that field and extract32 reads the same 64 back; the later replace32 result is not printed.",
         reason="A complete program using the ordinary device library's pure field arithmetic; it touches no register or host memory.",
     ),
+    "582a51f40dc2": contextual(
+        "Integer ranges in a nested pattern", "fragment",
+        "The first function and its Maybe<Integer> result are supplied by the surrounding guide text, not by this block.",
+    ),
+    "1e4b6c6f9b7a": contextual(
+        "Checking one case with is", "fragment",
+        "The shape value and the letters cursor are supplied by earlier examples, not by this block.",
+    ),
+    "4d17a8eeab22": standalone(
+        "Destructuring a record", "42\ndays\n",
+        "The positional pattern binds the fields in declaration order, so number is 42 and unit is days; each is printed on its own line.",
+    ),
+    "90016d90b0ed": standalone(
+        "A capability with a default method", "Hello, Ada\n",
+        "Visitor supplies name() and inherits the default greeting(), which prefixes Hello, ; greet calls it once for Ada.",
+    ),
     "c0407a26360b": contextual(
         "A match that produces a value", "fragment",
         "The Shape choice, its cases and the shape binding are supplied by the previous example, not by this block.",
