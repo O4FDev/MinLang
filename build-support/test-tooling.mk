@@ -30,7 +30,7 @@ build/tooling/tests/regressions.ll: $(MINYAR_NATIVE_EVIDENCE_SOURCES)
 build/tooling/tests/regressions.ll: tests/semantic-oracle.min
 
 build/tooling/%: build/tooling/%.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS)
-	$(LLVM_CC) $(LLVM_FLAGS) $< $(TOOL_RUNTIME) $(MINYAR_TOOL_NATIVE_OBJECTS) $(TOOL_NATIVE) -pthread -lm $(TOOL_LIBS) -o $@
+	"$(LLVM_CC)" $(LLVM_FLAGS) $< $(TOOL_RUNTIME) $(MINYAR_TOOL_NATIVE_OBJECTS) $(TOOL_NATIVE) -pthread -lm $(TOOL_LIBS) -o $@
 
 .PRECIOUS: build/tooling/%.ll
 
@@ -60,7 +60,7 @@ build/testing/cycle-runtime.c: runtime/minyar_runtime.c build/tooling/tools/buil
 	./build/tooling/tools/build-test-runtime $< $@
 
 build/testing/cycle-runtime.o: build/testing/cycle-runtime.c $(wildcard runtime/minyar_*.h)
-	$(LLVM_CC) -O2 -D_GNU_SOURCE -DMINYAR_SYSTEM_HEAP=1 -iquote runtime -c $< -o $@
+	"$(LLVM_CC)" -O2 -D_GNU_SOURCE -DMINYAR_SYSTEM_HEAP=1 -iquote runtime -c $< -o $@
 
 
 .PHONY: check-minyar-runner
@@ -68,8 +68,8 @@ check-minyar-runner: check-clang-cache build/tooling/tests/toolchain-cache build
 	$(LIMITED) ./build/tooling/tests/runner
 	$(LIMITED) ./build/tooling/tests/linux-runner "$(CURDIR)/build/tooling/scripts/check-linux"
 	$(LIMITED) ./build/tooling/tests/testing-inputs "$(CURDIR)/build/tooling/tests/testing-inputs"
-	$(SANITIZER_LIMITED) ./build/tooling/tests/test-clang "$(CURDIR)/build/tooling/tools/test-clang" "$(CURDIR)/build/tooling/tools/clang-cache" "$$(command -v $(LLVM_CC))" "$$(command -v ld.lld)"
-	$(SANITIZER_LIMITED) ./build/tooling/tests/toolchain-cache "$(CURDIR)" "$$(command -v $(LLVM_CC))" "$$(command -v clang++)" "$$(command -v ld.lld)"
+	$(SANITIZER_LIMITED) ./build/tooling/tests/test-clang "$(CURDIR)/build/tooling/tools/test-clang" "$(CURDIR)/build/tooling/tools/clang-cache" "$$(command -v "$(LLVM_CC)")" "$$(command -v ld.lld)"
+	$(SANITIZER_LIMITED) ./build/tooling/tests/toolchain-cache "$(CURDIR)" "$$(command -v "$(LLVM_CC)")" "$$(command -v clang++)" "$$(command -v ld.lld)"
 
 check: check-minyar-runner
 
@@ -92,10 +92,10 @@ check-clang-cache: build/tooling/tests/clang-cache build/tooling/tools/clang-cac
 check: check-clang-cache
 
 build/tooling/tools/clang-cache: build/tooling/tools/clang-cache.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c
-	$(LLVM_CC) $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@
+	"$(LLVM_CC)" $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@
 
 build/tooling/tests/mutation-score build/tooling/tests/mutation-score-harness: build/tooling/%: build/tooling/%.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c
-	$(LLVM_CC) $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@
+	"$(LLVM_CC)" $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@
 
 build/tooling/tests/maps-baseline: build/tooling/tests/maps-baseline.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c tests/maps-baseline-runtime.c
-	$(LLVM_CC) $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c tests/maps-baseline-runtime.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@
+	"$(LLVM_CC)" $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c tests/maps-baseline-runtime.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@
