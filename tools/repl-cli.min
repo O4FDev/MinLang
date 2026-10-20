@@ -88,8 +88,8 @@ function help() {
     Imports use quoted bundled package names, such as use "text" as text; paths,
     raw strings and interpolation are rejected. Compiler and library bytes are frozen
     for this session; changing them requires a restart. Records, globals, callbacks and threads
-    are not supported in this session. Avoid local bindings that shadow session values;
-    use explicit print arguments rather than interpolation of session values.
+    are not supported in this session. Avoid local bindings that shadow session values.
+    Text interpolation reads session values, including inside named functions.
     Compile errors leave accepted declarations and values available.
     Runtime failures and exit() end the session. Code images remain loaded until exit.
     :help   Show this help
@@ -107,7 +107,86 @@ function bindingNamed(bindings: List<Binding>, name: Text): Integer {
     for index in 0..bindings.length { if bindings[index].name == name { return index } }
     return -1
 }
-function rewrite(text: Text, bindings: List<Binding>): Rewritten {
+function literalAt(data: Bytes, index: Integer, value: Text): Boolean {
+    if index + value.byteLength > data.length { return false }
+    for offset in 0..value.byteLength { if data[index + offset] != Integer(value[offset]) { return false } }
+    return true
+}
+// The editor scanner keeps whole literals as tokens. Find their interpolation
+// boundaries without treating a nested string, character or comment as code.
+function literalEnd(data: Bytes, start: Integer, depth: Integer): Integer {
+    if depth > 128 { return -1 }
+    let raw = data[start] == 35
+    let quote = start
+    if raw { quote += 1 }
+    let triple = data[quote] == 34 && literalAt(data, quote, "\"\"\"")
+    let width = 1
+    if triple { width = 3 }
+    let index = quote + width
+    while index < data.length {
+        let closing = data[index] == data[quote]
+        if triple { closing = literalAt(data, index, "\"\"\"") }
+        if closing && (!raw || (index + width < data.length && data[index + width] == 35)) {
+            if raw { return index + width + 1 }
+            return index + width
+        }
+        if !raw && data[index] == 92 {
+            if data[quote] == 34 && index + 1 < data.length && data[index + 1] == 40 {
+                index = interpolationEnd(data, index + 2, depth + 1)
+                if index < 0 { return -1 }
+            } else { index += 2 }
+        } else { index += 1 }
+    }
+    return -1
+}
+function interpolationEnd(data: Bytes, start: Integer, depth: Integer): Integer {
+    if depth > 128 { return -1 }
+    let index = start
+    let round = 1
+    while index < data.length {
+        if data[index] == 34 || data[index] == 39 || literalAt(data, index, "#\"") {
+            index = literalEnd(data, index, depth)
+            if index < 0 { return -1 }
+        } else if literalAt(data, index, "//") {
+            while index < data.length && data[index] != 10 { index += 1 }
+        } else if literalAt(data, index, "/*") {
+            index += 2
+            while index < data.length && !literalAt(data, index, "*/") { index += 1 }
+            if index == data.length { return -1 }
+            index += 2
+        } else {
+            if data[index] == 40 { round += 1 }
+            if data[index] == 41 { round -= 1; if round == 0 { return index + 1 } }
+            index += 1
+        }
+    }
+    return -1
+}
+function rewriteLiteral(text: Text, bindings: List<Binding>, depth: Integer): Rewritten {
+    if !text.startsWith("\"") { return Rewritten { text: text; error: "" } }
+    let data = Bytes(text)
+    let parts: List<Text> = []
+    let start = 0
+    let index = 1
+    while index < data.length {
+        if data[index] == 92 && index + 1 < data.length {
+            if data[index + 1] == 40 {
+                let end = interpolationEnd(data, index + 2, depth)
+                if end < 0 { return Rewritten { text: ""; error: "cannot inspect this Text interpolation" } }
+                let expression = rewriteScoped(host.textSlice(text, index + 2, end - 1), bindings, depth + 1)
+                if expression.error != "" { return expression }
+                parts.add(host.textSlice(text, start, index + 2))
+                parts.add(expression.text)
+                start = end - 1
+                index = end
+            } else { index += 2 }
+        } else { index += 1 }
+    }
+    parts.add(host.textSlice(text, start, text.byteLength))
+    return Rewritten { text: joinText(parts); error: "" }
+}
+function rewriteScoped(text: Text, bindings: List<Binding>, depth: Integer): Rewritten {
+    if depth > 128 { return Rewritten { text: ""; error: "Text interpolation exceeds the session nesting limit" } }
     let parsed = editor.scan(text)
     if parsed.error != "" { return Rewritten { text: ""; error: parsed.error } }
     let significant = tokens(text)
@@ -116,6 +195,9 @@ function rewrite(text: Text, bindings: List<Binding>): Rewritten {
     if significant.length > 1 && significant[0].text == "public" && significant[1].text == "function" { header = true }
     for index in 0..significant.length {
         let token = significant[index]
+        if token.kind == 1 && token.text.startsWith("_repl_") {
+            return Rewritten { text: ""; error: "names beginning with _repl_ are reserved for session storage" }
+        }
         if token.kind == 4 && token.text == "{" { header = false }
         if header && index + 1 < significant.length && significant[index + 1].text == ":" { shadows.add(token.text) }
         if (token.text == "let" || token.text == "constant" || token.text == "for") && index + 1 < significant.length {
@@ -124,6 +206,8 @@ function rewrite(text: Text, bindings: List<Binding>): Rewritten {
             }
         }
     }
+    let visible: List<Binding> = []
+    for binding in bindings { if !host.listed(shadows, binding.name) { visible.add(binding) } }
     let parts: List<Text> = []
     let start = 0
     for index in 0..significant.length {
@@ -135,11 +219,18 @@ function rewrite(text: Text, bindings: List<Binding>): Rewritten {
             parts.add(host.textSlice(text, start, token.start))
             parts.add(bindings[binding].cell + "[0]")
             start = token.end
+        } else if token.kind == 3 {
+            let literal = rewriteLiteral(token.text, visible, depth)
+            if literal.error != "" { return literal }
+            parts.add(host.textSlice(text, start, token.start))
+            parts.add(literal.text)
+            start = token.end
         }
     }
     parts.add(host.textSlice(text, start, text.byteLength))
     return Rewritten { text: joinText(parts); error: "" }
 }
+function rewrite(text: Text, bindings: List<Binding>): Rewritten { return rewriteScoped(text, bindings, 0) }
 function inferred(expression: Text): Text {
     let values = tokens(expression)
     let index = 0

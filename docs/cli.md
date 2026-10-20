@@ -292,9 +292,11 @@ light()
 Literal bindings infer their type. Other initializers need an annotation, such
 as `let names: List<Text> = ["Ada", "Lin"]`. The first REPL slice supports
 bindings, named functions and actions. Type declarations, callbacks, managed
-threads, local bindings that shadow session values, and interpolation of session
-values require a source file. Native imports are limited to providers present
-in the REPL host. A runtime failure or `exit()` ends the session. `:reset` asks
+threads and local bindings that shadow session values require a source file.
+Text interpolation reads current session values, including in named functions
+and nested Text literals. Raw Text and escaped interpolation stay literal.
+Native imports are limited to providers present in the REPL host.
+A runtime failure or `exit()` ends the session. `:reset` asks
 you to restart it so native code and managed state are both cleared.
 Use `--release` for O2 submissions; the default is O0. Accepted code images and
 their persistent roots stay resident until the session exits.
