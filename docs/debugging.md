@@ -27,7 +27,9 @@ The default managed runtime supplies the layouts described below. Arena builds
 currently keep record and Map types opaque because their storage differs;
 Text, Bytes and List prefixes are shared. Native C-layout records and callable
 values are also opaque. Scalarized records are reconstructed from their existing
-field values or stack slots, exposing source fields without a runtime header.
+field values or stack slots as `minyar.value<Name>`, exposing source fields
+without a runtime header. The distinct name keeps debugger type merging from
+confusing these values with real record pointers.
 Closures describe their parameters and captured
 values; parallel workers describe their captures, loop bindings and locals.
 
