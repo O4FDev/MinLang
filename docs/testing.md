@@ -1083,3 +1083,12 @@ must bind to the runtime reporter; header-only C probes retain a weak no-op
 fallback. Existing semantic oracles use a strict trace-suffix projection;
 malformed frames and unrelated stderr are rejected. Cold counters and LLVM
 body comparisons are measured separately from functional success.
+
+`make check-simulation` checks deterministic choices and replay, asynchronous
+completion ordering, virtual clocks, explicit disk/network faults and crash
+durability at O0/O2 with ownership cleanup assertions. `check-simulation-neodb`
+runs pinned, unmodified neo-db WAL modules through simulated I/O and checks
+recovery against acknowledged records and torn tails. The fixtures record their
+upstream revision and hashes. `check-simulation-sanitize` adds ASan/UBSan to the
+compiler and generated programs. See [simulation](simulation.md) for the model's
+limits; this is explicit cooperative testing, not native thread exploration.

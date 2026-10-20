@@ -1,0 +1,735 @@
+// Write-ahead log: framing, preallocated segments, group commit bookkeeping, recovery reader.
+// See docs/STORAGE_API.md.
+//
+// Record: [u32 payloadLength][u32 crc32c(payload ++ lsn as 8 LE bytes)][u64 lsn][payload], little endian.
+// LSN = byte offset of the record header in the logical log stream. Segment files are
+// <dataDir>/wal-<16 lowercase hex start LSN>.log; records never span segments. A segment's data ends at the first
+// invalid record (zeros of a preallocated file, stale bytes of a recycled one, or a torn write); the next segment
+// continues the log only if it starts exactly at that LSN.
+//
+// Durability invariant: a segment named wal-X exists only once every byte below X is durable (rotate() waits for
+// the old segment's fdatasync before the new name appears). So a torn write can only be in the LAST segment, and a
+// reader that stops anywhere earlier has found corruption: openWriter then fails instead of deleting later data.
+//
+// Startup cost (round 2): the reader reads segments through a growing window (64 KiB .. 4 MiB) instead of whole
+// files, the writer creates its first segment lazily on the first flush (an idle or read-only database never
+// writes, creates or fsyncs anything), and nothing is zero-filled at open. A clean close (closeAfterCheckpoint)
+// removes every segment, so the next open reads no WAL at all.
+//
+// Preallocation: fdatasync after overwriting already-written blocks skips the file-size journal commit that an
+// append needs (measured ~3x lower latency on the dev box), so segments are prepared ahead of use:
+//   * recycled: full-size segments that a checkpoint made obsolete are renamed walprep-r<start>.tmp (preferred:
+//     no extra device writes);
+//   * zero-filled: only when the current segment is half full and nothing recycled is ready, walzero-<seq>.tmp is
+//     filled with zeros a slice per flush, fdatasynced in chunks by a second background syncer, then renamed
+//     walprep-z<seq>.tmp (ready).
+// Rotation renames a ready walprep file to the next wal-*.log name and fsyncs the directory. Stale records in a
+// recycled file can never pass validation because their LSN field does not match the new position.
+//
+// I/O failures are fatal (fail), like a Postgres PANIC: after a failed fdatasync nothing can be trusted.
+use "../../lib/dbio.min" as dbio
+use "./crc32c.min" as crc
+use "./util.min" as util
+
+public constant HEADER_BYTES = 16
+public constant MAX_PAYLOAD = 1073741824
+constant PREP_STEP = 524288          // zero bytes written per flush while preparing a segment
+constant PREP_SYNC_CHUNK = 2097152   // zeros are fdatasynced in chunks this big, so the background flush never
+                                     // queues a large burst on the device ahead of WAL commits
+constant WINDOW_MIN = 65536          // recovery reader: first pread of a segment
+constant WINDOW_MAX = 4194304        //   doubling up to this
+constant SCAN_STEP = 4194304         // tail scan for non-zero bytes
+
+public record Options {
+    segmentBytes: Integer            // rotate once a segment holds this much; files are preallocated a bit larger
+    preallocate: Boolean             // zero-fill the next segment in the background when nothing recycled is ready
+    recycleKeep: Integer             // ready walprep files kept for reuse (recycled or zero-filled)
+}
+
+public function defaultOptions(): Options {
+    return Options { segmentBytes: 33554432; preallocate: true; recycleKeep: 2 }
+}
+
+// ------------------------------------------------------------------ helpers
+
+public function hex16(value: Integer): Text { return util.hex16(value) }
+public function parseHex16(b: Bytes, offset: Integer): Integer { return util.parseHex16(b, offset) }
+
+public function segmentPath(dataDir: Text, start: Integer): Text {
+    return dataDir + "/wal-" + util.hex16(start) + ".log"
+}
+
+// Segment files among `names` sorted by start LSN (NamedLsn.lsn = start).
+function segmentsIn(dataDir: Text, names: List<Text>): List<util.NamedLsn> {
+    let segs: List<util.NamedLsn> = []
+    for name in names {
+        let start = util.matchHexName(name, "wal-", ".log")
+        if start >= 0 { segs.add(util.NamedLsn { lsn: start; path: dataDir + "/" + name }) }
+    }
+    util.sortByLsn(segs, false)
+    return segs
+}
+
+function listSegments(dataDir: Text): List<util.NamedLsn> {
+    return segmentsIn(dataDir, dbio.listDir(dataDir))
+}
+
+// ------------------------------------------------------------------ recovery reader
+
+public record WalReader {
+    private dir: Text
+    private table: crc.Table
+    private names: List<Text>      // the directory listing the reader worked from (openWriter reuses it)
+    private segs: List<util.NamedLsn>
+    private segIndex: Integer      // segment currently open, -1 if none
+    private fd: Integer            // its descriptor (-1 once the reader is done)
+    private fileSize: Integer
+    private buf: Bytes             // window of the file: buf[0] is file offset bufStart
+    private bufStart: Integer
+    private window: Integer        // size of the next pread (grows to WINDOW_MAX)
+    private pos: Integer           // file offset of the next record header
+    private recLsn: Integer
+    private recEnd: Integer
+    private payOff: Integer        // offset of the current payload in buf
+    private payLen: Integer
+    private done: Boolean
+    private reason: Text
+    private zeroStop: Boolean      // stopped at an all-zero header (a preallocated tail), not at garbage
+    private count: Integer
+    private endLsnValue: Integer   // after done: LSN where the valid log ends
+    private beyond: Boolean        // fromLsn lies past the end of the stored log: start a fresh segment there
+}
+
+public function openReader(dataDir: Text, fromLsn: Integer): WalReader {
+    return openReaderIn(dataDir, dbio.listDir(dataDir), fromLsn)
+}
+
+// Same as openReader, with a directory listing the caller already has (startup lists the directory once).
+public function openReaderIn(dataDir: Text, names: List<Text>, fromLsn: Integer): WalReader {
+    let segs = segmentsIn(dataDir, names)
+    let r = WalReader {
+        dir: dataDir; table: crc.makeTable(); names: names; segs: segs; segIndex: -1; fd: -1; fileSize: 0
+        buf: Bytes(); bufStart: 0; window: WINDOW_MIN; pos: 0; recLsn: 0; recEnd: fromLsn; payOff: 0; payLen: 0
+        done: false; reason: ""; zeroStop: false; count: 0; endLsnValue: fromLsn; beyond: false
+    }
+    if segs.length == 0 { return r }
+    if fromLsn < segs[0].lsn {
+        fail("storage: WAL gap: oldest segment starts at " + Text(segs[0].lsn) + " but recovery needs LSN " +
+             Text(fromLsn))
+    }
+    let i = 0
+    while i + 1 < segs.length && segs[i + 1].lsn <= fromLsn { i += 1 }
+    openSegment(r, i)
+    r.pos = fromLsn - segs[i].lsn
+    if r.pos > r.fileSize {
+        // The snapshot is newer than the stored log (should not happen when checkpoints sync the WAL first).
+        r.beyond = true
+    }
+    return r
+}
+
+function openSegment(r: WalReader, i: Integer) {
+    if r.fd >= 0 { dbio.close(r.fd) }
+    let path = r.segs[i].path
+    let fd = dbio.open(path, dbio.OPEN_READ)
+    if fd < 0 { util.storageFail("open " + path, fd) }
+    let size = dbio.fileSize(fd)
+    if size < 0 { util.storageFail("stat " + path, size) }
+    r.fd = fd
+    r.fileSize = size
+    r.segIndex = i
+    r.buf = Bytes()
+    r.bufStart = 0
+    r.pos = 0
+}
+
+// Make buf cover file bytes [from, from + need) of the current segment, as far as the file goes. Returns how many
+// of the `need` bytes are available (less at end of file).
+function cover(r: WalReader, from: Integer, need: Integer): Integer {
+    if from >= r.fileSize { return 0 }
+    let avail = min(need, r.fileSize - from)
+    if from >= r.bufStart && from + avail <= r.bufStart + r.buf.length { return avail }
+    let n = min(max(avail, r.window), r.fileSize - from)
+    let data = dbio.pread(r.fd, from, n)
+    let err = dbio.lastError()
+    if err < 0 { util.storageFail("read " + r.segs[r.segIndex].path, err) }
+    r.buf = data
+    r.bufStart = from
+    if r.window < WINDOW_MAX { r.window = r.window * 2 }
+    return min(avail, data.length)
+}
+
+function stopAt(r: WalReader, reason: Text, zero: Boolean): Boolean {
+    r.done = true
+    r.reason = reason
+    r.zeroStop = zero
+    if r.segIndex >= 0 && !r.beyond {
+        r.endLsnValue = r.segs[r.segIndex].lsn + r.pos
+    }
+    r.recEnd = r.endLsnValue
+    if r.fd >= 0 {
+        dbio.close(r.fd)
+        r.fd = -1
+    }
+    r.buf = Bytes()
+    return false
+}
+
+// The data of the current segment ends at pos: move to the next segment if it starts exactly there.
+function advance(r: WalReader): Boolean {
+    if r.segIndex + 1 >= r.segs.length { return false }
+    let nextSeg = r.segs[r.segIndex + 1]
+    if nextSeg.lsn != r.segs[r.segIndex].lsn + r.pos { return false }
+    openSegment(r, r.segIndex + 1)
+    return true
+}
+
+public function next(r: WalReader): Boolean {
+    if r.done { return false }
+    if r.segIndex < 0 || r.beyond { return stopAt(r, "end", true) }
+    while true {
+        let pos = r.pos
+        if cover(r, pos, HEADER_BYTES) < HEADER_BYTES {
+            if advance(r) { continue }
+            if pos == r.fileSize { return stopAt(r, "end", true) }
+            return stopAt(r, "torn", false)
+        }
+        let b = pos - r.bufStart
+        let len = r.buf.getUInt32(b)
+        let stored = r.buf.getUInt32(b + 4)
+        let lsn = r.buf.getInt64(b + 8)
+        let valid = lsn == r.segs[r.segIndex].lsn + pos && len <= MAX_PAYLOAD &&
+                    pos + HEADER_BYTES + len <= r.fileSize
+        if valid {
+            if cover(r, pos, HEADER_BYTES + len) < HEADER_BYTES + len {
+                valid = false
+            } else {
+                b = pos - r.bufStart
+                let c = crc.update(r.table, 0, r.buf, b + HEADER_BYTES, len)
+                c = crc.updateInt64(r.table, c, lsn)
+                valid = c == stored
+            }
+        }
+        if !valid {
+            let zero = len == 0 && stored == 0 && lsn == 0
+            if advance(r) { continue }
+            if zero { return stopAt(r, "end", true) }   // zero-filled tail
+            return stopAt(r, "torn", false)
+        }
+        r.recLsn = lsn
+        r.payOff = b + HEADER_BYTES
+        r.payLen = len
+        r.recEnd = lsn + HEADER_BYTES + len
+        r.pos = pos + HEADER_BYTES + len
+        r.count += 1
+        return true
+    }
+}
+
+public function lsn(r: WalReader): Integer { return r.recLsn }
+public function endLsn(r: WalReader): Integer { return r.recEnd }
+public function payload(r: WalReader): Bytes { return r.buf.slice(r.payOff, r.payOff + r.payLen) }
+public function buffer(r: WalReader): Bytes { return r.buf }
+public function payloadOffset(r: WalReader): Integer { return r.payOff }
+public function payloadLength(r: WalReader): Integer { return r.payLen }
+public function stopReason(r: WalReader): Text { return r.reason }
+public function recordsRead(r: WalReader): Integer { return r.count }
+
+// After next() == false: true if the log stopped before its last segment. By the durability invariant every
+// segment but the last was fully durable before its successor existed, so this is corruption or lost data, never a
+// torn write. openWriter refuses to continue in that case.
+public function corruptionDetected(r: WalReader): Boolean {
+    return r.done && r.segIndex >= 0 && r.segIndex < r.segs.length - 1
+}
+
+// ------------------------------------------------------------------ writer
+
+public record Wal {
+    private dir: Text
+    private table: crc.Table
+    private options: Options
+    private fd: Integer            // segment being written; -1 until the first flush creates it (lazy)
+    private segStart: Integer      // start LSN of the segment being written
+    private segPrealloc: Integer   // bytes of that file already allocated+written: writes below are overwrites
+    private buf: Bytes             // framed records not yet handed to write()
+    private written: Integer       // LSN up to which write() has completed
+    private durable: Integer       // LSN up to which fdatasync has completed
+    private requested: Integer     // highest LSN requested from the syncer
+    private syncer: Integer
+    private lastRecord: Integer
+    private recordStart: Integer   // beginRecord: offset in buf of the open record's header, -1 if none
+    private prepared: List<Text>   // ready walprep files (zero-filled or recycled), used in order
+    private pins: List<Integer>    // LSNs of snapshots still being served (snapshot.pin/release): never deleted
+    // background zero-filling of the next segment
+    private prepState: Integer     // 0 idle, 1 writing zeros (chunk-synced), 2 waiting for the final fdatasync
+    private prepSeq: Integer       // counter for walzero/walprep-z names (never reuses a name in the directory)
+    private prepFd: Integer
+    private prepTmp: Text
+    private prepFinal: Text
+    private prepWritten: Integer
+    private prepSize: Integer
+    private prepSyncer: Integer
+    private prepRequested: Integer // zeros requested to be synced so far
+    private zeros: Bytes
+    private rotations: Integer
+    private closed: Boolean
+    private verified: Integer      // LSN of the newest snapshot re-read and verified by retention (-1 none yet)
+}
+
+function prepSizeFor(o: Options): Integer {
+    return o.segmentBytes + max(4096, o.segmentBytes / 16)
+}
+
+// Tail check after recovery: is file[from, size) all zeros? (A preallocated tail is kept only then.)
+function tailIsZero(fd: Integer, path: Text, from: Integer, size: Integer): Boolean {
+    let at = from
+    while at < size {
+        let n = min(SCAN_STEP, size - at)
+        let data = dbio.pread(fd, at, n)
+        let err = dbio.lastError()
+        if err < 0 { util.storageFail("read " + path, err) }
+        if data.length != n { return false }
+        if dbio.firstNonZero(data, 0, n) >= 0 { return false }
+        at += n
+    }
+    return true
+}
+
+public function openWriter(dataDir: Text, r: WalReader, options: Options): Wal {
+    if !r.done { fail("storage: openWriter needs a reader that has reached the end of the log") }
+    if corruptionDetected(r) {
+        fail("storage: WAL corruption: the log stops at LSN " + Text(r.endLsnValue) + " (" + r.reason +
+             ") inside " + r.segs[r.segIndex].path + " but " + Text(r.segs.length - 1 - r.segIndex) +
+             " later segment(s) exist, starting with " + r.segs[r.segIndex + 1].path + ". Later segments only " +
+             "exist once this one was durable, so acknowledged data is missing or corrupt. Refusing to delete " +
+             "it; restore the data directory, or move the later segments away to accept the loss.")
+    }
+    let end = r.endLsnValue
+    let dirChanged = false
+    // Unfinished zero-fill files from a previous run are discarded; ready walprep files are reused.
+    let prepared: List<Text> = []
+    let seq = 0
+    for name in r.names {
+        let z = util.matchHexName(name, "walzero-", ".tmp")
+        if z >= 0 {
+            dbio.unlink(dataDir + "/" + name)
+            dirChanged = true
+            seq = max(seq, z + 1)
+        }
+        let pz = util.matchHexName(name, "walprep-z", ".tmp")
+        if pz >= 0 { seq = max(seq, pz + 1) }
+        if pz >= 0 || util.matchHexName(name, "walprep-r", ".tmp") >= 0 { prepared.add(dataDir + "/" + name) }
+    }
+    let fd = -1
+    let segStart = end
+    let segPrealloc = 0
+    if r.segIndex >= 0 && !r.beyond {
+        // r stopped in the last segment (checked above): it is the only one that can hold unsynced data.
+        let seg = r.segs[r.segIndex]
+        fd = dbio.open(seg.path, dbio.OPEN_WRITE)
+        if fd < 0 { util.storageFail("open " + seg.path, fd) }
+        let size = dbio.fileSize(fd)
+        let want = end - seg.lsn
+        segPrealloc = size
+        if size > want {
+            // Keep a preallocated tail only if it is all zeros; anything else (a torn record, stale recycled
+            // data, or records that followed a torn one) is cut so it can never be mistaken for new records.
+            let clean = r.zeroStop && tailIsZero(fd, seg.path, want, size)
+            if !clean {
+                let rc = dbio.ftruncate(fd, want)
+                if rc < 0 { util.storageFail("ftruncate " + seg.path, rc) }
+                segPrealloc = want
+            }
+        }
+        // Replayed records may still be only in the page cache (the previous process died before its fsync):
+        // make them durable before anything new is acknowledged. Nothing replayed: nothing to sync.
+        if r.count > 0 {
+            let rc = dbio.fdatasync(fd)
+            if rc < 0 { util.storageFail("fdatasync " + seg.path, rc) }
+        }
+        segStart = seg.lsn
+    }
+    if dirChanged {
+        let rc = dbio.fsyncDir(dataDir)
+        if rc < 0 { util.storageFail("fsync dir " + dataDir, rc) }
+    }
+    // The syncer (and its notification socket) exists from open to close. Without a segment yet it starts on a
+    // descriptor of the data directory; the first flush creates the segment and switches the syncer to it.
+    let h = 0
+    if fd >= 0 {
+        h = dbio.syncerStart(fd)
+    } else {
+        let dfd = dbio.open(dataDir, dbio.OPEN_READ)
+        if dfd < 0 { util.storageFail("open " + dataDir, dfd) }
+        h = dbio.syncerStart(dfd)
+        dbio.close(dfd)
+    }
+    if h < 0 { util.storageFail("start syncer", h) }
+    let w = Wal {
+        dir: dataDir; table: r.table; options: options; fd: fd; segStart: segStart; segPrealloc: segPrealloc
+        buf: Bytes(); written: end; durable: end; requested: end; syncer: h; lastRecord: end; recordStart: -1
+        prepared: prepared; pins: []; prepState: 0; prepSeq: seq; prepFd: -1; prepTmp: ""; prepFinal: ""; prepWritten: 0
+        prepSize: 0; prepSyncer: 0; prepRequested: 0; zeros: Bytes(); rotations: 0; closed: false; verified: -1
+    }
+    return w
+}
+
+// Remove segments that lie entirely below lsn (their successor starts at or before lsn); the newest segment is
+// never removed. Full-size ones are recycled as preallocated files (up to options.recycleKeep ready files), the
+// rest are deleted. Returns the number of segments removed. Only call it once a checkpoint whose recovery starts at
+// or after lsn is durable (snapshot.checkpoint/finishWal do this, keeping the previous snapshot's WAL).
+public function removeSegmentsBelow(w: Wal, lsn: Integer): Integer {
+    let segs = listSegments(w.dir)
+    let removed = 0
+    let i = 0
+    while i + 1 < segs.length {
+        if segs[i + 1].lsn <= lsn && segs[i].lsn != w.segStart {
+            if retire(w, segs[i], w.options.recycleKeep) { removed += 1 }
+        }
+        i += 1
+    }
+    if removed > 0 {
+        let rc = dbio.fsyncDir(w.dir)
+        if rc < 0 { util.storageFail("fsync dir " + w.dir, rc) }
+    }
+    if w.prepared.length > 0 { cancelPrep(w) }   // a recycled file is ready: no need to keep zero-filling
+    return removed
+}
+
+// Same as removeSegmentsBelow without the directory fsync (manifest slots, ADR-012): a removal lost in a crash
+// only brings back a segment that lies below the newest manifest's LSN, which recovery skips.
+public function retireSegmentsBelow(w: Wal, lsn: Integer): Integer {
+    let segs = listSegments(w.dir)
+    let removed = 0
+    let i = 0
+    while i + 1 < segs.length {
+        if segs[i + 1].lsn <= lsn && segs[i].lsn != w.segStart {
+            if retire(w, segs[i], w.options.recycleKeep) { removed += 1 }
+        }
+        i += 1
+    }
+    if w.prepared.length > 0 { cancelPrep(w) }
+    return removed
+}
+
+// Recycle (rename to walprep-r, while fewer than `keep` are ready) or delete one obsolete segment.
+function retire(w: Wal, seg: util.NamedLsn, keep: Integer): Boolean {
+    let path = seg.path
+    let rc = 0
+    if w.prepared.length < keep && dbio.pathSize(path) >= w.options.segmentBytes {
+        let target = w.dir + "/walprep-r" + util.hex16(seg.lsn) + ".tmp"
+        rc = dbio.rename(path, target)
+        if rc == 0 { w.prepared.add(target) }
+    } else {
+        rc = dbio.unlink(path)
+    }
+    if rc < 0 && rc != dbio.ENOENT { util.storageFail("remove " + path, rc) }
+    return true
+}
+
+// ---- background preparation of the next segment (bounded work per call) ----
+
+function startPrep(w: Wal) {
+    if w.prepState != 0 || !w.options.preallocate || w.closed { return }
+    let seq = w.prepSeq
+    w.prepSeq += 1
+    w.prepTmp = w.dir + "/walzero-" + util.hex16(seq) + ".tmp"
+    w.prepFinal = w.dir + "/walprep-z" + util.hex16(seq) + ".tmp"
+    let fd = dbio.open(w.prepTmp, dbio.OPEN_WRITE | dbio.OPEN_CREATE | dbio.OPEN_TRUNCATE)
+    if fd < 0 { util.storageFail("create " + w.prepTmp, fd) }
+    if w.zeros.length == 0 { w.zeros = Bytes(PREP_STEP) }
+    let h = dbio.syncerStart(fd)     // fdatasyncs the zeros on a background thread, chunk by chunk
+    if h < 0 { util.storageFail("start prep syncer", h) }
+    w.prepFd = fd
+    w.prepSyncer = h
+    w.prepWritten = 0
+    w.prepRequested = 0
+    w.prepSize = prepSizeFor(w.options)
+    w.prepState = 1
+}
+
+// Zero-filling starts only when the WAL is actually busy: the current segment is half full and nothing recycled
+// is ready. Idle and lightly written databases never write zeros (round 1 zero-filled 34 MiB at every open).
+function maybeStartPrep(w: Wal) {
+    if w.prepState != 0 || w.prepared.length > 0 || w.fd < 0 { return }
+    if w.written - w.segStart >= w.options.segmentBytes / 2 { startPrep(w) }
+}
+
+function stepPrep(w: Wal) {
+    if w.prepState == 1 {
+        let err = dbio.syncerError(w.prepSyncer)
+        if err != 0 { util.storageFail("fdatasync " + w.prepTmp, err) }
+        // wait until the previous chunk is on disk before dirtying more pages
+        if dbio.syncerSyncedOffset(w.prepSyncer) < w.prepRequested { return }
+        let n = min(PREP_STEP, w.prepSize - w.prepWritten)
+        let rc = dbio.pwrite(w.prepFd, w.zeros, 0, n, w.prepWritten)
+        if rc < 0 { util.storageFail("write " + w.prepTmp, rc) }
+        w.prepWritten += n
+        if w.prepWritten - w.prepRequested >= PREP_SYNC_CHUNK || w.prepWritten >= w.prepSize {
+            dbio.syncerRequest(w.prepSyncer, w.prepWritten)
+            w.prepRequested = w.prepWritten
+        }
+        if w.prepWritten >= w.prepSize { w.prepState = 2 }
+    } else if w.prepState == 2 {
+        let err = dbio.syncerError(w.prepSyncer)
+        if err != 0 { util.storageFail("fdatasync " + w.prepTmp, err) }
+        if dbio.syncerSyncedOffset(w.prepSyncer) >= w.prepSize {
+            dbio.syncerStop(w.prepSyncer)
+            dbio.close(w.prepFd)
+            let rc = dbio.rename(w.prepTmp, w.prepFinal)
+            if rc < 0 { util.storageFail("rename " + w.prepTmp, rc) }
+            w.prepared.add(w.prepFinal)
+            w.prepFd = -1
+            w.prepSyncer = 0
+            w.prepState = 0
+            w.zeros = Bytes()
+        }
+    } else {
+        maybeStartPrep(w)
+    }
+}
+
+function cancelPrep(w: Wal) {
+    if w.prepState != 0 {
+        dbio.syncerStop(w.prepSyncer)
+        dbio.close(w.prepFd)
+        dbio.unlink(w.prepTmp)
+        w.prepFd = -1
+        w.prepSyncer = 0
+        w.prepState = 0
+        w.zeros = Bytes()
+    }
+}
+
+// ---- appending ----
+
+public function append(w: Wal, payload: Bytes): Integer {
+    return appendSlice(w, payload, 0, payload.length)
+}
+
+public function appendSlice(w: Wal, data: Bytes, offset: Integer, length: Integer): Integer {
+    if w.recordStart >= 0 { fail("storage: append while a beginRecord is open") }
+    if length > MAX_PAYLOAD { fail("storage: WAL record too large") }
+    if w.closed { fail("storage: append to a closed WAL") }
+    let lsn = w.written + w.buf.length
+    let c = crc.update(w.table, 0, data, offset, length)
+    c = crc.updateInt64(w.table, c, lsn)
+    let buf = w.buf
+    buf.addUInt32(length)
+    buf.addUInt32(c)
+    buf.addInt64(lsn)
+    if offset == 0 && length == data.length {
+        buf.addBytes(data)
+    } else {
+        buf.addBytes(data.slice(offset, offset + length))
+    }
+    w.lastRecord = lsn
+    return lsn + HEADER_BYTES + length
+}
+
+public function beginRecord(w: Wal): Bytes {
+    if w.recordStart >= 0 { fail("storage: beginRecord while another record is open") }
+    if w.closed { fail("storage: append to a closed WAL") }
+    let buf = w.buf
+    w.recordStart = buf.length
+    buf.addInt64(0)
+    buf.addInt64(0)
+    return buf
+}
+
+public function endRecord(w: Wal): Integer {
+    let start = w.recordStart
+    if start < 0 { fail("storage: endRecord without beginRecord") }
+    let buf = w.buf
+    let length = buf.length - start - HEADER_BYTES
+    if length > MAX_PAYLOAD { fail("storage: WAL record too large") }
+    let lsn = w.written + start
+    let c = crc.update(w.table, 0, buf, start + HEADER_BYTES, length)
+    c = crc.updateInt64(w.table, c, lsn)
+    buf.setUInt32(start, length)
+    buf.setUInt32(start + 4, c)
+    buf.setInt64(start + 8, lsn)
+    w.recordStart = -1
+    w.lastRecord = lsn
+    return lsn + HEADER_BYTES + length
+}
+
+public function appendedLsn(w: Wal): Integer { return w.written + w.buf.length }
+public function writtenLsn(w: Wal): Integer { return w.written }
+public function durableLsn(w: Wal): Integer { return w.durable }
+public function lastRecordLsn(w: Wal): Integer { return w.lastRecord }
+public function dataDir(w: Wal): Text { return w.dir }
+public function syncSocket(w: Wal): Integer { return dbio.syncerNotifyFd(w.syncer) }
+public function rotations(w: Wal): Integer { return w.rotations }
+public function preparedCount(w: Wal): Integer { return w.prepared.length }
+public function hasSegment(w: Wal): Boolean { return w.fd >= 0 }
+
+// Snapshot pins (used by snapshot.pin/release): checkpoint retention never deletes a pinned snapshot file.
+public function pinSnapshot(w: Wal, lsn: Integer) { w.pins.add(lsn) }
+public function unpinSnapshot(w: Wal, lsn: Integer) {
+    let rest: List<Integer> = []
+    let dropped = false
+    for p in w.pins {
+        if p == lsn && !dropped { dropped = true } else { rest.add(p) }
+    }
+    w.pins = rest
+}
+public function isSnapshotPinned(w: Wal, lsn: Integer): Boolean {
+    for p in w.pins {
+        if p == lsn { return true }
+    }
+    return false
+}
+// Retention records the newest snapshot it re-read and verified; a clean close trims the WAL only below that one.
+public function setVerifiedSnapshot(w: Wal, lsn: Integer) { w.verified = lsn }
+public function verifiedSnapshot(w: Wal): Integer { return w.verified }
+// True while the current segment is being written inside its preallocated region (fast fdatasync).
+public function inPreallocated(w: Wal): Boolean { return w.fd >= 0 && w.written - w.segStart < w.segPrealloc }
+
+function checkSyncer(w: Wal) {
+    let err = dbio.syncerError(w.syncer)
+    if err != 0 { util.storageFail("WAL fdatasync", err) }
+}
+
+// Opens the segment that starts at w.written: a ready walprep file renamed into place, or a new file. The name is
+// made durable (directory fsync) before any record in the file can be acknowledged.
+function openNewSegment(w: Wal): Integer {
+    let newPath = segmentPath(w.dir, w.written)
+    let nfd = -1
+    let prealloc = 0
+    // Use the first prepared file that still exists. A missing one (ENOENT) only costs preallocation, never data:
+    // skip it rather than stopping the server (seen at 05:12 during a bulk COPY).
+    while nfd < 0 && w.prepared.length > 0 {
+        let from = w.prepared[0]
+        let rest: List<Text> = []
+        for i in 1..w.prepared.length { rest.add(w.prepared[i]) }
+        w.prepared = rest
+        let rc = dbio.rename(from, newPath)
+        if rc == -2 { continue }
+        if rc < 0 { util.storageFail("rename " + from, rc) }
+        nfd = dbio.open(newPath, dbio.OPEN_WRITE)
+        if nfd < 0 { util.storageFail("open " + newPath, nfd) }
+        prealloc = dbio.fileSize(nfd)
+    }
+    if nfd < 0 {
+        nfd = dbio.open(newPath, dbio.OPEN_WRITE | dbio.OPEN_CREATE | dbio.OPEN_TRUNCATE)
+        if nfd < 0 { util.storageFail("create " + newPath, nfd) }
+    }
+    let rc = dbio.fsyncDir(w.dir)
+    if rc < 0 { util.storageFail("fsync dir " + w.dir, rc) }
+    rc = dbio.syncerSwitch(w.syncer, nfd, w.written)
+    if rc < 0 { util.storageFail("syncer switch", rc) }
+    if w.fd >= 0 { dbio.close(w.fd) }   // the syncer keeps its own duplicate until it has processed the switch
+    w.fd = nfd
+    w.segStart = w.written
+    w.segPrealloc = prealloc
+    return nfd
+}
+
+function rotate(w: Wal) {
+    // Durability invariant: the old segment must be durable before the new segment's name can appear. This is one
+    // blocking fdatasync wait per segment (32 MiB by default); recovery relies on it to tell a torn tail from
+    // corruption.
+    let s = dbio.syncerWait(w.syncer, w.written, -1)
+    if s < 0 { util.storageFail("WAL sync before rotation", s) }
+    if s > w.durable { w.durable = s }
+    if w.written > w.requested { w.requested = w.written }
+    openNewSegment(w)
+    w.rotations += 1
+}
+
+public function flush(w: Wal): Integer {
+    if w.recordStart >= 0 { fail("storage: flush while a beginRecord is open") }
+    let buf = w.buf
+    if buf.length > 0 {
+        if w.fd < 0 { openNewSegment(w) }   // first write since open: create the segment now (lazy)
+        let n = dbio.pwrite(w.fd, buf, 0, buf.length, w.written - w.segStart)
+        if n < 0 { util.storageFail("WAL write", n) }
+        w.written += n
+        buf.clear()
+        let pos = w.written - w.segStart
+        if pos >= w.options.segmentBytes {
+            rotate(w)
+        } else if pos >= w.segPrealloc && w.prepared.length > 0 {
+            rotate(w)      // leave a non-preallocated segment (fresh start, recovery) as soon as one is ready
+        }
+    }
+    stepPrep(w)
+    return w.written
+}
+
+public function requestSync(w: Wal): Integer {
+    flush(w)
+    checkSyncer(w)
+    if w.written > w.requested {
+        let rc = dbio.syncerRequest(w.syncer, w.written)
+        if rc < 0 { util.storageFail("syncer request", rc) }
+        w.requested = w.written
+    }
+    return w.requested
+}
+
+// Optional: advance background segment preparation when idle (e.g. from engine.tick).
+public function tick(w: Wal) {
+    if !w.closed { stepPrep(w) }
+}
+
+public function onSyncReadable(w: Wal): Integer {
+    dbio.syncerDrain(w.syncer)
+    checkSyncer(w)
+    let s = dbio.syncerSyncedOffset(w.syncer)
+    if s > w.durable { w.durable = s }
+    return w.durable
+}
+
+public function syncNow(w: Wal): Integer {
+    flush(w)
+    if w.written > w.durable {
+        let s = dbio.syncerWait(w.syncer, w.written, -1)
+        if s < 0 { util.storageFail("WAL sync", s) }
+        if w.written > w.requested { w.requested = w.written }
+        if s > w.durable { w.durable = s }
+    }
+    return w.durable
+}
+
+public function close(w: Wal) {
+    if w.closed { return }
+    syncNow(w)
+    cancelPrep(w)
+    let rc = dbio.syncerStop(w.syncer)
+    if rc < 0 { util.storageFail("syncer stop", rc) }
+    if w.fd >= 0 { dbio.close(w.fd) }
+    w.fd = -1
+    w.closed = true
+}
+
+// Clean close after a checkpoint at `lsn` (== appendedLsn) is durable and verified: closes the WAL, then retires
+// every segment (they all lie below lsn), keeping at most `keep` ready walprep files for the next open. The data
+// directory is left with no WAL segment, so the next open reads no WAL (it starts a new segment at lsn lazily).
+public function closeAfterCheckpoint(w: Wal, lsn: Integer, keep: Integer) {
+    if appendedLsn(w) != lsn { fail("storage: closeAfterCheckpoint at " + Text(lsn) + " but the WAL ends at " + Text(appendedLsn(w))) }
+    close(w)
+    let changed = false
+    let k = min(keep, w.options.recycleKeep)
+    let kept: List<Text> = []
+    for p in w.prepared {
+        if kept.length < k {
+            kept.add(p)
+        } else {
+            dbio.unlink(p)
+            changed = true
+        }
+    }
+    w.prepared = kept
+    for seg in listSegments(w.dir) {
+        if seg.lsn <= lsn {
+            retire(w, seg, k)
+            changed = true
+        }
+    }
+    if changed {
+        let rc = dbio.fsyncDir(w.dir)
+        if rc < 0 { util.storageFail("fsync dir " + w.dir, rc) }
+    }
+}

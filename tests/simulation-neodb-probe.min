@@ -1,0 +1,254 @@
+use "simulation" as simulation
+use "./fixtures/neodb-simulation/lib/dbio.min" as dbio
+use "./fixtures/neodb-simulation/src/storage/wal.min" as wal
+
+function check(condition: Boolean, message: Text) { if !condition { fail("NeoDB simulation: " + message) } }
+function writer(directory: Text): wal.Wal {
+    dbio.mkdir(directory)
+    let reader = wal.openReader(directory, 0)
+    while wal.next(reader) {}
+    return wal.openWriter(directory, reader, wal.Options { segmentBytes: 64; preallocate: false; recycleKeep: 0 })
+}
+function recovered(directory: Text): List<Text> {
+    let reader = wal.openReader(directory, 0)
+    let result: List<Text> = []
+    while wal.next(reader) { result.add(Text(wal.payload(reader))) }
+    check(!wal.corruptionDetected(reader), "recovery must not skip a corrupt durable segment")
+    return result
+}
+function acknowledged() {
+    let world = simulation.create(17)
+    dbio.bind(world)
+    let log = writer("/db")
+    let end = wal.append(log, Bytes("ack"))
+    check(wal.syncNow(log) == end, "sync acknowledges the complete record")
+    wal.append(log, Bytes("buffered"))
+    dbio.crash()
+    let records = recovered("/db")
+    check(records.length == 1 && records[0] == "ack", "acknowledged data survives and an unflushed buffer is lost")
+    let again = writer("/db")
+    wal.append(again, Bytes("unsynced"))
+    wal.flush(again)
+    check(wal.durableLsn(again) == end, "a write alone acknowledges nothing")
+    dbio.crash()
+    records = recovered("/db")
+    check(records.length == 1 && records[0] == "ack", "flushed but unsynced bytes may disappear")
+}
+function tornTails() {
+    let payload = Bytes("tail payload")
+    let bytes = wal.HEADER_BYTES + payload.length
+    check(bytes == 28, "torn-tail coverage count")
+    for prefix in 0..bytes {
+        let world = simulation.create(prefix + 1)
+        dbio.bind(world)
+        let log = writer("/db")
+        let ack = wal.append(log, Bytes("ack"))
+        wal.syncNow(log)
+        wal.append(log, payload)
+        wal.flush(log)
+        let file = simulation.openFile(world, wal.segmentPath("/db", 0), false)
+        simulation.persistPrefix(world, file, ack + prefix)
+        dbio.crash()
+        let reader = wal.openReader("/db", 0)
+        check(wal.next(reader) && Text(wal.payload(reader)) == "ack", "prefix preserves acknowledged data")
+        check(!wal.next(reader), "every incomplete tail is rejected: " + Text(prefix))
+        check(wal.endLsn(reader) == ack && wal.recordsRead(reader) == 1, "tail never advances recovered LSN")
+        check(!wal.corruptionDetected(reader), "last-segment torn tail is repairable")
+        let reason = "torn"
+        if prefix == 0 { reason = "end" }
+        check(wal.stopReason(reader) == reason, "tail classification: " + Text(prefix))
+        let repaired = wal.openWriter("/db", reader, wal.Options { segmentBytes: 64; preallocate: false; recycleKeep: 0 })
+        check(dbio.pathSize(wal.segmentPath("/db", 0)) == ack, "writer cuts off incomplete tail")
+        wal.append(repaired, Bytes("next"))
+        wal.syncNow(repaired)
+        dbio.crash()
+        let records = recovered("/db")
+        check(records.length == 2 && records[0] == "ack" && records[1] == "next", "repair does not resurrect a torn record")
+    }
+    let world = simulation.create(29)
+    dbio.bind(world)
+    let log = writer("/db")
+    wal.append(log, Bytes("ack"))
+    wal.syncNow(log)
+    wal.append(log, payload)
+    wal.flush(log)
+    let file = simulation.openFile(world, wal.segmentPath("/db", 0), false)
+    simulation.persistPrefix(world, file, 19 + bytes)
+    dbio.crash()
+    let records = recovered("/db")
+    check(records.length == 2 && records[1] == "tail payload", "a complete unacknowledged record may survive")
+}
+function schedule(world: simulation.World, crashAfterOne: Boolean): Integer {
+    dbio.bind(world)
+    let left = writer("/left")
+    let right = writer("/right")
+    let leftEnd = wal.append(left, Bytes("left"))
+    let rightEnd = wal.append(right, Bytes("right"))
+    wal.requestSync(left)
+    wal.requestSync(right)
+    check(wal.durableLsn(left) == 0 && wal.durableLsn(right) == 0, "submitted sync is not an acknowledgement")
+    check(simulation.pendingCount(world) == 2, "both sync requests are queued")
+    let first = dbio.completeNext()
+    check(first == 1 || first == 2, "scheduler completes a real syncer")
+    let leftDurable = wal.onSyncReadable(left)
+    let rightDurable = wal.onSyncReadable(right)
+    if first == 1 { check(leftDurable == leftEnd && rightDurable == 0, "left completion acknowledges only left") }
+    else { check(leftDurable == 0 && rightDurable == rightEnd, "right completion acknowledges only right") }
+    if !crashAfterOne {
+        check(dbio.completeNext() == 3 - first, "other syncer finishes second")
+        check(wal.onSyncReadable(left) == leftEnd && wal.onSyncReadable(right) == rightEnd, "both completed records acknowledged")
+    }
+    dbio.crash()
+    check(simulation.pendingCount(world) == 0 && dbio.completeNext() == 0, "crash invalidates queued completions")
+    let leftRecords = recovered("/left")
+    let rightRecords = recovered("/right")
+    let leftCount = 1
+    let rightCount = 1
+    if crashAfterOne && first == 1 { rightCount = 0 }
+    if crashAfterOne && first == 2 { leftCount = 0 }
+    check(leftRecords.length == leftCount && rightRecords.length == rightCount, "only completed syncs are required to survive")
+    if leftCount == 1 { check(leftRecords[0] == "left", "left acknowledged payload survives") }
+    if rightCount == 1 { check(rightRecords[0] == "right", "right acknowledged payload survives") }
+    return first
+}
+function schedules() {
+    let leftFirst = false
+    let rightFirst = false
+    for seed in 1..65 {
+        for stop in 0..2 {
+            let world = simulation.create(seed)
+            let first = schedule(world, stop == 0)
+            if first == 1 { leftFirst = true } else { rightFirst = true }
+            let decisions = simulation.choices(world)
+            let expected = 2
+            if stop == 0 { expected = 1 }
+            check(decisions.length == expected && decisions[0].options == 2, "sync decisions record real competing completions")
+            let replay = simulation.replay(999, decisions)
+            check(schedule(replay, stop == 0) == first && simulation.finished(replay), "another seed replays the exact sync order and crash result")
+        }
+    }
+    check(leftFirst && rightFirst, "seed sweep exercises both completion orders")
+}
+function rotation() {
+    let world = simulation.create(91)
+    dbio.bind(world)
+    let log = writer("/db")
+    let end = 0
+    // Two 32-byte records per segment: each second write forces rotation.
+    for index in 0..128 {
+        let payload = Bytes(16)
+        payload.setInt64(0, index)
+        payload.setInt64(8, index ^ 0x55)
+        end = wal.append(log, payload)
+        wal.requestSync(log)
+        while simulation.pendingCount(world) > 0 { dbio.completeNext() }
+        check(wal.onSyncReadable(log) == end, "rotation acknowledges contiguous complete records")
+    }
+    check(wal.rotations(log) == 64 && end == 4096, "tiny segments force 64 durable rotations")
+    dbio.crash()
+    let reader = wal.openReader("/db", 0)
+    let index = 0
+    while wal.next(reader) {
+        let payload = wal.payload(reader)
+        check(payload.length == 16 && payload.getInt64(0) == index && payload.getInt64(8) == (index ^ 0x55),
+            "all acknowledged payloads survive across segments")
+        check(wal.lsn(reader) == index * 32, "record LSN stays contiguous across rotations")
+        index += 1
+    }
+    check(index == 128 && wal.endLsn(reader) == end && !wal.corruptionDetected(reader), "recovery retains every acknowledged segment")
+}
+
+function adapterControls() {
+    let world = simulation.create(19)
+    dbio.bind(world)
+    dbio.mkdir("/adapter")
+    let first = dbio.open("/adapter/first", dbio.OPEN_CREATE | dbio.OPEN_WRITE)
+    let second = dbio.open("/adapter/second", dbio.OPEN_CREATE | dbio.OPEN_WRITE)
+    dbio.fsyncDir("/adapter")
+    check(dbio.write(first, Bytes("one"), 0, 3) == 3, "adapter write uses descriptor offset")
+    let syncer = dbio.syncerStart(first)
+    check(dbio.syncerSwitch(syncer, second, 3) == 0, "switch durably finishes the previous file")
+    check(dbio.syncerSwitch(syncer, second, 2) == -22, "switch boundary cannot regress")
+    check(dbio.write(second, Bytes("two"), 0, 3) == 3, "next segment is written")
+    dbio.syncerRequest(syncer, 6)
+    dbio.close(second)
+    check(dbio.syncerStop(syncer) == 0, "stop finishes requests and retains its duplicated identity")
+    dbio.crash()
+    let fd = dbio.open("/adapter/first", dbio.OPEN_READ)
+    check(Text(dbio.pread(fd, 0, 3)) == "one", "switch retained previous file bytes")
+    fd = dbio.open("/adapter/second", dbio.OPEN_READ)
+    check(Text(dbio.pread(fd, 0, 3)) == "two", "stop retained requested bytes after descriptor close")
+
+    // The first failure is sticky even if a later queued operation succeeds.
+    // The physical sync may persist bytes; no offset after failure is promised.
+    // Both completions are driven through simulation's real scheduler.
+    let failedWorld = simulation.create(21)
+    dbio.bind(failedWorld)
+    let failedFile = dbio.open("/sticky", dbio.OPEN_CREATE | dbio.OPEN_WRITE)
+    dbio.write(failedFile, Bytes("two"), 0, 3)
+    let failed = dbio.syncerStart(failedFile)
+    dbio.syncerRequest(failed, 1)
+    dbio.syncerRequest(failed, 3)
+    simulation.injectError(failedWorld, simulation.SYNC, -5)
+    dbio.completeNext()
+    check(dbio.syncerError(failed) == -5 && dbio.syncerSyncedOffset(failed) == 0, "failed sync acknowledges nothing")
+    dbio.completeNext()
+    check(dbio.syncerError(failed) == -5 && dbio.syncerSyncedOffset(failed) == 0, "later success cannot clear error or advance durability")
+    check(dbio.syncerWait(failed, 3, -1) == -5 && dbio.syncerStop(failed) == -5, "wait and stop preserve the sync failure")
+
+    for mode in 0..2 {
+        let canceledWorld = simulation.create(41 + mode)
+        dbio.bind(canceledWorld)
+        let canceledFile = dbio.open("/canceled", dbio.OPEN_CREATE | dbio.OPEN_WRITE)
+        dbio.write(canceledFile, Bytes("pending"), 0, 7)
+        let canceled = dbio.syncerStart(canceledFile)
+        dbio.syncerRequest(canceled, 7)
+        if mode == 0 { check(simulation.cancel(canceledWorld, 1), "external cancellation removes the first submitted sync") }
+        else { simulation.crash(canceledWorld) }
+        check(simulation.pendingCount(canceledWorld) == 0 && dbio.syncerSyncedOffset(canceled) == 0,
+            "missing completion never advances the promised offset")
+        check(dbio.syncerStop(canceled) == -125, "stop reports cancellation when a completion disappears")
+        check(dbio.syncerStop(canceled) == -9, "canceled stop still invalidates the handle")
+    }
+}
+function syncFailure() {
+    let world = simulation.create(31)
+    dbio.bind(world)
+    let log = writer("/db")
+    wal.append(log, Bytes("never acknowledged"))
+    wal.requestSync(log)
+    simulation.injectError(world, simulation.SYNC, -5)
+    dbio.completeNext()
+    check(wal.durableLsn(log) == 0, "failed sync has no WAL acknowledgement")
+    wal.onSyncReadable(log)
+    fail("NeoDB simulation: WAL ignored a failed fdatasync")
+}
+function corruption() {
+    let world = simulation.create(32)
+    dbio.bind(world)
+    let log = writer("/db")
+    wal.append(log, Bytes(48))
+    wal.syncNow(log)
+    check(wal.rotations(log) == 1, "corruption fixture has a later segment")
+    let fd = dbio.open(wal.segmentPath("/db", 0), dbio.OPEN_WRITE)
+    let invalid = Bytes(4)
+    invalid.setUInt32(0, 65)
+    dbio.pwrite(fd, invalid, 0, 4, 0)
+    dbio.fdatasync(fd)
+    dbio.crash()
+    let reader = wal.openReader("/db", 0)
+    check(!wal.next(reader) && wal.corruptionDetected(reader), "corrupt non-final segment must be identified")
+    wal.openWriter("/db", reader, wal.Options { segmentBytes: 64; preallocate: false; recycleKeep: 0 })
+    fail("NeoDB simulation: WAL deleted later durable segments after corruption")
+}
+function suite() {
+    acknowledged()
+    tornTails()
+    schedules()
+    rotation()
+    adapterControls()
+    print("NeoDB WAL: durable records, lost tails, 28 torn prefixes, 64 replayed schedules and 64 rotations verified")
+}
+
+// selected entry
+suite()

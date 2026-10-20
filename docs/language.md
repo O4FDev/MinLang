@@ -488,6 +488,11 @@ generator: `arc4random_buf` on macOS and the BSDs, `getrandom` on Linux,
 `BCryptGenRandom` on Windows and the processor's `RDRAND` instruction in
 freestanding programs.
 
+For reproducible system tests, import `simulation`. Its explicit I/O boundary
+provides seeded completion ordering, virtual time, disk and network faults,
+durable file/name models and replayable decisions. It performs no host I/O.
+See [deterministic simulation](simulation.md) for its contracts and costs.
+
 ## Memory lifetime
 
 Text, List, and record values are reclaimed automatically. Acyclic components

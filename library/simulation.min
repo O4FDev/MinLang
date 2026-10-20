@@ -1,0 +1,367 @@
+// Deterministic, single-owner I/O simulation. No host clock, disk, socket or
+// thread is used. Applications explicitly submit work and consume completions.
+public constant READ = 1
+public constant WRITE = 2
+public constant SYNC = 3
+public constant PACKET = 4
+public constant TIMER = 5
+constant MAX_FILE_BYTES = 16777216
+constant RANDOM_RANGE = 2147483646
+
+public record Decision { options: Integer; selected: Integer }
+record File { data: Bytes; durable: Bytes }
+record Name { path: Text; live: Integer; durable: Integer }
+record Fault { kind: Integer; code: Integer }
+record Link { channel: Integer; blocked: Boolean }
+record Pending {
+    id: Integer
+    token: Integer
+    kind: Integer
+    target: Integer
+    position: Integer
+    length: Integer
+    data: Bytes
+    at: Integer
+}
+public record Completion {
+    id: Integer
+    token: Integer
+    kind: Integer
+    target: Integer
+    result: Integer
+    data: Bytes
+    at: Integer
+}
+public record World {
+    private random: Integer
+    private time: Integer
+    private wallOffset: Integer
+    private history: List<Decision>
+    private script: List<Decision>
+    private replaying: Boolean
+    private cursor: Integer
+    private files: List<File>
+    private names: List<Name>
+    private faults: List<Fault>
+    private links: List<Link>
+    private pending: List<Pending>
+    private nextId: Integer
+    private error: Integer
+    private log: List<Text>
+}
+
+public function create(seed: Integer): World {
+    let state = seed % 2147483647
+    if state < 0 { state += 2147483647 }
+    if state == 0 { state = 1 }
+    return World {
+        random: state; time: 0; wallOffset: 0; history: []; script: []
+        replaying: false; cursor: 0; files: []; names: []; faults: []; links: []
+        pending: []; nextId: 1; error: 0; log: []
+    }
+}
+
+// Copy both directions: a caller cannot change a recorded or replayed choice.
+public function choices(world: World): List<Decision> {
+    let result: List<Decision> = []
+    for item in world.history { result.add(Decision { options: item.options; selected: item.selected }) }
+    return result
+}
+public function replay(seed: Integer, script: List<Decision>): World {
+    let world = create(seed)
+    world.replaying = true
+    for item in script { world.script.add(Decision { options: item.options; selected: item.selected }) }
+    return world
+}
+public function finished(world: World): Boolean {
+    return !world.replaying || world.cursor == world.script.length
+}
+public function choose(world: World, options: Integer): Integer {
+    if options < 1 || options > RANDOM_RANGE { fail("simulation: choice count must be between 1 and 2147483646") }
+    let selected = 0
+    if world.replaying {
+        if world.cursor >= world.script.length { fail("simulation: replay ran out of decisions") }
+        let decision = world.script[world.cursor]
+        if decision.options != options || decision.selected < 0 || decision.selected >= options {
+            fail("simulation: replay decision does not match the available choices")
+        }
+        selected = decision.selected
+        world.cursor += 1
+    } else {
+        // Park-Miller uses bounded positive arithmetic. Reject the uneven tail
+        // instead of introducing modulo bias for counts that do not divide it.
+        let limit = RANDOM_RANGE - RANDOM_RANGE % options
+        while true {
+            world.random = world.random * 48271 % 2147483647
+            let value = world.random - 1
+            if value < limit { selected = value % options; break }
+        }
+    }
+    world.history.add(Decision { options: options; selected: selected })
+    world.log.add("choose " + Text(options) + " " + Text(selected))
+    return selected
+}
+public function transcript(world: World): List<Text> {
+    let result: List<Text> = []
+    for line in world.log { result.add(line) }
+    return result
+}
+public function now(world: World): Integer { return world.time }
+public function wallTime(world: World): Integer { return world.time + world.wallOffset }
+public function advance(world: World, milliseconds: Integer) {
+    if milliseconds < 0 { fail("simulation: monotonic time cannot move backwards") }
+    world.time += milliseconds
+    world.log.add("advance " + Text(milliseconds))
+}
+// Wall-clock faults never move monotonic deadlines.
+public function jumpClock(world: World, milliseconds: Integer) {
+    world.wallOffset += milliseconds
+    world.log.add("clock " + Text(milliseconds))
+}
+public function lastError(world: World): Integer { return world.error }
+
+// One-shot faults are consumed by the next matching operation, including an
+// asynchronous operation when it completes. Other kinds leave the fault armed.
+public function injectError(world: World, kind: Integer, code: Integer) {
+    if kind < READ || kind > PACKET || code >= 0 { fail("simulation: an I/O fault needs a valid operation and negative error code") }
+    world.faults.add(Fault { kind: kind; code: code })
+    world.log.add("fault " + Text(kind) + " " + Text(code))
+}
+function fault(world: World, kind: Integer): Integer {
+    let remaining: List<Fault> = []
+    let code = 0
+    for item in world.faults {
+        if code == 0 && item.kind == kind { code = item.code } else { remaining.add(item) }
+    }
+    world.faults = remaining
+    world.error = code
+    return code
+}
+function validFile(world: World, file: Integer): Boolean {
+    if file < 1 || file > world.files.length { world.error = -9; return false }
+    return true
+}
+function nameIndex(world: World, path: Text): Integer {
+    for index in 0..world.names.length { if world.names[index].path == path { return index } }
+    return -1
+}
+function ensureName(world: World, path: Text): Integer {
+    let found = nameIndex(world, path)
+    if found >= 0 { return found }
+    world.names.add(Name { path: path; live: 0; durable: 0 })
+    return world.names.length - 1
+}
+function parent(path: Text): Text {
+    let bytes = Bytes(path)
+    let at = bytes.length - 1
+    while at >= 0 {
+        if bytes[at] == 47 {
+            if at == 0 { return "/" }
+            return Text(bytes.slice(0, at))
+        }
+        at -= 1
+    }
+    return "."
+}
+function basename(path: Text): Text {
+    let bytes = Bytes(path)
+    let at = bytes.length - 1
+    while at >= 0 { if bytes[at] == 47 { return Text(bytes.slice(at + 1, bytes.length)) }; at -= 1 }
+    return path
+}
+
+// A file identity belongs to this World. It stays attached to the same inode
+// across rename/unlink. Discard application handles after crash, as on restart.
+// Paths are exact, lexical names; directory objects and path aliases are absent.
+public function openFile(world: World, path: Text, create: Boolean): Integer {
+    world.error = 0
+    let found = nameIndex(world, path)
+    if found >= 0 && world.names[found].live != 0 { return world.names[found].live }
+    if !create { world.error = -2; return -2 }
+    let index = ensureName(world, path)
+    world.files.add(File { data: Bytes(); durable: Bytes() })
+    let id = world.files.length
+    world.names[index].live = id
+    world.log.add("create " + path + " " + Text(id))
+    return id
+}
+public function size(world: World, file: Integer): Integer {
+    world.error = 0
+    if !validFile(world, file) { return world.error }
+    return world.files[file - 1].data.length
+}
+public function read(world: World, file: Integer, position: Integer, length: Integer): Bytes {
+    if fault(world, READ) < 0 { return Bytes() }
+    if !validFile(world, file) { return Bytes() }
+    if position < 0 || length < 0 { world.error = -22; return Bytes() }
+    let data = world.files[file - 1].data
+    if position >= data.length { return Bytes() }
+    let count = min(length, data.length - position)
+    world.log.add("read " + Text(file) + " " + Text(position) + " " + Text(count))
+    return data.slice(position, position + count)
+}
+public function write(world: World, file: Integer, position: Integer, data: Bytes): Integer {
+    if fault(world, WRITE) < 0 { return world.error }
+    if !validFile(world, file) { return world.error }
+    if position < 0 { world.error = -22; return world.error }
+    if position > MAX_FILE_BYTES || data.length > MAX_FILE_BYTES - position { world.error = -27; return world.error }
+    if data.length == 0 { return 0 }
+    let destination = world.files[file - 1].data
+    // Snapshot the source first: overlapping writes obey the submission bytes.
+    let source = data.slice(0, data.length)
+    if position + source.length > destination.length { destination.resize(position + source.length) }
+    for index in 0..source.length { destination[position + index] = source[index] }
+    world.log.add("write " + Text(file) + " " + Text(position) + " " + Text(source.length))
+    return source.length
+}
+public function resize(world: World, file: Integer, length: Integer): Integer {
+    if fault(world, WRITE) < 0 { return world.error }
+    if !validFile(world, file) { return world.error }
+    if length < 0 { world.error = -22; return world.error }
+    if length > MAX_FILE_BYTES { world.error = -27; return world.error }
+    world.files[file - 1].data.resize(length)
+    world.log.add("resize " + Text(file) + " " + Text(length))
+    return 0
+}
+public function syncFile(world: World, file: Integer): Integer {
+    if fault(world, SYNC) < 0 { return world.error }
+    if !validFile(world, file) { return world.error }
+    let contents = world.files[file - 1]
+    contents.durable = contents.data.slice(0, contents.data.length)
+    world.log.add("sync " + Text(file))
+    return 0
+}
+public function rename(world: World, from: Text, to: Text): Integer {
+    world.error = 0
+    let source = nameIndex(world, from)
+    if source < 0 || world.names[source].live == 0 { world.error = -2; return world.error }
+    if from == to { return 0 }
+    let destination = ensureName(world, to)
+    world.names[destination].live = world.names[source].live
+    world.names[source].live = 0
+    world.log.add("rename " + from + " " + to)
+    return 0
+}
+public function remove(world: World, path: Text): Integer {
+    world.error = 0
+    let index = nameIndex(world, path)
+    if index < 0 || world.names[index].live == 0 { world.error = -2; return world.error }
+    world.names[index].live = 0
+    world.log.add("remove " + path)
+    return 0
+}
+public function syncDirectory(world: World, directory: Text): Integer {
+    if fault(world, SYNC) < 0 { return world.error }
+    for item in world.names { if parent(item.path) == directory { item.durable = item.live } }
+    world.log.add("directory " + directory)
+    return 0
+}
+public function names(world: World, directory: Text): List<Text> {
+    let result: List<Text> = []
+    for item in world.names { if item.live != 0 && parent(item.path) == directory { result.add(basename(item.path)) } }
+    return result
+}
+
+// Explicit torn-write fault: preserve exactly this volatile file prefix on the
+// next crash. This may extend durable length, but never shrinks a durable file.
+// It is deliberately separate from sync: it proves no durability guarantee.
+public function persistPrefix(world: World, file: Integer, length: Integer) {
+    if !validFile(world, file) { fail("simulation: torn-write fault needs an open file") }
+    let contents = world.files[file - 1]
+    if length < 0 || length > contents.data.length { fail("simulation: torn-write prefix is outside the file") }
+    if length > contents.durable.length { contents.durable.resize(length) }
+    for index in 0..length { contents.durable[index] = contents.data[index] }
+    world.log.add("persist " + Text(file) + " " + Text(length))
+}
+public function crash(world: World) {
+    for item in world.files { item.data = item.durable.slice(0, item.durable.length) }
+    for item in world.names { item.live = item.durable }
+    world.pending = []
+    world.faults = []
+    world.error = 0
+    world.log.add("crash")
+}
+
+public function partition(world: World, channel: Integer, blocked: Boolean) {
+    world.log.add("partition " + Text(channel) + " " + Text(blocked))
+    for link in world.links { if link.channel == channel { link.blocked = blocked; return } }
+    world.links.add(Link { channel: channel; blocked: blocked })
+}
+function blocked(world: World, channel: Integer): Boolean {
+    for link in world.links { if link.channel == channel { return link.blocked } }
+    return false
+}
+function submit(world: World, kind: Integer, target: Integer, position: Integer, length: Integer,
+                data: Bytes, delay: Integer, token: Integer): Integer {
+    if delay < 0 { fail("simulation: an operation delay cannot be negative") }
+    let id = world.nextId
+    world.nextId += 1
+    world.pending.add(Pending {
+        id: id; token: token; kind: kind; target: target; position: position; length: length
+        data: data.slice(0, data.length); at: world.time + delay
+    })
+    world.log.add("submit " + Text(id) + " " + Text(kind) + " " + Text(token))
+    return id
+}
+public function submitRead(world: World, file: Integer, position: Integer, length: Integer, token: Integer): Integer {
+    return submit(world, READ, file, position, length, Bytes(), 0, token)
+}
+public function submitWrite(world: World, file: Integer, position: Integer, data: Bytes, token: Integer): Integer {
+    return submit(world, WRITE, file, position, data.length, data, 0, token)
+}
+public function submitSync(world: World, file: Integer, token: Integer): Integer {
+    return submit(world, SYNC, file, 0, 0, Bytes(), 0, token)
+}
+public function submitPacket(world: World, channel: Integer, data: Bytes, delay: Integer, token: Integer): Integer {
+    return submit(world, PACKET, channel, 0, data.length, data, delay, token)
+}
+public function submitTimer(world: World, delay: Integer, token: Integer): Integer {
+    return submit(world, TIMER, 0, 0, 0, Bytes(), delay, token)
+}
+public function pendingCount(world: World): Integer { return world.pending.length }
+function removePending(world: World, id: Integer): Boolean {
+    let remaining: List<Pending> = []
+    let found = false
+    for item in world.pending { if item.id == id { found = true } else { remaining.add(item) } }
+    world.pending = remaining
+    return found
+}
+public function cancel(world: World, id: Integer): Boolean {
+    let found = removePending(world, id)
+    world.log.add("cancel " + Text(id))
+    return found
+}
+// The earliest deadline runs first. Equal deadlines are chosen by the seed (or
+// replay script), including a single choice. A different choice count fails replay.
+// A read/sync observes writes completed before it, never merely submitted writes.
+public function next(world: World): Completion {
+    if world.pending.length == 0 { fail("simulation: no operation is pending") }
+    let earliest = world.pending[0].at
+    for item in world.pending { earliest = min(earliest, item.at) }
+    let ready: List<Integer> = []
+    for index in 0..world.pending.length { if world.pending[index].at == earliest { ready.add(index) } }
+    let index = ready[choose(world, ready.length)]
+    let operation = world.pending[index]
+    removePending(world, operation.id)
+    world.time = max(world.time, earliest)
+    let result = 0
+    let data = Bytes()
+    if operation.kind == READ {
+        data = read(world, operation.target, operation.position, operation.length)
+        result = data.length
+        if world.error < 0 { result = world.error }
+    } else if operation.kind == WRITE {
+        result = write(world, operation.target, operation.position, operation.data)
+    } else if operation.kind == SYNC {
+        result = syncFile(world, operation.target)
+    } else if operation.kind == PACKET {
+        result = fault(world, PACKET)
+        if result == 0 && blocked(world, operation.target) { result = -110 }
+        if result == 0 { data = operation.data; result = data.length }
+    }
+    world.log.add("complete " + Text(operation.id) + " " + Text(result) + " " + Text(world.time))
+    return Completion {
+        id: operation.id; token: operation.token; kind: operation.kind; target: operation.target
+        result: result; data: data; at: world.time
+    }
+}

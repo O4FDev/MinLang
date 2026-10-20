@@ -1,0 +1,48 @@
+use "io" as io
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "system" as system
+use "files" as files
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.compiler.compileTimeout = 120
+frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
+let root = test.resolvePath(".")
+let provenance = #"""
+    import hashlib, pathlib, sys
+    root = pathlib.Path(sys.argv[1])
+    expected = {
+        'wal.min': '1dc0de2a4cc00e6c6490686dd14b1b0f704142cf5baab5c497b8a8cc4be2635b',
+        'crc32c.min': '585a6697149eb7dd2ac828eb734dbc73841bcff4313fe23f44c4ae3c8f6514b1',
+        'util.min': 'db3a95e5e7b00dbdebed389a6afbc7fcd5a831984de00cb3aff5ef2ac458f04d',
+    }
+    for name, digest in expected.items():
+        actual = hashlib.sha256((root / 'src' / 'storage' / name).read_bytes()).hexdigest()
+        assert actual == digest, 'production NeoDB source changed: ' + name
+    print('NeoDB source pin verified')
+    """#
+let pin = test.run(["python3", "-c", provenance, root + "/tests/fixtures/neodb-simulation"],
+    system.environment(), "", frontend.compiler.directory + "/provenance", 10)
+test.require(pin, "verify byte-for-byte production NeoDB source hashes")
+test.check(pin.output == "NeoDB source pin verified\n" && pin.errorOutput == "", "source provenance oracle")
+// Local imports are relative to each generated case, not package names or
+// absolute paths. Keep the production directory shape in retained evidence.
+let destination = frontend.compiler.directory + "/fixtures/neodb-simulation"
+for directory in ["/fixtures", "/fixtures/neodb-simulation", "/fixtures/neodb-simulation/lib", "/fixtures/neodb-simulation/src", "/fixtures/neodb-simulation/src/storage"] {
+    test.check(files.makeDirectory(frontend.compiler.directory + directory) == 0, "create NeoDB fixture directory")
+}
+for path in ["lib/dbio.min", "src/storage/wal.min", "src/storage/crc32c.min", "src/storage/util.min"] {
+    io.writeBytesFile(destination + "/" + path, io.readBytesFile("tests/fixtures/neodb-simulation/" + path))
+}
+let source = io.readTextFile("tests/simulation-neodb-probe.min")
+fixtures.executes(frontend, source,
+    "NeoDB WAL: durable records, lost tails, 28 torn prefixes, 64 replayed schedules and 64 rotations verified\n",
+    ["-O0", "-O2"], 0, "", true)
+let syncFailure = test.replace(source, "// selected entry\nsuite()", "syncFailure()")
+fixtures.executes(frontend, syncFailure, "", ["-O0", "-O2"], 1,
+    "Minyar stopped: storage: WAL fdatasync: simulated I/O error (-5)\n", false)
+let corruption = test.replace(source, "// selected entry\nsuite()", "corruption()")
+fixtures.executes(frontend, corruption, "", ["-O0", "-O2"], 1,
+    "Minyar stopped: storage: WAL corruption: the log stops at LSN 0 (torn) inside /db/wal-0000000000000000.log but 1 later segment(s) exist, starting with /db/wal-0000000000000040.log. Later segments only exist once this one was durable, so acknowledged data is missing or corrupt. Refusing to delete it; restore the data directory, or move the later segments away to accept the loss.\n", false)
+test.removeTree(frontend.compiler.directory)
+print("Pinned production NeoDB WAL passed simulation and ownership at O0/O2")
