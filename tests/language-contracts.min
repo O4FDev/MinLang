@@ -56,7 +56,7 @@ function definitions(ir: Text): Integer {
 
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 let compiler = frontend.compiler
-fixtures.validate("LanguageContracts", ["boundaries", "nothing", "ownership", "names", "failures", "rejections", "release", "parallel", "incremental", "discovery", "gallery"])
+fixtures.validate("LanguageContracts", ["boundaries", "nothing", "ownership", "scope", "names", "failures", "rejections", "release", "parallel", "incremental", "discovery", "gallery"])
 
 // Every successful execution uses the exact ownership/debt oracle, including
 // release builds. Explicit contract failures use its exit-status exception.
@@ -385,6 +385,63 @@ if fixtures.selected("LanguageContracts", "release") {
                 test.require(observed, "literal path release execution")
                 test.check(observed.output == "42\n" && observed.errorOutput == "", "literal path enabled release contracts")
             }
+        }
+    }
+}
+
+if fixtures.selected("LanguageContracts", "scope") {
+    let source = #"""
+        type Done = Nothing
+        function decorate(value: Text, early: Boolean): Text
+            requires(Bytes(value).length > 0)
+            ensures(Bytes(result).length == value.length + 1)
+            ensures(result.length == value.length + 1) {
+            let owned = [Bytes(64)]
+            let pieces = [value + "!"]
+            if early { return pieces[0] }
+            return pieces[owned.length - 1]
+        }
+        function finish(result: Integer, values: List<Text>, early: Boolean): Done
+            requires(result == 42 && values.length == 0)
+            ensures(result == 42 && values.length == 1 && Bytes(values[0]).length == 3)
+            invariant(Bytes("inv").length == 3) {
+            let owned = [Bytes(64)]
+            values.add("ok" + "!")
+            if early { return }
+            print(owned.length)
+        }
+        function remember<Item>(values: List<Item>, value: Item): Done
+            requires(values.length == 0)
+            ensures(values.length == 1 && Bytes("generic").length == 7) {
+            let owned = [Bytes(64)]
+            values.add(value)
+        }
+        print(decorate("a" + "b", true))
+        print(decorate("c" + "d", false))
+        for early in [true, false] {
+            let values: List<Text> = []
+            finish(42, values, early)
+            print(values[0])
+        }
+        let numbers: List<Integer> = []
+        remember<Integer>(numbers, 42)
+        print(numbers[0])
+        print(numbers.length)
+        """#
+    for release in [false, true] {
+        let options = ["--scope-owners"]
+        if release { options.add("--release") }
+        executes(compiler, source, "ab!\ncd!\nok!\n1\nok!\n42\n1\n", options)
+        let path = compiler.directory + "/case" + Text(compiler.serial)
+        let llvm = io.readTextFile(path + ".ll")
+        test.check(test.contains(llvm, "call void @minyar_rc_scope_enter_v1("), "contract fixture did not lower scope ownership")
+        if release {
+            for omitted in ["minyar_contract_body_", "contract.failure|", "contract failed"] {
+                test.check(!test.contains(llvm, omitted), "scope release retained contract implementation " + omitted)
+            }
+        } else {
+            test.check(test.contains(llvm, "minyar_contract_body_"), "scope checked build lost contract body helpers")
+            test.check(test.contains(llvm, "contract.failure|"), "scope checked build lost contract checks")
         }
     }
 }

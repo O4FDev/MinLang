@@ -24,6 +24,7 @@ static _Noreturn void contract_exit(int status) {
 __attribute__((destructor)) static void check_memory_contract(void) {
     if (contract_explicit_exit) return;
     assert(rc_frames == NULL);
+    assert(rc_scopes == NULL);
 #ifdef MINYAR_BOUNDED_RC
     while (rc_pending_count) assert(minyar_rc_poll(MINYAR_RC_POLL_BUDGET) > 0);
 #else
