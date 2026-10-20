@@ -37,11 +37,42 @@ function invalidAccess(compiler: test.Compiler, declaration: Text, length: Integ
     }
 }
 
+function constructorReturns(compiler: test.Compiler, llvm: Text) {
+    for name in ["bytes_new", "list_new", "record_new", "record_new_scalar"] {
+        let parameters = "i64"
+        let arguments = "i64 %size"
+        if name == "list_new" { parameters = ""; arguments = "" }
+        let signature = "ptr @minyar_" + name + "(" + parameters + ")"
+        test.check(test.contains(llvm, "declare nonnull " + signature), "constructor return lacks nonnull: " + name)
+        // Compare the same observable call with and without the return promise.
+        for annotation in ["", "nonnull "] {
+            let source = "declare " + annotation + signature + "\ndefine i1 @constructor_can_return_null(i64 %size) {\n  %fresh = call ptr @minyar_" + name + "(" + arguments + ")\n  %isnull = icmp eq ptr %fresh, null\n  ret i1 %isnull\n}\n"
+            let prefix = compiler.directory + "/constructor-" + name
+            let input = prefix + ".ll"
+            let output = prefix + ".optimized.ll"
+            io.writeTextFile(input, source)
+            test.require(test.run([compiler.clang, "-O2", "-S", "-emit-llvm", "-Wno-override-module", input, "-o", output], system.environment(), "", prefix + ".optimize", 30), "optimize constructor return " + name)
+            let optimized = io.readTextFile(output)
+            let callRemains = false
+            for line in test.lines(optimized) {
+                if test.contains(line, "call ") && test.contains(line, "@minyar_" + name + "(") { callRemains = true }
+            }
+            test.check(callRemains, "nonnull removed observable constructor call " + name)
+            if annotation == "" {
+                test.check(test.contains(optimized, "icmp eq ptr") && !test.contains(optimized, "ret i1 false"), "nullable control lost comparison " + name)
+            } else {
+                test.check(!test.contains(optimized, "icmp eq ptr") && test.contains(optimized, "ret i1 false"), "nonnull did not remove impossible comparison " + name)
+            }
+        }
+    }
+}
+
 let compiler = test.compiler()
 test.check(processInfo.argumentCount() <= 1, "unexpected List access test selector")
 if processInfo.argumentCount() == 1 { test.check(processInfo.argument(0) == "ListAccess.test_inline_access_helpers_preserve_checked_fallback", "unknown List access test selector") }
 test.executes(compiler, "let values = [42]\nvalues[0] = 42\nprint(values[0])\nprint(values.length)\n", "42\n1\n")
 let llvm = generated(compiler)
+constructorReturns(compiler, llvm)
 for expected in ["define internal i64 @.minyar.list.get.checked", "define internal void @.minyar.list.set.scalar.checked", "define internal i64 @.minyar.list.length", "%get.valid = icmp ult i64 %position, %length", "%set.valid = icmp ult i64 %position, %length", "%fallback = call i64 @minyar_list_get(ptr %list, i64 %position)\n  ret i64 %fallback", "call void @minyar_list_set(ptr %list, i64 %position, i64 %value)\n  ret void"] {
     test.check(test.contains(llvm, expected), "missing checked List helper IR: " + expected)
 }

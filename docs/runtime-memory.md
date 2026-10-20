@@ -386,6 +386,12 @@ two-Integer record requests 32 bytes including the ownership prefix. Generated
 LLVM accesses managed records through runtime calls, while scalar-replaced
 records use captured values.
 
+The ordinary Bytes, List and record allocation entry points declare non-null
+header returns in LLVM, including empty objects. Invalid sizes and allocation
+failure terminate before returning. The guarantee covers the returned header;
+an empty List can still have a null values buffer. It adds no pointer-argument
+alias promise or allocation-success guarantee.
+
 Records with reference fields have a byte per field identifying owned references.
 Scalar-only records omit that map. Cleanup releases only initialized reference
 fields, so integer bits are never mistaken for pointers. Container insertion
