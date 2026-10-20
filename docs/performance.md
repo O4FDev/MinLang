@@ -161,6 +161,18 @@ continuous and unscaled. These fresh matching controls share one output
 filename. Full observations and identities are in
 [`frames-cell-reuse.json`](../experiments/memory/frames-cell-reuse.json).
 
+Coalescing temporary borrows into their retaining record/List publishers reduced
+eager instructions from 2,360,820,539 to 2,359,982,089, a further 0.03552%.
+Matching arena counts were 1,188,647,852 and 1,188,647,453; candidate eager is
+1.9854 times arena. Both same-source 728-function modules have zero legacy
+calls/fallbacks. All actual publisher calls remain identical; 64 direct retains
+and 64 temporary releases disappear, while 32 exit polls are added. Physical
+cells, slot GEPs and entry null stores each fall from 2,618 to 2,613. All 32
+outputs match the frozen original LLVM, with continuous unscaled counters and
+one shared output filename. The 1.2 times arena target remains unmet. Full
+observations and identities are in
+[`frames-publish-borrows.json`](../experiments/memory/frames-publish-borrows.json).
+
 [`frames-instructions.py`](../experiments/memory/frames-instructions.py) measures
 Linux x86_64 user-space hardware instructions through `perf_event_open`. It
 attaches to a stopped child, enables at exec, excludes the Python parent and
