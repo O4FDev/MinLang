@@ -12,14 +12,18 @@ check-scope-ownership: $(SCOPE_LAUNCHER_ARTIFACTS) build/tooling/tests/scope-own
 check-scope-ownership-sanitize: $(SCOPE_LAUNCHER_ARTIFACTS) build/minyarc-sanitize build/tooling/tests/scope-ownership
 	+MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/scope-ownership
 
+# Emitting scope-owner code for the whole compiler needs about 768 MiB of address space,
+# leaving no headroom under the 768 MiB unit-test cap; reducing it is tracked work.
+SCOPE_SELF_COMPILE_LIMITED = MINYAR_MAX_MEMORY_MIB=1024 $(LIMITED)
+
 build/scope-compiler-stage2.ll: build/compiler.min build/minyarc
-	$(LIMITED) ./build/minyarc $< $@ --library library --scope-owners
+	$(SCOPE_SELF_COMPILE_LIMITED) ./build/minyarc $< $@ --library library --scope-owners
 
 build/scope-compiler: build/scope-compiler-stage2.ll build/minyar-compiler-runtime.ll
 	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 build/scope-compiler-stage3.ll: build/compiler.min build/scope-compiler
-	$(LIMITED) ./build/scope-compiler $< $@ --library library --scope-owners
+	$(SCOPE_SELF_COMPILE_LIMITED) ./build/scope-compiler $< $@ --library library --scope-owners
 
 check-scope-fixed-point: build/scope-compiler-stage2.ll build/scope-compiler-stage3.ll
 	cmp build/scope-compiler-stage2.ll build/scope-compiler-stage3.ll
