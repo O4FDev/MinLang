@@ -17,12 +17,42 @@ static uint32_t next_random(void) {
     return random_state;
 }
 
+static void check_native_text(void) {
+    static const unsigned char sample[] = {'A', 'd', 'a', 0, 's', 'e', 'a'};
+    struct {
+        unsigned char before[8];
+        char text[16];
+        unsigned char after[8];
+    } buffer;
+    for (size_t length = 0; length <= sizeof(sample); length++) {
+        MinyarText text = {sample, (long long)length, (long long)length, NULL, NULL};
+        minyar_native_text(&text, NULL, 0);
+        for (size_t capacity = 0; capacity <= sizeof(buffer.text); capacity++) {
+            memset(&buffer, 0xa5, sizeof(buffer));
+            minyar_native_text(&text, buffer.text, capacity);
+            size_t copied = length;
+            if (capacity && copied >= capacity) copied = capacity - 1;
+            for (size_t i = 0; i < sizeof(buffer.text); i++) {
+                unsigned char expected = 0xa5;
+                if (capacity && i < copied) expected = sample[i];
+                if (capacity && i == copied) expected = 0;
+                assert((unsigned char)buffer.text[i] == expected);
+            }
+            for (size_t i = 0; i < sizeof(buffer.before); i++) {
+                assert(buffer.before[i] == 0xa5 && buffer.after[i] == 0xa5);
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
     MinyarBytes *bytes = minyar_bytes_new(0);
     if (argc == 2 && !strcmp(argv[1], "negative")) {
         minyar_native_bytes_append(bytes, -1);
         return 0;
     }
+
+    check_native_text();
 
     /* Within capacity: no reallocation, the new bytes follow the old ones. */
     unsigned char *first = minyar_native_bytes_append(bytes, 32);

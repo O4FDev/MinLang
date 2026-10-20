@@ -57,8 +57,10 @@ static inline void minyar_native_stop(const char *message) {
     exit(1);
 }
 
-/* Copy Text into a caller-provided C string, truncating if necessary. */
+/* Copy Text bytes into a caller-provided C string, truncating if necessary.
+ * A zero capacity writes nothing and permits a null output pointer. */
 static inline void minyar_native_text(const MinyarText *text, char *out, size_t capacity) {
+    if (!capacity) return;
     size_t length = (size_t)text->byte_length;
     if (length >= capacity) length = capacity - 1;
     memcpy(out, text->bytes, length);

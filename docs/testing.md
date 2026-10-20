@@ -1585,3 +1585,10 @@ CRC recovery and snapshot publication at O0/O2 with ownership assertions.
 `check-completionio-neodb-sanitize` adds compiler/runtime/generated ASan/UBSan
 and a real-kernel C probe with leak detection. Both strict Linux targets are
 separate from portable checks; see [the integration contract](completion-io-neodb.md).
+
+`make check-native-bytes` also checks the native Text-to-C-string boundary:
+zero capacity writes nothing and permits a null destination; positive capacity
+keeps a terminating zero and copies at most capacity minus one bytes. Its
+136 length/capacity cases include empty input, embedded zero bytes, exact fits,
+truncation and unchanged destination guards. `check-native-bytes-sanitize`
+repeats these checks and the existing Bytes model with ASan/UBSan.

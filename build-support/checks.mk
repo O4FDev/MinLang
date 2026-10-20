@@ -833,15 +833,20 @@ check-half-float: | build
 check: check-half-float
 check-portable: check-half-float
 
-# The native header's inline Bytes append, linked with the program runtime.
-.PHONY: check-native-bytes
+# Native header Text copying and inline Bytes append, linked with the runtime.
+.PHONY: check-native-bytes check-native-bytes-sanitize
 check-native-bytes: build/minyar-runtime.o | build
 	$(LIMITED) "$(LLVM_CC)" -std=c11 -O2 -Wall -Wextra -Werror tests/native-bytes.c build/minyar-runtime.o -lm -o build/native-bytes
 	$(LIMITED) ./build/native-bytes
 	$(LIMITED) ./build/native-bytes negative 2>&1 | grep -q "Bytes cannot shrink by a negative amount"
 
+check-native-bytes-sanitize: build/minyar-runtime-sanitize.o | build
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -std=c11 -Wall -Wextra -Werror tests/native-bytes.c build/minyar-runtime-sanitize.o -lm -o build/native-bytes-sanitize
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 $(SANITIZER_LIMITED) ./build/native-bytes-sanitize
+
 check: check-native-bytes
 check-portable: check-native-bytes
+check-sanitize: check-native-bytes-sanitize
 
 
 .PHONY: check-module-test-driver check-build-wiring
