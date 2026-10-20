@@ -183,6 +183,26 @@ POLICIES = {
         "A capability with a default method", "Hello, Ada\n",
         "Visitor supplies name() and inherits the default greeting(), which prefixes Hello, ; greet calls it once for Ada.",
     ),
+    "a7aa06ffc448": standalone(
+        "Constant expressions", "",
+        "Only three module constants are declared; there are no print calls or executable statements.",
+        reason="A standalone declaration of compile-time Integer constants. Running it produces no output.",
+    ),
+    "02ac13e8c43d": standalone(
+        "An immutable Integer table", "",
+        "Constants and port() are declared, but port() is never called and nothing is printed.",
+        reason="A standalone declaration of a static table and its reader. Running it does not call port(), so it produces no output.",
+    ),
+    "f674bc0ec73a": standalone(
+        "Function contracts", "",
+        "share() is declared with requires/ensures clauses but never called, so no contract is checked and nothing is printed.",
+        reason="A standalone function declaration. Running it does not call share(), so it produces no output.",
+    ),
+    "c95319845a7b": standalone(
+        "A method contract with an invariant", "",
+        "Only the Lantern record and its method are declared; no Lantern is created and nothing is printed.",
+        reason="A standalone record and method declaration. Running it does not call share(), so it produces no output.",
+    ),
     "c0407a26360b": contextual(
         "A match that produces a value", "fragment",
         "The Shape choice, its cases and the shape binding are supplied by the previous example, not by this block.",
