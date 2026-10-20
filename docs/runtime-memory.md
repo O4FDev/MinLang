@@ -178,7 +178,12 @@ and the independent review.
 - `minyar_rc_step` releases completed expression owners. It does not scan the
   heap. Nested function calls have separate expression storage.
 - A reference return transfers its owned result, or retains a borrowed result
-  for the caller.
+  for the caller. A checked return of a local name, optionally parenthesized,
+  moves that local's ownership count to the caller: returning ends the binding's
+  lifetime on that path. Other aliases retain their counts. Readonly borrowed
+  parameters, fields and indexed values keep the borrowed-return rule; a mutable
+  parameter without an established local owner receives a retained count instead.
+  Recoverable compiler jobs keep the existing retain-and-cleanup path.
   `minyar_rc_leave` retires that function's expression and local owners; the
   incremental profiles can complete their reclamation at later service points.
 - Functions using only scalars and borrowed parameters can omit ownership frames. Local stack slots are

@@ -20,6 +20,12 @@ $(STACK_OWNERSHIP_BOUNDED) $(STACK_OWNERSHIP_FALLBACK): build/tooling/tests/stac
 
 check: check-ownership-policy check-stack-ownership
 
+.PHONY: check-last-use-returns
+check: check-last-use-returns
+check-last-use-returns: build/minyarc build/minyarc-sanitize build/tooling/tests/last-use-returns
+	$(LIMITED) ./build/tooling/tests/last-use-returns
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/last-use-returns
+
 check-smoke: build/minyarc build/minyar-runtime.o
 	$(LIMITED) sh tests/smoke.sh
 

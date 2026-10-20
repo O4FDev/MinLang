@@ -13,6 +13,12 @@ ordinary and cached-interface compilation; the duplicate discovery scanners
 have been removed. Header type checking and body emission still consume
 tokens, as do some ownership lookahead helpers.
 
+Reference returns inspect the completed typed expression. A direct local name,
+optionally wrapped in grouping nodes, is a last use on that return path and can
+transfer its local owner. Member, index, call and operator nodes retain their
+existing ownership rules. This proof needs no future-token scan and does not
+assume that the returned heap object has only one alias.
+
 Index ownership lookahead uses `callFreeIndexes`, a token-addressed Boolean
 column prepared in one linear pass. `syntaxIndexHasNoCalls` answers in constant
 time, including for nested brackets; the old `indexWithoutCalls` scanner has

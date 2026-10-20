@@ -552,6 +552,8 @@ use reference counting; cycle-capable record and List components use traced
 allocation selected by the compiler and launcher. No extra build option or
 memory-management syntax is required. Expression temporaries are released
 between statements; locals retain their values until reassignment or scope exit.
+Returning a local can transfer its existing ownership to the caller. This
+does not copy the value or change what other aliases observe.
 Aliases keep shared values alive.
 
 Recursive records support construction, sharing and mutation:

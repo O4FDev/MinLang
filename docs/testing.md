@@ -843,6 +843,13 @@ copy, owned join chains must keep one Text identity with geometric capacity,
 and shared join operands must take the copying fallback. The compiler test also
 asserts that only owned producer tokens select the consuming join entry point.
 
+`make check-last-use-returns` checks local-owner transfers using emitted LLVM
+and O0/O2 executions. Aliased records and Lists, grouped names, branches, loops,
+shadowing and parameter reassignment preserve their values and lifetimes.
+Fields, indexes, calls and readonly borrowed parameters keep their existing
+return paths. The sanitized run checks both the compiler and generated programs,
+with the ownership runtime asserting complete cleanup at normal exit.
+
 Diagnostic locations are captured at token start. The byte-exact corpus covers
 lexer, parser, type, encoding, and whole-program failures; every current golden
 diagnostic asserts both line and column, including duplicate declarations and

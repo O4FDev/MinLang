@@ -1,0 +1,244 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && test.contains(line, "@.minyar.fn." + name + "(") { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing last-use function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let raw = Bytes(source)
+    let pattern = Bytes(needle)
+    let found = 0
+    if raw.length < pattern.length { return 0 }
+    for start in 0..(raw.length - pattern.length + 1) {
+        let equal = true
+        for index in 0..pattern.length { if raw[start + index] != pattern[index] { equal = false; break } }
+        if equal { found += 1 }
+    }
+    return found
+}
+
+function checkMoves(ir: Text, name: Text, expected: Integer) {
+    test.check(count(body(ir, name), "call void @minyar_rc_local_move_owner(") == expected, name + ": local return owner transfers")
+}
+
+function checkRetains(ir: Text, name: Text, expected: Integer) {
+    test.check(count(body(ir, name), "call void @minyar_rc_retain(") == expected, name + ": borrowed return retains")
+}
+
+function checkDistinctMoves(ir: Text, name: Text) {
+    let slots: List<Text> = []
+    for line in test.lines(body(ir, name)) {
+        let marker = "call void @minyar_rc_local_move_owner(i64 "
+        let start = line.find(marker)
+        if start >= 0 {
+            let rest = line.slice(start + marker.length, line.length)
+            let end = rest.find(",")
+            test.check(end > 0, name + ": missing ownership slot")
+            slots.add(rest.slice(0, end))
+        }
+    }
+    test.check(slots.length == 2 && slots[0] != slots[1], name + ": distinct bindings must transfer distinct owner slots")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let source = #"""
+    record Parcel { label: Text; pages: List<Text> }
+    record Node { label: Text; children: List<Node> }
+
+    function directText(seed: Integer): Text {
+        let value = Text(seed) + "!"
+        return value
+    }
+    function directList(seed: Integer): List<Text> {
+        let values = [Text(seed) + "!"]
+        return values
+    }
+    function directRecord(seed: Integer): Parcel {
+        let parcel = Parcel { label: Text(seed) + "!"; pages: ["page" + "!"] }
+        return parcel
+    }
+    function directBytes(): Bytes {
+        let value = Bytes("bytes" + "!")
+        return value
+    }
+    function cycleRecord(): Node {
+        let children: List<Node> = []
+        let node = Node { label: "node" + "!"; children: children }
+        children.add(node)
+        return node
+    }
+    function cycleList(): List<Node> {
+        let children: List<Node> = []
+        let node = Node { label: "list" + "!"; children: children }
+        children.add(node)
+        return children
+    }
+    function grouped(seed: Integer): Text {
+        let value = Text(seed) + "!"
+        return (((value)))
+    }
+    function branch(flag: Boolean): List<Text> {
+        let values = ["outer" + "!"]
+        if flag {
+            let inner = ["inner" + "!"]
+            return inner
+        }
+        return values
+    }
+    function loopReturn(limit: Integer): List<Text> {
+        let fallback = ["fallback" + "!"]
+        let index = 0
+        while index < limit {
+            let values = [Text(index) + "!"]
+            if index == 1 { return values }
+            index += 1
+        }
+        return fallback
+    }
+    function aliased(values: List<Text>): List<Text> {
+        let owned = values
+        let other = owned
+        owned.add("alias" + "!")
+        return other
+    }
+    function borrowedText(value: Text): Text { return value }
+    function borrowedList(value: List<Text>): List<Text> { return value }
+    function borrowedRecord(value: Parcel): Parcel { return value }
+    function reassigned(value: Text, replace: Boolean): Text {
+        if replace { value = "new" + "!" }
+        return value
+    }
+    function distinctName(valu: Text): Text {
+        let value = "local" + "!"
+        if value.length == 0 { fail("missing local") }
+        return valu
+    }
+    function shadow(value: Text, flag: Boolean): Text {
+        let result = value + " outer"
+        if flag {
+            let result = value + " inner"
+            return result
+        }
+        return result
+    }
+    function fieldReturn(): Text {
+        let parcel = Parcel { label: "field" + "!"; pages: [] }
+        return parcel.label
+    }
+    function indexReturn(): Text {
+        let values = ["index" + "!"]
+        return values[0]
+    }
+    function callReturn(): Text {
+        let value = "call" + "!"
+        return borrowedText(value)
+    }
+    function operatorReturn(): Text {
+        let value = "operator" + "!"
+        return value + " tail"
+    }
+    function capturedReturn(): () -> Text {
+        let values = ["captured" + "!"]
+        let callback: () -> Text = function(): Text {
+            let result = values[0] + " alive"
+            return result
+        }
+        return callback
+    }
+
+    print(directText(7))
+    print(directList(8)[0])
+    let parcel = directRecord(9)
+    print(parcel.label)
+    print(parcel.pages[0])
+    print(grouped(10))
+    print(branch(true)[0])
+    print(branch(false)[0])
+    print(loopReturn(3)[0])
+    print(loopReturn(0)[0])
+    let shared = ["root" + "!"]
+    let returned = aliased(shared)
+    returned[0] = "changed" + "!"
+    print(shared[0])
+    print(shared[1])
+    let original = "old" + "!"
+    print(borrowedText(original))
+    let borrowed = borrowedList(shared)
+    borrowed.add("borrowed" + "!")
+    print(shared[2])
+    let recordAlias = borrowedRecord(parcel)
+    recordAlias.label = "record" + "!"
+    print(parcel.label)
+    let unchanged = reassigned(original, false)
+    let changed = reassigned(original, true)
+    print(unchanged)
+    print(changed)
+    print(original)
+    print(distinctName("parameter" + "!"))
+    print(shadow("root", true))
+    print(shadow("root", false))
+    print(fieldReturn())
+    print(indexReturn())
+    print(callReturn())
+    print(operatorReturn())
+    let callback = capturedReturn()
+    print(callback())
+    print(callback())
+    let bytes = directBytes()
+    bytes[0] = 66
+    print(Text(bytes))
+    let cycle = cycleRecord()
+    print(cycle.children[0].label)
+    cycle.children[0].label = "record cycle" + "!"
+    print(cycle.label)
+    let cyclicList = cycleList()
+    print(cyclicList[0].label)
+    cyclicList[0].children.add(cyclicList[0])
+    print(cyclicList.length)
+    print(cyclicList[1].label)
+    """#
+
+test.require(fixtures.compile(frontend, source), "compile last-use return IR")
+let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+for name in ["directText", "directList", "directRecord", "directBytes", "cycleRecord", "cycleList", "grouped", "aliased", "reassigned"] {
+    checkMoves(ir, name, 1)
+    checkRetains(ir, name, 0)
+}
+for name in ["branch", "loopReturn", "shadow"] {
+    checkMoves(ir, name, 2)
+    checkRetains(ir, name, 0)
+    checkDistinctMoves(ir, name)
+}
+for name in ["borrowedText", "borrowedList", "borrowedRecord", "distinctName", "fieldReturn", "indexReturn"] {
+    checkMoves(ir, name, 0)
+    checkRetains(ir, name, 1)
+}
+for name in ["callReturn", "operatorReturn"] { checkMoves(ir, name, 0) }
+checkMoves(ir, "capturedReturn", 1)
+test.check(test.contains(body(ir, "directRecord"), "call ptr @minyar_record_new("), "returned reference record must remain heap allocated")
+test.check(test.contains(body(ir, "cycleRecord"), "call ptr @minyar_record_new_traced("), "returned cycle record must use traced allocation")
+test.check(test.contains(body(ir, "cycleList"), "call ptr @minyar_list_new_traced("), "returned cycle List must use traced allocation")
+for name in ["cycleRecord", "cycleList"] {
+    test.check(!test.contains(body(ir, name), "call void @minyar_rc_retain_traced("), name + ": traced owner transfer must not retain")
+}
+fixtures.executes(frontend, source, "7!\n8!\n9!\npage!\n10!\ninner!\nouter!\n1!\nfallback!\nchanged!\nalias!\nold!\nborrowed!\nrecord!\nold!\nnew!\nold!\nparameter!\nroot inner\nroot outer\nfield!\nindex!\ncall!\noperator! tail\ncaptured! alive\ncaptured! alive\nBytes!\nnode!\nrecord cycle!\nlist!\n2\nlist!\n", ["-O0", "-O2"], 0, "", true)
+
+let gallery = io.readTextFile("examples/gallery/last-use-returns.min")
+test.check(gallery.length > 0, "missing last-use return gallery")
+fixtures.executes(frontend, gallery, "Home\nA little light from the sleeping harbour.\nA little light from the last boat.\nA little light from a window left open.\nEnough to find each other.\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(compiler.directory)
+print("Last-use returns: passed")
