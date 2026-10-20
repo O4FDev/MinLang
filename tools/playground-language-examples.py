@@ -163,6 +163,11 @@ POLICIES = {
         "Only describe is declared. The function is never called, and neither its arms nor the top level contain a print call, so the unchanged program produces no output.",
         reason="A standalone function declaration using the automatically available Maybe type. Running it does not call describe().",
     ),
+    "a84bd499c698": standalone(
+        "Hardware register fields", "64\n",
+        "field32(12, 10) describes bits 12..21. encode32 places 64 in that field and extract32 reads the same 64 back; the later replace32 result is not printed.",
+        reason="A complete program using the ordinary device library's pure field arithmetic; it touches no register or host memory.",
+    ),
     "c0407a26360b": contextual(
         "A match that produces a value", "fragment",
         "The Shape choice, its cases and the shape binding are supplied by the previous example, not by this block.",
