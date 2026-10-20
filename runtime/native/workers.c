@@ -42,6 +42,19 @@ static MinyarBytes *worker_data(unsigned status, int code, const void *data, siz
         memcpy(out + 8, data, length);
     return result;
 }
+static MinyarBytes *worker_readiness(unsigned status, int code, long long reading,
+                                    long long writing, long long pending) {
+    MinyarBytes *result = minyar_bytes_new(32);
+    unsigned char *out = (unsigned char *)result->bytes;
+    worker_put32(out, status);
+    worker_put32(out + 4, (uint32_t)code);
+    for (unsigned at = 0; at < 8; at++) {
+        out[8 + at] = (unsigned char)((uint64_t)reading >> (at * 8));
+        out[16 + at] = (unsigned char)((uint64_t)writing >> (at * 8));
+        out[24 + at] = (unsigned char)((uint64_t)pending >> (at * 8));
+    }
+    return result;
+}
 
 #ifdef _WIN32
 #include "workers_windows.h"
@@ -239,6 +252,16 @@ static MinyarBytes *worker_spawn(const char *path, const char *mode) {
 }
 bool minyar_workers_supported(void) {
     return true;
+}
+bool minyar_workers_readinessSupported(void) {
+    return true;
+}
+MinyarBytes *minyar_workers_readinessNative(long long handle) {
+    WorkerProcess *worker = worker_lookup(handle);
+    if (!worker)
+        return worker_readiness(WORK_FAILURE, ESRCH, -1, -1, 0);
+    return worker_readiness(WORK_OK, 0, worker->output, worker->input,
+                            (long long)(worker->queue_length - worker->queue_sent));
 }
 MinyarBytes *minyar_workers_spawnNative(const MinyarText *path, const MinyarText *mode) {
     char *executable = worker_text(path);

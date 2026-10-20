@@ -1310,6 +1310,25 @@ as `+=`. To maintain captured state, mutate a field of a captured record.
 Callbacks belong to their creator's execution domain; they do not transfer
 managed objects between threads.
 
+## Structured tasks
+
+`tasks.together(timeoutMs, body)` owns a scope of one-shot worker processes.
+The ordinary callback starts typed tasks with `tasks.start` and reads replies
+with `tasks.response`. Returning waits for unobserved replies; errors,
+cancellation and deadlines close and reap every child before the scope returns.
+Task and Scope aliases cannot be used after the callback ends. Managed values
+stay on their creating domain, and workers receive copied messages in separate
+heaps. There is no function colouring or shared managed mutation.
+
+`tasks.channel` pairs request and reply codecs, with built-in codecs for Bytes,
+Text and Integer. The event loop services all outstanding workers while waiting
+for a reply. Each worker uses `tasks.serve` to handle one request and send a
+terminal Result. A terminal reply ends task work; process exit status is not a
+separate result. Deadlines are cooperative at task operations and after user
+callbacks. This first slice supports macOS and Linux; task workers cannot create
+descendant task scopes. See [Tasks that come home together](tasks.md) for the
+complete contract, costs and a runnable example.
+
 ## Parallel ranges
 
 `parallel for` gives each iteration its own slot in an existing `Bytes` or a

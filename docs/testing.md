@@ -531,6 +531,12 @@ compare optimized and unoptimized language behavior against independent models,
 including operand evaluation order and conversion boundaries. Generated LLVM
 and runtime C are both instrumented in their sanitizer variants.
 
+`make check-structured-tasks` runs the one-shot typed task protocol and together
+gallery at O0/O2 with ownership assertions. It checks automatic completion of
+unobserved tasks, copied messages, cancellation, whole-scope deadlines, body and
+worker failures, closed aliases and malformed replies. The sanitizer companion
+instruments generated LLVM, the ownership runtime and both native providers.
+
 `make check-parallel-for` runs safe range programs and the parallel gallery at
 O0/O2 with exact output and ownership cleanup assertions. Race rejections cover
 shared scalars, changed indices, overlapping slots, managed values, escaping

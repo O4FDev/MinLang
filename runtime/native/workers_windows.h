@@ -363,6 +363,13 @@ static MinyarBytes *worker_spawn(const wchar_t *path, const wchar_t *mode) {
 bool minyar_workers_supported(void) {
     return true;
 }
+bool minyar_workers_readinessSupported(void) {
+    return false;
+}
+MinyarBytes *minyar_workers_readinessNative(long long handle) {
+    (void)handle;
+    return worker_readiness(WORK_FAILURE, ERROR_NOT_SUPPORTED, -1, -1, 0);
+}
 MinyarBytes *minyar_workers_spawnNative(const MinyarText *path, const MinyarText *mode) {
     wchar_t *executable = worker_text(path);
     if (!executable)

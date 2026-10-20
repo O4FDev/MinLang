@@ -1,0 +1,412 @@
+use "io" as io
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.sources = ["-pthread"]
+let providers = ["runtime/native/workers.c", "runtime/native/net.c"]
+let nativeLevel = "-O2"
+if frontend.compiler.flags.length > 0 { nativeLevel = "-O1" }
+for index in 0..providers.length {
+    let object = frontend.compiler.directory + "/provider-" + Text(index) + ".o"
+    let command = [frontend.compiler.clang, nativeLevel]
+    for flag in frontend.compiler.flags { command.add(flag) }
+    for item in ["-pthread", "-c", providers[index], "-o", object] { command.add(item) }
+    test.require(test.run(command, frontend.environment, "", object + ".build", 30), "build structured task provider " + providers[index])
+    frontend.sources.add(object)
+}
+// A FIFO handshake proves that a later task can complete while the first is
+// blocked. It needs no scheduling assumptions or short polling waits. The
+// liveness probe separately proves that terminal replies close and reap peers.
+frontend.helpers = #"""
+    #include <errno.h>
+    #include <fcntl.h>
+    #include <signal.h>
+    #include <stdio.h>
+    #include <sys/stat.h>
+    #include <unistd.h>
+    static int structured_keeper = -1;
+    static long long structured_token;
+    static void structured_path(char *path, size_t capacity, long long token) {
+        snprintf(path, capacity, "/tmp/minyar-structured-%lld", token);
+    }
+    _Bool minyar_structured_test_createToken(long long token) {
+        char path[96]; structured_path(path, sizeof(path), token);
+        unlink(path);
+        if (mkfifo(path, 0600) != 0) return 0;
+        structured_keeper = open(path, O_RDWR | O_NONBLOCK);
+        if (structured_keeper < 0) { unlink(path); return 0; }
+        if (fcntl(structured_keeper, F_SETFD, FD_CLOEXEC) < 0) {
+            close(structured_keeper); structured_keeper = -1; unlink(path); return 0;
+        }
+        structured_token = token;
+        return 1;
+    }
+    long long minyar_structured_test_waitToken(long long token) {
+        char path[96]; structured_path(path, sizeof(path), token);
+        int descriptor;
+        do { descriptor = open(path, O_RDONLY); } while (descriptor < 0 && errno == EINTR);
+        if (descriptor < 0) return -errno;
+        unsigned char value;
+        ssize_t received;
+        do { received = read(descriptor, &value, 1); } while (received < 0 && errno == EINTR);
+        int saved = errno; close(descriptor);
+        return received == 1 ? 0 : -(received < 0 ? saved : EIO);
+    }
+    _Bool minyar_structured_test_releaseToken(long long token) {
+        if (structured_keeper < 0 || structured_token != token) return 0;
+        unsigned char value = 1;
+        ssize_t written;
+        do { written = write(structured_keeper, &value, 1); } while (written < 0 && errno == EINTR);
+        return written == 1;
+    }
+    void minyar_structured_test_removeToken(long long token) {
+        if (structured_keeper >= 0 && structured_token == token) {
+            close(structured_keeper); structured_keeper = -1;
+        }
+        char path[96]; structured_path(path, sizeof(path), token); unlink(path);
+    }
+    _Bool minyar_structured_test_processAlive(long long pid) {
+        return kill((pid_t)pid, 0) == 0 || errno == EPERM;
+    }
+    """#
+
+let source = #"""
+    use "tasks" as tasks
+    use "workers" as workers
+    use "errors" as errors
+    use "process" as processInfo
+    use "net" as net
+
+    function createToken(token: Integer): Boolean { native "structured_test" }
+    function waitToken(token: Integer): Integer { native "structured_test" }
+    function releaseToken(token: Integer): Boolean { native "structured_test" }
+    function removeToken(token: Integer) { native "structured_test" }
+    function processAlive(pid: Integer): Boolean { native "structured_test" }
+    function require(condition: Boolean, message: Text): Result<Nothing, errors.Error> {
+        if !condition { return Err(errors.make(99, 0, message)) }
+        return Ok()
+    }
+    record Parcel { number: Integer; label: Text }
+    function parcels(): tasks.Codec<Parcel> {
+        return tasks.codec(function(value: Parcel): Result<Bytes, errors.Error> {
+            let encoded = Bytes(8)
+            encoded.setInt64(0, value.number)
+            encoded.addBytes(Bytes(value.label))
+            return Ok(encoded)
+        }, function(encoded: Bytes): Result<Parcel, errors.Error> {
+            if encoded.length < 8 { return Err(errors.make(errors.invalidDataCode(), 0, "short parcel")) }
+            return Ok(Parcel { number: encoded.getInt64(0); label: Text(encoded.slice(8, encoded.length)) })
+        })
+    }
+    function integerChannel(): tasks.Channel<Integer, Integer> { return tasks.channel(tasks.integers(), tasks.integers()) }
+    function worker(mode: Text): Result<Nothing, errors.Error> {
+        if mode == "eof" { return Ok() }
+        if mode == "malformed" { try workers.replyMessage(Bytes("not a task envelope")); return Ok() }
+        if mode == "stall" { try workers.readRequest(); try workers.readRequest(); return Ok() }
+        if mode == "bytes" {
+            return tasks.serve(tasks.channel(tasks.bytes(), tasks.bytes()), function(value: Bytes): Result<Bytes, errors.Error> { return Ok(value) })
+        }
+        if mode == "text" {
+            return tasks.serve(tasks.channel(tasks.text(), tasks.integers()), function(value: Text): Result<Integer, errors.Error> { return Ok(value.length) })
+        }
+        if mode == "parcel" {
+            return tasks.serve(tasks.channel(parcels(), parcels()), function(value: Parcel): Result<Parcel, errors.Error> {
+                return Ok(Parcel { number: value.number + 1; label: value.label + " arrived" })
+            })
+        }
+        return tasks.serve(integerChannel(), function(value: Integer): Result<Integer, errors.Error> {
+            if mode == "fail" { return Err(errors.make(77, 9, "worker failed")) }
+            if mode == "none-error" { return Err(errors.none()) }
+            if mode == "pid" { return Ok(processInfo.processId()) }
+            if mode == "gated" {
+                let status = waitToken(value)
+                if status != 0 { return Err(errors.make(errors.systemCode(), -status, "task rendezvous failed")) }
+                return Ok(11)
+            }
+            if mode == "worker-nesting" {
+                let nested = tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> { return Ok() })
+                match nested { Err(error) { if error.code() == errors.unavailableCode() { return Ok(1) } } Ok() { } }
+                return Ok(0)
+            }
+            return Ok(value * 2)
+        })
+    }
+    function bodyFailure(): Result<Nothing, errors.Error> { return Err(errors.make(78, 4, "body failed")) }
+    function verify(): Result<Nothing, errors.Error> {
+        try require(tasks.supported(), "structured tasks are unavailable")
+        let standalone = try workers.startSelf("stall")
+        let ready = try workers.readiness(standalone)
+        try require(ready.reading >= 0 && ready.writing >= 0 && ready.pending == 0, "worker readiness descriptors")
+        try workers.finish(standalone)
+        try require(workers.readiness(standalone).isErr(), "closed worker readiness remained usable")
+        try tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let number = try tasks.start(scope, "integer", integerChannel(), 21)
+            try require((try tasks.response(number)) == 42, "typed Integer reply")
+            let letters = try tasks.start(scope, "text", tasks.channel(tasks.text(), tasks.integers()), "lantern")
+            try require((try tasks.response(letters)) == 7, "typed Text request")
+            let parcel = try tasks.start(scope, "parcel", tasks.channel(parcels(), parcels()), Parcel { number: 6; label: "moon" })
+            let delivered = try tasks.response(parcel)
+            try require(delivered.number == 7 && delivered.label == "moon arrived", "typed record reply")
+            let original = Bytes(262144)
+            original[0] = 97; original[original.length - 1] = 122
+            let copied = try tasks.start(scope, "bytes", tasks.channel(tasks.bytes(), tasks.bytes()), original)
+            original[0] = 120; original[original.length - 1] = 121
+            let reply = try tasks.response(copied)
+            try require(reply.length == 262144 && reply[0] == 97 && reply[reply.length - 1] == 122, "copied mutable payload")
+            let identity = try tasks.start(scope, "pid", integerChannel(), 0)
+            let pid = try tasks.response(identity)
+            try require(!processAlive(pid), "terminal task process was not reaped")
+            return Ok()
+        })
+        print("typed replies, copied payloads and reaped workers")
+
+        let token = processInfo.processId()
+        try require(createToken(token), "create task rendezvous")
+        let unordered = tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let first = try tasks.start(scope, "gated", integerChannel(), token)
+            let second = try tasks.start(scope, "integer", integerChannel(), 21)
+            try require((try tasks.response(second)) == 42, "later task reply")
+            try require(releaseToken(token), "release earlier task")
+            try require((try tasks.response(first)) == 11, "earlier task reply")
+            return Ok()
+        })
+        removeToken(token)
+        try unordered
+        print("out of order completion")
+
+        let decodes = [0]
+        let counted = tasks.codec(function(value: Integer): Result<Bytes, errors.Error> {
+            let data = Bytes(8); data.setInt64(0, value); return Ok(data)
+        }, function(data: Bytes): Result<Integer, errors.Error> { decodes[0] += 1; return Ok(data.getInt64(0)) })
+        try tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let task = try tasks.start(scope, "integer", tasks.channel(tasks.integers(), counted), 21)
+            try require((try tasks.response(task)) == 42, "first cached reply")
+            try require((try tasks.response(task)) == 42, "repeated cached reply")
+            try require(decodes[0] == 1, "reply decoder ran more than once")
+            return Ok()
+        })
+        print("one reply decode")
+
+        let scopes: List<tasks.Scope> = []
+        let escaped: List<tasks.Task<Integer>> = []
+        try tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            scopes.add(scope)
+            let unobserved = try tasks.start(scope, "integer", integerChannel(), 3)
+            let observed = try tasks.start(scope, "integer", integerChannel(), 4)
+            escaped.add(unobserved); escaped.add(observed)
+            try tasks.response(observed)
+            return Ok()
+        })
+        for task in escaped {
+            match tasks.response(task) { Err(error) { try require(error.code() == errors.closedCode(), "escaped task error") } Ok(value) { return Err(errors.make(99, 0, "escaped task remained usable")) } }
+        }
+        try require(tasks.cancel(scopes[0]).isErr(), "escaped scope cancellation")
+        try require(tasks.start(scopes[0], "integer", integerChannel(), 1).isErr(), "escaped scope launch")
+        print("unobserved joins and expired aliases")
+
+        let unobservedFailure = tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            try tasks.start(scope, "stall", integerChannel(), 0)
+            try tasks.start(scope, "fail", integerChannel(), 0)
+            return Ok()
+        })
+        match unobservedFailure {
+            Err(error) { try require(error.code() == 77 && error.nativeCode() == 9 && error.message() == "worker failed", "unobserved worker error") }
+            Ok() { return Err(errors.make(99, 0, "unobserved task failure was lost")) }
+        }
+        let observedFailure = tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let sibling = try tasks.start(scope, "stall", integerChannel(), 0)
+            let broken = try tasks.start(scope, "fail", integerChannel(), 0)
+            try require(tasks.response(broken).isErr(), "worker failure reply")
+            try require(tasks.response(sibling).isErr(), "failed task did not cancel sibling")
+            return Ok()
+        })
+        try require(observedFailure.isErr(), "caught task failure was lost at scope exit")
+        print("task failures cancel siblings")
+
+        let early = tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            try tasks.start(scope, "stall", integerChannel(), 0)
+            return Err(errors.make(78, 4, "body failed"))
+        })
+        let propagated = tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            try tasks.start(scope, "stall", integerChannel(), 0)
+            try bodyFailure()
+            return Ok()
+        })
+        for result in [early, propagated] {
+            match result { Err(error) { try require(error.code() == 78 && error.message() == "body failed", "body failure was replaced") } Ok() { return Err(errors.make(99, 0, "body failure was lost")) } }
+        }
+        print("early return and try cleanup")
+
+        let cancelled = tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let task = try tasks.start(scope, "stall", integerChannel(), 0)
+            try tasks.cancel(scope); try tasks.cancel(scope)
+            try require(tasks.response(task).isErr(), "cancelled task replied")
+            try require(tasks.start(scope, "integer", integerChannel(), 1).isErr(), "cancelled scope started work")
+            return Ok()
+        })
+        match cancelled { Err(error) { try require(error.code() == errors.cancelledCode(), "cancellation code") } Ok() { return Err(errors.make(99, 0, "cancelled scope succeeded")) } }
+        print("idempotent cancellation")
+
+        let invoked = [0]
+        for timeout in [-2, 2147483648] {
+            let invalid = tasks.together(timeout, function(scope: tasks.Scope): Result<Nothing, errors.Error> { invoked[0] += 1; return Ok() })
+            try require(invalid.isErr(), "invalid timeout accepted")
+        }
+        try require(invoked[0] == 0, "invalid timeout called body")
+        let immediate = tasks.together(0, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            invoked[0] += 1
+            try require(tasks.start(scope, "integer", integerChannel(), 1).isErr(), "expired deadline started work")
+            return Ok()
+        })
+        match immediate { Err(error) { try require(error.code() == errors.timedOutCode(), "zero deadline code") } Ok() { return Err(errors.make(99, 0, "expired scope succeeded")) } }
+        try require(invoked[0] == 1, "zero deadline skipped callback")
+        let began = net.monotonicMilliseconds()
+        let expired = tasks.together(100, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            return tasks.together(5000, function(nested: tasks.Scope): Result<Nothing, errors.Error> {
+                let task = try tasks.start(nested, "stall", integerChannel(), 0)
+                try tasks.response(task)
+                return Ok()
+            })
+        })
+        match expired { Err(error) { try require(error.code() == errors.timedOutCode(), "inherited deadline code") } Ok() { return Err(errors.make(99, 0, "nested deadline succeeded")) } }
+        try require(net.monotonicMilliseconds() - began < 3000, "nested scope reset the parent deadline")
+        let slowDecodes = [0]
+        let delayed = tasks.codec(function(value: Integer): Result<Bytes, errors.Error> {
+            let data = Bytes(8); data.setInt64(0, value); return Ok(data)
+        }, function(data: Bytes): Result<Integer, errors.Error> {
+            slowDecodes[0] += 1
+            try processInfo.sleep(1100000000)
+            return Ok(data.getInt64(0))
+        })
+        let delayedResult = tasks.together(1000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let task = try tasks.start(scope, "integer", tasks.channel(tasks.integers(), delayed), 21)
+            try tasks.response(task)
+            return Ok()
+        })
+        match delayedResult { Err(error) { try require(error.code() == errors.timedOutCode(), "reply decode exceeded deadline") } Ok() { return Err(errors.make(99, 0, "late final decoder succeeded")) } }
+        try require(slowDecodes[0] == 1, "late decoder was not exercised")
+        print("validated shared deadlines")
+
+        let parentCancelled = tasks.together(-1, function(parent: tasks.Scope): Result<Nothing, errors.Error> {
+            let nested = tasks.together(-1, function(child: tasks.Scope): Result<Nothing, errors.Error> {
+                let task = try tasks.start(child, "stall", integerChannel(), 0)
+                try tasks.cancel(parent)
+                try require(tasks.response(task).isErr(), "nested scope ignored parent cancellation")
+                return Ok()
+            })
+            match nested { Err(error) { try require(error.code() == errors.cancelledCode(), "nested parent cancellation code") } Ok() { return Err(errors.make(99, 0, "nested cancelled scope succeeded")) } }
+            return Ok()
+        })
+        match parentCancelled { Err(error) { try require(error.code() == errors.cancelledCode(), "parent cancellation code") } Ok() { return Err(errors.make(99, 0, "cancelled parent succeeded")) } }
+        print("nested cancellation")
+
+        for mode in ["eof", "malformed"] {
+            let failed = tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+                let task = try tasks.start(scope, mode, integerChannel(), 0)
+                try tasks.response(task)
+                return Ok()
+            })
+            try require(failed.isErr(), "invalid worker reply accepted")
+        }
+        print("EOF and malformed replies")
+
+        let rejected = tasks.codec(function(value: Bytes): Result<Bytes, errors.Error> { return Err(errors.make(91, 0, "request encode failed")) }, function(value: Bytes): Result<Bytes, errors.Error> { return Ok(value) })
+        let encoding = tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            try tasks.start(scope, "bytes", tasks.channel(rejected, tasks.bytes()), Bytes("message"))
+            return Ok()
+        })
+        match encoding { Err(error) { try require(error.code() == 91, "request codec error") } Ok() { return Err(errors.make(99, 0, "request codec failure was lost")) } }
+        let rejectedReply = tasks.codec(function(value: Bytes): Result<Bytes, errors.Error> { return Ok(value) }, function(value: Bytes): Result<Bytes, errors.Error> { return Err(errors.make(92, 0, "reply decode failed")) })
+        let decoding = tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let task = try tasks.start(scope, "bytes", tasks.channel(tasks.bytes(), rejectedReply), Bytes("message"))
+            try tasks.response(task)
+            return Ok()
+        })
+        match decoding { Err(error) { try require(error.code() == 92, "reply codec error") } Ok() { return Err(errors.make(99, 0, "reply codec failure was lost")) } }
+        let emptyFailure = tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> { return Err(errors.none()) })
+        match emptyFailure { Err(error) { try require(error.code() == errors.invalidDataCode(), "empty body error normalization") } Ok() { return Err(errors.make(99, 0, "empty body error became success")) } }
+        let emptyEncoder = tasks.codec(function(value: Integer): Result<Bytes, errors.Error> { return Err(errors.none()) }, function(value: Bytes): Result<Integer, errors.Error> { return Ok(value.getInt64(0)) })
+        let emptyEncoding = tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            try tasks.start(scope, "integer", tasks.channel(emptyEncoder, tasks.integers()), 21)
+            return Ok()
+        })
+        match emptyEncoding { Err(error) { try require(error.code() == errors.invalidDataCode(), "empty encoder error normalization") } Ok() { return Err(errors.make(99, 0, "empty encoder error became success")) } }
+        let emptyDecoder = tasks.codec(function(value: Integer): Result<Bytes, errors.Error> { let data = Bytes(8); data.setInt64(0, value); return Ok(data) }, function(value: Bytes): Result<Integer, errors.Error> { return Err(errors.none()) })
+        let emptyDecoding = tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let task = try tasks.start(scope, "integer", tasks.channel(tasks.integers(), emptyDecoder), 21)
+            try tasks.response(task)
+            return Ok()
+        })
+        match emptyDecoding { Err(error) { try require(error.code() == errors.invalidDataCode(), "empty decoder error normalization") } Ok() { return Err(errors.make(99, 0, "empty decoder error became success")) } }
+        let emptyWorker = tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let task = try tasks.start(scope, "none-error", integerChannel(), 21)
+            try tasks.response(task)
+            return Ok()
+        })
+        match emptyWorker { Err(error) { try require(error.code() == errors.invalidDataCode(), "empty worker error normalization") } Ok() { return Err(errors.make(99, 0, "empty worker error became success")) } }
+        let recursiveEncodes = [0]
+        let recursive = tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let requests = tasks.codec(function(value: Integer): Result<Bytes, errors.Error> {
+                recursiveEncodes[0] += 1
+                let data = Bytes(8); data.setInt64(0, value); return Ok(data)
+            }, function(data: Bytes): Result<Integer, errors.Error> { return Ok(data.getInt64(0)) })
+            let replies = tasks.codec(function(value: Integer): Result<Bytes, errors.Error> {
+                let data = Bytes(8); data.setInt64(0, value); return Ok(data)
+            }, function(data: Bytes): Result<Integer, errors.Error> {
+                let denied = tasks.start(scope, "integer", tasks.channel(requests, tasks.integers()), 1)
+                try require(denied.isErr(), "recursive decoder started a task")
+                return Ok(data.getInt64(0))
+            })
+            let task = try tasks.start(scope, "integer", tasks.channel(tasks.integers(), replies), 21)
+            try tasks.response(task)
+            return Ok()
+        })
+        match recursive { Err(error) { try require(error.code() == errors.invalidDataCode(), "recursive decoder error") } Ok() { return Err(errors.make(99, 0, "recursive decoder succeeded")) } }
+        try require(recursiveEncodes[0] == 0, "rejected recursive start invoked a codec")
+        print("codec errors stay recoverable")
+
+        try tasks.together(10000, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+            let task = try tasks.start(scope, "worker-nesting", integerChannel(), 0)
+            try require((try tasks.response(task)) == 1, "worker opened nested scope")
+            return Ok()
+        })
+        try require(tasks.serve(integerChannel(), function(value: Integer): Result<Integer, errors.Error> { return Ok(value) }).isErr(), "coordinator served a task")
+        print("worker boundaries")
+        return Ok()
+    }
+    if workers.isWorker() {
+        match worker(workers.mode()) { Ok() { } Err(error) { fail(error.describe()) } }
+    } else {
+        match verify() { Ok() { print("done") } Err(error) { fail(error.describe()) } }
+    }
+    """#
+
+let expected = "typed replies, copied payloads and reaped workers\nout of order completion\none reply decode\nunobserved joins and expired aliases\ntask failures cancel siblings\nearly return and try cleanup\nidempotent cancellation\nvalidated shared deadlines\nnested cancellation\nEOF and malformed replies\ncodec errors stay recoverable\nworker boundaries\ndone\n"
+fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+
+fixtures.rejects(frontend, #"""
+    use "tasks" as tasks
+    use "errors" as errors
+    tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+        try tasks.start(scope, "wrong", tasks.channel(tasks.integers(), tasks.integers()), "a Text is not an Integer")
+        return Ok()
+    }).unwrap()
+    """#, "type", true)
+fixtures.rejects(frontend, #"""
+    use "tasks" as tasks
+    let codec = tasks.integers()
+    print(codec.encode)
+    """#, "private to its module", true)
+fixtures.rejects(frontend, #"""
+    use "tasks" as tasks
+    use "errors" as errors
+    tasks.together(-1, function(scope: tasks.Scope): Result<Nothing, errors.Error> {
+        print(scope.active)
+        return Ok()
+    }).unwrap()
+    """#, "private to its module", true)
+
+fixtures.executes(frontend, io.readTextFile("examples/gallery/together.min"), "A light is on in the harbour.\nA light is on in the hills.\nEveryone is home.\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(frontend.compiler.directory)
+print("Structured tasks: passed")

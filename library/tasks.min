@@ -1,0 +1,355 @@
+// Structured, one-request/one-reply tasks. Managed values and codec callbacks
+// stay on their creating domain; only copied Bytes enter a worker process.
+use "workers" as workers
+use "eventloop" as eventloop
+use "net" as net
+use "text" as textEncoding
+use "errors" as errors
+
+public record Codec<Item> {
+    private encode: (Item) -> Result<Bytes, errors.Error>
+    private decode: (Bytes) -> Result<Item, errors.Error>
+}
+public record Channel<Request, Reply> {
+    private request: Codec<Request>
+    private reply: Codec<Reply>
+}
+record Operation {
+    worker: workers.Worker
+    reading: Integer
+    writing: Integer
+    done: Boolean
+    closed: Boolean
+    decode: (Bytes) -> Result<Nothing, errors.Error>
+}
+public record Scope {
+    private operations: List<Operation>
+    private parent: Maybe<Scope>
+    private loop: Integer
+    private deadline: Integer
+    private active: Boolean
+    private driving: Boolean
+    private failure: errors.Error
+}
+record Cell<Item> { value: Maybe<Item> }
+public record Task<Item> {
+    private scope: Scope
+    private index: Integer
+    private cell: Cell<Item>
+}
+
+// This module, like eventloop and workers, has one creating execution domain.
+// Nested coordinator scopes inherit their parent's absolute deadline.
+record ScopeContext { current: Maybe<Scope> }
+global scopeContext: ScopeContext = ScopeContext { current: None }
+
+public function codec<Item>(encode: (Item) -> Result<Bytes, errors.Error>, decode: (Bytes) -> Result<Item, errors.Error>): Codec<Item> {
+    return Codec { encode: encode; decode: decode }
+}
+public function channel<Request, Reply>(request: Codec<Request>, reply: Codec<Reply>): Channel<Request, Reply> {
+    return Channel { request: request; reply: reply }
+}
+public function bytes(): Codec<Bytes> {
+    return codec(function(value: Bytes): Result<Bytes, errors.Error> { return Ok(value) }, function(value: Bytes): Result<Bytes, errors.Error> { return Ok(value) })
+}
+public function text(): Codec<Text> {
+    return codec(function(value: Text): Result<Bytes, errors.Error> { return Ok(Bytes(value)) }, function(value: Bytes): Result<Text, errors.Error> { return textEncoding.decode(value) })
+}
+public function integers(): Codec<Integer> {
+    return codec(function(value: Integer): Result<Bytes, errors.Error> {
+        let encoded = Bytes(8)
+        encoded.setInt64(0, value)
+        return Ok(encoded)
+    }, function(value: Bytes): Result<Integer, errors.Error> {
+        if value.length != 8 { return Err(errors.make(errors.invalidDataCode(), 0, "a task Integer needs exactly eight bytes")) }
+        return Ok(value.getInt64(0))
+    })
+}
+public function supported(): Boolean { return workers.readinessSupported() }
+
+function remaining(scope: Scope): Integer {
+    if scope.deadline < 0 { return -1 }
+    let left = scope.deadline - net.monotonicMilliseconds()
+    if left < 0 { return 0 }
+    return left
+}
+function closeOperation(scope: Scope, operation: Operation): errors.Error {
+    if operation.closed { return errors.none() }
+    let failure = errors.none()
+    // Retire registrations before releasing their borrowed pipe descriptors.
+    // Closing the owning loop below also retires a failed removal.
+    if operation.reading != 0 {
+        let removed = eventloop.remove(scope.loop, operation.reading)
+        if !errors.booleanOk(removed) { failure = errors.booleanError(removed) }
+        operation.reading = 0
+    }
+    if operation.writing != 0 {
+        let removed = eventloop.remove(scope.loop, operation.writing)
+        if !errors.booleanOk(removed) && !failure.isError() { failure = errors.booleanError(removed) }
+        operation.writing = 0
+    }
+    operation.closed = true
+    let result = workers.finish(operation.worker)
+    match result { Ok() { return failure } Err(error) { if failure.isError() { return failure }; return error } }
+}
+function validFailure(error: errors.Error): errors.Error {
+    if error.isError() { return error }
+    return errors.make(errors.invalidDataCode(), 0, "a failed task Result must contain an error")
+}
+function forgetDecoder(operation: Operation) {
+    operation.decode = function(data: Bytes): Result<Nothing, errors.Error> { return Ok() }
+}
+function stop(scope: Scope, error: errors.Error) {
+    if !scope.failure.isError() { scope.failure = validFailure(error) }
+    for operation in scope.operations { closeOperation(scope, operation); operation.done = true; forgetDecoder(operation) }
+}
+function available(scope: Scope): errors.Error {
+    if !scope.active { return errors.make(errors.closedCode(), 0, "this task scope has ended") }
+    if scope.failure.isError() { return scope.failure }
+    match scope.parent {
+        Some(parent) {
+            let error = available(parent)
+            if error.isError() { stop(scope, error); return error }
+        }
+        None { }
+    }
+    if remaining(scope) == 0 {
+        let error = errors.make(errors.timedOutCode(), 0, "the task scope reached its deadline")
+        stop(scope, error)
+        return error
+    }
+    return errors.none()
+}
+public function cancel(scope: Scope): Result<Nothing, errors.Error> {
+    if !scope.active { return Err(errors.make(errors.closedCode(), 0, "this task scope has ended")) }
+    stop(scope, errors.make(errors.cancelledCode(), 0, "the task scope was cancelled"))
+    return Ok()
+}
+
+function terminal(payload: Bytes, error: errors.Error): Bytes {
+    let result = Bytes(24)
+    let magic = Bytes("MYTASK01")
+    for index in 0..8 { result[index] = magic[index] }
+    result.setInt64(8, error.code())
+    result.setInt64(16, error.nativeCode())
+    if error.isError() { result.addBytes(Bytes(error.describe())) } else { result.addBytes(payload) }
+    return result
+}
+function decodeTerminal(operation: Operation, frame: Bytes): Result<Nothing, errors.Error> {
+    if frame.length < 24 { return Err(errors.make(errors.protocolCode(), 0, "the worker did not send a task reply")) }
+    let magic = Bytes("MYTASK01")
+    for index in 0..8 {
+        if frame[index] != magic[index] { return Err(errors.make(errors.protocolCode(), 0, "the worker did not send a task reply")) }
+    }
+    let code = frame.getInt64(8)
+    if code < 0 { return Err(errors.make(errors.protocolCode(), 0, "the worker sent an invalid task error")) }
+    if code > 0 {
+        let message = try textEncoding.decode(frame.slice(24, frame.length))
+        return Err(errors.make(code, frame.getInt64(16), message))
+    }
+    if frame.getInt64(16) != 0 { return Err(errors.make(errors.protocolCode(), 0, "the worker sent an invalid task reply")) }
+    return operation.decode(frame.slice(24, frame.length))
+}
+function pump(scope: Scope): Integer {
+    let unfinished = 0
+    for operation in scope.operations {
+        if !operation.done {
+            let reply = workers.receive(operation.worker, 0)
+            let status = errors.bytesStatus(reply)
+            if status == errors.wouldBlockStatus() {
+                unfinished += 1
+                if operation.writing != 0 {
+                    match workers.readiness(operation.worker) {
+                        Ok(ready) {
+                            if ready.pending == 0 {
+                                let removed = eventloop.remove(scope.loop, operation.writing)
+                                operation.writing = 0
+                                if !errors.booleanOk(removed) { stop(scope, errors.booleanError(removed)); return 0 }
+                            }
+                        }
+                        Err(error) { stop(scope, error); return 0 }
+                    }
+                }
+            } else {
+                operation.done = true
+                let closed = closeOperation(scope, operation)
+                if closed.isError() { stop(scope, closed); return 0 }
+                if status == errors.endOfStreamStatus() {
+                    stop(scope, errors.make(errors.protocolCode(), 0, "the worker ended without a task reply"))
+                    return 0
+                }
+                if status != errors.successStatus() { stop(scope, errors.bytesError(reply)); return 0 }
+                let decoded = decodeTerminal(operation, errors.bytesValue(reply))
+                forgetDecoder(operation)
+                match decoded {
+                    Ok() { }
+                    Err(error) { stop(scope, error); return 0 }
+                }
+                if scope.failure.isError() { return 0 }
+            }
+        }
+    }
+    return unfinished
+}
+function drive(scope: Scope, wanted: Integer): Result<Nothing, errors.Error> {
+    let error = available(scope)
+    if error.isError() { return Err(error) }
+    if scope.driving {
+        stop(scope, errors.make(errors.invalidDataCode(), 0, "a task codec cannot recursively wait for tasks"))
+        return Err(scope.failure)
+    }
+    scope.driving = true
+    let done = false
+    while !done {
+        let error = available(scope)
+        if error.isError() { scope.driving = false; return Err(error) }
+        let pending = pump(scope)
+        if scope.failure.isError() { scope.driving = false; return Err(scope.failure) }
+        let after = available(scope)
+        if after.isError() { scope.driving = false; return Err(after) }
+        done = pending == 0
+        if wanted >= 0 { done = scope.operations[wanted].done }
+        if !done {
+            let batch = eventloop.wait(scope.loop, remaining(scope), 64)
+            let error = eventloop.batchError(batch)
+            if error.isError() { stop(scope, error); scope.driving = false; return Err(error) }
+        }
+    }
+    scope.driving = false
+    return Ok()
+}
+function launch(scope: Scope, mode: Text, request: Bytes, decode: (Bytes) -> Result<Nothing, errors.Error>): Result<Operation, errors.Error> {
+    let error = available(scope)
+    if error.isError() { return Err(error) }
+    if scope.driving {
+        stop(scope, errors.make(errors.invalidDataCode(), 0, "a task codec cannot start another task"))
+        return Err(scope.failure)
+    }
+    let started = workers.startSelf(mode)
+    match started {
+        Err(error) { stop(scope, error); return Err(scope.failure) }
+        Ok(worker) {
+            let operation = Operation { worker: worker; reading: 0; writing: 0; done: false; closed: false; decode: decode }
+            scope.operations.add(operation)
+            match workers.sendMessage(worker, request) {
+                Ok(count) { }
+                Err(error) { stop(scope, error); return Err(error) }
+            }
+            let readyResult = workers.readiness(worker)
+            match readyResult {
+                Err(error) { stop(scope, error); return Err(error) }
+                Ok(ready) {
+                    let watched = eventloop.watch(scope.loop, ready.reading, eventloop.readableInterest(), scope.operations.length)
+                    if !errors.integerOk(watched) { stop(scope, errors.integerError(watched)); return Err(scope.failure) }
+                    operation.reading = errors.integerValue(watched)
+                    if ready.pending > 0 {
+                        let writing = eventloop.watch(scope.loop, ready.writing, eventloop.writableInterest(), scope.operations.length)
+                        if !errors.integerOk(writing) { stop(scope, errors.integerError(writing)); return Err(scope.failure) }
+                        operation.writing = errors.integerValue(writing)
+                    }
+                }
+            }
+            return Ok(operation)
+        }
+    }
+}
+public function start<Request, Reply>(scope: Scope, mode: Text, channel: Channel<Request, Reply>, request: Request): Result<Task<Reply>, errors.Error> {
+    let error = available(scope)
+    if error.isError() { return Err(error) }
+    if scope.driving {
+        stop(scope, errors.make(errors.invalidDataCode(), 0, "a task codec cannot start another task"))
+        return Err(scope.failure)
+    }
+    let encoded = channel.request.encode(request)
+    match encoded {
+        Err(error) { stop(scope, error); return Err(scope.failure) }
+        Ok(data) {
+            let cell: Cell<Reply> = Cell { value: None }
+            let decode: (Bytes) -> Result<Nothing, errors.Error> = function(data: Bytes): Result<Nothing, errors.Error> {
+                let value = try channel.reply.decode(data)
+                cell.value = Some(value)
+                return Ok()
+            }
+            let operation = try launch(scope, mode, data, decode)
+            return Ok(Task { scope: scope; index: scope.operations.length - 1; cell: cell })
+        }
+    }
+}
+public function response<Item>(task: Task<Item>): Result<Item, errors.Error> {
+    let error = available(task.scope)
+    if error.isError() { return Err(error) }
+    try drive(task.scope, task.index)
+    match task.cell.value {
+        Some(value) { return Ok(value) }
+        None { return Err(errors.make(errors.protocolCode(), 0, "the task has no reply")) }
+    }
+}
+public function together(timeoutMs: Integer, body: (Scope) -> Result<Nothing, errors.Error>): Result<Nothing, errors.Error> {
+    if timeoutMs < -1 || timeoutMs > 2147483647 { return Err(errors.make(errors.invalidDataCode(), 0, "a task timeout must be -1 or 0 through 2147483647 milliseconds")) }
+    if workers.isWorker() { return Err(errors.make(errors.unavailableCode(), 0, "a task worker cannot create another task scope")) }
+    if !supported() { return Err(errors.make(errors.unavailableCode(), 0, "task readiness is unavailable on this platform")) }
+    let deadline = -1
+    if timeoutMs >= 0 { deadline = net.monotonicMilliseconds() + timeoutMs }
+    let context = scopeContext
+    match context.current {
+        Some(parent) {
+            let error = available(parent)
+            if error.isError() { return Err(error) }
+            if parent.deadline >= 0 && (deadline < 0 || parent.deadline < deadline) { deadline = parent.deadline }
+        }
+        None { }
+    }
+    let created = eventloop.create()
+    if !errors.integerOk(created) { return Err(errors.integerError(created)) }
+    let scope = Scope { operations: []; parent: context.current; loop: errors.integerValue(created); deadline: deadline; active: true; driving: false; failure: errors.none() }
+    let previous = context.current
+    context.current = Some(scope)
+    match body(scope) {
+        Ok() {
+            match drive(scope, -1) { Ok() { } Err(error) { stop(scope, error) } }
+        }
+        Err(error) { stop(scope, error) }
+    }
+    scope.active = false
+    for operation in scope.operations {
+        let error = closeOperation(scope, operation)
+        if error.isError() && !scope.failure.isError() { scope.failure = error }
+    }
+    let closed = eventloop.close(scope.loop)
+    if !errors.booleanOk(closed) && !scope.failure.isError() { scope.failure = errors.booleanError(closed) }
+    scope.operations = []
+    scope.parent = None
+    context.current = previous
+    if scope.failure.isError() { return Err(scope.failure) }
+    return Ok()
+}
+
+// A terminal reply is the end of task work: the owner may reclaim the process
+// immediately after receiving it. Do not place child work after serve returns.
+public function serve<Request, Reply>(channel: Channel<Request, Reply>, body: (Request) -> Result<Reply, errors.Error>): Result<Nothing, errors.Error> {
+    if !workers.isWorker() { return Err(errors.make(errors.invalidDataCode(), 0, "serve requires a task worker")) }
+    let request = try workers.readRequest()
+    let payload = Bytes()
+    let error = errors.none()
+    match request {
+        None { error = errors.make(errors.protocolCode(), 0, "the task worker received no request") }
+        Some(data) {
+            match channel.request.decode(data) {
+                Err(failure) { error = validFailure(failure) }
+                Ok(value) {
+                    match body(value) {
+                        Err(failure) { error = validFailure(failure) }
+                        Ok(reply) {
+                            match channel.reply.encode(reply) { Ok(data) { payload = data } Err(failure) { error = validFailure(failure) } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if payload.length > 16777192 { error = errors.make(errors.invalidDataCode(), 0, "the task reply exceeds the 16 MiB message limit") }
+    let frame = terminal(payload, error)
+    if frame.length > 16777216 { frame = terminal(Bytes(), errors.make(errors.invalidDataCode(), 0, "the task error exceeds the 16 MiB message limit")) }
+    try workers.replyMessage(frame)
+    return Ok()
+}

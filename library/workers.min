@@ -4,6 +4,7 @@ use "process" as processInfo
 // Worker stdout is reserved for the framed protocol; use reply(), not print().
 use "errors" as errors
 public record Worker { private handle: Integer }
+public record Readiness { reading: Integer; writing: Integer; pending: Integer }
 public record WorkerResult { private value: Worker; private error: errors.Error }
 public function ok(result: WorkerResult): Boolean { return !errors.isError(result.error) }
 public function error(result: WorkerResult): errors.Error { return result.error }
@@ -12,6 +13,7 @@ public function value(result: WorkerResult): Worker {
     return result.value
 }
 public function supported(): Boolean { native "workers" }
+public function readinessSupported(): Boolean { native "workers" }
 public function isWorker(): Boolean {
     return processInfo.argumentCount() > 0 && processInfo.argument(0) == "--minyar-worker"
 }
@@ -71,6 +73,7 @@ function spawnNative(executable: Text, mode: Text): Bytes { native "workers" }
 function spawnSelfNative(mode: Text): Bytes { native "workers" }
 function sendNative(handle: Integer, message: Bytes): Bytes { native "workers" }
 function receiveNative(handle: Integer, timeoutMs: Integer): Bytes { native "workers" }
+function readinessNative(handle: Integer): Bytes { native "workers" }
 function closeNative(handle: Integer): Bytes { native "workers" }
 function readMessageNative(): Bytes { native "workers" }
 function replyNative(message: Bytes): Bytes { native "workers" }
@@ -102,6 +105,21 @@ public function currentMode(): Maybe<Text> {
 }
 public function sendMessage(worker: Worker, message: Bytes): Result<Integer, errors.Error> { return typedCount(send(worker, message)) }
 public function receiveMessage(worker: Worker, timeoutMs: Integer): Result<Maybe<Bytes>, errors.Error> { return typedMessage(receive(worker, timeoutMs)) }
+// Borrowed POSIX pipe descriptors for eventloop.watch. Remove every watch
+// before closing the worker, and never close these descriptors directly.
+// pending counts unsent bytes. Watch writing only while pending is positive;
+// receive(worker, 0) pumps sends, then readiness() refreshes that count.
+public function readiness(worker: Worker): Result<Readiness, errors.Error> {
+    let result = readinessNative(worker.handle)
+    if result.length != 32 { fail("invalid native worker readiness result") }
+    if result.getUInt32(0) != 0 {
+        if !readinessSupported() {
+            return Err(errors.make(errors.unavailableCode(), result.getUInt32(4), "worker readiness is unavailable"))
+        }
+        return Err(operationError(result))
+    }
+    return Ok(Readiness { reading: result.getInt64(8); writing: result.getInt64(16); pending: result.getInt64(24) })
+}
 public function finish(worker: Worker): Result<Nothing, errors.Error> {
     let result = close(worker)
     if errors.booleanOk(result) { return Ok() }
