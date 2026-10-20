@@ -1931,7 +1931,9 @@ Use this registry from one serialized boot CPU, outside interrupt context.
 `model.modelRing(slots)` gives a queue with up to 64 requests in flight, each
 with its own Pending; `modelDeliverNewest` completes them out of order. Each
 reclaim is checked against its own slot and generation, so a completion for one
-buffer never returns another to the CPU.
+buffer never returns another to the CPU. The virtio bridge works the same way on real
+hardware: up to 64 buffers in flight, each descriptor's id checked against an
+outstanding request (`make check-osdev-dma-virtio-qemu`).
 
 These opaque handles allocate ordinary managed records. A separately rooted
 runtime registry owns backing storage and checks capability epochs. Readiness
