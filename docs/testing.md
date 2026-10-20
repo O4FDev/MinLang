@@ -537,14 +537,18 @@ thresholds; in particular, they keep shared replacement inference open.
 
 ## Compiler-selected stack ownership
 
-`make check-scope-ownership` exercises the direct compiler's experimental
+`make check-scope-ownership` exercises the direct compiler's
 `--scope-owners` lowering at O0/O2. Its eager ordinary and cycle runtimes require
 empty scope/frame chains, no pending work, and zero managed objects and bytes
 at normal exit. Cases cover condition owners on either branch, short circuits,
 loop exit and jumps, borrowed parameter moves, aliases across mutation, early
 propagation, escaping closures, large cycles, nested and mixed-frame diagnostic
 recovery, call-depth recovery, cold/warm module replay, and the large-function
-fallback. `make check-scope-ownership-sanitize` instruments the generated LLVM
+fallback. Eight public launcher builds check eager and system selection through
+direct and incremental compilation, in default and release modes, by inspecting
+the actual generated LLVM and checking exact alias output. The module-driver
+option checks cover forwarding, conflicting modes and flag-shaped library values.
+`make check-scope-ownership-sanitize` instruments the direct fixtures' generated LLVM
 and both runtimes with ASan/UBSan. `make check-scope-fixed-point` checks that a
 scope-lowered compiler emits exactly its own LLVM. The native and fixed-point
 checks are part of `check-portable`; the sanitizer check also belongs to

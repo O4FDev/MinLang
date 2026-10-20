@@ -189,9 +189,10 @@ and the independent review.
 
 ## Scope ownership lowering
 
-The direct compiler accepts `--scope-owners` for an experimental eager ownership
-lowering. It replaces local-frame lookups with explicit retain, store and release
-operations. Each remaining expression producer receives an initialized-null stack
+The launcher selects scope ownership for `--memory-profile eager`, including
+incremental module builds and release builds. The direct compiler exposes the
+same lowering as `--scope-owners`. It replaces local-frame lookups with explicit
+retain, store and release operations. Each remaining expression producer receives an initialized-null stack
 cell. A control-flow walk places its release at the first statement cleanup or
 return on every reachable path, including both sides of a conditional and loop
 exits. Cleanup visits only cells that can be live there. A producer that could
@@ -212,9 +213,9 @@ without a write. Last owners, traced values and pending work use the ordinary
 release path. Incremental profiles keep their ordinary release and service
 accounting. Null cells do not request an unlimited cycle drain.
 
-This mode is explicit and cannot be combined with `--bounded-owners`. The launcher
-continues to select the ordinary bounded lowering. Linking scope output against
-an incremental runtime preserves ownership but performs a separately budgeted
+The direct compiler rejects combining this mode with `--bounded-owners`. The
+system, fixed and lazy launcher profiles retain ordinary bounded lowering.
+Linking scope output against an incremental runtime preserves ownership but performs a separately budgeted
 release for each live cell, followed by a service batch. The ordinary frame's
 single K-total limit for statement cleanup or frame exit therefore does not apply
 to this experimental sequence. It is not a replacement for that bounded contract.

@@ -2,11 +2,13 @@
 
 build/tooling/tests/scope-ownership: tests/frontend-fixtures.min tools/test-runtime.min
 
-check-scope-ownership: build/minyarc build/tooling/tests/scope-ownership
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/scope-ownership
+SCOPE_LAUNCHER_ARTIFACTS = build/minyarc build/minyarc-modules build/minyar-module-build build/tooling/tools/clang-driver build/minyar-runtime-eager.o build/minyar-runtime-eager-release.ll
 
-check-scope-ownership-sanitize: build/minyarc build/tooling/tests/scope-ownership
-	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/scope-ownership
+check-scope-ownership: $(SCOPE_LAUNCHER_ARTIFACTS) build/tooling/tests/scope-ownership
+	+MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/scope-ownership
+
+check-scope-ownership-sanitize: $(SCOPE_LAUNCHER_ARTIFACTS) build/tooling/tests/scope-ownership
+	+MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/scope-ownership
 
 build/scope-compiler-stage2.ll: build/compiler.min build/minyarc
 	$(LIMITED) ./build/minyarc $< $@ --library library --scope-owners
