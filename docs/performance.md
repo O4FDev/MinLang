@@ -51,6 +51,13 @@ The separate `check-performance` self-compile limits are 20 seconds wall,
 2 seconds CPU and 64 MiB. These remain regression targets, not a statement
 that the current, larger compiler passes.
 
+`make check-budget-functional` exercises the budget controls on every platform,
+including all three 100-pair batches, alternating compiler order, complete
+reports and exact resource boundaries. It uses fixture measurements and does
+not qualify host performance. Both `check` and `check-portable` include these
+controls. On macOS, `check` also runs the real `check-budget`; an explicit
+`check-budget` on another platform still rejects unsupported qualification.
+
 The October hardening review reconstructs the starting compiler and runtime
 instead of comparing against old documentation. That branch already exceeded
 the instruction and memory limits. Typed source positions defer diagnostic
@@ -68,8 +75,9 @@ hardening report for that fixture's evidence; these are not measurements of
 the current full compiler.
 
 The budget test runs outside the development limiter because background
-priority changes absolute timings. It takes the 90th percentile across batches;
-shared-host load can still affect results. Most other checks run under
+priority changes absolute timings. It retains all 300 paired wall and CPU
+observations across three batches; shared-host load can still affect results.
+Most other checks run under
 `scripts/with-limits.sh`, with background priority and CPU, memory, and output
 limits. Avoid parallel test jobs when comparing timings.
 

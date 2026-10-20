@@ -189,6 +189,15 @@ build/tooling/tests/self-compile-budget: build/testing/cycle-runtime.o tests/per
 check-budget: build/minyarc build/compiler-stage3.ll build/tooling/tests/self-compile-budget
 	./build/tooling/tests/self-compile-budget
 
+.PHONY: check-budget-functional
+check-budget-functional: build/tooling/tests/self-compile-budget
+	./build/tooling/tests/self-compile-budget --functional
+
+check check-portable: check-budget-functional
+ifeq ($(shell uname -s),Darwin)
+check: check-budget
+endif
+
 build/minyarc-budget-previous: build/compiler-budget-previous.ll build/minyar-compiler-runtime.ll
 	"$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
@@ -240,7 +249,7 @@ check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/min
 check-stress: build/minyarc build/minyar-runtime.o build/tooling/tests/fuzz
 	MINYAR_FUZZ_CASES=2000 $(LIMITED) ./build/tooling/tests/fuzz
 
-check: doctor check-smoke check-release-build check-recursive-data check-compact-ownership check-adversarial check-ownership-mutation check-regressions check-memory check-runtime-unit check-modules check-fuzz check-stack-overflow check-mutation check-performance check-scaling check-budget check-sanitize check-ownership check-examples
+check: doctor check-smoke check-release-build check-recursive-data check-compact-ownership check-adversarial check-ownership-mutation check-regressions check-memory check-runtime-unit check-modules check-fuzz check-stack-overflow check-mutation check-performance check-scaling check-sanitize check-ownership check-examples
 
 .PHONY: check-examples
 check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds build/minyar-runtime.o build/tooling/tests/compiler-behavior
