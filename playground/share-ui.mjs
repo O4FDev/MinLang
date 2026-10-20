@@ -1,6 +1,6 @@
 import { createShareURL, decodeShareFragment, SHARE_FRAGMENT_LIMIT } from './share.mjs';
 
-export function createSharing({ getSource, getRevision, getExampleId, loadShared }) {
+export function createSharing({ getSource, getRevision, getExampleId, getProject = () => undefined, loadShared }) {
   const button = document.getElementById('share');
   const field = document.getElementById('share-url');
   const message = document.getElementById('share-message');
@@ -31,14 +31,15 @@ export function createSharing({ getSource, getRevision, getExampleId, loadShared
   button.addEventListener('click', async () => {
     const token = ++sharing;
     const revision = getRevision();
-    const source = getSource();
-    const exampleId = getExampleId();
     button.disabled = true;
     try {
+      const source = getSource();
+      const exampleId = getExampleId();
+      const project = getProject();
       const base = new URL(location.origin);
       base.pathname = location.pathname;
       const url = await createShareURL(base, source,
-        /^[A-Za-z0-9_-]{1,64}$/.test(exampleId ?? '') ? { exampleId } : {});
+        /^[A-Za-z0-9_-]{1,64}$/.test(exampleId ?? '') ? { exampleId, project } : { project });
       if (token !== sharing) return;
       if (getRevision() !== revision) {
         message.textContent = 'Your program changed. Choose Share code again to make a link to the latest version.';

@@ -1,6 +1,7 @@
 import { tour } from './tour.mjs';
 import { createLearning } from './learning.mjs';
 import { createSharing } from './share-ui.mjs';
+import { createProjectEditor } from './project-editor.mjs';
 
 export const MAX_SOURCE_BYTES = 64 * 1024;
 export const LIVE_CHECK_DELAY_MS = 600;
@@ -24,7 +25,8 @@ export function diagnosticSelection(source, line, column, endLine, endColumn) {
   };
   const start = offset(line, column);
   const end = offset(endLine ?? line, endColumn ?? column);
-  return { start, end: Math.max(start, end) };
+  const displayedOffset = offset => source.slice(0, offset).replace(/\r\n?/g, '\n').length;
+  return { start: displayedOffset(start), end: displayedOffset(Math.max(start, end)) };
 }
 
 export function requestTimeout(value, fallback) {
@@ -67,9 +69,11 @@ async function initialisePlayground() {
   const tourButtons = new Map();
   let learning = null;
   let sharing = null;
+  let project = null;
 
-  function customExample(program) {
-    return { id: 'shared', title: 'Your program', description: 'A thought to make your own. Review the source, then run it when you’re ready.', source: program };
+  function customExample(program, baselineProject) {
+    return { id: 'shared', title: 'Your program', description: 'A thought to make your own. Review the source, then run it when you’re ready.', source: program,
+      ...(baselineProject ? { project: baselineProject } : {}) };
   }
 
   function status(message, state = 'ready') {
@@ -88,15 +92,18 @@ async function initialisePlayground() {
   function renderSourceInformation() {
     const bytes = sourceByteLength(source.value);
     const lines = source.value.split('\n').length;
-    get('source-info').textContent = `${lines} ${lines === 1 ? 'line' : 'lines'} · ${formatBytes(bytes)} / 64 KiB`;
-    get('source-info').parentElement.dataset.overLimit = String(bytes > MAX_SOURCE_BYTES);
+    const information = project.information();
+    get('source-info').textContent = project.hasExtras()
+      ? `${lines} ${lines === 1 ? 'line' : 'lines'} · ${formatBytes(bytes)} · ${information.count} files · ${formatBytes(information.bytes)} / 64 KiB`
+      : `${lines} ${lines === 1 ? 'line' : 'lines'} · ${formatBytes(bytes)} / 64 KiB`;
+    get('source-info').parentElement.dataset.overLimit = String(Boolean(information.problem));
     lineNumbers.textContent = Array.from({ length: lines }, (_, index) => index + 1).join('\n');
     lineNumbers.style.transform = `translateY(${-source.scrollTop}px)`;
-    run.disabled = !supported || bytes > MAX_SOURCE_BYTES || learning?.blocksRun(currentExample)
+    run.disabled = !supported || Boolean(information.problem) || learning?.blocksRun(currentExample)
       || activeRequest?.type === 'run' || queuedType === 'run';
     stop.disabled = !activeRequest && !queuedType;
     output.setAttribute('aria-busy', String(activeRequest?.type === 'run' && activeRequest.revision === sourceRevision));
-    return bytes;
+    return information.bytes;
   }
 
   function discardDownload() {
@@ -135,7 +142,11 @@ async function initialisePlayground() {
         location.textContent = `${text(problem.file, 'main.min')}:${problem.line}:${column}`;
         location.setAttribute('aria-label', `Go to line ${problem.line}, column ${column}`);
         location.addEventListener('click', () => {
-          const selection = diagnosticSelection(source.value, problem.line, column, problem.endLine, problem.endColumn);
+          if (!project.selectDiagnostic(text(problem.file, 'input.min'))) {
+            status('This location is outside the project. Read the diagnostic context below.', 'error');
+            return;
+          }
+          const selection = diagnosticSelection(project.currentSource(), problem.line, column, problem.endLine, problem.endColumn);
           source.focus();
           source.setSelectionRange(selection.start, selection.end);
         });
@@ -171,13 +182,15 @@ async function initialisePlayground() {
   }
 
   function checkSize() {
-    if (renderSourceInformation() <= MAX_SOURCE_BYTES) return true;
+    renderSourceInformation();
+    const information = project.information();
+    if (!information.problem) return true;
     queuedType = null;
     renderDiagnostics([{
-      message: 'This program is too large for the playground.',
-      help: 'Keep the source within 64 KiB, then try again.',
+      message: information.overLimit ? 'This program is too large for the playground.' : information.problem.message,
+      help: 'Keep the combined project source within 64 KiB and use valid Unicode text, then try again.',
     }]);
-    status('This program is over the 64 KiB source limit.', 'error');
+    status(information.overLimit ? 'This program is over the 64 KiB source limit.' : 'This project needs a change before it can run.', 'error');
     return false;
   }
 
@@ -187,12 +200,16 @@ async function initialisePlayground() {
       draftState.textContent = 'Shared program · local draft kept';
       return;
     }
-    if (sourceByteLength(source.value) > MAX_SOURCE_BYTES) {
-      draftState.textContent = 'Over limit · draft not saved';
+    let snapshot;
+    try { snapshot = project.snapshot(); } catch {
+      draftState.textContent = 'Over limit or invalid text · draft not saved';
       return;
     }
     try {
-      localStorage.setItem(DRAFT_KEY, JSON.stringify({ version: 1, exampleId: currentExample.id, source: source.value }));
+      const draft = project.hasExtras()
+        ? { version: 2, exampleId: currentExample.id, project: snapshot, currentPath: project.currentPath() }
+        : { version: 1, exampleId: currentExample.id, source: project.entrySource() };
+      localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
       draftState.textContent = 'Saved on this device';
     } catch {
       draftState.textContent = 'Local saving unavailable';
@@ -202,10 +219,13 @@ async function initialisePlayground() {
   function restoreDraft() {
     try {
       const draft = JSON.parse(localStorage.getItem(DRAFT_KEY));
-      if (draft?.version !== 1 || typeof draft.source !== 'string'
-          || draft.source.length > MAX_SOURCE_BYTES || sourceByteLength(draft.source) > MAX_SOURCE_BYTES) return false;
-      currentExample = learning.resolveExample(draft.exampleId) ?? customExample(draft.source);
-      source.value = draft.source;
+      if (draft?.version === 2) project.load(draft.project, draft.currentPath);
+      else if (draft?.version === 1 && typeof draft.source === 'string'
+          && draft.source.length <= MAX_SOURCE_BYTES && sourceByteLength(draft.source) <= MAX_SOURCE_BYTES) {
+        project.loadSource(draft.source);
+      } else return false;
+      currentExample = learning.resolveExample(draft.exampleId)
+        ?? customExample(project.entrySource(), draft.version === 2 ? project.snapshot() : undefined);
       return true;
     } catch {
       draftState.textContent = 'Local saving unavailable';
@@ -375,6 +395,8 @@ async function initialisePlayground() {
       return;
     }
     try {
+      const snapshot = project.snapshot();
+      const entrySource = project.entrySource();
       const currentWorker = getWorker();
       const isStartup = type === 'run' ? !backendIsWarm : !frontendIsWarm;
       const request = { id: ++nextRequestId, type, revision: sourceRevision, executionStarted: false,
@@ -391,7 +413,8 @@ async function initialisePlayground() {
         outputNote.textContent = isStartup ? 'The first run may take a moment to get ready.' : 'Your program is running.';
       }
       armRequestTimeout(request, startupTimeout);
-      currentWorker.postMessage({ id: request.id, type, source: source.value });
+      currentWorker.postMessage({ id: request.id, type, source: entrySource,
+        ...(project.hasExtras() ? { project: snapshot } : {}) });
       renderSourceInformation();
     } catch (error) {
       workerFailure(text(error?.message, 'This browser could not start the compiler worker.'));
@@ -410,7 +433,8 @@ async function initialisePlayground() {
     startRequest(type);
   }
 
-  function sourceChanged({ save = true, check = true } = {}) {
+  function sourceChanged({ save = true, check = true, sync = true } = {}) {
+    if (sync) project.updateCurrent();
     if (save) draftShouldPersist = true;
     sourceRevision += 1;
     sharing?.invalidate({ clearFragment: save });
@@ -448,7 +472,8 @@ async function initialisePlayground() {
     if (currentExample === example && !reset) return;
     currentExample = example;
     if (reset) learning.reset();
-    source.value = example.source;
+    if (example.project) project.load(example.project);
+    else project.loadSource(example.source);
     source.scrollTop = 0;
     source.scrollLeft = 0;
     output.textContent = '';
@@ -457,9 +482,14 @@ async function initialisePlayground() {
     outputNote.textContent = 'Choose Run code to see your program’s output.';
     lastOutputRevision = null;
     renderExampleHeading();
-    sourceChanged();
+    sourceChanged({ sync: false });
     if (reset) source.focus();
   }
+
+  project = createProjectEditor({ source, onEdit: () => sourceChanged({ sync: false }), onSelect: () => {
+    renderSourceInformation();
+    persistDraft();
+  } });
 
   // Load only the small local catalog before restoring a draft. No compiler
   // worker or toolchain asset is requested until an edit or an explicit Run.
@@ -471,9 +501,17 @@ async function initialisePlayground() {
   } catch {
     get('language-unavailable').hidden = false;
   }
-  learning = createLearning({ catalog, selectExample, getCurrent: () => currentExample, getSource: () => source.value });
+  learning = createLearning({ catalog, selectExample, getCurrent: () => currentExample,
+    getSource: () => project.entrySource(), getProjectHasExtras: () => project.hasExtras(),
+    addSupportingProject(prepared) {
+      project.load(prepared);
+      sourceChanged({ sync: false });
+      status('geometry.min added as an editable file. Choose Run code to run the project.');
+      source.focus();
+    } });
   sharing = createSharing({
-    getSource: () => source.value,
+    getSource: () => project.entrySource(),
+    getProject: () => project.hasExtras() ? project.snapshot() : undefined,
     getRevision: () => sourceRevision,
     getExampleId: () => currentExample.id,
     loadShared(shared) {
@@ -484,9 +522,10 @@ async function initialisePlayground() {
       queuedType = null;
       destroyWorker();
       draftShouldPersist = false;
-      currentExample = learning.resolveExample(shared.exampleId) ?? customExample(shared.source);
+      currentExample = learning.resolveExample(shared.exampleId) ?? customExample(shared.source, shared.project);
       learning.reset();
-      source.value = shared.source;
+      if (shared.project) project.load(shared.project);
+      else project.loadSource(shared.source);
       source.scrollTop = 0;
       source.scrollLeft = 0;
       output.textContent = '';
@@ -495,7 +534,7 @@ async function initialisePlayground() {
       outputNote.textContent = 'Review the shared program, then choose Run code.';
       lastOutputRevision = null;
       renderExampleHeading();
-      sourceChanged({ save: false, check: false });
+      sourceChanged({ save: false, check: false, sync: false });
       persistDraft();
       status('Shared program ready. Review it, then choose Run code.');
     },
@@ -519,8 +558,9 @@ async function initialisePlayground() {
     tourButtons.set(example.id, button);
   }
 
-  source.value = currentExample.source;
+  project.loadSource(currentExample.source);
   const restored = restoreDraft();
+  project.enable();
   source.readOnly = false;
   get('share').disabled = false;
   get('reset').disabled = false;

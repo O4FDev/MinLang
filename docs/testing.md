@@ -175,6 +175,11 @@ frontend LLVM parity, JSON diagnostic recovery and resource limits.
 Stop/timeout, draft, download and mobile-layout checks. All browser assets are
 local; external requests fail the browser gate. The separate WebAssembly CI
 job uploads the tested site and evidence. See [WebAssembly](wasm.md).
+`make check-playground-projects` focuses on bounded multi-file projects,
+relative imports and dependency cache invalidation, complete-project links
+and drafts, file-aware diagnostics, and explicit supporting files for guide
+fragments. It runs the project model and binary codec checks, the shipped
+compiler worker, and Chromium project flows.
 
 `make check-iteration` checks user-record iteration through `iterator`, `advance`
 and `current`, including independent cursors, control flow, managed items, generic

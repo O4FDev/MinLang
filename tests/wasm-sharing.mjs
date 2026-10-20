@@ -94,7 +94,7 @@ await check('damaged and noncanonical payloads', async () => {
 });
 
 await check('versions and compression remain explicit and bounded', async () => {
-  await assert.rejects(decodeShareFragment('#minyar=v2.u.0.00000000.'), failure('unsupported_version'));
+  await assert.rejects(decodeShareFragment('#minyar=v3.u.0.00000000.'), failure('unsupported_version'));
   await assert.rejects(decodeShareFragment('#minyar=v999.u.0.00000000.'), failure('unsupported_version'));
   for (const mode of ['g', 'z', 'U']) {
     await assert.rejects(decodeShareFragment(`#minyar=v1.${mode}.0.00000000.`), failure('unsupported_encoding'));

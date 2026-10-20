@@ -74,13 +74,33 @@ hash; new or changed blocks require an explicit classification and output
 oracle before the site builds. Each build generates its catalog from the
 current guide, keeping source locations current after documentation edits.
 
-Share code creates a link containing the current source in its URL
+Programs can contain up to 16 source files, with 64 KiB of combined UTF-8
+source. Add a file such as `geometry.min`, then use the file buttons to edit
+it. Run always starts at the entry shown above the editor, normally
+`main.min`. Switching the displayed file does not change the entry. Imports
+resolve relative to their importing file; an unused file is not checked.
+A diagnostic selects its source file and range, including preserved CRLF
+and bare-CR source. Remove file keeps one undo; the entry cannot be removed.
+Project drafts retain all files and the selected file across reloads.
+The guide’s local-module excerpt offers Add geometry.min. This explicit action
+adds a visible companion with public Point and answer declarations; the guide
+entry stays unchanged. Both files can be inspected, edited and shared.
+
+File names are relative `.min` paths of at most 256 UTF-8 bytes, using forward
+slashes. Nested folders, spaces and Unicode are supported. Dot and parent
+segments, control characters, duplicate/file-directory collisions and the
+reserved `library/` root are rejected. Over-budget edits stay visible but
+cannot be compiled, saved or shared until the source fits again.
+
+Share code creates a link containing the complete project in its URL
 fragment. It makes no upload or server request. Query parameters and old
 fragments are omitted. The link appears in a selectable field and is copied
 when clipboard access is available. Anyone with the link can read the
-source; it is not encrypted. Shared programs are limited to 64 KiB of UTF-8
-source, use an uncompressed versioned encoding, and carry a checksum to
-detect damaged links. Some messaging apps impose shorter URL limits.
+source; it is not encrypted. All project files share a 64 KiB UTF-8 source
+limit. Links use an uncompressed versioned encoding and carry a checksum to
+detect damaged links. Single-file links use the original v1 format; projects
+use v2 with a canonical binary file list. Old source-only links still open.
+Some messaging apps impose shorter URL limits.
 
 Opening a shared link takes precedence over the displayed draft and never
 starts a compiler check or execution. Review it, then choose Run code.
@@ -93,7 +113,9 @@ Compilation has two stages, both in the browser: the wasm build of Minyar's
 self-hosted compiler emits LLVM, then the bundled YoWASP LLVM/Clang toolchain
 links it with a prebuilt Minyar runtime. Live checking runs only the
 frontend. Each compiler and user execution gets a fresh WASI instance and
-in-memory files. Files disappear after each execution; no host filesystem
+in-memory files. Project sources exist only in the compiler filesystem; a
+user program starts with an empty filesystem. Files disappear after each
+execution; no host filesystem
 or network is exposed to a program. The bundled portable modules are
 `maybe`, `errors`, `text`, `math`, `io`, `process`, `random` and `json`.
 
@@ -124,6 +146,7 @@ make check-playground
 # Focused browser checks while working on a feature:
 make check-playground-sharing
 make check-playground-learning
+make check-playground-projects
 ```
 
 `check-wasm` executes real O0/O2 WASI programs, including every unmodified
@@ -133,7 +156,10 @@ browser LLVM backend, compares native/wasm frontend LLVM, and checks
 diagnostic recovery and resource limits. `check-playground` also drives
 Chromium through the editor, worker, cancellation, drafts, private fragment
 links, all six challenge solutions, the full guide picker and its contextual
-Run guards. Every standalone guide block also executes through the real
+Run guards. Project checks exercise relative and Unicode imports, changed
+dependency cache identity, full-project links/drafts, file-aware diagnostic
+selection, source budgets and fresh execution filesystems. Every standalone
+guide block also executes through the real
 browser frontend/backend with independently reviewed stdout and exit status.
 Evidence is retained under `build/wasm-evidence`. The separate WebAssembly
 CI workflow builds and tests the site and uploads it as a static artifact.

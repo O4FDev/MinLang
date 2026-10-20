@@ -1,9 +1,10 @@
 import { tour } from './tour.mjs';
+import { supportingProjectFor } from './project-examples.mjs';
 import { guides, recordTourRun, restoreTourProgress, summarizeTourProgress, visitTourStep } from './tour-guide.mjs';
 
 const PROGRESS_KEY = 'minyar.playground.tour.v1';
 
-export function createLearning({ catalog, selectExample, getCurrent, getSource }) {
+export function createLearning({ catalog, selectExample, getCurrent, getSource, getProjectHasExtras = () => false, addSupportingProject }) {
   const get = id => document.getElementById(id);
   const examples = new Map(tour.map(example => [example.id, example]));
   const entries = catalog?.examples ?? [];
@@ -25,8 +26,12 @@ export function createLearning({ catalog, selectExample, getCurrent, getSource }
   function sourceChanged() {
     const example = getCurrent();
     const changed = getSource() !== example.source;
+    const provenance = changed ? 'edited in this browser'
+      : getProjectHasExtras() ? 'exact original source · project files changed' : 'exact original source';
     get('example-provenance').textContent = example.file
-      ? `${example.file}:${example.line} · ${changed ? 'edited in this browser' : 'exact original source'}` : '';
+      ? `${example.file}:${example.line} · ${provenance}` : '';
+    get('supporting-files').hidden = !addSupportingProject || changed || getProjectHasExtras()
+      || !supportingProjectFor(example);
     get('lesson-feedback').textContent = '';
     delete get('lesson-feedback').dataset.achieved;
   }
@@ -95,6 +100,11 @@ export function createLearning({ catalog, selectExample, getCurrent, getSource }
     get('language-list').append(item);
   }
   get('language-search').addEventListener('input', filterExamples);
+  get('open-supporting-files').addEventListener('click', () => {
+    if (!addSupportingProject || getProjectHasExtras() || getSource() !== getCurrent().source) return;
+    const project = supportingProjectFor(getCurrent());
+    if (project) addSupportingProject(project);
+  });
   get('challenge').addEventListener('click', () => {
     if (!guides[getCurrent().id]) return;
     mode = 'challenge';
@@ -120,7 +130,7 @@ export function createLearning({ catalog, selectExample, getCurrent, getSource }
     sourceChanged,
     runMode: () => mode,
     reset() { mode = 'example'; },
-    blocksRun: example => example.runnable === false && getSource() === example.source,
+    blocksRun: example => example.runnable === false && getSource() === example.source && !getProjectHasExtras(),
     recordRun(id, runMode, result) {
       if (!guides[id]) return;
       const before = summarizeTourProgress(progress);

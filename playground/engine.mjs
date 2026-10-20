@@ -1,6 +1,7 @@
 import { WASI, File, Directory, OpenFile, ConsoleStdout, PreopenDirectory } from './vendor/wasi/dist/index.js';
 import { runClang } from './vendor/clang/gen/bundle.js';
 import { normalizeLLVM } from './target.mjs';
+import { normalizeProject, projectFromSource, projectCacheKey } from './project.mjs';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -98,6 +99,22 @@ export function parseDiagnostics(stderr) {
   return diagnostics;
 }
 
+export function writeArgumentSizes(memory, args, countPointer, sizePointer) {
+  const fault = 21; // WASI EFAULT; validate both writes before changing memory.
+  if (!(memory instanceof WebAssembly.Memory)) return fault;
+  const pointers = [countPointer, sizePointer];
+  if (pointers.some(value => !Number.isInteger(value) || value < -0x80000000 || value > 0xffffffff)) return fault;
+  const [count, size] = pointers.map(value => value >>> 0);
+  const buffer = memory.buffer;
+  if (count + 4 > buffer.byteLength || size + 4 > buffer.byteLength) return fault;
+  const argumentBytes = args.reduce((total, argument) => total + encoder.encode(argument).length + 1, 0);
+  if (args.length > 0xffffffff || argumentBytes > 0xffffffff) return fault;
+  const view = new DataView(buffer);
+  view.setUint32(count, args.length, true);
+  view.setUint32(size, argumentBytes, true);
+  return 0;
+}
+
 async function execute(module, args, tree = new Map()) {
   const stdout = capture();
   const stderr = capture();
@@ -108,9 +125,36 @@ async function execute(module, args, tree = new Map()) {
     new PreopenDirectory('.', tree),
   ], { debug: false });
   limitFilesystem(wasi);
-  const instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: wasi.wasiImport });
+  // The pinned shim writes UTF-8 argv but counts UTF-16 code units when it
+  // allocates their buffer. Entry paths can contain Unicode, so use the exact
+  // encoded size and only the module's public memory export.
+  let instance;
+  wasi.wasiImport.args_sizes_get = (countPointer, sizePointer) =>
+    writeArgumentSizes(instance?.exports.memory, args, countPointer, sizePointer);
+  instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: wasi.wasiImport });
   const exitCode = wasi.start(instance);
   return { exitCode, stdout: stdout.text(), stderr: stderr.text(), tree };
+}
+
+function compilerTree(project, library) {
+  const directories = new Map();
+  for (const { path, source } of project.files) {
+    const names = path.split('/');
+    let directory = directories;
+    for (const name of names.slice(0, -1)) {
+      if (!directory.has(name)) directory.set(name, new Map());
+      directory = directory.get(name);
+    }
+    directory.set(names.at(-1), new File(encoder.encode(source)));
+  }
+  function entries(directory) {
+    return new Map([...directory].map(([name, value]) =>
+      [name, value instanceof Map ? new Directory(entries(value)) : value]));
+  }
+  const tree = entries(directories);
+  tree.set('library', new Directory(new Map(Object.entries(library).map(([name, text]) =>
+    [name, new File(encoder.encode(text))]))));
+  return tree;
 }
 
 export async function createEngine({ loadBytes, progress = () => {} } = {}) {
@@ -132,23 +176,30 @@ export async function createEngine({ loadBytes, progress = () => {} } = {}) {
   let downloadPercent = -1;
   let previous;
 
-  async function check(source) {
+  async function check(source, project) {
     if (typeof source !== 'string') throw new Error('Source must be text.');
-    if (encoder.encode(source).length > SOURCE_LIMIT) throw new Error('Keep your program within 64 KiB.');
-    if (previous?.source === source) return previous;
+    if (source.length > SOURCE_LIMIT || encoder.encode(source).length > SOURCE_LIMIT) throw new Error('Keep your program within 64 KiB.');
+    const normalized = project === undefined ? projectFromSource(source, 'input.min') : normalizeProject(project);
+    if (normalized.files.find(file => file.path === normalized.entry).source !== source) {
+      throw new Error('Source must match the project entry file.');
+    }
+    const key = projectCacheKey(normalized);
+    if (previous?.key === key) return previous;
     progress('Checking your program…', 'checking');
-    const tree = new Map([
-      ['input.min', new File(encoder.encode(source))],
-      ['library', new Directory(new Map(Object.entries(library).map(([name, text]) => [name, new File(encoder.encode(text))])))],
-    ]);
+    const tree = compilerTree(normalized, library);
+    let outputPath = 'output.ll';
+    let outputNumber = 0;
+    // A valid source path may put a directory at any candidate output name.
+    // At most sixteen project roots can collide; library never matches.
+    while (tree.has(outputPath)) outputPath = `output-${++outputNumber}.ll`;
     const started = performance.now();
-    const result = await execute(frontend, ['minyarc', 'input.min', 'output.ll', '--library', 'library', '--error-format', 'json'], tree);
+    const result = await execute(frontend, ['minyarc', normalized.entry, outputPath, '--library', 'library', '--error-format', 'json'], tree);
     const diagnostics = parseDiagnostics(result.stderr);
     if (result.exitCode !== 0 && diagnostics.length === 0) throw new Error(`The compiler stopped with status ${result.exitCode}.`);
-    const output = tree.get('output.ll');
+    const output = tree.get(outputPath);
     if (result.exitCode === 0 && (!output || diagnostics.length)) throw new Error('The compiler did not produce a complete program.');
     previous = {
-      source, diagnostics, exitCode: result.exitCode,
+      source, key, diagnostics, exitCode: result.exitCode,
       llvm: output ? decoder.decode(output.data) : '', compileMs: performance.now() - started,
     };
     return previous;
@@ -156,9 +207,9 @@ export async function createEngine({ loadBytes, progress = () => {} } = {}) {
 
   return {
     check,
-    async request(type, source) {
+    async request(type, source, project) {
       if (type !== 'check' && type !== 'run') throw new Error('Unknown playground request.');
-      const checked = await check(source);
+      const checked = await check(source, project);
       const result = { diagnostics: checked.diagnostics, output: '', exitCode: checked.exitCode, compileMs: checked.compileMs, runMs: 0 };
       if (type === 'check' || checked.diagnostics.length) return result;
       if (!checked.wasm) {

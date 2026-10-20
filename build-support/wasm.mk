@@ -28,7 +28,7 @@ build/playground/.built: build/wasm/compiler.wasm build/wasm/runtime.o $(PLAYGRO
 	python3 tools/playground-language-examples.py --check
 	python3 tools/build-playground.py
 
-.PHONY: playground prepare-wasm prepare-playground-tests wasm check-wasm check-playground check-playground-sharing check-playground-learning
+.PHONY: playground prepare-wasm prepare-playground-tests wasm check-wasm check-playground check-playground-sharing check-playground-learning check-playground-projects
 prepare-wasm: build/wasm/.prepared
 playground: build/playground/.built
 
@@ -50,6 +50,11 @@ check-wasm: playground build/minyarc
 	python3 tests/wasm-resources.py --source build/wasm/clang/package/gen/llvm-resources.tar
 	node tests/wasm-sharing.mjs
 	node tests/wasm-tour-guide.mjs
+	node tests/wasm-project-model.mjs
+	node tests/wasm-project-share.mjs
+	node tests/wasm-project-links.mjs
+	node tests/wasm-project-examples.mjs
+	node tests/wasm-projects.mjs
 	node tests/wasm.mjs
 	node --no-warnings tests/wasm-target.mjs
 	node tests/wasm-language-examples.mjs
@@ -58,6 +63,7 @@ check-playground: check-wasm build/playground-tests/.ready
 	node tests/playground-browser.mjs
 	node tests/playground-sharing-browser.mjs
 	node tests/playground-learning-browser.mjs
+	node tests/playground-projects-browser.mjs
 
 check-playground-sharing: playground build/playground-tests/.ready
 	node tests/wasm-sharing.mjs
@@ -67,3 +73,11 @@ check-playground-learning: playground build/playground-tests/.ready
 	node tests/wasm-tour-guide.mjs
 	node tests/wasm-language-examples.mjs
 	node tests/playground-learning-browser.mjs
+
+check-playground-projects: playground build/playground-tests/.ready
+	node tests/wasm-project-model.mjs
+	node tests/wasm-project-share.mjs
+	node tests/wasm-project-links.mjs
+	node tests/wasm-project-examples.mjs
+	node tests/wasm-projects.mjs
+	node tests/playground-projects-browser.mjs
