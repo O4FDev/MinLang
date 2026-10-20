@@ -1824,7 +1824,6 @@ use "machine" as machine
 
 interrupt function keyboard(vector: Integer) handles(33) {
     let key = machine.in8(0x60)
-    machine.out8(0x20, 0x20)
     if key != 0 { signalInterrupt(1) }
 }
 ```
