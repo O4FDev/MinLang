@@ -57,5 +57,28 @@ check-unicode-text-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitiz
 	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/unicode-text
 	$(NATIVE_SANITIZER_ENV) $(SANITIZER_LIMITED) ./build/unicode-conformance-sanitize
 
-check check-portable: check-unicode-text check-unicode-conformance check-unicode-launcher check-unicode-case check-unicode-case-data
-check-sanitize: check-unicode-text-sanitize check-unicode-case-sanitize
+.PHONY: check-unicode-normalization check-unicode-normalization-sanitize
+
+build/unicode-normalization-o0: tests/unicode-normalization.c $(UNICODE_TEXT_SOURCES) runtime/minyar_native.h | build
+	$(LIMITED) "$(LLVM_CC)" $(CPPFLAGS) $(CFLAGS) -O0 -DMINYAR_UNICODE_NORMALIZATION_TESTING "$<" $(UNICODE_TEXT_IMPLEMENTATION) -lm -o "$@"
+
+build/unicode-normalization-o2: tests/unicode-normalization.c $(UNICODE_TEXT_SOURCES) runtime/minyar_native.h | build
+	$(LIMITED) "$(LLVM_CC)" $(CPPFLAGS) $(CFLAGS) -O2 -DMINYAR_UNICODE_NORMALIZATION_TESTING "$<" $(UNICODE_TEXT_IMPLEMENTATION) -lm -o "$@"
+
+check-unicode-normalization: build/unicode-normalization-o0 build/unicode-normalization-o2
+	$(LIMITED) ./build/unicode-normalization-o0
+	$(LIMITED) ./build/unicode-normalization-o2
+
+build/unicode-normalization-sanitize: tests/unicode-normalization.c $(UNICODE_TEXT_SOURCES) runtime/minyar_native.h | build
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(CPPFLAGS) $(CFLAGS) $(SANITIZER_FLAGS) -DMINYAR_UNICODE_NORMALIZATION_TESTING "$<" $(UNICODE_TEXT_IMPLEMENTATION) -lm -o "$@"
+
+check-unicode-normalization-sanitize: build/unicode-normalization-sanitize
+	$(NATIVE_SANITIZER_ENV) $(SANITIZER_LIMITED) ./build/unicode-normalization-sanitize
+
+.PHONY: check-unicode-installed
+build/tooling/tests/unicode-installed.ll: tests/release-support.min
+check-unicode-installed: build/tooling/tests/unicode-installed $(MINYAR_INSTALL_FRONTENDS) build/tooling/tools/clang-driver build/minyar-module-build build/minyar-default-runtime.o build/minyar-default-runtime-release.ll $(UNICODE_TEXT_SOURCES)
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/unicode-installed "$(CURDIR)"
+
+check check-portable: check-unicode-text check-unicode-conformance check-unicode-launcher check-unicode-case check-unicode-case-data check-unicode-normalization check-unicode-installed
+check-sanitize: check-unicode-text-sanitize check-unicode-case-sanitize check-unicode-normalization-sanitize

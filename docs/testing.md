@@ -315,6 +315,21 @@ column invariants and canonical-fold consistency; folding checks idempotence.
 Both targets are in the portable gate. `check-unicode-text-sanitize` repeats
 the focused cases and full corpora with ASan/UBSan, including the native provider.
 
+`make check-unicode-normalization` adds byte-exact ordering, stability, leading
+marks, zero-class barriers and composition regressions at O0/O2. It compares
+2,048 bounded deterministic inputs against the pinned provider's original
+normalization algorithm. Long adversarial runs through 131,072 combining marks
+use independent exact outputs and deterministic ordering-work bounds, including
+many short runs; they never call the quadratic reference. Test-only counters
+charge scalar visits, moves and bucket iterations. These are operation bounds,
+not timing assertions. `check-unicode-normalization-sanitize` adds ASan/UBSan.
+
+`make check-unicode-installed` installs twice into temporary paths containing
+spaces, removes the first installation, then builds an external Unicode program
+with the final installed launcher in ordinary and release modes. Each build uses
+a separate empty native-provider cache. Exact output includes embedded zero
+bytes, graphemes, normalization, folding, display casing and UTF-8 validation.
+
 `make check-unicode-case` checks full default uppercase and lowercase mappings
 against 41,297 UnicodeData scalar rows and all 104 unconditional SpecialCasing
 rows, at O0/O2. Focused ownership cases cover expansions, original-order casing,

@@ -60,12 +60,152 @@ MinyarBytes *minyar_unicode_unicodeBoundaries(const MinyarText *source) {
     return marks;
 }
 
+#ifdef MINYAR_UNICODE_NORMALIZATION_TESTING
+static unsigned long long unicode_ordering_work;
+void minyar_unicode_normalization_reset_work(void) { unicode_ordering_work = 0; }
+unsigned long long minyar_unicode_normalization_ordering_work(void) { return unicode_ordering_work; }
+#define UNICODE_ORDER_WORK(count) (unicode_ordering_work += (unsigned long long)(count))
+#else
+#define UNICODE_ORDER_WORK(count) ((void)0)
+#endif
+
+/* Query, then fill, complete recursive decompositions without invoking the
+ * vendor's adjacent-swap ordering pass. Scalar expansions are table-bounded;
+ * nevertheless size them from the API rather than a version-specific maximum. */
+static utf8proc_ssize_t unicode_decompose_pass(const unsigned char *source,
+                                              utf8proc_ssize_t length,
+                                              utf8proc_int32_t *buffer,
+                                              utf8proc_ssize_t capacity,
+                                              unsigned int options) {
+    utf8proc_ssize_t position = 0, written = 0;
+    const utf8proc_ssize_t maximum = (PTRDIFF_MAX - 1) / (utf8proc_ssize_t)sizeof(*buffer);
+    while (position < length) {
+        utf8proc_int32_t scalar;
+        utf8proc_ssize_t width = utf8proc_iterate(source + position, length - position, &scalar);
+        if (width <= 0) minyar_native_stop("Text contained invalid UTF-8.");
+        position += width;
+        utf8proc_ssize_t count = utf8proc_decompose_char(scalar,
+            buffer ? buffer + written : NULL, buffer ? capacity - written : 0,
+            options | UTF8PROC_STABLE, NULL);
+        if (count < 0) minyar_native_stop(utf8proc_errmsg(count));
+        if (count > maximum - written || (buffer && count > capacity - written))
+            minyar_native_stop("the normalized Text is too large.");
+        written += count;
+    }
+    return written;
+}
+
+static void unicode_order_run(utf8proc_int32_t *buffer, utf8proc_ssize_t length,
+                              utf8proc_int32_t *scratch) {
+    /* A fixed small-run limit avoids initializing 256 buckets for two accents.
+     * The inner loop is bounded by 15, independent of overall input length. */
+    if (length <= 16) {
+        for (utf8proc_ssize_t index = 1; index < length; index++) {
+            utf8proc_int32_t scalar = buffer[index];
+            unsigned int combining = (unsigned int)utf8proc_get_property(scalar)->combining_class;
+            utf8proc_ssize_t position = index;
+            UNICODE_ORDER_WORK(1);
+            while (position > 0) {
+                unsigned int previous = (unsigned int)utf8proc_get_property(buffer[position - 1])->combining_class;
+                UNICODE_ORDER_WORK(1);
+                if (previous <= combining) break;
+                buffer[position] = buffer[position - 1];
+                position--;
+                UNICODE_ORDER_WORK(1);
+            }
+            buffer[position] = scalar;
+            UNICODE_ORDER_WORK(1);
+        }
+        return;
+    }
+    utf8proc_ssize_t offsets[256];
+    for (size_t index = 0; index < 256; index++) {
+        offsets[index] = 0;
+        UNICODE_ORDER_WORK(1);
+    }
+    for (utf8proc_ssize_t index = 0; index < length; index++) {
+        offsets[(unsigned int)utf8proc_get_property(buffer[index])->combining_class]++;
+        UNICODE_ORDER_WORK(1);
+    }
+    utf8proc_ssize_t total = 0;
+    for (size_t index = 1; index < 256; index++) {
+        utf8proc_ssize_t count = offsets[index];
+        offsets[index] = total;
+        total += count;
+        UNICODE_ORDER_WORK(1);
+    }
+    /* Input-order scatter preserves equal-class order and composition blocking. */
+    for (utf8proc_ssize_t index = 0; index < length; index++) {
+        unsigned int combining = (unsigned int)utf8proc_get_property(buffer[index])->combining_class;
+        scratch[offsets[combining]++] = buffer[index];
+        UNICODE_ORDER_WORK(1);
+    }
+    memcpy(buffer, scratch, (size_t)length * sizeof(*buffer));
+    UNICODE_ORDER_WORK(length);
+}
+
+/* First find the largest disordered nonstarter run, then sort using one scratch
+ * buffer. Class-zero scalars never move. Already ordered input needs no scratch.
+ * Each pass visits each scalar once; large sorts cost 3*run_length + 511 work,
+ * and insertion sorts have a fixed 16-scalar limit.
+ * There are at most length/2 disordered runs, so even adversarial input is linear. */
+static utf8proc_ssize_t unicode_order_runs(utf8proc_int32_t *buffer,
+                                          utf8proc_ssize_t length,
+                                          utf8proc_int32_t *scratch, bool reorder) {
+    utf8proc_ssize_t first = 0, largest = 0;
+    unsigned int previous = 0;
+    bool disordered = false;
+    for (utf8proc_ssize_t position = 0; position <= length; position++) {
+        unsigned int combining = position == length ? 0 :
+            (unsigned int)utf8proc_get_property(buffer[position])->combining_class;
+        UNICODE_ORDER_WORK(1);
+        if (combining == 0) {
+            utf8proc_ssize_t count = position - first;
+            if (disordered) {
+                if (count > largest) largest = count;
+                if (reorder) unicode_order_run(buffer + first, count, scratch);
+            }
+            first = position + 1;
+            previous = 0;
+            disordered = false;
+        } else {
+            if (combining < previous) disordered = true;
+            previous = combining;
+        }
+    }
+    return largest;
+}
+
 static utf8proc_ssize_t unicode_map(const unsigned char *source, utf8proc_ssize_t length,
                                    unsigned char **output, unsigned int options) {
-    utf8proc_ssize_t result = utf8proc_map(source, length, output, options | UTF8PROC_STABLE);
+    utf8proc_ssize_t count = unicode_decompose_pass(source, length, NULL, 0, options);
+    /* The extra byte is required by the in-place UTF-8 encoder, even when empty. */
+    utf8proc_int32_t *buffer = malloc((size_t)count * sizeof(*buffer) + 1);
+    if (!buffer) minyar_native_stop("there is not enough memory for normalized Text.");
+    unicode_decompose_pass(source, length, buffer, count, options);
+    utf8proc_ssize_t largest = unicode_order_runs(buffer, count, NULL, false);
+    if (largest > 0) {
+        utf8proc_int32_t *scratch = NULL;
+        if (largest > 16) {
+            scratch = malloc((size_t)largest * sizeof(*scratch));
+            if (!scratch) minyar_native_stop("there is not enough memory to order normalized Text.");
+        }
+        unicode_order_runs(buffer, count, scratch, true);
+        free(scratch);
+    }
+    /* Compose the entire ordered buffer: even two class-zero scalars can combine
+     * (Hangul and some Indic vowels). The pinned composition-table lookup has
+     * bounded length; this step does not perform canonical ordering again. */
+    utf8proc_ssize_t result = utf8proc_reencode(buffer, count, options | UTF8PROC_STABLE);
     if (result < 0) minyar_native_stop(utf8proc_errmsg(result));
+    /* Match the vendor's optional shrink, especially for the retained NFD
+     * intermediate during folding. A failed shrink leaves the valid buffer. */
+    void *compact = realloc(buffer, (size_t)result + 1);
+    if (compact) buffer = compact;
+    *output = (unsigned char *)buffer;
     return result;
 }
+#undef UNICODE_ORDER_WORK
 
 MinyarText *minyar_unicode_normalized(const MinyarText *source) {
     unsigned char *output;

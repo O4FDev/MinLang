@@ -383,8 +383,13 @@ Casing uses two linear passes with a checked, exactly sized output buffer.
 Native scratch storage uses the system allocator rather than the selected
 Minyar heap profile. Unicode tables add read-only program data when linked.
 
-Canonical reordering can take quadratic time on adversarial runs of combining
-marks. Normalize complete keys after concatenating their parts.
+Normalization and folding take linear time in the input size for the pinned
+Unicode tables. Canonical reordering uses stable counting sort for disordered
+runs longer than 16 combining marks, with four scratch bytes per scalar in the
+largest such run. Shorter runs use bounded insertion sort; they and already
+ordered input need no sorting buffer. Recursive decomposition uses four bytes
+per resulting scalar before in-place UTF-8 encoding and an optional buffer
+shrink. Normalize complete keys after concatenating their parts.
 
 `joinText(parts)` joins a `List<Text>` into one Text value.
 
