@@ -267,11 +267,13 @@ instruction counts. Preserve this distinction when reporting results.
 ## Checked collection access
 
 A `for` loop over a List or Bytes reads the length through the same inline
-helper on every iteration, so the loop header makes no runtime call. The loop
-holds its own count on the List, so when the body makes no calls and assigns
-only plain local names, nothing can remove an element and the loop name borrows
-each element instead of retaining and releasing it. Summing two fields over a
-1,000-element `List<Point>` 100,000 times fell from 0.29 to 0.08 seconds
+helper on every iteration, so the loop header makes no runtime call. When the
+body makes no calls and assigns only plain local names, nothing in it can
+change the collection: the loop name borrows each element instead of retaining
+and releasing it, and a plain variable source that the body does not reassign
+needs no extra count of its own. A function whose only owners were those then
+needs no ownership frame or loop service points. Summing two fields over a
+1,000-element `List<Point>` 100,000 times fell from 0.29 to 0.06 seconds
 (checked C with pointers to heap structs: 0.04).
 
 Ordinary Bytes indexing, indexed replacement, length and single-byte `add`
@@ -328,6 +330,11 @@ reduced decode time by 22–35%:
 
 The left column is the direct compiler's default ownership lowering, which
 those products used; the right is `--scope-owners` with the eager runtime.
+Libraries and embedders that call `build/minyarc` directly get that legacy
+heap-frame lowering unless they pass the launcher's choice: `--bounded-owners
+32` with a runtime that includes `minyar_stack_frames.h` (as
+`runtime/minyar_default_runtime.c` does), or `--scope-owners` with the eager
+runtime.
 Both remain 18–37 times slower than the system zlib, libpng and libjpeg-turbo.
 
 `experiments/codegen/byte-access-study.py` compares two frozen compilers with

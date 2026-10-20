@@ -8,10 +8,10 @@ function isAssignmentOperator(token: Text): Boolean {
     return token == "=" || token == "+=" || token == "-=" || token == "*=" || token == "/=" || token == "%="
 }
 
-// A List loop already holds its own count on the List it walks. When the loop
-// body makes no calls and assigns only plain local names, nothing in it can
-// remove an element from that List, so the loop name can borrow each element.
-function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
+// When a loop body makes no calls and assigns only plain local names, nothing
+// in it can change the collection it walks. Unless the body reassigns the
+// source name itself, whoever owns that source keeps every element alive.
+function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer, source: Text): Boolean {
     if tokenKinds[position] != 4 || tokenTexts[position] != "{" { return false }
     let cursor = position + 1
     let depth = 0
@@ -32,7 +32,7 @@ function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>
                 } else {
                     let previous = tokenKinds[cursor - 2]
                     let boundary = previous == 6 || (previous == 4 && (tokenTexts[cursor - 2] == "{" || tokenTexts[cursor - 2] == "}"))
-                    if tokenKinds[cursor - 1] != 1 || !boundary { return false }
+                    if tokenKinds[cursor - 1] != 1 || !boundary || tokenTexts[cursor - 1] == source { return false }
                 }
             }
         }
@@ -530,6 +530,10 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     let sequenceStages: List<Integer> = []
     let source = parseForSequenceSource(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, sourceType, sequenceStages, parts.length == 0)
     source = prepareSequenceSource(context, localNames, localTypes, localIds, localLengths, state, textState, output, source, sourceType, sequenceStages, sourceLocation)
+    // A plain variable source already owns the collection for the whole loop.
+    let sourceName = ""
+    if tokenKinds[sourceLocation] == 1 && sourceLocation + 1 == state[0] && sequenceStages.length == 0 && !isMapType(sourceType[0]) && !isSetType(sourceType[0]) { sourceName = tokenTexts[sourceLocation] }
+    let walkKept = sequenceStages.length == 0 && parts.length == 0 && loopBodyKeepsElements(tokenKinds, tokenTexts, state[0], sourceName)
     if parts.length > 0 && sequenceStages.length > 0 { failAtToken(tokenLines, sourceLocation, "parallel for needs an Integer range; use an ordinary for for a lazy sequence") }
     if isMapType(sourceType[0]) || isSetType(sourceType[0]) {
         let keyType = mapKeyType(sourceType[0])
@@ -583,7 +587,7 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
         }
         collection = nextLocal(state)
         addLocal(localNames, localTypes, localIds, localLengths, state, " for collection", sourceType[0], collection)
-        assignReference(output, state, collection, source, sourceType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+        if !walkKept || sourceName == "" { assignReference(output, state, collection, source, sourceType, functionParameterCounts, functionParameterTypes, functionReturnTypes) }
         storeLocal(output, collection, sourceType[0], source)
         storeLocal(output, counter, 1, "0")
     }
@@ -641,8 +645,7 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     output.add("; minyar-debug-scope: begin\n")
     let variable = nextLocal(state)
     addLocal(localNames, localTypes, localIds, localLengths, state, name, elementType, variable)
-    let borrowed = collection >= 0 && isListType(sourceType[0]) && sequenceStages.length == 0 && parts.length == 0 && loopBodyKeepsElements(tokenKinds, tokenTexts, state[0])
-    if !borrowed { assignReference(output, state, variable, element, elementResult, functionParameterCounts, functionParameterTypes, functionReturnTypes) }
+    if !(walkKept && collection >= 0 && isListType(sourceType[0])) { assignReference(output, state, variable, element, elementResult, functionParameterCounts, functionParameterTypes, functionReturnTypes) }
     storeLocal(output, variable, elementType, element)
     emitDebugBinding(context, output, nameLocation, name, elementType, "ptr %local." + Text(variable), 0, true)
     addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -2, loopLabel)
@@ -662,7 +665,7 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     textState[0] = "for.end." + Text(endLabel)
     let scoped = firstLoopLocal
     while scoped < state[3] {
-        rootLocal(output, state, localIds[scoped], "null", localTypes[scoped])
+        if hasOwnershipSlot(state, localIds[scoped]) { rootLocal(output, state, localIds[scoped], "null", localTypes[scoped]) }
         scoped = scoped + 1
     }
     state[3] = firstLoopLocal
