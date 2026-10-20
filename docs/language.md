@@ -1278,8 +1278,10 @@ arguments. A file cannot mix this form with executable top-level statements
 because that would create two entry points. The executable entry `main` cannot
 be called from language code; put shared work in a separate function. An imported
 module function named `main` is an ordinary function and remains callable.
+Reaching the end of the executable entry `main` returns process status zero;
+an explicit `return` can choose another Integer status.
 
-Functions with a value return type must return a value on every reachable path.
+Other functions with a value return type must return a value on every reachable path.
 A path ending in `fail(...)`, `exit(...)`, or a literal `while true` loop without
 a reachable `break` is also terminal. Literal `true` and `false` conditions
 select the reachable branch for return analysis, though unreachable source is

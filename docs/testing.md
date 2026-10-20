@@ -22,6 +22,24 @@ doctest filtering and aggregation, standalone release examples and expectation
 failures. A wrong output must leave both previous site files byte-identical.
 Documentation examples run in private temporary working directories.
 
+`make check-book` reads every Markdown page under `docs/book` and the Rust,
+C++ and Swift transition guides. Each Minyar fence must be a complete program
+with an explicit, immediately following output fence. The suite rejects
+malformed or mistagged fences, checks parser rejection controls, and executes
+every program at O0/O2 against exact stdout, zero exit status and empty stderr.
+It also compiles each example in test mode and executes embedded tests at both
+optimization levels. Examples run in independent temporary directories. The
+target belongs to `check-portable`; `./build/tooling/tests/book --self-check`
+runs only the parser controls after building the harness.
+
+`make check-book-cli` follows the book's first-program and garden walkthroughs
+through the public launcher: project creation, running, checking, embedded-test
+discovery, release building and execution of the documented output path. It
+reads both programs from the published pages and checks the release output
+exactly. An intentionally wrong garden expectation must fail with status 1
+and a failed-test report. The runnable garden gallery must match the book's
+complete source. Both book targets belong to `check-portable`.
+
 `make check-library-documentation` verifies every documented example across
 the whole standard library and gallery at debug/O0 and release/O2, including
 Error contexts, Maybe, generic choices, aliases and methods. It also checks

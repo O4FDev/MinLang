@@ -1,0 +1,224 @@
+use "../tools/testing.min" as test
+use "io" as io
+use "files" as files
+use "system" as system
+use "process" as arguments
+
+record Example { source: Text; output: Text; line: Integer }
+record Parsed { examples: List<Example>; error: Text }
+record Page { path: Text; examples: List<Example> }
+
+function whitespace(character: Character): Boolean {
+    return character == ' ' || character == '\t' || character == '\r' || character == '\n'
+}
+function stripped(value: Text): Text {
+    let first = 0
+    let after = value.length
+    while first < after && whitespace(value[first]) { first += 1 }
+    while after > first && whitespace(value[after - 1]) { after -= 1 }
+    return value.slice(first, after)
+}
+function rows(source: Text): List<Text> {
+    let result: List<Text> = []
+    for line in test.lines(source) {
+        if line.endsWith("\r") { line = line.slice(0, line.length - 1) }
+        result.add(line)
+    }
+    return result
+}
+function fence(line: Text): Boolean {
+    let value = stripped(line)
+    return value.startsWith("```") || value.startsWith("~~~")
+}
+function closing(lines: List<Text>, first: Integer): Integer {
+    let position = first + 1
+    while position < lines.length {
+        if fence(lines[position]) {
+            if lines[position] == "```" { return position }
+            return -2
+        }
+        position += 1
+    }
+    return -1
+}
+function content(lines: List<Text>, first: Integer, after: Integer): Text {
+    let parts: List<Text> = []
+    for index in first..after { parts.add(lines[index] + "\n") }
+    return joinText(parts)
+}
+function displayFence(line: Text): Boolean {
+    for tag in ["text", "sh", "shell", "console", "rust", "cpp", "c++", "swift"] {
+        if line == "```" + tag { return true }
+    }
+    return false
+}
+function invalid(line: Integer, message: Text): Parsed {
+    return Parsed { examples: []; error: "line " + Text(line + 1) + ": " + message }
+}
+function parse(source: Text): Parsed {
+    let result = Parsed { examples: []; error: "" }
+    let lines = rows(source)
+    let position = 0
+    while position < lines.length {
+        let line = lines[position]
+        // Reject unsupported spellings instead of silently losing an example.
+        if test.contains(line, "```") || test.contains(line, "~~~") {
+            if line == "```output" { return invalid(position, "orphan output fence") }
+            if line != "```minyar" && !displayFence(line) { return invalid(position, "unsupported or indented code fence") }
+            let after = closing(lines, position)
+            if after == -1 { return invalid(position, "unclosed code fence") }
+            if after == -2 { return invalid(position, "malformed closing code fence") }
+            if line != "```minyar" { position = after + 1; continue }
+            let first = position
+            let program = content(lines, position + 1, after)
+            if stripped(program) == "" { return invalid(first, "empty Minyar program") }
+            position = after + 1
+            while position < lines.length && stripped(lines[position]) == "" { position += 1 }
+            if position == lines.length { return invalid(first, "Minyar program needs an immediately following output fence") }
+            if lines[position] != "```output" { return invalid(position, "Minyar program needs an immediately following output fence") }
+            after = closing(lines, position)
+            if after == -1 { return invalid(position, "unclosed output fence") }
+            if after == -2 { return invalid(position, "malformed closing output fence") }
+            result.examples.add(Example { source: program; output: content(lines, position + 1, after); line: first + 2 })
+            position = after + 1
+        } else { position += 1 }
+    }
+    if result.examples.length == 0 { return invalid(0, "each book page needs at least one Minyar program") }
+    return result
+}
+
+function parserControls(): Integer {
+    let example = "```minyar\nprint(\"Héllo, sea.\")\n```\n\n```output\nHéllo, sea. \n\n```\n"
+    let quiet = "```minyar\nlet answer = 42\n```\n```output\n```\n"
+    let parsed = parse("# A chapter\n\n```rust\nfn main() {}\n```\n" + example + quiet)
+    test.check(parsed.error == "" && parsed.examples.length == 2, "parser discovers every complete program beside display fences")
+    test.check(parsed.examples[0].source == "print(\"Héllo, sea.\")\n" && parsed.examples[0].output == "Héllo, sea. \n\n" && parsed.examples[0].line == 7,
+        "parser preserves UTF-8, source lines, trailing spaces and blank output lines")
+    test.check(parsed.examples[1].output == "", "an explicit empty output fence means zero output bytes")
+    let windows = parse(test.replace(quiet, "\n", "\r\n"))
+    test.check(windows.error == "" && windows.examples[0].source == "let answer = 42\n" && windows.examples[0].output == "", "CRLF documentation has the same source and output")
+    let invalidCases: List<List<Text>> = [
+        ["# No program\n", "at least one"],
+        ["```output\n42\n```\n", "orphan output"],
+        ["```minyar\nprint(42)\n```\n", "immediately following output"],
+        ["```minyar\nprint(42)\n```\nSome prose\n```output\n42\n```\n", "immediately following output"],
+        ["```minyar\n```\n```output\n```\n", "empty Minyar"],
+        ["```minyar\n \t\n```\n```output\n```\n", "empty Minyar"],
+        ["```minyarr\nprint(42)\n```\n", "unsupported"],
+        ["```Minyar\nprint(42)\n```\n", "unsupported"],
+        ["```minyar skip\nprint(42)\n```\n", "unsupported"],
+        [" ```minyar\nprint(42)\n```\n", "unsupported"],
+        ["> ```minyar\nprint(42)\n```\n", "unsupported"],
+        ["~~~minyar\nprint(42)\n~~~\n", "unsupported"],
+        ["````minyar\nprint(42)\n````\n", "unsupported"],
+        ["```python\nprint(42)\n```\n", "unsupported"],
+        ["```\n", "unsupported"],
+        ["```minyar\nprint(42)\n", "unclosed code"],
+        ["```text\nunfinished\n", "unclosed code"],
+        ["```minyar\nprint(42)\n```output\n", "malformed closing code"],
+        ["```minyar\nprint(42)\n ```\n", "malformed closing code"],
+        ["```minyar\nprint(42)\n```\n```output\n42\n", "unclosed output"],
+        ["```minyar\nprint(42)\n```\n```output\n42\n````\n", "malformed closing output"],
+        [quiet + "```output\n```\n", "orphan output"],
+        [quiet + "```minyarr\nprint(42)\n```\n", "unsupported"]
+    ]
+    for candidate in invalidCases {
+        let rejected = parse(candidate[0])
+        test.check(test.contains(rejected.error, candidate[1]), "parser accepted or misreported invalid documentation: " + candidate[0] + "\n" + rejected.error)
+    }
+    return invalidCases.length
+}
+
+function discover(directory: Text, root: Text, found: List<Text>, seen: Map<Text, Boolean>) {
+    let real = test.resolvePath(directory)
+    test.check(real != "" && (real == root || real.startsWith(root + "/")), "book directory escapes its root: " + directory)
+    test.check(!seen.has(real), "book directory is repeated or cyclic: " + directory)
+    seen[real] = true
+    let names = files.list(directory)
+    test.check(files.lastError() == 0, "cannot list book directory: " + directory)
+    names.sort()
+    for name in names {
+        let path = directory + "/" + name
+        let children = files.list(path)
+        let error = files.lastError()
+        if error == 0 { discover(path, root, found, seen) }
+        else {
+            test.check(error == -20, "cannot inspect book entry: " + path + " (" + Text(error) + ")")
+            if path.endsWith(".md") { found.add(path) }
+        }
+    }
+}
+function read(path: Text): Text {
+    let data = files.readFile(path)
+    test.check(files.lastError() == 0, "cannot read required book page: " + path)
+    return Text(data)
+}
+function verify(compiler: test.Compiler, example: Example, location: Text, serial: Integer) {
+    let work = compiler.directory + "/example-" + Text(serial)
+    test.check(files.makeDirectory(work) == 0, "cannot create example directory")
+    let source = work + "/program.min"
+    io.writeTextFile(source, example.source)
+    for mode in ["program", "tests"] {
+        let llvm = work + "/" + mode + ".ll"
+        let command = [compiler.executable, source, llvm, "--library", "library"]
+        if mode == "tests" { command.add("--test-mode") }
+        let built = test.run(command, system.environment(), "", work + "/" + mode + "-compile", compiler.compileTimeout)
+        test.require(built, location + " " + mode + " compilation")
+        test.check(built.errorOutput == "" && files.pathSize(llvm) > 0, location + " compilation produced diagnostics or no LLVM\n" + built.errorOutput)
+        if test.addressEnabled(compiler.flags) { io.writeTextFile(llvm, test.instrument(io.readTextFile(llvm))) }
+        for optimization in ["-O0", "-O2"] {
+            let directory = work + "/" + mode + optimization
+            test.check(files.makeDirectory(directory) == 0, "cannot create private execution directory")
+            let executable = directory + "/program"
+            test.check(files.pathSize(executable) < 0, "example executable already exists")
+            let link = [compiler.clang, optimization]
+            for flag in compiler.flags { link.add(flag) }
+            for item in ["-Wno-override-module", llvm, compiler.runtime, "-lm", "-o", executable] { link.add(item) }
+            test.require(test.run(link, system.environment(), "", directory + "/link", compiler.linkTimeout), location + " " + mode + " " + optimization + " link")
+            let run = test.run([executable], system.environment(), directory, directory + "/run", compiler.runTimeout)
+            test.require(run, location + " " + mode + " " + optimization + " execution")
+            test.check(run.errorOutput == "", location + " " + mode + " " + optimization + " wrote diagnostics\n" + run.errorOutput)
+            if mode == "program" {
+                test.check(run.output == example.output, location + " " + optimization + " output differs\nexpected:\n" + example.output + "received:\n" + run.output)
+            }
+        }
+    }
+}
+
+let rejected = parserControls()
+if arguments.argumentCount() == 1 && arguments.argument(0) == "--self-check" {
+    print("Book parser: " + Text(rejected) + " invalid controls rejected; output and discovery controls passed")
+    exit(0)
+}
+test.check(arguments.argumentCount() == 0, "usage: book [--self-check]")
+let paths: List<Text> = []
+let root = test.resolvePath("docs/book")
+test.check(root != "", "required docs/book directory is missing")
+discover("docs/book", root, paths, Map<Text, Boolean>())
+test.check(paths.length > 0, "book has no Markdown pages")
+let introduction = false
+for path in paths { if path == "docs/book/README.md" { introduction = true } }
+test.check(introduction, "required docs/book/README.md is missing")
+for path in ["docs/from-rust.md", "docs/from-cpp.md", "docs/from-swift.md"] { paths.add(path) }
+paths.sort()
+let pages: List<Page> = []
+for path in paths {
+    let parsed = parse(read(path))
+    test.check(parsed.error == "", path + ": " + parsed.error)
+    if path == "docs/book/08-garden.md" {
+        test.check(parsed.examples.length == 1 && read("examples/gallery/community-garden.min") == parsed.examples[0].source,
+            "the runnable garden gallery must match the complete book program")
+    }
+    pages.add(Page { path: path; examples: parsed.examples })
+}
+let compiler = test.compiler()
+if compiler.flags.length == 0 { compiler.compileTimeout = 15 }
+let checked = 0
+for page in pages {
+    for example in page.examples {
+        checked += 1
+        verify(compiler, example, page.path + ":" + Text(example.line), checked)
+    }
+}
+test.removeTree(compiler.directory)
+print(Text(checked) + " book examples across " + Text(paths.length) + " pages passed at O0/O2, including embedded tests; " + Text(rejected) + " invalid parser controls rejected")

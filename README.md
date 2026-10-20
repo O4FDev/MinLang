@@ -167,6 +167,8 @@ remain unfinished.
 
 ## Documentation
 
+- [Minyar for people who have never programmed](docs/book/README.md)
+- [Minyar for Rust](docs/from-rust.md), [C++](docs/from-cpp.md) and [Swift programmers](docs/from-swift.md)
 - [Language guide](docs/language.md)
 - [Installation and toolchain versions](docs/install.md)
 - [Project CLI](docs/cli.md), [packages](docs/packages.md) and [hosting an index](docs/registry.md)

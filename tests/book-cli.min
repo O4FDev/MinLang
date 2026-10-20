@@ -1,0 +1,69 @@
+use "../tools/testing.min" as test
+use "../tools/documentation-markup.min" as markup
+use "io" as io
+use "system" as system
+use "files" as files
+
+record Walkthrough { launcher: Text; directory: Text; log: Text; serial: Integer }
+
+function environment(): List<Text> {
+    let result: List<Text> = []
+    // A terminal walkthrough has no parent Make jobserver descriptors. Do not
+    // pass the harness's stale jobserver flags into the launcher's nested Make.
+    for entry in system.environment() {
+        if !entry.startsWith("MAKEFLAGS=") && !entry.startsWith("MFLAGS=") && !entry.startsWith("MAKELEVEL=") &&
+            !entry.startsWith("MAKEFILES=") && !entry.startsWith("GNUMAKEFLAGS=") { result.add(entry) }
+    }
+    return result
+}
+
+function invoke(walkthrough: Walkthrough, arguments: List<Text>): test.Result {
+    walkthrough.serial += 1
+    let command = [walkthrough.launcher]
+    for argument in arguments { command.add(argument) }
+    let result = test.run(command, environment(), walkthrough.directory,
+        walkthrough.log + "/command-" + Text(walkthrough.serial), 180)
+    test.require(result, "book walkthrough " + arguments[0])
+    test.check(result.errorOutput == "", "book walkthrough " + arguments[0] + " wrote diagnostics\n" + result.errorOutput)
+    return result
+}
+
+let work = test.scratch()
+let root = test.resolvePath(".")
+let walkthrough = Walkthrough { launcher: root + "/minyar"; directory: work; log: work; serial: 0 }
+invoke(walkthrough, ["new", "hello"])
+walkthrough.directory = work + "/hello"
+test.check(files.pathSize(walkthrough.directory + "/src/main.min") > 0, "book project scaffold exists")
+let first = markup.examples(io.readTextFile("docs/book/01-first-program.md"), "first chapter")
+test.check(first.length == 2, "first chapter has the expected two programs")
+io.writeTextFile(walkthrough.directory + "/src/main.min", first[0].source)
+let hello = invoke(walkthrough, ["run"])
+let debugPrefix = "built " + walkthrough.directory + "/target/debug/hello\nFinished debug hello\n"
+test.check(hello.output == debugPrefix + first[0].output, "first book program runs through the public CLI\n" + hello.output)
+
+let garden = markup.examples(io.readTextFile("docs/book/08-garden.md"), "garden chapter")
+test.check(garden.length == 1, "garden chapter has one complete program")
+io.writeTextFile(walkthrough.directory + "/src/main.min", garden[0].source)
+invoke(walkthrough, ["check"])
+let plan = invoke(walkthrough, ["run"])
+test.check(plan.output == debugPrefix + garden[0].output, "garden output matches through the public CLI\n" + plan.output)
+let checked = invoke(walkthrough, ["test"])
+for name in ["an empty garden needs no seeds", "every bed contributes to the total", "3 passed; 0 failed"] {
+    test.check(test.contains(checked.output, name), "garden tests are discovered: " + name + "\n" + checked.output)
+}
+let broken = test.replace(garden[0].source, "expect(totalSeeds([]) == 0)", "expect(totalSeeds([]) == 1)")
+test.check(broken != garden[0].source, "negative control changed the garden expectation")
+io.writeTextFile(walkthrough.directory + "/src/main.min", broken)
+let rejected = test.run([walkthrough.launcher, "test"], environment(), walkthrough.directory, work + "/failed-expectation", 180)
+test.check(rejected.status == 1 && test.contains(rejected.output, "2 passed; 1 failed") &&
+    test.contains(rejected.output + rejected.errorOutput, "expectation failed"),
+    "an incorrect garden expectation must fail, not merely be discovered\n" + rejected.output + rejected.errorOutput)
+io.writeTextFile(walkthrough.directory + "/src/main.min", garden[0].source)
+invoke(walkthrough, ["build", "--release"])
+let executable = walkthrough.directory + "/target/release/hello"
+test.check(files.pathSize(executable) > 0, "book's documented release executable exists")
+let released = test.run([executable], system.environment(), walkthrough.directory, work + "/release-run", 10)
+test.require(released, "book release executable")
+test.check(released.output == garden[0].output && released.errorOutput == "", "release garden has exact output\n" + released.output + released.errorOutput)
+test.removeScratch(work)
+print("Book walkthrough passed: new, run, check, test, failed-expectation control, release build and executable")
