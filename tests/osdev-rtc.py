@@ -531,8 +531,6 @@ def main():
     args = parser.parse_args()
     if bool(args.qemu_log) != bool(args.rtc_base) or (args.log_only and not args.qemu_log):
         parser.error("--qemu-log and --rtc-base are required together; --log-only requires both")
-    if sys.platform != "linux":
-        raise CheckFailure("run this test on the BX Linux worker; laptop execution is not supported")
     if args.qemu_log:
         qemu_log(args.qemu_log, args.rtc_base)
     if args.log_only:

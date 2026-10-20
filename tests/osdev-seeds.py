@@ -17,8 +17,8 @@ through the same ladder, stopping at the first stage that notices:
 
 A seed that cannot be written in one language says so instead of being forced.
 The unmodified drivers must pass every stage first, or the study is invalid.
-Run on the BX Linux box (needs build/minyarc, build/minyar-runtime.o, clang,
-QEMU); never on the laptop.
+Use the approved build host with build/minyarc, build/minyar-runtime.o and
+Clang. The full QEMU study requires Linux; --no-qemu uses hosted checks.
 """
 
 import argparse
@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 import importlib.util
 import json
 import os
+import re
+import signal
 from pathlib import Path
 import shutil
 import subprocess
@@ -108,6 +110,15 @@ SEEDS = (
     Seed("write-wrong-register", "rtc", "register index written to the data port, overwriting CMOS", "write to the wrong/read-only register",
          Edit(M_PORT, "device.out8(selector, index)", "device.out8(data, index)"),
          Edit(C_RTC, '"Nd"((uint16_t)0x70)', '"Nd"((uint16_t)0x71)')),
+    Seed("read-only-register-write", "rtc", "writes zero to read-only CMOS Register D", "MC146818 Register D access permissions",
+         Edit(M_PORT, "device.out8(selector, index)",
+              "device.out8(selector, 13)\n        device.out8(data, 0)\n        device.out8(selector, index)"),
+         Edit(C_RTC, '__asm__ volatile ("outb %0, %1" : : "a"(register_index), "Nd"((uint16_t)0x70) : "memory");',
+              '__asm__ volatile ("outb %0, %1" : : "a"((uint8_t)13), "Nd"((uint16_t)0x70) : "memory");\n'
+              '    __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0), "Nd"((uint16_t)0x71) : "memory");\n'
+              '    __asm__ volatile ("outb %0, %1" : : "a"(register_index), "Nd"((uint16_t)0x70) : "memory");'),
+         minyar_note="no read-only permission type; hardware silently ignores the write",
+         c_note="hardware silently ignores the write"),
     Seed("index-out-of-range", "rtc", "selector value computed outside a byte", "integer truncation at device boundaries",
          Edit(M_PORT, "device.out8(selector, index)", "device.out8(selector, index + 256)"),
          Edit(C_RTC, '"a"(register_index), "Nd"((uint16_t)0x70)', '"a"((uint8_t)(register_index + 256)), "Nd"((uint16_t)0x70)')),
@@ -194,6 +205,7 @@ EXPECTED = {
     "wrong-port-width": ("compile", "compile"),
     "register-as-port": ("compile", "qemu"),
     "write-wrong-register": ("qemu", "qemu"),
+    "read-only-register-write": ("undetected", "undetected"),
     "index-out-of-range": ("qemu", "undetected"),
     "nmi-disabled": ("undetected", "undetected"),
     "read-to-clear": ("host", "host"),
@@ -213,6 +225,31 @@ EXPECTED = {
     "dma-missing-acquire-fence": ("not expressible", "undetected"),
     "dma-virtual-address": ("not expressible", "host"),
 }
+
+
+# Stable semantic concepts, all required, for the compile-caught mutants.
+# An unrelated compiler error or a compiler crash never counts as detection.
+MINYAR_REJECTIONS = {
+    "field-width": ("register field", "overlaps"),
+    "field-past-register": ("register field", "outside"),
+    "overlapping-fields": ("register field", "overlaps"),
+    "wrong-port-width": ("Port32", "Port8"),
+    "register-as-port": ("Port8", "Register8"),
+    "irq-allocation": ("interrupt context",),
+    "irq-lock": ("interrupt context",),
+    "irq-print": ("interrupt context",),
+    "irq-float": ("interrupt context",),
+    "irq-unbounded-wait": ("interrupt context",),
+    "dma-cpu-touch": ("DMA ownership",),
+    "dma-early-read": ("Cpu", "Pending"),
+    "dma-use-after-free": ("DMA ownership",),
+    "dma-double-submit": ("DMA ownership",),
+    "dma-leak": ("DMA ownership",),
+}
+
+
+def decoded_output(value):
+    return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")
 
 
 class StudyFailure(Exception):
@@ -235,20 +272,43 @@ class Study:
 
     def run(self, label, command, cwd=None, timeout=120, stdin=None, quiet=False):
         started = time.monotonic()
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL", "MAKEOVERRIDES", "LLVM_BIN")}
+        timed_out = False
         try:
-            result = subprocess.run([str(part) for part in command], cwd=cwd, input=stdin,
-                                    capture_output=True, text=True, timeout=timeout)
-            status, stdout, stderr = result.returncode, result.stdout, result.stderr
+            process = subprocess.Popen([str(part) for part in command], cwd=cwd, env=environment,
+                                       stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                       encoding="utf-8", errors="replace", start_new_session=True)
+        except OSError as error:
+            raise StudyFailure(f"{label}: could not start command: {error}") from error
+        try:
+            stdout, stderr = process.communicate(input=stdin, timeout=timeout)
         except subprocess.TimeoutExpired as error:
-            status, stdout, stderr = 124, error.stdout or "", (error.stderr or "") + "\nTIMEOUT"
-            stdout = stdout if isinstance(stdout, str) else stdout.decode(errors="replace")
-            stderr = stderr if isinstance(stderr, str) else stderr.decode(errors="replace")
-        if quiet and status == 0:
-            return status, stdout, stderr
-        self.log.append(dict(label=label, command=[str(part) for part in command], status=status,
-                             seconds=round(time.monotonic() - started, 2),
-                             stdout=stdout[-4000:], stderr=stderr[-4000:]))
+            timed_out = True
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+            stdout = decoded_output(stdout) or decoded_output(error.stdout)
+            stderr = decoded_output(stderr) or decoded_output(error.stderr)
+        status = 124 if timed_out else process.returncode
+        stdout, stderr = decoded_output(stdout), decoded_output(stderr)
+        if status == 124:
+            timed_out = True
+            stderr += "\nTIMEOUT"
+        if not (quiet and status == 0):
+            self.log.append(dict(label=label, command=[str(part) for part in command], status=status,
+                                 timed_out=timed_out, seconds=round(time.monotonic() - started, 2),
+                                 stdout=stdout[-4000:], stderr=stderr[-4000:]))
+        if timed_out:
+            raise StudyFailure(f"{label}: timeout invalidates the study (limit {timeout}s)")
         return status, stdout, stderr
+
+    def require_build(self, label, status, stderr):
+        if status != 0:
+            raise StudyFailure(f"{label}: build/infrastructure failure, not driver detection (status {status})\n{stderr[-2000:]}")
 
     def tree(self, name, edit):
         """A private copy of the needed sources with at most one exact edit applied."""
@@ -268,8 +328,9 @@ class Study:
                 # mkimage is built through the checkout's ./minyar launcher, which
                 # these private trees omit; its source is never seeded.
                 mkimage = ROOT / "build/os/mkimage"
-                status, _, stderr = self.run("mkimage", ["make", "-C", ROOT / "os", "ARCH=x86_64",
-                                                         f"LLVM_BIN={self.llvm_bin}", mkimage], timeout=600)
+                mkimage.parent.mkdir(parents=True, exist_ok=True)
+                status, _, stderr = self.run("mkimage", [ROOT / "minyar", ROOT / "os/tools/mkimage.min", "-o", mkimage],
+                                             cwd=ROOT, timeout=600)
                 if status != 0:
                     raise StudyFailure("could not build build/os/mkimage:\n" + stderr[-2000:])
                 (base / "build/os").mkdir()
@@ -289,19 +350,64 @@ class Study:
     # ----- Minyar stages -----
 
     def minyar_compile(self, tree, source, freestanding):
-        command = [self.compiler, tree / source, tree / "out.ll"]
+        output = tree / "out.ll"
+        output.unlink(missing_ok=True)
+        command = [self.compiler, tree / source, output]
         if freestanding:
             command += ["--library", tree / "os/arch/x86_64", "--library", tree / "library",
                         "--bounded-owners", "32", "--freestanding", "--kernel-target", "x86_64"]
         else:
             command += ["--library", tree / "library"]
         status, stdout, stderr = self.run(f"{tree.name}/minyar-compile", command, timeout=180)
-        return status == 0, (stderr or stdout).strip().splitlines()[:1]
+        if status == 0:
+            if stdout or stderr or not output.is_file() or output.stat().st_size == 0:
+                raise StudyFailure(f"{tree.name}: compiler success lacks clean, fresh LLVM evidence")
+        elif (status != 1 or output.exists() or stdout or "error:" not in stderr or
+              re.search(r"\.min:\d+:\d+", stderr) is None or
+              re.search(r"LLVM ERROR|Traceback|Sanitizer|runtime error:|Segmentation fault|List position|Minyar stopped:|internal compiler", stderr, re.I)):
+            raise StudyFailure(f"{tree.name}: compiler failure is not a semantic source rejection\n{stderr[-2000:]}")
+        return status == 0, stderr.strip().splitlines()[:1]
 
     def minyar_rtc_host(self, tree):
+        artifacts = self.out / "oracle-artifacts" / tree.name
+        artifacts.parent.mkdir(parents=True, exist_ok=True)
         status, stdout, stderr = self.run(f"{tree.name}/minyar-host", [
             sys.executable, tree / "tests/osdev-rtc.py", "--compiler", self.compiler, "--clang", self.clang,
-            "--group", "decode", "--group", "reader"], timeout=600)
+            "--group", "decode", "--group", "reader", "--artifacts", artifacts], timeout=600)
+        try:
+            events = json.loads((artifacts / "events.json").read_text())
+        except (OSError, ValueError) as error:
+            raise StudyFailure(f"{tree.name}: missing RTC execution evidence") from error
+        if not isinstance(events, list) or not events:
+            raise StudyFailure(f"{tree.name}: malformed RTC execution evidence")
+        runs = []
+        for event in events:
+            if (not isinstance(event, dict) or not isinstance(event.get("stage"), str) or
+                    type(event.get("status")) is not int or type(event.get("timed_out")) is not bool):
+                raise StudyFailure(f"{tree.name}: malformed RTC stage evidence")
+            stage = event["stage"]
+            if event["timed_out"] or event["status"] == 124:
+                raise StudyFailure(f"{tree.name}: nested RTC timeout invalidates the study")
+            if stage == "runtime-build" or stage.endswith("-compile") or "-link-" in stage:
+                self.require_build(stage, event["status"], stderr)
+            elif "-run-" in stage:
+                runs.append(event)
+            else:
+                raise StudyFailure(f"{tree.name}: unknown RTC stage {stage!r}")
+        expected = ["runtime-build"]
+        for group in ("decode", "reader"):
+            expected.append(group + "-compile")
+            for level in ("O0", "O2"):
+                expected.extend((group + "-link-" + level, group + "-run-" + level))
+        if [event["stage"] for event in events] != expected[:len(events)]:
+            raise StudyFailure(f"{tree.name}: RTC stage order/coverage does not match the selected groups")
+        if status == 0:
+            if len(events) != len(expected) or any(event["status"] != 0 for event in events):
+                raise StudyFailure(f"{tree.name}: incomplete or contradictory RTC success evidence")
+        elif (status != 1 or not runs or "-run-" not in events[-1]["stage"] or
+              "Traceback" in stderr or not (events[-1]["status"] != 0 or re.search(
+                  r"(?m)^RTC oracle FAILED: [^\n]*output/diagnostic mismatch", stderr))):
+            raise StudyFailure(f"{tree.name}: RTC harness failed without a runtime/oracle detection\n{stderr[-2000:]}")
         return status == 0, (stderr or stdout).strip().splitlines()[-1:]
 
     def minyar_dma_host(self, tree):
@@ -310,10 +416,9 @@ class Study:
             status, stdout, stderr = self.run(f"{tree.name}/minyar-link{level}", [
                 self.clang, level, "-Wno-override-module", tree / "out.ll", self.runtime, "-lm", "-pthread",
                 "-o", executable])
-            if status != 0:
-                return False, [f"link {level} failed"]
+            self.require_build(f"{tree.name}/minyar-link{level}", status, stderr)
             status, stdout, stderr = self.run(f"{tree.name}/minyar-run{level}", [executable], timeout=60)
-            if status != 0 or stdout != "MINYAR ENTROPY HOST PASS\n":
+            if status != 0 or stderr or stdout != "MINYAR ENTROPY HOST PASS\n":
                 return False, (stderr or stdout).strip().splitlines()[-1:] or [f"status {status}"]
         return True, []
 
@@ -321,6 +426,11 @@ class Study:
         status, stdout, stderr = self.run(f"{tree.name}/serial-validator", [
             sys.executable, tree / "tests/osdev-rtc.py", "--qemu-log", serial, "--rtc-base", RTC_BASE,
             "--log-only"], timeout=30)
+        if status != 0:
+            semantic = ("RTC serial calendar is ", "invalid RTC serial calendar:", "malformed RTC calendar serial line")
+            if (status != 1 or "RTC oracle FAILED:" not in stderr or not any(term in stderr for term in semantic) or
+                    re.search(r"Traceback|Sanitizer|runtime error:|LLVM ERROR", stderr, re.I)):
+                raise StudyFailure(f"{tree.name}: serial validator failed without a calendar-oracle rejection\n{stderr[-2000:]}")
         return status == 0, (stderr or stdout).strip().splitlines()[-1:]
 
     def minyar_qemu(self, tree):
@@ -330,20 +440,25 @@ class Study:
         status, stdout, stderr = self.run(f"{tree.name}/minyar-os-build", [
             "make", "-C", tree / "os", "ARCH=x86_64", f"LLVM_BIN={self.llvm_bin}", "-W", source,
             f"KERNEL_SOURCE={source}", "all"], timeout=900)
-        if status != 0:
-            return False, ["OS build failed: " + (stderr.strip().splitlines() or [""])[-1][:120]]
+        self.require_build(f"{tree.name}/minyar-os-build", status, stderr)
         serial = tree / "serial.log"
         status, stdout, stderr = self.run(f"{tree.name}/minyar-qemu", [
             sys.executable, tree / "tools/osdev.py", "test", "--root", tree, "--no-build", "--arch", "x86_64",
             "--expect", "OSDEV RTC PASS", "--timeout", "30", "--rtc-base", RTC_BASE,
             "--llvm-bin", self.llvm_bin, "--log", serial], timeout=120)
         if status != 0:
-            return False, (stderr or stdout).strip().splitlines()[-1:] or [f"status {status}"]
+            text = serial.read_text(errors="replace") if serial.is_file() else ""
+            if status != 1 or "OSDEV RTC START" not in text or re.search(
+                    r"Minyar stopped:|C comparator RTC error|Minyar OS processor exception|PANIC:", text) is None:
+                raise StudyFailure(f"{tree.name}: QEMU failed without guest defect evidence\n{stderr[-2000:]}")
+            return False, text.strip().splitlines()[-3:]
         return self.qemu_log_valid(tree, serial)
 
     # ----- C stages -----
 
     def c_compile(self, tree, driver):
+        artifact = tree / ("irq.o" if driver == "irq" else "dma.o" if driver == "dma" else "rtc.o")
+        artifact.unlink(missing_ok=True)
         flags = ["-Wall", "-Wextra"]
         if driver == "irq":
             command = [self.clang, "--target=x86_64-unknown-none-elf", "-ffreestanding", "-mgeneral-regs-only",
@@ -351,9 +466,21 @@ class Study:
         elif driver == "dma":
             command = [self.clang, "-std=c11", "-O2", *flags, "-c", tree / C_DMA, "-o", tree / "dma.o"]
         else:
-            command = [self.clang, "-std=c11", "-O2", *flags, "-DRTC_COMPARATOR_CLI", tree / C_RTC,
-                       "-o", tree / "rtc-cli"]
+            # The port adapter is x86 code even when hosted oracles run on Arm.
+            # Check its actual instruction widths independently of host macros.
+            command = [self.clang, "--target=x86_64-unknown-none-elf", "-ffreestanding", "-std=c11",
+                       "-O2", *flags, "-c", tree / C_RTC, "-o", artifact]
         status, stdout, stderr = self.run(f"{tree.name}/c-compile", command, timeout=120)
+        if status != 0:
+            expected = tree.name == "wrong-port-width-c"
+            source_error = re.search(r"rtc\.c:\d+:\d+: error: invalid operand for instruction", stderr)
+            if (not expected or status != 1 or artifact.exists() or stdout or source_error is None or
+                    re.search(r"LLVM ERROR|Traceback|PLEASE submit|Segmentation fault|Sanitizer|runtime error:", stderr, re.I)):
+                raise StudyFailure(f"{tree.name}: C compiler failed outside the expected width rejection\n{stderr[-2000:]}")
+        else:
+            artifact = tree / ("irq.o" if driver == "irq" else "dma.o" if driver == "dma" else "rtc.o")
+            if not artifact.is_file() or artifact.stat().st_size == 0:
+                raise StudyFailure(f"{tree.name}: C compiler success lacks an artifact")
         warnings = [line for line in stderr.splitlines() if "warning:" in line]
         errors = [line for line in stderr.splitlines() if "error:" in line]
         return status == 0, (errors or warnings)[:1], bool(warnings)
@@ -366,8 +493,7 @@ class Study:
             executable = tree / ("rtc-host-" + label)
             status, _, stderr = self.run(f"{tree.name}/c-host-build-{label}", [
                 self.clang, "-std=c11", *flags, "-DRTC_COMPARATOR_CLI", tree / C_RTC, "-o", executable])
-            if status != 0:
-                return False, [f"{label} build failed"]
+            self.require_build(f"{tree.name}/c-host-build-{label}", status, stderr)
             for case in oracle.decode_cases():
                 status, stdout, stderr = self.run(f"{tree.name}/c-decode-{label}", [executable, "decode", *case.raw],
                                                   timeout=20, quiet=True)
@@ -398,10 +524,9 @@ class Study:
             executable = tree / ("entropy-host-" + label)
             status, _, stderr = self.run(f"{tree.name}/c-host-build-{label}", [
                 self.clang, "-std=c11", "-Wall", "-Wextra", *flags, *sources, "-o", executable])
-            if status != 0:
-                return False, [f"{label} build failed: " + (stderr.strip().splitlines() or [""])[0][:120]]
+            self.require_build(f"{tree.name}/c-host-build-{label}", status, stderr)
             status, stdout, stderr = self.run(f"{tree.name}/c-host-run-{label}", [executable], timeout=60)
-            if status != 0 or "C ENTROPY HOST PASS" not in stdout:
+            if status != 0 or stderr or stdout != "C ENTROPY HOST PASS\n":
                 lines = [line for line in (stderr + stdout).splitlines() if line.strip()]
                 summary = next((line for line in lines if "ERROR" in line or "FAIL" in line or "runtime error" in line),
                                lines[-1] if lines else f"status {status}")
@@ -421,6 +546,7 @@ class Study:
         if status != 0:
             raise StudyFailure("could not build the bare x86 support objects:\n" + stderr[-2000:])
         status, stdout, stderr = self.run("c-support/resource", [self.clang, "-print-resource-dir"])
+        self.require_build("c-support/resource", status, stderr)
         self.c_support = dict(objects=objects, resource=Path(stdout.strip()) / "include")
         return self.c_support
 
@@ -440,31 +566,32 @@ class Study:
             "-fno-builtin", "-nostdinc", "-isystem", support["resource"], "-isystem",
             tree / "runtime/freestanding/include", "-mno-red-zone", "-fno-stack-protector", "-fno-pic",
             "-include", tree / C_RTC, "-c", tree / "tests/osdev-seeds/c/rtc_guest.c", "-o", program])
-        if status != 0:
-            return False, ["guest compile failed: " + (stderr.strip().splitlines() or [""])[0][:120]]
+        self.require_build(f"{tree.name}/c-guest-compile", status, stderr)
         kernel = isolated / "kernel.elf"
         entry, runtime, freestanding = support["objects"][2], support["objects"][0], support["objects"][1]
         status, stdout, stderr = self.run(f"{tree.name}/c-guest-link", [
             self.llvm_bin / "ld.lld", "-static", "--no-pie", "-nostdlib", "--lto-O3", "-mllvm", "-mcpu=x86-64-v2",
             "-z", "max-page-size=4096", "--image-base=0", "-T", tree / "os/arch/x86_64/boot/kernel.ld",
             entry, program, runtime, freestanding, "-o", kernel])
-        if status != 0:
-            return False, ["guest link failed: " + (stderr.strip().splitlines() or [""])[0][:120]]
+        self.require_build(f"{tree.name}/c-guest-link", status, stderr)
         fonts = [f"fonts/{font}={tree / 'os/assets/fonts' / font}"
                  for font in ("Archivo-Regular.ttf", "Archivo-Medium.ttf", "Archivo-SemiBold.ttf")]
         status, stdout, stderr = self.run(f"{tree.name}/c-guest-image", [
             self.base_qemu_tree / "build/os/mkimage", isolated / "minyar-os.img", isolated / "mbr.bin",
             isolated / "loader.bin", f"kernel.elf={kernel}", f"config.txt={isolated / 'config.txt'}", *fonts],
             cwd=tree / "os")
-        if status != 0:
-            return False, ["image build failed"]
+        self.require_build(f"{tree.name}/c-guest-image", status, stderr)
         serial = tree / "c-serial.log"
         status, stdout, stderr = self.run(f"{tree.name}/c-qemu", [
             sys.executable, tree / "tools/osdev.py", "test", "--root", fixture, "--no-build", "--arch", "x86_64",
             "--llvm-bin", self.llvm_bin, "--rtc-base", RTC_BASE, "--expect", "OSDEV RTC PASS",
             "--timeout", "30", "--log", serial], timeout=120)
         if status != 0:
-            return False, (stderr or stdout).strip().splitlines()[-1:] or [f"status {status}"]
+            text = serial.read_text(errors="replace") if serial.is_file() else ""
+            if status != 1 or "OSDEV RTC START" not in text or re.search(
+                    r"Minyar stopped:|C comparator RTC error|Minyar OS processor exception|PANIC:", text) is None:
+                raise StudyFailure(f"{tree.name}: QEMU failed without guest defect evidence\n{stderr[-2000:]}")
+            return False, text.strip().splitlines()[-3:]
         return self.qemu_log_valid(tree, serial)
 
     # ----- the ladder -----
@@ -481,6 +608,10 @@ class Study:
             passed, detail, warned = self.c_compile(tree, driver)
         evidence["compile"] = detail
         if not passed:
+            if language == "minyar":
+                required = MINYAR_REJECTIONS.get(name)
+                if required is None or not all(term in "\n".join(detail) for term in required):
+                    raise StudyFailure(f"{name}: wrong semantic rejection; expected {required}, got {detail}")
             return "compile", evidence, warned
         host = {("minyar", "rtc"): self.minyar_rtc_host, ("minyar", "dma"): self.minyar_dma_host,
                 ("c", "rtc"): self.c_rtc_host, ("c", "dma"): self.c_dma_host}.get((language, driver))
@@ -556,8 +687,8 @@ def main():
     parser.add_argument("--no-qemu", action="store_true", help="skip the QEMU stage (RTC seeds stop at host tests)")
     parser.add_argument("--keep-trees", action="store_true")
     args = parser.parse_args()
-    if sys.platform != "linux":
-        parser.error("run this study on the BX Linux box, not the laptop")
+    if not args.no_qemu and sys.platform != "linux":
+        parser.error("run the full QEMU study on the BX Linux box; --no-qemu is portable")
     if args.output is None:
         args.output = Path(tempfile.mkdtemp(prefix="osdev-seeds-"))
     args.output = args.output.resolve()

@@ -57,6 +57,26 @@ static _Unwind_Reason_Code minyar_trace_frame(struct _Unwind_Context *context, v
 }
 #endif
 
+#if defined(__STDC_HOSTED__) && !__STDC_HOSTED__ && (defined(__x86_64__) || defined(__aarch64__))
+/* A freestanding kernel has no unwinder and no loaded symbol table. Its
+ * compiler keeps frame pointers, so follow that chain (saved frame, then return
+ * address, on both x86-64 and Arm64) and print raw return addresses, innermost
+ * first. tools/osdev.py maps them to Minyar functions using the kernel ELF.
+ * Each step must move up the stack by less than 1 MiB; anything else ends it. */
+#define MINYAR_TRACE_RETURN_ADDRESSES 1
+static void minyar_trace_return_addresses(int (*print)(FILE *, const char *, ...)) {
+    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    for (unsigned depth = 0; depth < 16 && frame && !(frame & 7); depth++) {
+        uintptr_t next = ((const uintptr_t *)frame)[0];
+        uintptr_t address = ((const uintptr_t *)frame)[1];
+        if (!address) break;
+        print(stderr, "  at 0x%llx\n", (unsigned long long)address);
+        if (next <= frame || next - frame >= ((uintptr_t)1 << 20)) break;
+        frame = next;
+    }
+}
+#endif
+
 __attribute__((visibility("hidden"))) MINYAR_COLD void minyar_print_stack_trace(void) {
     if (!minyar_trace_module_count) return;
     MinyarTrace trace;
@@ -76,6 +96,9 @@ __attribute__((visibility("hidden"))) MINYAR_COLD void minyar_print_stack_trace(
      * volatile target prevents libcall rewriting into new startup imports. */
     int (*volatile print)(FILE *, const char *, ...) = fprintf;
     print(stderr, "Minyar stack trace:\n");
+#ifdef MINYAR_TRACE_RETURN_ADDRESSES
+    minyar_trace_return_addresses(print);
+#endif
     for (unsigned index = 0; index < trace.count; index++) {
         const MinyarTraceRow *row = trace.rows[index];
         uintptr_t base = trace.bases[index];

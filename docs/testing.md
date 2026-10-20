@@ -34,6 +34,15 @@ Checks reuse the working tree's warm build and retain the existing commit-check
 logs and JSON results. `make check-changed-inputs` tests Git/input handling
 without compiling the language; `make check-check-selection` tests the policy.
 
+`make check-foundations-proofs` selects the Lean version pinned by
+`proofs/lean-toolchain`, builds the ownership and effect semantics, checks the
+required soundness theorem signatures, and audits every project declaration for
+unapproved axioms, `sorry`, unsafe definitions and partial definitions. Its
+negative trust controls must be rejected for the expected reason. The target
+also runs accepted and rejected ownership, DMA and interrupt traces through the
+executable semantics and retains command output, traces and source hashes under
+`build/foundations-proof-evidence`.
+
 For a smaller deterministic fuzz loop, use `make check-fuzz-expressions`,
 `check-fuzz-language`, `check-fuzz-semantic`, `check-fuzz-hostile`,
 `check-fuzz-regressions`, `check-fuzz-seeds` or `check-fuzz-modules`. Each runs
@@ -259,6 +268,21 @@ C fixture is separate from real hardware DMA. `check-osdev-allocator` isolates
 the actual freestanding allocator in a fixed hosted heap and checks overflow,
 size-class boundaries and failure preservation at O0/O2 with UBSan. Guest startup,
 linker heap bounds and actual Virtio completion require their own finite guests.
+
+`make check-osdev-seeds` applies paired register, port, interrupt and DMA
+mistakes to the Minyar and C drivers, retaining the first detection stage and
+requiring clean baselines. RTC seeds reach real x86 QEMU; DMA seeds use host
+models; IRQ seeds are compile-only. The read-only CMOS register write is a
+permission-coverage probe, not an assumed compile-time rejection.
+`check-osdev-seeds-host` runs the available host stages in the portable gate;
+QEMU-only classifications require the explicit full target. C host programs
+run at O2, then O0 with ASan/UBSan if still passing. Timeouts, compiler crashes,
+wrong diagnostic families and later build/link failures invalidate the study.
+Nested RTC events and guest serial evidence distinguish real oracle failures
+from infrastructure failures. Both targets first run `check-osdev-seeds-harness`,
+whose independent child processes test those evidence boundaries without LLVM
+or QEMU. Results and retained execution artifacts are written outside the
+checkout; `--output` selects a fresh evidence directory.
 
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
@@ -1360,7 +1384,7 @@ have separate checks. Multi-error goldens assert exact independent spans,
 shadowing. The bootstrap native suite repeats recovery at O0/O2 with ownership
 assertions and a native probe that enters a real stack ownership header.
 
-`make check-explain` checks all 35 published codes through the compiler and
+`make check-explain` checks all published codes through the compiler and
 the public launcher from outside a project. It compiles the explanation
 examples, checks exact usage and unknown-code errors, and verifies code/help
 parity for independent rejection cases, including malformed numbers, choice
@@ -1625,3 +1649,32 @@ absent names, duplicate policy and deterministic `pretty` diagnostics at
 O0/O2. Normal returns use exact ownership/debt checks; deliberate fatal stops
 do not claim unwind cleanup. `check-json-values-sanitize` repeats these with
 a sanitized compiler, emitted-LLVM ASan and C runtime ASan/UBSan.
+
+`make check-handles` runs typed generational pools at O0/O2 with exact ownership
+cleanup checks. It covers wrong pools, stale copies, replacement, repeated clear,
+bounded generation exhaustion, nested Maybe payloads, shared record values, a
+2,000-operation independent history model, private-field and type rejections,
+and the delayed-window gallery. `check-handles-sanitize` repeats these through
+the sanitized compiler, emitted LLVM and C runtime.
+
+`make check-protocol-completion` proves completion witnesses at O0/O2 with exact
+ownership cleanup. It exercises moves, generic aliases, helpers, returns, branch
+agreement, scope exit, explicit commit/rollback, private opaque construction and
+rejections of stale aliases, dropped obligations, aggregate escape, loops,
+callbacks, recursion, native boundaries and exceptional modes. Cold/warm module
+entry must retain complete-source proof, including after an imported helper is
+changed. `check-protocol-completion-sanitize` repeats the executable paths with
+compiler/generated LLVM/C runtime sanitizers. `check-osdev-dma` preserves the
+existing checker's separate DMA behavior.
+
+`make check-ownership-explanations` checks actual source-site JSON remark reasons,
+quiet ordinary and JSON success, byte-identical emitted LLVM, no success remarks
+on rejection, unsupported cached-mode rejection and O0/O2 alias-preserving
+execution with exact cleanup. Its sanitizer variant is
+`check-ownership-explanations-sanitize`.
+
+`make measure-ownership-explanations` is an optional standalone compiler cost
+measurement. Five alternating flag-on/flag-off pairs compile the same 200
+functions, verify every remark and source site, require identical LLVM and retain
+raw CPU/RSS samples. It has no performance threshold and is outside portable
+checks. The complete evidence directory and machine-readable report are printed.

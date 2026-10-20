@@ -230,6 +230,19 @@ The contextual `at(first, width)` metadata is consumed by module/generic/header
 readers before typed layout validation. Declaration-operand operations emit
 scalar IR and never create a runtime record, field-name literal or initializer.
 
+Contextual `assembly for TARGET "text" [inputs(EXPRESSION in REGISTER, ...)]
+changes(...)` is an ordinary statement (compiler/assembly-compiler.min). It is
+recognized only by that token shape and lowers to one `call ... asm sideeffect`.
+Each input uses a discarded fixed-register early-clobber output and a tied
+input constraint, allowing the assembly to overwrite that register without
+changing the Minyar value. The call returns void with no inputs, the register's
+integer type with one input, or a struct of those types with multiple inputs.
+Physical register aliases cannot hold separate inputs; explicit changes to an
+input's register family need no additional clobber. Arm64 x29/w29 are reserved
+for the kernel frame pointer. Other changes become explicit clobbers. Every
+`$` in the template is doubled, because the form has no operand references.
+It adds no syntax kind, keyword, feature bit or runtime ABI.
+
 Interrupt contexts use contextual `interrupt function` and header
 `handles(vector)`, with the existing modifier feature bit 16. An explicit
 `--freestanding --kernel-target x86_64|arm64` selects the compilation context;
@@ -478,6 +491,26 @@ failure and uses the platform unwinder. If symbols or unwind information are
 unavailable, the registry supplies an entry location. No C runtime failure is
 caught or converted to recoverable control flow by this reporter.
 
-The JSON contract covers explicit compiler diagnostics and source-read errors.
-Host failures writing LLVM or cache files still use runtime reports. Hosted Linux currently loads libgcc_s for unwinding; this is a fixed
+The JSON contract covers explicit compiler diagnostics and source-read errors
+such as missing files or invalid UTF-8. Allocation failures remain fatal runtime
+reports, including while reading source files; JSON formatting does not catch
+them. Host failures writing LLVM or cache files also use runtime reports.
+Hosted Linux currently loads libgcc_s for unwinding; this is a fixed
 startup cost, so a strict zero-instruction claim does not apply there.
+
+## Ownership remarks and protocol obligations
+
+The standalone `--explain-ownership` option buffers version-1 JSON remarks in
+`TerminalReuseSite` and publishes them after complete source validation. It
+reports the final terminal Text/List local-transfer proof, including conservative
+fallback reasons, without changing emitted LLVM. Default success stays quiet;
+cached module-state and metadata-only modes reject the option. A transfer remark
+does not prove runtime storage reuse. See [ownership explanations](ownership-explanations.md).
+
+Opaque `protocol_completion` records reuse the DMA flow checker's stable logical
+binding identities and final complete-tree audit, as a distinct obligation phase.
+Exact `protocol` provider/name/signature rules recognize token creation and
+completion. Ordinary bindings and helper arguments move the obligation, and all
+normal exits prove completion or transfer. Unsupported containment, exceptional
+and concurrent edges reject before LLVM publication. The existing managed record
+ABI remains; source responsibility is independent of RC ownership slots.

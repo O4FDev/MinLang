@@ -1,0 +1,85 @@
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "io" as io
+use "json" as json
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let source = #"""
+    record Box { text: Text }
+    function borrowed(text: Text): Text { return text + "!" }
+    function borrowedList(values: List<Integer>): List<Integer> { return values.appended(3) }
+    function owned(): Text {
+        let text = "Harbour" + Text(1)
+        return (text) + "!"
+    }
+    function projected(box: Box): Text { return box.text + "!" }
+    function different(): Text {
+        let text = "Harbour" + Text(2)
+        let other = ""
+        other = text + "!"
+        print(text)
+        return other
+    }
+    print(borrowed("light"))
+    print(borrowedList([1, 2]).length)
+    print(owned())
+    print(projected(Box { text: "stars" }))
+    print(different())
+    """#
+let quiet = fixtures.compile(frontend, source)
+test.require(quiet, "compile quiet ownership source")
+test.check(quiet.output == "" && quiet.errorOutput == "", "ordinary successful compilation is quiet")
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let plain = io.readTextFile(path + ".ll")
+let command = [compiler.executable, path + ".min", path + "-remarks.ll", "--library", "library", "--explain-ownership"]
+let explained = test.run(command, frontend.environment, "", path + ".explain", compiler.compileTimeout)
+test.require(explained, "compile with ownership explanations")
+test.check(explained.output == "", "remarks do not pollute stdout")
+let remarkedLLVM = io.readTextFile(path + "-remarks.ll")
+if test.addressEnabled(compiler.flags) { remarkedLLVM = test.instrument(remarkedLLVM) }
+test.check(remarkedLLVM == plain, "remarks changed emitted LLVM")
+let sourceRows = io.readTextFile(path + ".min").split("\n")
+let borrowed = false
+let projected = false
+let different = false
+let transfer = false
+for line in explained.errorOutput.split("\n") {
+    if line != "" {
+        let remark = json.decode(line).unwrap()
+        test.check(remark.requireString("severity").text == "remark", "successful remark severity")
+        test.check(remark.requireString("pass").text == "terminal-ownership", "remark proof identity")
+        test.check(remark.requireString("file").text == path + ".min", "remark source path")
+        let row = remark.requireNumber("line").number
+        test.check(row > 0.0 && remark.requireNumber("column").number > 0.0, "remark source coordinates")
+        test.check(Integer(row) <= sourceRows.length, "remark row exists")
+        let sourceRow = sourceRows[Integer(row) - 1]
+        let reason = remark.requireString("reason").text
+        let decision = remark.requireString("decision").text
+        if test.contains(reason, "no transferable local owner") { borrowed = true; test.check(decision == "retain" && test.contains(sourceRow, "function borrowed"), "borrowed decision and source row") }
+        if test.contains(reason, "not a direct local binding") { projected = true; test.check(decision == "retain" && test.contains(sourceRow, "function projected"), "projection decision and source row") }
+        if test.contains(reason, "different binding") { different = true; test.check(decision == "retain" && test.contains(sourceRow, "other = text"), "assignment decision and source row") }
+        if decision == "transfer" { transfer = true; test.check(test.contains(reason, "runtime uniqueness still decides") && test.contains(sourceRow, "return (text)"), "transfer claim and source row") }
+        test.check(!test.contains(reason, "always copies"), "no invented runtime outcome")
+    }
+}
+test.check(borrowed && projected && different && transfer, "expected terminal ownership reasons\n" + explained.errorOutput)
+let jsonQuiet = test.run([compiler.executable, path + ".min", path + "-json.ll", "--library", "library", "--error-format", "json"], frontend.environment, "", path + ".quiet-json", compiler.compileTimeout)
+test.require(jsonQuiet, "quiet JSON success")
+test.check(jsonQuiet.output == "" && jsonQuiet.errorOutput == "", "ordinary successful compilation remains quiet")
+
+let invalid = compiler.directory + "/invalid.min"
+io.writeTextFile(invalid, source + "\nfunction broken(): Integer { return missingName }\n")
+let rejected = test.run([compiler.executable, invalid, invalid + ".ll", "--explain-ownership", "--error-format", "json"], frontend.environment, "", path + ".invalid", compiler.compileTimeout)
+test.check(rejected.status == 1 && !test.contains(rejected.errorOutput, "\"severity\":\"remark\""), "failed compilation publishes no success remarks")
+
+let module = test.run([compiler.executable, path + ".min", path + "-module.ll", "--module-state", "state", "key", "output", "--explain-ownership"], frontend.environment, "", path + ".module", compiler.compileTimeout)
+test.check(module.status == 1 && test.contains(module.errorOutput, "ownership explanations require a whole-source compilation"), "cached modules reject unsupported report mode")
+// An option-looking positional state filename is not an opt-in flag.
+io.writeTextFile(path + ".empty-state", "")
+let namedState = test.run([test.resolvePath(compiler.executable), path + ".min", path + "-named-state.ll", "--module-state", path + ".empty-state", "--explain-ownership", path + ".named-stats"], frontend.environment, compiler.directory, path + ".named-state", compiler.compileTimeout)
+test.require(namedState, "module state filename matching an option")
+test.check(namedState.errorOutput == "" && namedState.output == "", "positional state filename enabled remarks")
+fixtures.executes(frontend, source, "light!\n3\nHarbour1!\nstars!\nHarbour2\nHarbour2!\n", ["-O0", "-O2"], 0, "", true)
+test.removeTree(compiler.directory)
+print("ownership explanation checks: passed")

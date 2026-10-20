@@ -1,9 +1,11 @@
 // Opaque handles retain the ordinary managed-record ABI. Affine source flow
-// and a separately rooted runtime registry establish payload ownership.
+// and a separately rooted runtime registry establish payload ownership. Protocol
+// completion tokens share the source proof, with no DMA registry or payload.
 function dmaMarkerKind(tag: Text): Integer {
     if tag == "dma_cpu" { return 1 }
     if tag == "dma_pending" { return 2 }
     if tag == "dma_queue" { return 3 }
+    if tag == "protocol_completion" { return 4 }
     return 0
 }
 
@@ -24,7 +26,7 @@ function discoverDmaDeclarations(context: CompilerContext) {
     if !present { return }
     let index = 0
     while index < context.functionNames.length { context.dma.kinds.add(0); context.dma.rules.add(-1); index = index + 1 }
-    let seen: List<Integer> = [0, 0, 0, 0]
+    let seen: List<Integer> = [0, 0, 0, 0, 0]
     declarationIndex = 0
     while declarationIndex < context.syntax.declarations.length {
         let node = context.syntax.declarations[declarationIndex]
@@ -33,10 +35,16 @@ function discoverDmaDeclarations(context: CompilerContext) {
         if declaration.kind == 2 && context.tokenTexts[start + 2] == "native" {
             let kind = dmaMarkerKind(context.tokenTexts[start + 3])
             if kind > 0 {
-                if seen[kind] != 0 { failAtToken(context.tokenLines, start, "a DMA handle kind needs one canonical declaration") }
+                if seen[kind] != 0 {
+                    if kind == 4 { failAtToken(context.tokenLines, start, "a protocol completion token needs one canonical declaration") }
+                    failAtToken(context.tokenLines, start, "a DMA handle kind needs one canonical declaration")
+                }
                 seen[kind] = 1
                 if declaration.symbol < 0 || declaration.symbol >= context.dma.kinds.length { failCompiler("internal DMA declaration identity is missing") }
-                if context.functionParameterCounts[declaration.symbol] != 0 { failAtToken(context.tokenLines, start, "opaque DMA handle declarations must have no fields") }
+                if context.functionParameterCounts[declaration.symbol] != 0 {
+                    if kind == 4 { failAtToken(context.tokenLines, start, "opaque protocol completion declarations must have no fields") }
+                    failAtToken(context.tokenLines, start, "opaque DMA handle declarations must have no fields")
+                }
                 context.dma.kinds[declaration.symbol] = kind
                 context.registerLiteralTokens.add(start + 3)
             }
@@ -63,6 +71,15 @@ function dmaSetFact(values: List<Integer>, node: Integer, value: Integer) {
     values[node] = value
 }
 
+function hasProtocolCompletion(context: CompilerContext): Boolean {
+    let symbol = 0
+    while symbol < context.dma.kinds.length {
+        if context.dma.kinds[symbol] == 4 { return true }
+        symbol = symbol + 1
+    }
+    return false
+}
+
 function dmaStartFunction(context: CompilerContext) {
     if context.dma.kinds.length > 0 { context.dma.lexical.clear() }
 }
@@ -87,6 +104,8 @@ function dmaRecordCall(context: CompilerContext, node: Integer, symbol: Integer)
 }
 
 function dmaSignatureType(context: CompilerContext, type: Integer, expected: Integer): Boolean {
+    // -4 remains the existing ordinary-record operand of unsafeVirtioQueue.
+    if expected == -5 { return dmaKind(context, type) == 4 }
     if expected == -4 { return isRecordType(type) && dmaKind(context, type) == 0 }
     if expected < 0 { return dmaKind(context, type) == 0 - expected }
     return type == expected
@@ -124,7 +143,7 @@ function dmaPrimitive(context: CompilerContext, symbol: Integer): Integer {
     while context.dma.rules.length <= symbol { context.dma.rules.add(-1) }
     if context.dma.rules[symbol] >= 0 { return context.dma.rules[symbol] }
     let provider = dmaNativeProvider(context, symbol)
-    if provider != "dma" && provider != "dma_model" { context.dma.rules[symbol] = 0; return 0 }
+    if provider != "dma" && provider != "dma_model" && provider != "protocol" { context.dma.rules[symbol] = 0; return 0 }
     let name = readableDeclarationName(context.functionNames[symbol])
     let kind = 0
     let valid = false
@@ -145,10 +164,14 @@ function dmaPrimitive(context: CompilerContext, symbol: Integer): Integer {
             // models can run the real drivers. The bridge stays private to
             // virtio.min, which only calls it for a validated virtio-rng.
         }
-    } else {
+    } else if provider == "dma_model" {
         if name == "modelQueue" { kind = 10; valid = dmaSignature(context, symbol, [], -3) }
         if name == "modelDeliver" { kind = 11; valid = dmaSignature(context, symbol, [-3, 8], 4) }
         if name == "modelCorrupt" { kind = 12; valid = dmaSignature(context, symbol, [-3, 1, 1], 5) }
+    } else {
+        if name == "begin" { kind = 21; valid = dmaSignature(context, symbol, [], -5) }
+        if name == "complete" { kind = 22; valid = dmaSignature(context, symbol, [-5], 5) }
+        if kind == 0 || !valid { failAtToken(context.tokenLines, context.syntax.nodes[context.syntax.symbolNodes[symbol]].start, "protocol primitives need begin(): Completion or complete(Completion): Nothing with the canonical completion type") }
     }
     if kind == 0 || !valid { failAtToken(context.tokenLines, context.syntax.nodes[context.syntax.symbolNodes[symbol]].start, "DMA primitives need the exact declared CPU, Pending, Queue and scalar signature") }
     context.dma.rules[symbol] = kind
@@ -158,17 +181,31 @@ function dmaPrimitive(context: CompilerContext, symbol: Integer): Integer {
 function dmaRejectNativeEscape(context: CompilerContext, symbol: Integer, location: Integer) {
     if context.dma.kinds.length == 0 { return }
     let opaque = dmaKind(context, context.functionReturnTypes[symbol]) > 0
+    let completion = dmaKind(context, context.functionReturnTypes[symbol]) == 4
     let first = functionParameterOffset(context.functionParameterCounts, symbol)
     let index = 0
     while index < context.functionParameterCounts[symbol] {
         if dmaKind(context, context.functionParameterTypes[first + index]) > 0 { opaque = true }
+        if dmaKind(context, context.functionParameterTypes[first + index]) == 4 { completion = true }
         index = index + 1
     }
+    if completion { failAtToken(context.tokenLines, location, "protocol completion tokens cannot cross an unclassified native boundary") }
     if opaque { failAtToken(context.tokenLines, location, "opaque DMA handles cannot cross an unclassified native boundary") }
 }
 
 function compileDmaNative(context: CompilerContext, symbol: Integer, library: Text, state: List<Integer>, textState: List<Text>, output: List<Text>, returnType: Integer) {
     let kind = dmaPrimitive(context, symbol)
+    if library == "protocol" {
+        if kind != 21 && kind != 22 { failAtToken(context.tokenLines, context.syntax.nodes[context.syntax.symbolNodes[symbol]].start, "protocol primitives need the canonical completion declaration and exact signature") }
+        // An ordinary zero-field managed record owns the token's memory. There
+        // is no runtime protocol flag: the complete typed-source proof is the
+        // only authority for consuming the completion obligation.
+        if kind == 21 { output.add("  %native.result = call ptr @minyar_record_new_scalar(i64 0)\n") }
+        output.add("  call void @minyar_rc_leave()\n")
+        output.add("  call void @minyar_stack_leave()\n")
+        if kind == 21 { output.add("  ret ptr %native.result\n") } else { output.add("  ret void\n") }
+        return
+    }
     if kind == 0 { failCompiler("internal DMA primitive has no verified lowering") }
     let name = readableDeclarationName(context.functionNames[symbol])
     let callee = "minyar_dma_" + name

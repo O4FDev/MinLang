@@ -1,0 +1,210 @@
+// Kernel inline assembly: one statement, written for one kernel target.
+//
+//     assembly for x86_64 "outb %al, %dx" inputs(byte in al, port in dx) changes(memory)
+//
+// `assembly` is contextual: it starts this statement only when followed by
+// `for`, a target and a text literal, so ordinary names called `assembly`
+// keep working. Inputs are Integer expressions bound to named general
+// registers; each must fit its register's unsigned width. The statement has no
+// outputs. `changes(...)` must list what the instructions modify beyond their
+// inputs: `memory`, `flags`, named registers, or `nothing`. The compiler cannot
+// check that list against the instructions; that remains the author's promise.
+// Interrupt handlers reject assembly, as they reject every native effect.
+
+function isAssemblyStatement(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    return kinds[position] == 1 && texts[position] == "assembly" && texts[position + 1] == "for" && kinds[position + 2] == 1 && kinds[position + 3] == 3
+}
+
+// Register width in bits, or 0 when the name is not a supported register.
+function assemblyRegisterWidth(target: Integer, name: Text): Integer {
+    if target == 1 {
+        let families: List<Text> = ["a", "b", "c", "d"]
+        let family = 0
+        while family < families.length {
+            if name == families[family] + "l" { return 8 }
+            if name == families[family] + "x" { return 16 }
+            if name == "e" + families[family] + "x" { return 32 }
+            if name == "r" + families[family] + "x" { return 64 }
+            family = family + 1
+        }
+        let pointers: List<Text> = ["si", "di"]
+        let pointer = 0
+        while pointer < pointers.length {
+            if name == pointers[pointer] { return 16 }
+            if name == "e" + pointers[pointer] { return 32 }
+            if name == "r" + pointers[pointer] { return 64 }
+            pointer = pointer + 1
+        }
+        let number = 8
+        while number <= 15 {
+            if name == "r" + Text(number) { return 64 }
+            if name == "r" + Text(number) + "d" { return 32 }
+            number = number + 1
+        }
+        return 0
+    }
+    if name == "x29" || name == "w29" { return 0 }
+    let index = 0
+    while index <= 30 {
+        if name == "x" + Text(index) { return 64 }
+        if name == "w" + Text(index) { return 32 }
+        index = index + 1
+    }
+    return 0
+}
+
+// Canonical physical register identity, after width validation.
+function assemblyRegisterIdentity(target: Integer, name: Text): Text {
+    if target == 1 {
+        let families: List<Text> = ["a", "b", "c", "d"]
+        let index = 0
+        while index < families.length {
+            let family = families[index]
+            if name == family + "l" || name == family + "x" || name == "e" + family + "x" || name == "r" + family + "x" { return "r" + family + "x" }
+            index = index + 1
+        }
+        let pointers: List<Text> = ["si", "di"]
+        index = 0
+        while index < pointers.length {
+            let pointer = pointers[index]
+            if name == pointer || name == "e" + pointer || name == "r" + pointer { return "r" + pointer }
+            index = index + 1
+        }
+        index = 8
+        while index <= 15 {
+            if name == "r" + Text(index) || name == "r" + Text(index) + "d" { return "r" + Text(index) }
+            index = index + 1
+        }
+    } else {
+        let index = 0
+        while index <= 30 {
+            if name == "x" + Text(index) || name == "w" + Text(index) { return "x" + Text(index) }
+            index = index + 1
+        }
+    }
+    return name
+}
+
+function assemblyJoin(values: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    let index = 0
+    while index < values.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(values[index])
+        index = index + 1
+    }
+    return joinText(pieces)
+}
+
+function assemblyTemplate(text: Text): Text {
+    // LLVM reads `$` as an operand reference; this form has no operand
+    // references, so every `$` in the template is literal.
+    let escaped = escapeLLVMText(text)
+    let pieces: List<Text> = []
+    let index = 0
+    while index < escaped.length {
+        if escaped[index] == '$' { pieces.add("$$") } else { pieces.add(escaped.slice(index, index + 1)) }
+        index = index + 1
+    }
+    return joinText(pieces)
+}
+
+function compileAssemblyStatement(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>) {
+    let kinds = context.tokenKinds
+    let texts = context.tokenTexts
+    let lines = context.tokenLines
+    let location = state[0]
+    let target = compilerKernelTarget()
+    if target == 0 { failAtToken(lines, location, "assembly needs a kernel build: compile with --freestanding --kernel-target x86_64 or arm64") }
+    let named = texts[location + 2]
+    if named != "x86_64" && named != "arm64" { failAtToken(lines, location + 2, "assembly targets are x86_64 and arm64") }
+    let selected = "x86_64"
+    if target == 2 { selected = "arm64" }
+    if named != selected { failAtToken(lines, location + 2, "this assembly is for " + named + ", but the kernel target is " + selected) }
+    let template = assemblyTemplate(texts[location + 3])
+    state[0] = location + 4
+    let constraints: List<Text> = []
+    let operands: List<Text> = []
+    let resultTypes: List<Text> = []
+    let used: List<Text> = []
+    if tokenIs(kinds, texts, state, "inputs") && texts[state[0] + 1] == "(" {
+        state[0] = state[0] + 2
+        while !tokenIs(kinds, texts, state, ")") {
+            if used.length > 0 { expectToken(kinds, texts, lines, state, ",") }
+            let valueLocation = state[0]
+            let valueType: List<Integer> = [1]
+            let value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
+            if valueType[0] != 1 { failAtToken(lines, valueLocation, "assembly inputs are Integer values") }
+            expectToken(kinds, texts, lines, state, "in")
+            let register = texts[state[0]]
+            let width = 0
+            if kinds[state[0]] == 1 { width = assemblyRegisterWidth(target, register) }
+            if width == 0 { failAtToken(lines, state[0], "'" + register + "' is not a general register assembly can name on " + selected) }
+            let identity = assemblyRegisterIdentity(target, register)
+            if findText(used, identity) >= 0 { failAtToken(lines, state[0], "register '" + register + "' already holds an input") }
+            used.add(identity)
+            state[0] = state[0] + 1
+            registerRequireFits(output, textState, state, lines, valueLocation, value, width, "this assembly input")
+            let operand = value
+            if width < 64 { operand = emitInstruction(output, textState, state, "trunc i64 " + value + " to i" + Text(width)) }
+            // Inputs may be changed by the instructions. Tied early-clobber
+            // outputs tell LLVM to preserve the original Minyar SSA values.
+            constraints.add("=&{" + register + "}")
+            resultTypes.add("i" + Text(width))
+            operands.add("i" + Text(width) + " " + operand)
+        }
+        expectToken(kinds, texts, lines, state, ")")
+    }
+    if !(tokenIs(kinds, texts, state, "changes") && texts[state[0] + 1] == "(") {
+        failAtToken(lines, location, "assembly must say what it changes: changes(memory), changes(flags), named registers, or changes(nothing)")
+    }
+    state[0] = state[0] + 2
+    let changes: List<Text> = []
+    let nothing = false
+    while !tokenIs(kinds, texts, state, ")") {
+        if changes.length > 0 || nothing { expectToken(kinds, texts, lines, state, ",") }
+        let word = texts[state[0]]
+        if kinds[state[0]] != 1 { failAtToken(lines, state[0], "expected memory, flags, a register or nothing") }
+        if word == "nothing" {
+            if changes.length > 0 { failAtToken(lines, state[0], "changes(nothing) cannot list anything else") }
+            nothing = true
+        } else {
+            if nothing { failAtToken(lines, state[0], "changes(nothing) cannot list anything else") }
+            let clobber = ""
+            if word == "memory" { clobber = "~{memory}" }
+            if word == "flags" {
+                clobber = "~{cc}"
+                if target == 1 { clobber = "~{flags},~{dirflag},~{fpsr}" }
+            }
+            if clobber == "" {
+                if assemblyRegisterWidth(target, word) == 0 { failAtToken(lines, state[0], "'" + word + "' is not memory, flags or a general register on " + selected) }
+                clobber = "~{" + assemblyRegisterIdentity(target, word) + "}"
+            }
+            if findText(changes, clobber) >= 0 { failAtToken(lines, state[0], "'" + word + "' is listed twice") }
+            changes.add(clobber)
+        }
+        state[0] = state[0] + 1
+    }
+    expectToken(kinds, texts, lines, state, ")")
+    if changes.length == 0 && !nothing { failAtToken(lines, location, "write changes(nothing) when the instructions change nothing else") }
+    let input = 0
+    while input < used.length {
+        constraints.add(Text(input))
+        input = input + 1
+    }
+    let change = 0
+    while change < changes.length {
+        let redundant = false
+        input = 0
+        while input < used.length {
+            if changes[change] == "~{" + used[input] + "}" { redundant = true }
+            input = input + 1
+        }
+        if !redundant { constraints.add(changes[change]) }
+        change = change + 1
+    }
+    let resultType = "void"
+    if resultTypes.length == 1 { resultType = resultTypes[0] }
+    if resultTypes.length > 1 { resultType = "{ " + assemblyJoin(resultTypes, ", ") + " }" }
+    output.add("  call " + resultType + " asm sideeffect \"" + template + "\", \"" + assemblyJoin(constraints, ",") + "\"(" + assemblyJoin(operands, ", ") + ")\n")
+}

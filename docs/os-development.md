@@ -179,8 +179,87 @@ symbolizer command, and symbolization has a 15-second deadline by default.
 Keep the exact ELF from the failing run. A rebuilt kernel can assign different
 addresses to functions. The current optimized OS build does not emit full source
 debug information: symbol names can resolve, while source locations and inlined
-frames may appear as `??`. This workflow does not reconstruct a stack or add
-compiler debug metadata. It resolves the instruction addresses the guest reports.
+frames may appear as `??`. The fault path resolves only the instruction
+addresses the guest reports; Minyar failures also print their call chain, as
+below.
+
+### Interrupt handlers
+
+An `interrupt function` is the real hardware entry on x86-64 and Arm64. The handler records work with `signalInterrupt`, and ordinary code
+collects it with `takeInterrupt`:
+
+```minyar
+constant TICK = 0
+
+interrupt function timerTick(vector: Integer) handles(32) {
+    signalInterrupt(TICK)
+}
+```
+
+The compiler checks the handler's whole call graph: it must be scalar and
+acyclic, with no allocation, locks, blocking, native calls or floating point.
+It then emits `irq_32`. That entry saves the registers it uses, counts the
+interrupt, runs the handler, acknowledges the PIC (the slave PIC too for
+vectors 40 to 47) and returns with `iretq`. The linker picks it over the weak
+stub in `os/arch/x86_64/boot/entry.S`; unbound vectors keep the stub.
+Acknowledging the device itself, such as reading the RTC's Register C, is port
+I/O, so ordinary code does it after `takeInterrupt`.
+`make check-osdev-irq-qemu` boots `os/tests/irq-kernel.min`. It checks the
+linked entry's instructions, delivery, counting, and that code interrupted mid-loop
+keeps its registers. On Arm64 the GIC entry in `os/arch/arm64/head.S` counts,
+rearms the timer and sends the EOI as before. For IDs 16 to 1019 it also calls the
+compiled `minyar_irq_dispatch`, after saving x5 to x30, ELR and SPSR. The same
+test boots the Arm64 kernel, whose handler uses `handles(arch.TIMER)`.
+
+### Recording and replaying a run
+
+On Arm64, `--record FILE` makes `run`, `test` or `debug` write a replay log. A
+later `--replay FILE` repeats that run exactly, instruction for instruction,
+including when each interrupt arrived:
+
+```sh
+python3 tools/osdev.py test --arch arm64 --expect 'OSDEV IRQ PASS' --record build/irq.replay
+python3 tools/osdev.py debug --arch arm64 --replay build/irq.replay
+```
+
+Replaying under `debug` lets a GDB with reverse execution step backwards from a
+failure. Recording uses one CPU, single-threaded TCG, a virtual clock, disk
+reads through QEMU's `blkreplay`, the network through `filter-replay`, and
+seeded entropy. x86-64 is refused for now: its boot loader polls the ATA disk,
+and under `blkreplay` those reads time out. `make check-osdev-replay-qemu`
+checks that a replay of the IRQ kernel reproduces its serial log byte for byte.
+
+### Kernel failure call chains
+
+When kernel code stops, through `fail`, a failed check or a runtime range
+error, the guest prints `Minyar stopped:` with the message, then
+`Minyar stack trace:` and one return address per frame, innermost first:
+
+```text
+Minyar stopped: OSDEV PANIC EXPECTED
+Minyar stack trace:
+  at 0x1003bd
+  at 0x100375
+  at 0x100565
+  at main (os/tests/panic-kernel.min:9:10)
+```
+
+`run` and `test` then map those addresses to Minyar functions using the kernel
+ELF, and `symbolize --log` does the same for a saved log:
+
+```text
+osdev: Minyar stack trace, symbolized with build/os/x86_64/kernel.elf:
+  at descend (os/tests/panic-kernel.min:4:10)
+  at main (os/tests/panic-kernel.min:9:10)
+```
+
+Each frame names its function and the line where that function is declared, as
+hosted traces do. The kernel needs no symbol table or unwinder for this:
+freestanding builds keep frame pointers, and the runtime follows that chain
+only when it fails. Keeping frame pointers costs one register in every kernel
+function. Functions that link-time optimization inlines have no frame of their
+own, so they don't appear. Runtime helpers have no Minyar name and are left
+out. `make check-osdev-panic-qemu` checks the chain on x86-64 and Arm64.
 
 For a deliberate Arm fault with a real instruction address, build and run the
 expected-failure fixture, then symbolize its log before rebuilding the kernel:

@@ -210,6 +210,7 @@ exception:
     b 8b
 
 /* A hardware interrupt: every register it uses is restored before eret. */
+    .weak minyar_irq_dispatch
 interrupt:
     sub sp, sp, #48
     stp x0, x1, [sp]
@@ -242,7 +243,52 @@ interrupt:
 13: msr cntv_cval_el0, x2
     b 11f
 10: msr cntv_ctl_el0, xzr
-11: msr icc_eoir1_el1, x0
+    /* IDs 16..1019 go to a Minyar `interrupt function` dispatcher when one is
+     * linked (weak, so absent means zero). It is ordinary-ABI code, so save
+     * x5..x30, ELR and SPSR, and keep the raw IAR for the single EOI. */
+11: cmp x1, #16
+    b.lo 14f
+    ldr x2, =minyar_irq_dispatch
+    cbz x2, 14f
+    sub sp, sp, #240
+    stp x5, x6, [sp, #0]
+    stp x7, x8, [sp, #16]
+    stp x9, x10, [sp, #32]
+    stp x11, x12, [sp, #48]
+    stp x13, x14, [sp, #64]
+    stp x15, x16, [sp, #80]
+    stp x17, x18, [sp, #96]
+    stp x19, x20, [sp, #112]
+    stp x21, x22, [sp, #128]
+    stp x23, x24, [sp, #144]
+    stp x25, x26, [sp, #160]
+    stp x27, x28, [sp, #176]
+    stp x29, x30, [sp, #192]
+    mrs x3, elr_el1
+    mrs x4, spsr_el1
+    stp x3, x4, [sp, #208]
+    str x0, [sp, #224]
+    mov x0, x1
+    blr x2
+    ldr x0, [sp, #224]
+    ldp x3, x4, [sp, #208]
+    msr elr_el1, x3
+    msr spsr_el1, x4
+    ldp x5, x6, [sp, #0]
+    ldp x7, x8, [sp, #16]
+    ldp x9, x10, [sp, #32]
+    ldp x11, x12, [sp, #48]
+    ldp x13, x14, [sp, #64]
+    ldp x15, x16, [sp, #80]
+    ldp x17, x18, [sp, #96]
+    ldp x19, x20, [sp, #112]
+    ldp x21, x22, [sp, #128]
+    ldp x23, x24, [sp, #144]
+    ldp x25, x26, [sp, #160]
+    ldp x27, x28, [sp, #176]
+    ldp x29, x30, [sp, #192]
+    add sp, sp, #240
+14: msr icc_eoir1_el1, x0
 12: ldp x0, x1, [sp]
     ldp x2, x3, [sp, #16]
     ldr x4, [sp, #32]

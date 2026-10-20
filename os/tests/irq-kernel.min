@@ -1,0 +1,59 @@
+// A Minyar interrupt function bound to the timer becomes the real entry: on
+// x86-64 it replaces the weak assembly stub for vector 32, and on Arm64 the GIC
+// entry dispatches interrupt 27 to it. The guest proves delivery (the handler's signal reaches
+// ordinary code), the entry's count and acknowledgement (ticks keep coming),
+// and that interrupted code keeps its registers: a register-heavy mix gives the
+// same answer with the timer firing as it did before interrupts were enabled.
+use "arch" as arch
+use "machine" as machine
+
+constant TICK = 0
+
+interrupt function timerTick(vector: Integer) handles(arch.TIMER) {
+    signalInterrupt(TICK)
+}
+
+function mix(rounds: Integer): Integer {
+    let a = 1
+    let b = 2
+    let c = 3
+    let d = 5
+    let e = 7
+    let f = 11
+    let g = 13
+    let h = 17
+    for round in 0..rounds {
+        a = (a * 31 + h) & 0xFFFFFFFF
+        b = (b ^ (a >> 3)) + round
+        c = (c + b * 7) & 0xFFFFFFFF
+        d = d ^ (c << 1)
+        e = (e + d) & 0xFFFFFFFF
+        f = (f * 3 + e) & 0xFFFFFFFF
+        g = g ^ (f >> 5)
+        h = (h + g + a) & 0xFFFFFFFF
+    }
+    return a ^ b ^ c ^ d ^ e ^ f ^ g ^ h
+}
+
+function main(): Integer {
+    print("OSDEV IRQ START")
+    let quiet = mix(2000000)
+    let interrupts = arch.startInterrupts()
+    let before = machine.interruptCount(arch.TIMER)
+    let busy = mix(2000000)
+    let during = machine.interruptCount(arch.TIMER) - before
+    let signals = 0
+    let waits = 0
+    while signals < 3 && waits < 1000 {
+        machine.waitForInterrupt()
+        if takeInterrupt(TICK) { signals += 1 }
+        waits += 1
+    }
+    machine.disableInterrupts()
+    if signals < 3 { fail("the Minyar timer handler did not signal ordinary code") }
+    if machine.interruptCount(arch.TIMER) - before < 3 { fail("the entry did not count timer interrupts") }
+    if during < 2 { fail("the timer never interrupted the mix, so register preservation is unproven") }
+    if busy != quiet { fail("interrupted code lost register state") }
+    print("OSDEV IRQ PASS ticks during mix " + Text(during))
+    return 0
+}

@@ -47,13 +47,17 @@ if chosen("test_release_and_custom_flags") {
     let log = work + "/clang-args.txt"
     let shim = work + "/clang-capture"
     let clang = test.lines(support.output(["/bin/sh", "-c", "command -v \"$1\"", "minyar", test.setting("MINYAR_TEST_CLANG", "clang")], work + "/which-clang"))[0]
-    io.writeTextFile(shim, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$MINYAR_RELEASE_ARGUMENT_LOG\"\nexec '" + clang + "' \"$@\"\n")
+    io.writeTextFile(shim, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$MINYAR_RELEASE_ARGUMENT_LOG\"\n" +
+        "for argument in \"$@\"; do\n    case \"$argument\" in\n        */runtime.ll) cp \"$argument\" \"$MINYAR_RELEASE_RUNTIME_CAPTURE\" ;;\n    esac\ndone\n" +
+        "exec " + support.shellQuote(clang) + " \"$@\"\n")
     test.require(test.run(["chmod", "755", shim], system.environment(), "", work + "/shim-mode", 10), "release argument shim mode")
     let base = ["LIMITED=", "SANITIZER_LIMITED=", "MINYAR_CLANG=" + shim, "MINYAR_RELEASE_ARGUMENT_LOG=" + log]
     let expectations = ["-O2", "-O2", "-O1"]
     for index in 0..3 {
         let flags: List<Text> = []
         let overrides = support.copy(base)
+        let capturedRuntime = work + "/runtime-capture-" + Text(index) + ".ll"
+        overrides.add("MINYAR_RELEASE_RUNTIME_CAPTURE=" + capturedRuntime)
         let lto = index > 0
         if lto { flags.add("--release") }
         if index == 2 { overrides.add("MINYAR_CLANG_FLAGS=-O1 -Wno-override-module") }
@@ -75,6 +79,34 @@ if chosen("test_release_and_custom_flags") {
         test.check(runtimePath != "", "release build runtime argument " + runtimeName)
         test.check(support.starts(basename(parent(runtimePath)), "invocation."), "release runtime is invocation-local")
         test.check(parent(parent(runtimePath)) == root + "/build/programs", "release runtime lives in project programs")
+        if lto {
+            test.check(support.exists(capturedRuntime), "release runtime LLVM was not captured before launcher cleanup")
+            let runtime = io.readTextFile(capturedRuntime)
+            let definition = false
+            for line in test.lines(runtime) {
+                if support.starts(line, "define ") && test.contains(line, "@minyar_list_length(") { definition = true }
+            }
+            test.check(definition, "captured release LLVM must contain the runtime definitions")
+            for attribute in ["target-cpu", "target-features", "tune-cpu"] {
+                test.check(!test.contains(runtime, "\"" + attribute + "\""), "release runtime must strip " + attribute + " for inlining")
+            }
+            // This isolates single-module inlining compatibility. The release
+            // execution below separately covers the actual ThinLTO link.
+            let probe = capturedRuntime + ".probe.ll"
+            io.writeTextFile(probe, runtime + "\ndefine i64 @minyar_release_inline_probe(ptr %list) {\n  %length = call i64 @minyar_list_length(ptr %list)\n  ret i64 %length\n}\n")
+            test.require(test.run([clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm", probe, "-o", probe + ".optimized.ll"], system.environment(), "", probe + ".optimize", 120), "optimize generic caller with stripped runtime")
+            let active = false
+            let body: List<Text> = []
+            for line in test.lines(io.readTextFile(probe + ".optimized.ll")) {
+                if support.starts(line, "define ") && test.contains(line, "@minyar_release_inline_probe(") { active = true }
+                if active {
+                    body.add(line + "\n")
+                    if line == "}" { break }
+                }
+            }
+            let inlined = joinText(body)
+            test.check(test.contains(inlined, "load i64") && !test.contains(inlined, "@minyar_list_length("), "generic caller must inline runtime length reader\n" + inlined)
+        }
         let ran = test.run([output], system.environment(), "", work + "/program" + Text(index), 10)
         test.check(ran.status == 0 && ran.output == "42\n", "release program output\n" + ran.output + ran.errorOutput)
     }

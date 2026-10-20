@@ -46,7 +46,7 @@ check-osdev-interrupts-sanitize: build/minyarc-sanitize build/minyar-runtime-san
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/osdev-interrupts.py --phase ir --sanitized-compiler
 	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) python3 tests/osdev-interrupts.py --phase host-flags --sanitized-compiler
 
-# Requires the subsequent hardware entry-ABI implementation; absence fails closed.
+# Compiled hardware entries: x86 irq_N and the Arm64 GIC dispatcher.
 check-osdev-interrupt-assembly: build/minyarc
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-interrupts.py --phase assembly --case signal-zero
 
@@ -63,7 +63,12 @@ build/testing/cycle-runtime-sanitize.o: build/testing/cycle-runtime.c $(wildcard
 # Seeded-mistake study: the same driver mistakes applied to Minyar and C, each
 # classified by the first stage that notices. The QEMU variant is explicit;
 # the host variant runs in check-portable.
-.PHONY: check-osdev-seeds check-osdev-seeds-host
+.PHONY: check-osdev-seeds check-osdev-seeds-host check-osdev-seeds-harness
+check-osdev-seeds-harness:
+	python3 tests/osdev-seeds-harness.py
+
+check-osdev-seeds check-osdev-seeds-host: check-osdev-seeds-harness
+
 check-osdev-seeds: build/minyarc build/minyar-runtime.o
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) python3 tests/osdev-seeds.py
 
@@ -74,7 +79,7 @@ check-osdev-seeds-host: build/minyarc build/minyar-runtime.o
 check-osdev-allocator: build/.toolchain.json
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-allocator.py
 
-check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator check-osdev-seeds-host check-osdev-devices check-osdev-rtc-campaign check-osdev-virtio
+check check-portable: check-osdev-fields check-osdev-workflow check-osdev-freestanding check-register-layouts check-osdev-rtc check-osdev-interrupts check-osdev-dma check-osdev-allocator check-osdev-seeds-host check-osdev-devices check-osdev-rtc-campaign check-osdev-virtio check-osdev-interrupt-assembly check-osdev-assembly
 check-sanitize: check-osdev-fields-sanitize check-register-layouts-sanitize check-osdev-rtc-sanitize check-osdev-interrupts-sanitize check-osdev-dma-sanitize check-osdev-allocator check-osdev-devices-sanitize
 
 .PHONY: check-osdev-virtio
@@ -98,6 +103,29 @@ check-osdev-devices-sanitize: build/minyarc-sanitize build/minyar-runtime-saniti
 OSDEV_ARCH ?= arm64
 check-osdev-qemu: build/minyarc
 	python3 tools/osdev.py test --arch "$(OSDEV_ARCH)" --kernel-source os/tests/fields-kernel.min --expect "OSDEV FIELDS PASS" --timeout 30
+
+# Kernel inline assembly: lowering and rejections, then a live x86 serial write.
+.PHONY: check-osdev-assembly check-osdev-assembly-qemu
+check-osdev-assembly: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/osdev-assembly.py --no-qemu
+
+check-osdev-assembly-qemu: build/minyarc build/minyar-runtime.o
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-assembly.py
+
+# A Minyar interrupt function is the live timer entry on x86-64 and Arm64 QEMU.
+.PHONY: check-osdev-irq-qemu
+check-osdev-irq-qemu: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-irq.py
+
+# A recorded Arm64 run replays byte for byte, interrupt timing included.
+.PHONY: check-osdev-replay-qemu
+check-osdev-replay-qemu: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-replay.py
+
+# A real kernel failure prints a call chain that tools/osdev.py symbolizes.
+.PHONY: check-osdev-panic-qemu
+check-osdev-panic-qemu: build/minyarc
+	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/osdev-panic.py
 
 .PHONY: check-osdev-callback-qemu
 check-osdev-callback-qemu: build/minyarc

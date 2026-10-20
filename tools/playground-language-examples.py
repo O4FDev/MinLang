@@ -171,6 +171,14 @@ POLICIES = {
         "An interrupt handler", "unsupported-host",
         "Interrupt handlers require a freestanding x86_64 or arm64 kernel target. The playground uses a hosted WASI target and cannot supply hardware interrupt entry points.",
     ),
+    "8d81fc998d88": contextual(
+        "Reading a device from an interrupt", "unsupported-host",
+        "This handler reads the x86 keyboard data port through machine.in8. It requires a freestanding x86-64 kernel target; the hosted WASI playground has no native machine port I/O or hardware interrupt entry.",
+    ),
+    "9373eccc6f5f": contextual(
+        "Kernel inline assembly", "unsupported-host",
+        "This x86-64 serial-port assembly requires a matching freestanding kernel target and privileged port I/O. The hosted wasm32-WASI playground cannot execute it; native cross-assembly and QEMU checks cover this example's syntax.",
+    ),
     "a73ef813f422": contextual(
         "DMA ownership with a device model", "unsupported-host",
         "The dma and dma_model modules require the native DMA registry and are not included in the browser library bundle.",

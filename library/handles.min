@@ -1,0 +1,103 @@
+// Single-owner, domain-bound generational storage. No native pointers or clocks.
+record Domains { next: Integer }
+global domains: Domains = Domains { next: 1 }
+
+public record Handle<Item> {
+    private domain: Integer
+    private slot: Integer
+    private generation: Integer
+}
+record Slot<Item> {
+    value: Maybe<Item>
+    generation: Integer
+    next: Integer
+}
+public record Pool<Item> {
+    private domain: Integer
+    private slots: List<Slot<Item>>
+    private available: Integer
+    private live: Integer
+    private limit: Integer
+}
+
+/// Create storage whose handles cannot resolve in another pool.
+public function create<Item>(): Pool<Item> {
+    return withGenerationLimit<Item>(9223372036854775807)
+}
+
+/// Limit the number of identities each slot can issue before retiring it.
+/// Useful for bounded-lifetime resources; retired slots are never reused.
+public function withGenerationLimit<Item>(limit: Integer): Pool<Item> {
+    if limit < 1 { fail("handles: the generation limit must be positive") }
+    if domains.next == 9223372036854775807 { fail("handles: pool identities are exhausted") }
+    let domain = domains.next
+    domains.next += 1
+    return Pool<Item> { domain: domain; slots: []; available: -1; live: 0; limit: limit }
+}
+
+/// Insert a value and return its opaque identity. Reuses an available slot.
+public function insert<Item>(pool: Pool<Item>, value: Item): Handle<Item> {
+    let index = pool.available
+    if index < 0 {
+        index = pool.slots.length
+        pool.slots.add(Slot<Item> { value: Some(value); generation: 1; next: -1 })
+    } else {
+        let slot = pool.slots[index]
+        pool.available = slot.next
+        slot.next = -1
+        slot.value = Some(value)
+    }
+    pool.live += 1
+    return Handle<Item> { domain: pool.domain; slot: index; generation: pool.slots[index].generation }
+}
+
+/// A wrong pool, a removed value or a retired generation is absent.
+public function contains<Item>(pool: Pool<Item>, handle: Handle<Item>): Boolean {
+    if handle.domain != pool.domain || handle.slot < 0 || handle.slot >= pool.slots.length { return false }
+    let slot = pool.slots[handle.slot]
+    if slot.generation != handle.generation { return false }
+    return slot.value.isSome()
+}
+
+/// Return the current value. Managed payloads keep ordinary shared ownership.
+public function get<Item>(pool: Pool<Item>, handle: Handle<Item>): Maybe<Item> {
+    if !contains(pool, handle) { return None }
+    return pool.slots[handle.slot].value
+}
+
+/// Replace a live value without changing its identity.
+public function replace<Item>(pool: Pool<Item>, handle: Handle<Item>, value: Item): Boolean {
+    if !contains(pool, handle) { return false }
+    pool.slots[handle.slot].value = Some(value)
+    return true
+}
+
+function release<Item>(pool: Pool<Item>, index: Integer) {
+    let slot = pool.slots[index]
+    slot.value = None
+    pool.live -= 1
+    if slot.generation < pool.limit {
+        slot.generation += 1
+        slot.next = pool.available
+        pool.available = index
+    }
+}
+
+/// Remove once. Even an alias of this handle cannot remove a replacement.
+public function remove<Item>(pool: Pool<Item>, handle: Handle<Item>): Maybe<Item> {
+    if !contains(pool, handle) { return None }
+    let value = pool.slots[handle.slot].value
+    release(pool, handle.slot)
+    return value
+}
+
+/// Invalidate every live handle, preserving generation history.
+public function clear<Item>(pool: Pool<Item>) {
+    for index in 0..pool.slots.length {
+        if pool.slots[index].value.isSome() { release(pool, index) }
+    }
+}
+
+public function count<Item>(pool: Pool<Item>): Integer { return pool.live }
+/// Includes available and retired slots. Storage never compacts or resets IDs.
+public function slotCount<Item>(pool: Pool<Item>): Integer { return pool.slots.length }

@@ -108,23 +108,42 @@ def qemu_command(args):
     name = "qemu-system-aarch64" if args.arch == "arm64" else "qemu-system-x86_64"
     local = args.root / "build/qemu/bin" / name
     executable = args.qemu or (str(local) if local.is_file() else name)
-    command = [executable, "-m", "1G", "-smp", "4", "-accel", "tcg", "-cpu", "max",
+    replay = getattr(args, "record", None) or getattr(args, "replay", None)
+    # Record/replay needs one deterministic instruction counter: one CPU,
+    # single-threaded TCG, a virtual clock, and every input passing through QEMU's
+    # replay log (disk via blkreplay, network via filter-replay, seeded entropy).
+    command = [executable, "-m", "1G", "-smp", "1" if replay else "4",
+               "-accel", "tcg,thread=single" if replay else "tcg", "-cpu", "max",
                "-display", args.display, "-serial", "stdio", "-monitor", "none",
                "-no-reboot", "-netdev", "user,id=net0", "-device", "e1000,netdev=net0"]
+    if replay:
+        mode = "record" if getattr(args, "record", None) else "replay"
+        log = str(Path(replay).resolve()).replace(",", ",,")
+        command += ["-icount", f"shift=auto,rr={mode},rrfile={log}", "-object", "filter-replay,id=replay,netdev=net0",
+                    "-seed", "1"]
     if args.rtc_base:
         command += ["-rtc", f"base={args.rtc_base},clock=vm"]
+    elif replay:
+        command += ["-rtc", "clock=vm"]
     # QEMU key/value options use doubled commas for literal path commas.
     image = str(output / "minyar-os.img").replace(",", ",,")
     if args.arch == "x86_64":
-        command += ["-vga", "std", "-drive", f"file={image},format=raw,if=ide,snapshot=on",
-                    "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
+        command += ["-vga", "std", "-drive", f"file={image},format=raw,if=ide,snapshot=on"]
+        command += ["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"]
     else:
-        command += ["-M", "virt,gic-version=3", "-kernel", str(output / "kernel.elf"),
-                    "-device", "bochs-display", "-drive", f"if=none,id=disk,file={image},format=raw,snapshot=on",
-                    "-device", "virtio-blk-pci,drive=disk,disable-legacy=on",
+        command += ["-M", "virt,gic-version=3", "-kernel", str(output / "kernel.elf"), "-device", "bochs-display"]
+        if replay:
+            command += ["-drive", f"if=none,id=disk-direct,file={image},format=raw,snapshot=on",
+                        "-drive", "driver=blkreplay,if=none,image=disk-direct,id=disk"]
+        else:
+            command += ["-drive", f"if=none,id=disk,file={image},format=raw,snapshot=on"]
+        command += ["-device", "virtio-blk-pci,drive=disk,disable-legacy=on",
                     "-device", "virtio-keyboard-pci,disable-legacy=on",
-                    "-device", "virtio-tablet-pci,disable-legacy=on",
-                    "-device", "virtio-rng-pci,disable-legacy=on"]
+                    "-device", "virtio-tablet-pci,disable-legacy=on"]
+        if replay:
+            command += ["-object", "rng-builtin,id=entropy", "-device", "virtio-rng-pci,rng=entropy,disable-legacy=on"]
+        else:
+            command += ["-device", "virtio-rng-pci,disable-legacy=on"]
     if args.action == "debug":
         command += ["-S", "-gdb", f"tcp:127.0.0.1:{args.gdb_port}"]
     return command
@@ -195,6 +214,10 @@ def boot(args, command, log):
 def run(args):
     if args.action == "test" and (not args.expect or "\n" in args.expect or "\r" in args.expect):
         raise WorkflowError("test requires --expect with one nonempty exact serial line")
+    if (getattr(args, "record", None) or getattr(args, "replay", None)) and args.arch != "arm64":
+        # x86 boots through a polled ATA loader; under QEMU's blkreplay its reads
+        # time out, and without blkreplay a replay diverges.
+        raise WorkflowError("record/replay currently supports --arch arm64 only")
     if args.no_build and args.kernel_source:
         raise WorkflowError("--kernel-source requires a build; remove --no-build")
     if not (args.root / "os/Makefile").is_file():
@@ -219,6 +242,20 @@ def run(args):
     print(f"osdev: serial log: {log}", file=sys.stderr)
     if args.dry_run:
         return 0
+    # Validate every writable path before either building or starting QEMU.
+    # Resolve symlinks and compare inodes too: hard links can alias a journal.
+    def aliases(first, second):
+        return first.resolve() == second.resolve() or (first.exists() and second.exists() and first.samefile(second))
+
+    journal = getattr(args, "record", None) or getattr(args, "replay", None)
+    for name in ("minyar-os.img", "kernel.elf"):
+        artifact = args.root / "build/os" / args.arch / name
+        if aliases(log, artifact):
+            raise WorkflowError("serial log must not overwrite the kernel or disk image")
+        if journal and aliases(journal, artifact):
+            raise WorkflowError("replay journal must not overwrite the kernel or disk image")
+    if journal and aliases(log, journal):
+        raise WorkflowError("serial log must not overwrite the replay journal")
     qemu[0] = tool(qemu[0])
     if not args.no_build:
         make[0] = str(Path(tool(make[0])).resolve())
@@ -251,12 +288,120 @@ def run(args):
         path = args.root / "build/os" / args.arch / artifact
         if not path.is_file():
             raise WorkflowError(f"missing {path}; build the selected architecture first")
-    for name in ("minyar-os.img", "kernel.elf"):
-        artifact = args.root / "build/os" / args.arch / name
-        if log == artifact.resolve() or (log.exists() and log.samefile(artifact)):
-            raise WorkflowError("serial log must not overwrite the kernel or disk image")
     log.parent.mkdir(parents=True, exist_ok=True)
-    return boot(args, qemu, log)
+    status = boot(args, qemu, log)
+    elf = args.root / "build/os" / args.arch / "kernel.elf"
+    if log.is_file() and elf.is_file():
+        report_minyar_trace(log.read_text(errors="replace"), elf)
+    return status
+
+
+def trace_return_addresses(text):
+    """Return addresses a freestanding kernel printed under "Minyar stack trace:"."""
+    traces, current = [], None
+    for line in text.splitlines():
+        if line.strip() == "Minyar stack trace:":
+            current = []
+            traces.append(current)
+        elif current is not None:
+            match = re.fullmatch(r"\s+at (0x[0-9a-fA-F]+)\s*", line)
+            if match:
+                current.append(int(match.group(1), 16))
+            elif not line.startswith("  at "):
+                current = None
+    return traces
+
+
+# runtime/minyar_traces.h MinyarTraceRow: five i32 offsets/flags, padding,
+# then i64 line and column.
+TRACE_ROW_BYTES = 40
+
+
+def elf_trace_functions(elf):
+    """Map kernel function addresses to Minyar names through the ELF symbol
+    table and the compiler's runtime trace rows; no DWARF or runtime cost."""
+    data = Path(elf).read_bytes()
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        raise WorkflowError(f"{elf} is not a little-endian ELF64 kernel")
+    number = lambda offset, size: int.from_bytes(data[offset:offset + size], "little")
+    signed = lambda offset, size: int.from_bytes(data[offset:offset + size], "little", signed=True)
+    sections = []
+    table, entry_size, count = number(0x28, 8), number(0x3A, 2), number(0x3C, 2)
+    for index in range(count):
+        base = table + index * entry_size
+        sections.append(dict(type=number(base + 4, 4), address=number(base + 16, 8), offset=number(base + 24, 8),
+                             size=number(base + 32, 8), link=number(base + 40, 4)))
+
+    def at(address, size):
+        for section in sections:
+            if section["type"] != 8 and section["address"] <= address and address + size <= section["address"] + section["size"]:
+                start = section["offset"] + address - section["address"]
+                return data[start:start + size]
+        return None
+
+    def text(address):
+        for section in sections:
+            if section["type"] != 8 and section["address"] <= address < section["address"] + section["size"]:
+                start = section["offset"] + address - section["address"]
+                return data[start:data.index(b"\0", start)].decode(errors="replace")
+        return None
+
+    functions, objects = [], {}
+    for section in (item for item in sections if item["type"] == 2):
+        strings = sections[section["link"]]
+        for base in range(section["offset"], section["offset"] + section["size"], 24):
+            start = strings["offset"] + number(base, 4)
+            name = data[start:data.index(b"\0", start)].decode(errors="replace")
+            kind, value, size = number(base + 4, 1) & 15, number(base + 8, 8), number(base + 16, 8)
+            if kind == 2 and size:
+                functions.append((value, size, name))
+            elif name.startswith("minyar.trace|"):
+                objects[name] = value
+    rows = {}
+    for name, address in objects.items():
+        if not name.endswith("|rows") or name[:-5] + "|count" not in objects:
+            continue
+        total = at(objects[name[:-5] + "|count"], 8)
+        for index in range(int.from_bytes(total or b"", "little")):
+            row = at(address + index * TRACE_ROW_BYTES, TRACE_ROW_BYTES)
+            if row is None:
+                break
+            relative = lambda field: address + int.from_bytes(row[field:field + 4], "little", signed=True)
+            symbol, readable, path = text(relative(0)), text(relative(4)), text(relative(8))
+            if symbol:
+                rows[symbol] = (readable, path, int.from_bytes(row[24:32], "little", signed=True),
+                                int.from_bytes(row[32:40], "little", signed=True))
+    return sorted(functions), rows
+
+
+def symbolize_minyar_trace(addresses, functions, rows):
+    frames = []
+    for address in addresses:
+        # A return address follows its call; look up the call instruction.
+        target = address - 1
+        for start, size, name in functions:
+            if start <= target < start + size:
+                row = rows.get(name) or rows.get(name.split(".llvm.")[0])
+                if row:
+                    frames.append("  at %s (%s:%d:%d)" % row)
+                break
+    return frames
+
+
+def report_minyar_trace(text, elf):
+    traces = [trace for trace in trace_return_addresses(text) if trace]
+    if not traces:
+        return
+    try:
+        functions, rows = elf_trace_functions(elf)
+    except (OSError, ValueError, WorkflowError) as error:
+        print(f"osdev: cannot symbolize the Minyar stack trace: {error}", file=sys.stderr)
+        return
+    for trace in traces:
+        frames = symbolize_minyar_trace(trace, functions, rows)
+        print(f"osdev: Minyar stack trace, symbolized with {elf}:", file=sys.stderr)
+        for frame in frames or ["  (no Minyar function owns these return addresses)"]:
+            print(frame, file=sys.stderr)
 
 
 def instruction_addresses(text):
@@ -267,8 +412,18 @@ def instruction_addresses(text):
 
 def symbolize(args):
     addresses = args.addresses[:]
+    traced = False
     if args.log:
-        addresses += instruction_addresses(Path(args.log).read_text(errors="replace"))
+        text = Path(args.log).read_text(errors="replace")
+        addresses += instruction_addresses(text)
+        traced = any(trace_return_addresses(text))
+        elf = Path(args.elf).resolve() if args.elf else args.root / "build/os" / args.arch / "kernel.elf"
+        if traced and not args.dry_run:
+            if not elf.is_file():
+                raise WorkflowError(f"missing ELF {elf}; preserve the exact kernel from the failing run")
+            report_minyar_trace(text, elf)
+        if traced and not addresses:
+            return 0
     normalized = []
     for address in addresses:
         if not re.fullmatch(r"(?:0x)?[0-9a-fA-F]{1,16}", address):
@@ -316,6 +471,9 @@ def main(argv=None):
             part.add_argument("--qemu", help="QEMU executable (one path, not shell syntax)")
             part.add_argument("--display", default="none", help="QEMU display backend, e.g. cocoa or gtk; default none")
             part.add_argument("--rtc-base", type=rtc_datetime, help="initial QEMU calendar YYYY-MM-DDTHH:MM:SS, advancing on virtual time")
+            journal = part.add_mutually_exclusive_group()
+            journal.add_argument("--record", type=Path, help="record a deterministic replay log of this run (arm64, one CPU)")
+            journal.add_argument("--replay", type=Path, help="replay a recorded run exactly; with debug, GDB can step backwards")
             if action == "test":
                 part.add_argument("--expect", required=True, help="nonempty exact guest serial line required for success")
             if action == "debug":

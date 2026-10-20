@@ -51,6 +51,13 @@ The separate `check-performance` self-compile limits are 20 seconds wall,
 2 seconds CPU and 64 MiB. These remain regression targets, not a statement
 that the current, larger compiler passes.
 
+`make check-budget-functional` exercises the budget controls on every platform,
+including all three 100-pair batches, alternating compiler order, complete
+reports and exact resource boundaries. It uses fixture measurements and does
+not qualify host performance. Both `check` and `check-portable` include these
+controls. On macOS, `check` also runs the real `check-budget`; an explicit
+`check-budget` on another platform still rejects unsupported qualification.
+
 The October hardening review reconstructs the starting compiler and runtime
 instead of comparing against old documentation. That branch already exceeded
 the instruction and memory limits. Typed source positions defer diagnostic
@@ -68,8 +75,9 @@ hardening report for that fixture's evidence; these are not measurements of
 the current full compiler.
 
 The budget test runs outside the development limiter because background
-priority changes absolute timings. It takes the 90th percentile across batches;
-shared-host load can still affect results. Most other checks run under
+priority changes absolute timings. It retains all 300 paired wall and CPU
+observations across three batches; shared-host load can still affect results.
+Most other checks run under
 `scripts/with-limits.sh`, with background priority and CPU, memory, and output
 limits. Avoid parallel test jobs when comparing timings.
 
@@ -305,6 +313,30 @@ iterations; on the frozen safelibs fixtures this cut JPEG decode from 32.59 to
 21.19 ms and PNG from 9.17 to 7.58 ms. Resizing and other calls retain their
 ordinary memory effects; invalid accesses still use the runtime diagnostic.
 
+The call-free Bytes and List length helpers describe their effects as
+`memory(argmem: read)`, with noncapturing, non-null headers readable for sixteen
+bytes. They do no allocation, synchronization or unwinding and always return.
+This describes each read; aliases can still change the next observed length.
+Checked accessors expose non-null backing storage only after their bounds check.
+Empty Lists may have a null backing pointer, and native Bytes views imply no
+backing-allocation size, alignment or disjointness. Trap branches carry source
+likelihood hints, with the failing successor unlikely; ordinary append growth
+does not. These contracts preserve the existing runtime checks and diagnostics.
+`make check-llvm-helper-contracts` verifies the emitted contracts and mutable,
+overlapping views at O0/O2 with ownership cleanup; its sanitizer variant also
+instruments the compiler and generated memory accesses.
+
+On one Linux x86_64 LLVM 23.1.2 host, seven alternating retained pairs against
+the same frozen inputs measured 2,233,443,703 → 2,231,188,537 median user
+instructions for arena compiler self-compilation (−0.10%). Whole-process
+instructions for the frozen safelibs zlib/PNG/JPEG workers fell by
+0.17%/0.47%/0.12%; the three jsmn sizes were unchanged. Compiler file size grew
+from 2,040,344 to 2,041,440 bytes; codec and jsmn file sizes stayed unchanged.
+Decode CPU timings were mixed, so these narrow instruction reductions do not
+establish a general speedup. Compiler output matched after removing exactly
+the intended helper-contract differences; decoded bytes and jsmn checksums
+matched without normalization.
+
 `make check-bytes-access check-list-access` checks the raw helpers and optimized
 loops: a proven traversal removes redundant bounds and index-overflow checks
 while retaining checked accumulation. The suites also exercise errors, shared
@@ -400,3 +432,72 @@ comparison on one host. The tool reports the median paired ratios and their
 full range. It enforces correctness, not a speed threshold: inspect the retained
 samples and holdouts before choosing a compiler. Profile generation and extra
 links have a cost, and no result from this experiment changes release defaults.
+
+## Runtime declarations and LLVM optimization
+
+The native Text byte-length, Bytes length and List length declarations describe
+leaf reads of their mutable headers: `captures(none)`, `nonnull`, a 16-byte
+dereferenceable prefix, `nofree nosync nounwind willreturn`, and
+`memory(argmem: read)`. Text equality has the same parameter and leaf contracts
+but uses `memory(read)`: it follows backing pointers loaded from the headers.
+Restricting equality to argument memory would permit incorrect reuse across a
+store to a separate backing allocation. Neither header nor backing storage is
+declared invariant or disjoint. Lazy Text character-length/index operations
+remain outside these contracts. Explicit failure is `cold noreturn`; ordinary
+exit is only `noreturn`, preserving its shutdown effects.
+
+`make check-llvm-runtime-contracts` checks emitted declarations and matching
+stage0 strings, declaration-only call merging, and the calls that must remain
+across header/backing mutations. It also checks empty and Unicode Text,
+equality's small-load and memcmp paths, exact failure/exit behavior, and ownership
+cleanup at O0/O2. Its sanitizer counterpart instruments generated accesses and
+the native runtime.
+
+A separate Linux x86_64 LLVM 23.1.2 study built both compilers through two
+generations, verified byte-identical fixed points per compiler and identical
+self-compile output after only the six declaration changes were normalized.
+Seven alternating retained pairs after warmup found effectively unchanged
+instructions for compiler self-compilation, frozen safelibs codecs and three
+jsmn sizes. Compiler file size increased by 472 bytes in that matched study;
+product file sizes were unchanged. A labeled synthetic loop comparing the same
+Text ten million times fell from 270,441,745 to 50,441,543 instructions after
+LLVM hoisted the read. This explains an optimization opportunity and does not
+establish a general application speedup.
+
+The compiler and `--release` programs retain O2 with ThinLTO. Clang's current
+default pipeline already enables loop and SLP vectorization; adding those flags
+again does not remove checked-overflow dependencies. A separately controlled
+O3 experiment reduced compiler self-compile instructions by 1.82% while growing
+its binary by 4.62%. Codec changes ranged from effectively zero to 0.78% fewer
+instructions with 5.93% more library bytes; jsmn was unchanged. These workloads
+do not justify changing the default optimization level.
+
+Runtime LLVM must keep the documented stripping of `target-cpu`,
+`target-features` and `tune-cpu`, so generic generated callers remain compatible
+with runtime inlining. `make check-release-build` captures the actual temporary
+release runtime before cleanup, checks those attributes are absent, and verifies
+a generic length wrapper inlines against that captured module. That last probe
+tests single-module optimization; release execution separately exercises the
+actual ThinLTO link.
+
+One standalone byte-sum prototype illustrates a sound arithmetic pattern for
+future loop lowering. Starting at zero, n unsigned bytes have every prefix at
+most 255*n. For n <= 16,843,009 = floor(UINT32_MAX/255), an unsigned 32-bit sum
+followed by zero-extension gives the exact language Integer result; larger
+inputs retain the original checked 64-bit loop. Plain wrapping LLVM addition
+needs no speculative no-wrap or alias metadata. On generic x86_64 SSE2, LLVM
+23.1.2 vectorized that guarded 32-bit loop at O2/O3; a guarded 64-bit version
+was legal but declined by the cost model. An isolated 1 MiB byte ramp summed
+128 times retired about 80.3% fewer instructions, with 145 additional function
+text bytes. Real boundary and boundary+1 buffers, tails, unaligned input,
+empty input and sanitizer checks passed. This prototype is not production
+compiler lowering. Adoption also needs live/stable collection storage and
+unchanged diagnostic, ownership and effect ordering; the arithmetic proof alone
+does not permit hoisting across mutation or reassociating arbitrary signed sums.
+
+Broader tag ranges, TBAA, noalias and explicit noundef contracts remain deferred.
+Native scalar boundaries, nullable choice niches, shared native views and
+partially initialized payloads require more precise proofs; explicit noundef
+also needs matching ABI treatment at call sites for MemorySanitizer. Existing
+nonnegative length ranges and successful-block backing `!nonnull` metadata
+retain their narrow scope.

@@ -713,6 +713,15 @@ copying behavior. Parentheses do not change this rule.
 The same applies when replacing the local itself, such as
 `values = (values).appended(values[0])`: the index is read before storage reuse.
 
+For values named by delayed events, the [handles library](handles.md) provides
+typed pool identities with generation checks. Removing a value invalidates its
+handles, and an old event cannot accidentally reach a replacement in that slot.
+
+The [protocol library](protocol-completion.md) can require explicit completion
+or transfer of a transaction or close witness on every normal return path.
+The standalone compiler's [ownership explanations](ownership-explanations.md)
+describe terminal Text/List transfer decisions and conservative fallbacks.
+
 Reconstructing a scalar record into its local can also reuse uniquely owned
 storage. Every field initializer runs before any old field is replaced, so
 `point = Point { x: point.y; y: point.x }` still swaps the two values. Other
@@ -1802,12 +1811,17 @@ Compile this context with `--freestanding --kernel-target x86_64` or `arm64`.
 PIC vectors 32..47 and GIC IDs 16..1019 are accepted respectively. A handler
 takes one Integer and returns Nothing. Its complete direct call graph must use
 scalar, acyclic code: allocation, managed values, Float, blocking, locks,
-native calls, indirect calls, recursion and loops reject. A handler may read and
+unproved native calls, indirect calls, recursion and loops reject. A handler may read and
 acknowledge its device: fixed-width MMIO (`machine.read8` to `machine.write64`),
 x86 port I/O (`machine.in8` to `machine.out32`) and `machine.fence()` are allowed,
 because each is one access or barrier. Halting, waiting, pausing and changing the
-interrupt mask are not. Ordinary functions keep their ordinary behavior. This context proof is separate from hardware
-entry, register preservation and a physical stack bound.
+interrupt mask are not. Ordinary functions keep their ordinary behavior. On x86-64
+the compiler also emits the hardware entry `irq_N` for each bound vector: it saves
+the registers it uses, counts the interrupt, runs the checked handler, acknowledges
+the PIC and returns with `iretq`, replacing the kernel's weak assembly stub. On
+Arm64 the GIC entry calls a compiled `minyar_irq_dispatch` for IDs 16 to 1019,
+after saving every general register, ELR and SPSR. Handler code may not use x87,
+MMX, SSE or Arm FP/SIMD state. Neither target proves a physical stack bound.
 
 A rejection names the path from the handler to the unsafe operation:
 
@@ -1815,13 +1829,15 @@ A rejection names the path from the handler to the unsafe operation:
 error: interrupt context handles(42): linkChanged -> waitForLink -> sleepNanoseconds -> calls native code (library 'system') that the compiler cannot prove interrupt-safe; it may block, sleep, take a lock or allocate
 ```
 
-The check costs nothing at run time. Programs without interrupt handlers compile
-to the same LLVM IR as before, and a handler that only signals a flag compiles
-to one release store.
+Context checking adds no run-time checks. Programs without interrupt handlers
+compile to the same LLVM IR as before. A handler body that only signals a flag
+has one release store; its hardware entry still counts the interrupt, preserves
+registers and acknowledges the controller.
 
 ```minyar
 use "machine" as machine
 
+// The entry acknowledges the PIC; the handler reads its device.
 interrupt function keyboard(vector: Integer) handles(33) {
     let key = machine.in8(0x60)
     if key != 0 { signalInterrupt(1) }
@@ -1833,6 +1849,38 @@ interrupt function keyboard(vector: Integer) handles(33) {
 These operations use release/acquire ordering. A flag carries no event count,
 payload access or DMA completion permission. Existing user callables with these
 names retain normal lookup precedence.
+
+### Inline assembly
+
+A kernel can write a few instructions directly. Each statement names the target
+it is written for:
+
+```minyar
+function writeSerial(character: Integer) {
+    assembly for x86_64 "outb %al, %dx" inputs(character in al, 0x3F8 in dx) changes(nothing)
+}
+```
+
+The text is passed to the target's assembler as written. `inputs(...)` binds
+Integer values to named general registers (`al` to `rax` and `r8` to `r15` on
+x86-64, `w0`/`x0` through `w30`/`x30` on Arm64, excluding the frame pointer
+`w29`/`x29`). Each value must fit its register's unsigned width, checked like a
+register field. The instructions may overwrite input registers; the original
+Minyar values remain unchanged. Two inputs cannot name overlapping registers,
+such as `al` and `rax`, or `w0` and `x0`.
+
+`changes(...)` is required. It lists what the instructions change besides
+their inputs: `memory`, `flags`, named registers, or `nothing`. Listing an
+input register or its alias again is allowed and adds no further change.
+The compiler cannot check that list against the instructions, so it is the
+author's promise.
+
+The statement compiles only in a kernel build for its own target. It has no
+outputs. Input range checks, register setup and preserving live values may
+add scalar instructions; the assembly itself allocates nothing. It is a native
+effect, so interrupt handlers reject it. `assembly` is contextual: it starts this statement only
+when followed by `for`, a target name and text. Other names called `assembly`
+keep working.
 
 The `dma` module separates CPU access from a device-owned pending request:
 
@@ -1911,7 +1959,10 @@ still become visible where they are declared.
 The compiler retains resolved types and source spans for checked declarations,
 statements and expressions. See the [compiler syntax tree](compiler-syntax.md).
 
-Compiler diagnostics identify the source file, line and column. Source-read failures, including invalid UTF-8, use the same text or JSON format. Common syntax,
+Compiler diagnostics identify the source file, line and column. Source-read
+failures, including invalid UTF-8, use the same text or JSON format. Allocation
+failures remain fatal runtime reports, including when reading source files.
+Common syntax,
 type and field errors also show the source line and underline the relevant
 token. Columns count Unicode scalar values, starting at one. Type mismatches
 show the expected and actual types where those are known:

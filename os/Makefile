@@ -59,7 +59,7 @@ QEMU_ZOOM ?= $(if $(wildcard $(ROOT)/build/qemu/bin/$(QEMU_SYSTEM)),zoom-to-fit=
 CFLAGS := $(TARGET) -O2 -flto -ffreestanding -fno-builtin -nostdinc \
 	-isystem $(shell $(CLANG) -print-resource-dir)/include \
 	-isystem $(ROOT)/runtime/freestanding/include \
-	$(CPU_FLAGS) -fno-stack-protector -fno-pic -Wall -Wno-unused-function
+	$(CPU_FLAGS) -fno-stack-protector -fno-pic -fno-omit-frame-pointer -Wall -Wno-unused-function
 # These kernel flags must not leak into ./minyar, whose hosted bootstrap would
 # then compile stage0 with -nostdinc when the parent make exported CFLAGS.
 unexport CFLAGS

@@ -189,6 +189,15 @@ build/tooling/tests/self-compile-budget: build/testing/cycle-runtime.o tests/per
 check-budget: build/minyarc build/compiler-stage3.ll build/tooling/tests/self-compile-budget
 	./build/tooling/tests/self-compile-budget
 
+.PHONY: check-budget-functional
+check-budget-functional: build/tooling/tests/self-compile-budget
+	./build/tooling/tests/self-compile-budget --functional
+
+check check-portable: check-budget-functional
+ifeq ($(shell uname -s),Darwin)
+check: check-budget
+endif
+
 build/minyarc-budget-previous: build/compiler-budget-previous.ll build/minyar-compiler-runtime.ll
 	"$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
@@ -240,10 +249,10 @@ check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/min
 check-stress: build/minyarc build/minyar-runtime.o build/tooling/tests/fuzz
 	MINYAR_FUZZ_CASES=2000 $(LIMITED) ./build/tooling/tests/fuzz
 
-check: doctor check-smoke check-release-build check-recursive-data check-compact-ownership check-adversarial check-ownership-mutation check-regressions check-memory check-runtime-unit check-modules check-fuzz check-stack-overflow check-mutation check-performance check-scaling check-budget check-sanitize check-ownership check-examples
+check: doctor check-smoke check-release-build check-recursive-data check-compact-ownership check-adversarial check-ownership-mutation check-regressions check-memory check-runtime-unit check-modules check-fuzz check-stack-overflow check-mutation check-performance check-scaling check-sanitize check-ownership check-examples
 
 .PHONY: check-examples
-check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds build/minyar-runtime.o build/tooling/tests/compiler-behavior
+check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds build/minyar-runtime.o build/tooling/tests/compiler-behavior tests/diagnostics/expected/errors/malformed-expression.stderr tests/diagnostics/expected/errors/top-level-malformed-expression.stderr
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
 	test "$$(./build/hello)" = "hello from LLVM-backed Minyar"
 	test "$$(./build/language-tour | tr '\n' ' ')" = "The answer is 42 3 2 1 "
@@ -287,9 +296,9 @@ check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello 
 	! ./build/minyarc tests/errors/top-level-statement.min build/invalid.ll 2> build/top-level-return-error.txt
 	grep -q "use exit(status) to finish a top-level program" build/top-level-return-error.txt
 	! ./build/minyarc tests/errors/malformed-expression.min build/invalid.ll 2> build/expression-error.txt
-	grep -q "line 2, column 16: expected an expression, found ')'" build/expression-error.txt
+	cmp tests/diagnostics/expected/errors/malformed-expression.stderr build/expression-error.txt
 	! ./build/minyarc tests/errors/top-level-malformed-expression.min build/invalid.ll 2> build/top-level-expression-error.txt
-	grep -q "line 1, column 12: expected an expression, found ')'" build/top-level-expression-error.txt
+	cmp tests/diagnostics/expected/errors/top-level-malformed-expression.stderr build/top-level-expression-error.txt
 	! ./build/minyarc tests/errors/duplicate-function.min build/invalid.ll 2> build/duplicate-function-error.txt
 	grep -q "module declares 'duplicate' more than once" build/duplicate-function-error.txt
 	! ./build/minyarc tests/errors/duplicate-record.min build/invalid.ll 2> build/duplicate-record-error.txt
@@ -354,8 +363,8 @@ check-compiler-slice-cache: build/tooling/tests/compiler-slice-cache
 	$(LIMITED) ./build/tooling/tests/compiler-slice-cache
 
 check-compact-ownership: build/minyarc build/minyarc-sanitize build/ownership-runtime.o build/minyar-compiler-runtime.ll build/tooling/tests/compact-ownership
-	$(LIMITED) ./build/tooling/tests/compact-ownership
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/compact-ownership
+	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compact-ownership
+	MINYAR_TEST_CLANG="$(LLVM_CC)" ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/compact-ownership
 
 .PHONY: check-text-view-budget
 check-text-view-budget: build/tooling/tests/text-view-budget

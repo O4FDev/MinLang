@@ -1,3 +1,32 @@
+// Standalone opt-in remarks describe this proof, never runtime alias counts.
+function ownershipRemarksRequested(): Boolean {
+    let position = 2
+    if processInfo.argumentCount() > 2 && processInfo.argument(2) == "--module-state" { position = 6 }
+    while position < processInfo.argumentCount() {
+        let argument = processInfo.argument(position)
+        if argument == "--library" || argument == "--error-format" || argument == "--kernel-target" { position = position + 1 } else if argument == "--explain-ownership" { return true }
+        position = position + 1
+    }
+    return false
+}
+
+function terminalOwnershipRemark(context: CompilerContext, node: Integer, decision: Text, reason: Text) {
+    let site = context.terminalReuse
+    if !site.explain { return }
+    let span = syntaxSpan(context.syntax, node)
+    site.remarks.add("{\"version\":1,\"severity\":\"remark\",\"pass\":\"terminal-ownership\",\"file\":" + diagnosticJsonText(span.file) + ",\"line\":" + Text(span.line) + ",\"column\":" + Text(span.column) + ",\"decision\":" + diagnosticJsonText(decision) + ",\"reason\":" + diagnosticJsonText(reason) + "}\n")
+}
+
+function finishOwnershipRemarks(context: CompilerContext) {
+    if context.terminalReuse.explain {
+        let index = 0
+        while index < context.terminalReuse.remarks.length {
+            diagnosticWrite(context.terminalReuse.remarks[index])
+            index = index + 1
+        }
+    }
+}
+
 function keepReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer): Integer {
     let owner = -1
     if isReferenceType(type) {
@@ -94,12 +123,21 @@ function takeTerminalReuse(context: CompilerContext, localNames: List<Text>, loc
     let callee = output[site.calleePiece]
     if callee != "minyar_join_text" && callee != "minyar_list_appended" { return }
     let receiver = ungroupOwnershipNode(tree, tree.nodes[node].firstChild)
-    if !directOwnershipName(context, receiver) { return }
+    if !directOwnershipName(context, receiver) {
+        terminalOwnershipRemark(context, node, "retain", "the receiver is not a direct local binding; this proof preserves its ownership")
+        return
+    }
     let local = findLocal(localNames, localLengths, state, context.tokenTexts[tree.nodes[receiver].start])
-    if local < 0 || localIds[local] < 0 { return }
+    if local < 0 || localIds[local] < 0 {
+        terminalOwnershipRemark(context, node, "retain", "the receiver has no transferable local owner; this proof preserves its ownership")
+        return
+    }
     // Assignment ends this owner's lifetime only when replacing that binding.
     // A return passes -1 because every local ends on its completed path.
-    if target >= 0 && localIds[local] != target { return }
+    if target >= 0 && localIds[local] != target {
+        terminalOwnershipRemark(context, node, "retain", "the assignment replaces a different binding, so the receiver remains live")
+        return
+    }
     state[6] = 1
     let slot = ownershipSlot(state, localIds[local])
     // The reserved fragment follows all argument evaluation. Keep the local
@@ -107,6 +145,7 @@ function takeTerminalReuse(context: CompilerContext, localNames: List<Text>, loc
     output[site.transferPiece] = "  call void @minyar_rc_local_move_owner(i64 " + Text(slot) + ", ptr " + site.receiver + ")\n"
     if callee == "minyar_join_text" { output[site.calleePiece] = "minyar_join_text_take_left" }
     else { output[site.calleePiece] = "minyar_list_appended_take" }
+    terminalOwnershipRemark(context, node, "transfer", "the local owner can transfer after argument evaluation; runtime uniqueness still decides storage reuse")
     site.node = -1
 }
 

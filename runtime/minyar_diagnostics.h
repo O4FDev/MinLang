@@ -1,6 +1,6 @@
-/* Compiler diagnostics use raw stderr and best-effort source reads. Neither
- * helper runs on a successful compiler path. Source files may be unavailable
- * when a tool checks an in-memory syntax tree; keep its location and message. */
+/* Compiler diagnostics use raw stderr and best-effort source reads. Trace
+ * metadata also reads source during successful compilation. Source files may
+ * be unavailable for in-memory trees; keep their location and message. */
 void minyar_runtime_diagnosticWrite(const MinyarText *text) {
     (void)fwrite(text->bytes, 1, (size_t)text->byte_length, stderr);
     (void)fflush(stderr);
@@ -8,8 +8,9 @@ void minyar_runtime_diagnosticWrite(const MinyarText *text) {
 
 static long long minyar_source_error, minyar_source_line = 1, minyar_source_column = 1;
 
-/* Never panic while trying to explain an earlier error. Validate UTF-8 before
- * crossing the native Text boundary; an invalid byte gets a visible marker. */
+/* Unavailable sources keep the original diagnostic. Allocation failures remain
+ * fatal, including trace metadata reads. Validate UTF-8 before crossing the
+ * native Text boundary; an invalid byte gets a visible marker. */
 MinyarText *minyar_runtime_diagnosticReadSource(const MinyarText *path_text) {
     minyar_source_error = 0; minyar_source_line = minyar_source_column = 1;
     if (memchr(path_text->bytes, 0, (size_t)path_text->byte_length)) {
@@ -37,7 +38,7 @@ MinyarText *minyar_runtime_diagnosticReadSource(const MinyarText *path_text) {
         fclose(file); minyar_source_error = 2; return copy_c_text("");
     }
     unsigned char *bytes = malloc((size_t)length + 3);
-    if (!bytes) { fclose(file); minyar_source_error = 4; return copy_c_text(""); }
+    if (!bytes) { fclose(file); out_of_memory(); }
     size_t received = fread(bytes, 1, (size_t)length, file);
     int closed = fclose(file);
     if (received != (size_t)length || closed != 0) {

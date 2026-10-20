@@ -1,0 +1,180 @@
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "io" as io
+use "files" as files
+
+function rejectsAt(frontend: fixtures.Frontend, source: Text, diagnostic: Text, origin: Text) {
+    fixtures.rejects(frontend, source, diagnostic, true)
+    let path = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+    let error = io.readTextFile(path + ".compile.err")
+    let expected = path + ".min"
+    if origin != "" { expected = origin }
+    test.check(test.contains(error, "  --> " + expected + ":"), "protocol rejection needs its actual source span\n" + error)
+    test.check(!test.contains(error, "unknown function") && !test.contains(error, "unknown type") && !test.contains(error, "internal compiler"), "protocol rejection must reach the semantic checker")
+}
+
+function rejects(frontend: fixtures.Frontend, source: Text, diagnostic: Text) {
+    rejectsAt(frontend, source, diagnostic, "")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+let imports = "use \"protocol\" as protocol\n"
+let acquire = "let token = protocol.begin()\n"
+let release = "protocol.complete(token)\n"
+
+// This source imports no DMA module: protocol-only declarations must activate
+// the same stable source-binding facts used by the existing DMA proof.
+let positive = imports + #"""
+    type Done = protocol.Completion
+    function relay(token: Done): Done { return token }
+    function identity<Item>(value: Item): Item { return value }
+    function open(): Done {
+        let token = protocol.begin()
+        return token
+    }
+    function complete(value: Integer): Integer { return value + 1 }
+    function finish(ok: Boolean, early: Boolean) {
+        let token = protocol.begin()
+        if early {
+            protocol.complete(token)
+            print("early")
+            return
+        }
+        if ok {
+            protocol.complete(token)
+            print("committed")
+        } else {
+            protocol.complete(token)
+            print("rolled back")
+        }
+    }
+    function nested(ok: Boolean) {
+        let token = protocol.begin()
+        if ok {
+            let nested = protocol.begin()
+            protocol.complete(nested)
+        }
+        protocol.complete(token)
+    }
+    finish(true, false)
+    finish(false, false)
+    finish(true, true)
+    nested(true)
+    nested(false)
+    let count = 0
+    while count < 2 { count += 1 }
+    let original: Done = open()
+    let moved = original
+    let returned = relay(moved)
+    let generic = identity<Done>(returned)
+    protocol.complete(generic)
+    let first = protocol.begin()
+    let second = protocol.begin()
+    protocol.complete(first)
+    first = second
+    protocol.complete(first)
+    if true {
+        let scoped = protocol.begin()
+        let alias = scoped
+        protocol.complete(alias)
+    }
+    for index in 0..3 { count += index }
+    print(complete(count))
+    """#
+fixtures.executes(frontend, positive, "committed\nrolled back\nearly\n6\n", levels, 0, "", true)
+let llvm = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+test.check(test.contains(llvm, "call ptr @minyar_record_new_scalar(i64 0)"), "begin allocates the existing empty managed record")
+test.check(!test.contains(llvm, "@minyar_protocol_"), "protocol proof introduces no external runtime protocol provider")
+fixtures.executes(frontend, io.readTextFile("examples/gallery/protocol-completion.min"), "Ada: committed 25\nAda: rolled back\nBalance: 125\n", levels, 0, "", true)
+
+// Independent DMA and completion obligations may coexist. Their distinct kinds
+// preserve trusted DMA borrowing and consuming completion calls in one body.
+let mixedImports = imports + "use \"dma\" as dma\ntype Cpu = dma.Cpu\ntype Done = protocol.Completion\ntype Finished = Done\n"
+fixtures.executes(frontend, mixedImports + "let token: Finished = protocol.begin()\nlet cpu: Cpu = dma.allocate(16, 16)\ndma.store8(cpu, 0, 42)\nlet answer = dma.load8(cpu, 0)\n" + release + "dma.dispose(cpu)\nprint(answer)\n", "42\n", levels, 0, "", true)
+rejects(frontend, mixedImports + acquire + "let cpu = dma.allocate(16, 16)\nlet moved = cpu\ndma.dispose(moved)\nlet stale = dma.load8(cpu, 0)\n" + release, "Affine ownership: 'cpu' was moved to another binding on line 8; use that binding instead")
+
+// Explicit returns, implicit function return and top-level return all carry
+// obligations. A user helper's name or Nothing result never proves completion.
+rejects(frontend, imports + acquire, "Protocol ownership: scope exit leaves a live completion token")
+rejects(frontend, imports + "protocol.begin()\n", "Protocol ownership: affine call results must bind directly")
+rejects(frontend, imports + acquire + release + release, "Protocol ownership: binding is unavailable")
+rejects(frontend, imports + acquire + "let alias = token\n" + release + "protocol.complete(alias)\n", "Protocol ownership: binding is unavailable")
+rejects(frontend, imports + "type Done = protocol.Completion\n" + acquire + "let alias: Done = token\n" + release + "protocol.complete(alias)\n", "Protocol ownership: binding is unavailable")
+rejects(frontend, imports + "function identity<Item>(value: Item): Item { return value }\n" + acquire + "let alias = identity<protocol.Completion>(token)\n" + release + "protocol.complete(alias)\n", "Protocol ownership: binding is unavailable")
+rejects(frontend, imports + "function finish(token: protocol.Completion) { protocol.complete(token) }\n" + acquire + "finish(token)\n" + release, "Protocol ownership: binding is unavailable")
+rejects(frontend, imports + "function complete(token: protocol.Completion) {}\n" + acquire + "complete(token)\n", "Protocol ownership: normal exit must complete or transfer every live completion token")
+rejects(frontend, imports + "function drop(token: protocol.Completion) {}\n", "Protocol ownership: normal exit must complete or transfer every live completion token")
+rejects(frontend, imports + "function forgot() { let token = protocol.begin() }\nforgot()\n", "Protocol ownership: scope exit leaves a live completion token")
+rejects(frontend, imports + "function forgot(): Integer { let token = protocol.begin(); return 1 }\nprint(forgot())\n", "Protocol ownership: normal exit must complete or transfer every live completion token")
+rejects(frontend, imports + "function asymmetric(ok: Boolean) { let token = protocol.begin(); if ok { protocol.complete(token) }; protocol.complete(token) }\nasymmetric(true)\n", "Protocol ownership: continuing branches disagree")
+rejects(frontend, imports + "function early(ok: Boolean) { let token = protocol.begin(); if ok { return }; protocol.complete(token) }\nearly(false)\n", "Protocol ownership: normal exit must complete or transfer every live completion token")
+rejects(frontend, imports + acquire + "let other = protocol.begin()\ntoken = other\n" + release, "Protocol ownership: assignment would overwrite a live ownership obligation")
+rejects(frontend, imports + acquire + "protocol.complete(protocol.begin())\n" + release, "Protocol ownership: affine operands must be bare uncaptured local names")
+rejects(frontend, imports + "function consume(token: protocol.Completion): Boolean { protocol.complete(token); return true }\n" + acquire + "if false && consume(token) { print(1) }\n" + release, "Protocol ownership: conditions and short-circuit operands may only borrow capabilities")
+rejects(frontend, imports + "function consume(token: protocol.Completion, changed: Boolean) { protocol.complete(token) }\nfunction changed(token: protocol.Completion): Boolean { protocol.complete(token); return true }\n" + acquire + "consume(token, changed(token))\n", "Protocol ownership: an argument moved the capability before the call boundary")
+rejects(frontend, imports + "function both(first: protocol.Completion, second: protocol.Completion) { protocol.complete(first); protocol.complete(second) }\n", "Protocol ownership: ordinary functions may have at most one affine parameter")
+
+// Scalar loops remain available outside a token's live interval. The initial
+// subset deliberately rejects every token operation within a loop subtree.
+rejects(frontend, imports + acquire + "while false {}\n" + release, "Protocol ownership: loops cannot hold a live completion token")
+rejects(frontend, imports + "for index in 0..1 { let token = protocol.begin(); protocol.complete(token) }\n", "Protocol ownership: loops cannot create, use, consume or return affine values")
+rejects(frontend, imports + "while false { if false { let token = protocol.begin(); protocol.complete(token) } }\n", "Protocol ownership: loops cannot create, use, consume or return affine values")
+
+// Type-level traversal and the final expression-coverage audit prevent ordinary
+// RC containers, wrappers and closures from hiding or copying an obligation.
+rejects(frontend, imports + acquire + "let hidden = [token]\n" + release, "Protocol ownership: completion tokens and opaque handles cannot be contained")
+rejects(frontend, imports + acquire + "if false { let hidden = [token] }\n" + release, "Protocol ownership: completion tokens and opaque handles cannot be contained")
+rejects(frontend, imports + "record Box { token: protocol.Completion }\n", "Protocol ownership: completion tokens and opaque handles cannot be contained")
+rejects(frontend, imports + "type Tokens = List<protocol.Completion>\n", "Protocol ownership: completion tokens and opaque handles cannot be contained")
+rejects(frontend, imports + "type Done = protocol.Completion\nrecord Box { token: Done }\n", "Protocol ownership: completion tokens and opaque handles cannot be contained")
+rejects(frontend, imports + "record Box { children: List<Box>; tokens: List<protocol.Completion> }\n", "Protocol ownership: completion tokens and opaque handles cannot be contained")
+rejects(frontend, imports + "choice Hidden { Value(token: protocol.Completion); Empty }\nlet value: Hidden = Empty\n", "Protocol ownership: completion tokens and opaque handles cannot be contained")
+// Generic declaration errors retain the real template's source origin.
+rejectsAt(frontend, imports + acquire + "let hidden: Maybe<protocol.Completion> = Some(token)\n", "Protocol ownership: completion tokens and opaque handles cannot be contained", "library/maybe.min")
+rejects(frontend, imports + "global TOKEN: protocol.Completion = protocol.begin()\nprotocol.complete(TOKEN)\n", "Protocol ownership: completion tokens and opaque handles cannot be contained")
+rejects(frontend, imports + "type Done = protocol.Completion\nglobal TOKEN: Done = protocol.begin()\nprotocol.complete(TOKEN)\n", "Protocol ownership: completion tokens and opaque handles cannot be contained")
+rejects(frontend, imports + acquire + "let finish: () -> Nothing = function() { protocol.complete(token) }\nfinish()\n", "Protocol ownership: completion tokens cannot be captured by callbacks")
+rejects(frontend, imports + "type Consumer = (protocol.Completion) -> Nothing\nfunction accept(value: Consumer) {}\n", "Protocol ownership: completion tokens and opaque handles cannot be contained")
+rejects(frontend, imports + acquire + "print(token == token)\n" + release, "Protocol ownership: completion tokens have no automatic record equality")
+rejects(frontend, imports + "let forged = protocol.Completion {}\nprotocol.complete(forged)\n", "Protocol ownership: opaque completion tokens cannot be constructed as records")
+rejects(frontend, imports + "function cycle(token: protocol.Completion) { bridge(token) }\nfunction bridge(token: protocol.Completion) { cycle(token) }\n", "Protocol ownership: recursive consuming-helper call graphs are unsupported")
+rejects(frontend, imports + "function leaf(value: Integer): Integer { let token = protocol.begin(); protocol.complete(token); return value }\nfunction middle(value: Integer): Integer { return leaf(value) }\nlet callback: (Integer) -> Integer = function(value) { return middle(value) }\nprint(callback(7))\n", "Protocol ownership: completion tokens and opaque handles cannot be reached from thread, parallel or callback execution")
+// Direct concurrent uses can be rejected by the existing effect/type guards
+// before the final affine audit. Both are semantic barriers, not syntax errors.
+rejects(frontend, imports + "thread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { let token = protocol.begin(); protocol.complete(token); return seed }\n", "unsafe thread effect in")
+rejects(frontend, imports + "parallel function worker(seed: Integer): Integer { let token = protocol.begin(); protocol.complete(token); return seed }\n", "may use only Integer, Float, Boolean and Character values")
+rejects(frontend, imports + "function propagate(): Result<Integer, Text> { let token = protocol.begin(); let value = try Ok<Integer, Text>(7); protocol.complete(token); return Ok<Integer, Text>(value) }\n", "Protocol ownership:")
+rejects(frontend, imports + acquire + "match Ok<Integer, Text>(7) { Ok(value) { print(value) }; Err(error) { print(error) } }\n" + release, "Protocol ownership: match, native, captures and jumps are unsupported")
+rejects(frontend, imports + "use \"calldepth\" as depth\n" + acquire + release + "print(depth.remaining())\n", "Protocol ownership: recoverable call-depth mode requires unsupported exceptional ownership edges")
+
+// Trusted boundaries require resolved declaration identity AND provider/signature.
+rejects(frontend, imports + "function foreign(token: protocol.Completion) { native \"unknown_protocol_provider\" }\n", "protocol completion tokens cannot cross an unclassified native boundary")
+rejects(frontend, imports + "function begin(): Integer { native \"protocol\" }\n", "protocol primitives need begin(): Completion or complete(Completion): Nothing")
+rejects(frontend, imports + "function complete(token: protocol.Completion): Integer { native \"protocol\" }\n", "protocol primitives need begin(): Completion or complete(Completion): Nothing")
+rejects(frontend, imports + "function complete(token: protocol.Completion) { native \"protocol\" value }\n", "protocol completion primitives do not use native value bridges")
+rejects(frontend, "function begin(): Integer { native \"protocol\" }\n", "protocol primitives need the canonical completion declaration and exact signature")
+// Imported declarations may follow entry declarations in the normalized stream.
+rejectsAt(frontend, imports + "record Duplicate native \"protocol_completion\" {}\n", "a protocol completion token needs one canonical declaration", "library/protocol.min")
+rejects(frontend, "record Invalid native \"protocol_completion\" { value: Integer }\n", "opaque protocol completion declarations must have no fields")
+rejects(frontend, "record Invalid<Item> native \"protocol_completion\" {}\n", "opaque protocol completion tokens cannot have type parameters")
+
+// Imported consuming helpers retain complete bodies through the whole-graph
+// fallback. Warm module state must neither skip validation nor trust old code.
+let helper = frontend.compiler.directory + "/completion-helper.min"
+io.writeTextFile(helper, "use \"protocol\" as protocol\npublic function finish(token: protocol.Completion) { protocol.complete(token) }\n")
+let imported = imports + "use \"./completion-helper.min\" as helper\n" + acquire + "helper.finish(token)\nprint(42)\n"
+fixtures.executes(frontend, imported, "42\n", levels, 0, "", true)
+let entry = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".min"
+let cache = frontend.compiler.directory + "/completion-cache"
+io.writeTextFile(cache + ".empty", "")
+test.require(test.run([frontend.compiler.executable, entry, cache + ".cold.ll", "--module-state", cache + ".empty", cache + ".state", cache + ".cold.stats", "--library", "library"], frontend.environment, "", cache + ".cold", frontend.compiler.compileTimeout), "compile completion cold module state")
+test.require(test.run([frontend.compiler.executable, entry, cache + ".warm.ll", "--module-state", cache + ".state", cache + ".next", cache + ".warm.stats", "--library", "library"], frontend.environment, "", cache + ".warm", frontend.compiler.compileTimeout), "compile completion warm module state")
+test.check(io.readTextFile(cache + ".cold.ll") == io.readTextFile(cache + ".warm.ll"), "completion module state has stable LLVM")
+test.check(io.readTextFile(cache + ".state") == "" && io.readTextFile(cache + ".next") == "", "completion uses complete-source module fallback")
+io.writeTextFile(helper, "use \"protocol\" as protocol\npublic function finish(token: protocol.Completion) {}\n")
+let changed = test.run([frontend.compiler.executable, entry, cache + ".changed.ll", "--module-state", cache + ".next", cache + ".changed.state", cache + ".changed.stats", "--library", "library"], frontend.environment, "", cache + ".changed", frontend.compiler.compileTimeout)
+test.check(changed.status == 1 && test.containsDiagnostic(changed.errorOutput, "Protocol ownership: normal exit must complete or transfer every live completion token"), "warm completion rejects a helper changed to drop its parameter")
+test.check(files.pathSize(cache + ".changed.ll") < 0, "warm completion rejection publishes no LLVM")
+test.removeTree(frontend.compiler.directory)
+print("Protocol completion: passed")

@@ -1,0 +1,46 @@
+// Optional bounded CPU/RSS samples; no performance threshold or speedup claim.
+use "./frontend-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+use "io" as io
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+let workloads = [#"""
+    use "handles" as handles
+    let pool = handles.create<Integer>()
+    let sum = 0
+    for index in 0..10000000 {
+        let handle = handles.insert(pool, index)
+        sum += handles.get(pool, handle).unwrap()
+        if handles.remove(pool, handle).unwrap() != index { fail("measurement remove") }
+    }
+    if handles.slotCount(pool) != 1 || handles.count(pool) != 0 { fail("measurement reuse") }
+    print(sum)
+    """#, #"""
+    let values = [0]
+    let sum = 0
+    for index in 0..10000000 { values[0] = index; sum += values[0] }
+    print(sum)
+    """#, #"""
+    use "protocol" as protocol
+    function transaction() { let done = protocol.begin(); protocol.complete(done) }
+    for index in 0..10000000 { transaction() }
+    print(10000000)
+    """#]
+let names = ["handles-insert-get-remove", "list-replace-get", "protocol-begin-complete-helper"]
+let outputs = ["49999995000000\n", "49999995000000\n", "10000000\n"]
+for workload in 0..workloads.length {
+    test.require(fixtures.compile(frontend, workloads[workload]), "compile measurement " + names[workload])
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    let build = test.run([compiler.clang, "-O2", "-Wno-override-module", path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"], frontend.environment, "", path + ".link", 30)
+    test.require(build, "link measurement " + names[workload])
+    print(names[workload] + " operations=10000000 llvm-bytes=" + Text(io.readTextFile(path + ".ll").length))
+    for sample in 0..5 {
+        let log = path + ".sample" + Text(sample)
+        let result = test.finish(test.monitoredStart([path + ".exe"], frontend.environment, "", log, 30), log)
+        test.require(result, "run measurement " + names[workload])
+        test.check(result.output == outputs[workload] && result.errorOutput == "", "measurement result oracle")
+        print("sample=" + Text(sample) + " user-s sys-s max-rss-kib=" + io.readTextFile(log + ".cpu").trim())
+    }
+}
+test.removeTree(compiler.directory)
