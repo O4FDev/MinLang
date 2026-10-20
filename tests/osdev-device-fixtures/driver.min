@@ -175,7 +175,9 @@ function seededPoll(adapter: e1000.Adapter, seed: Integer, expected: List<Bytes>
     return delivered + 1
 }
 
-function seededRun(seed: Integer, steps: Integer): Integer {
+record CampaignTotals { sent: Integer; delivered: Integer; malformed: Integer; duplicates: Integer; spurious: Integer; missed: Integer }
+
+function seededRun(seed: Integer, steps: Integer, totals: CampaignTotals) {
     let adapter = boot()
     let world = simulation.create(seed)
     let txSlots: List<Integer> = []
@@ -187,6 +189,7 @@ function seededRun(seed: Integer, steps: Integer): Integer {
     let malformed = 0
     let duplicates = 0
     let spurious = 0
+    let missed = 0
     for step in 0..steps {
         let action = simulation.choose(world, 6)
         if action == 0 {
@@ -203,6 +206,7 @@ function seededRun(seed: Integer, steps: Integer): Integer {
             if simulation.pendingCount(world) > 0 {
                 let token = simulation.next(world).token
                 let interrupt = simulation.choose(world, 2) == 1
+                if !interrupt { missed += 1 }
                 seededCheck(seed, model.completeTransmit(txSlots[token], txGenerations[token], interrupt), "TX completion for an owned slot was refused")
                 if simulation.choose(world, 4) == 0 {
                     duplicates += 1
@@ -262,7 +266,8 @@ function seededRun(seed: Integer, steps: Integer): Integer {
     let digest = digestText(seed, model.events())
     for line in simulation.transcript(world) { digest = digestText(digest, line) }
     print("seed " + Text(seed) + ": tx " + Text(sent) + ", rx " + Text(delivered) + ", malformed " + Text(malformed) + ", duplicate completions " + Text(duplicates) + ", spurious IRQs " + Text(spurious) + ", decisions " + Text(simulation.choices(world).length) + ", trace " + Text(digest))
-    return malformed
+    totals.sent += sent; totals.delivered += delivered; totals.malformed += malformed
+    totals.duplicates += duplicates; totals.spurious += spurious; totals.missed += missed
 }
 
 function decimal(text: Text): Integer {
@@ -276,9 +281,14 @@ function decimal(text: Text): Integer {
 }
 
 function seededCampaign(first: Integer, count: Integer, steps: Integer) {
-    let malformed = 0
-    for seed in first..first + count { malformed += seededRun(seed, steps) }
-    print("SEEDED PASS seeds " + Text(first) + ".." + Text(first + count - 1) + ", " + Text(steps) + " steps each, " + Text(malformed) + " malformed RX frames dropped")
+    let totals = CampaignTotals { sent: 0; delivered: 0; malformed: 0; duplicates: 0; spurious: 0; missed: 0 }
+    for seed in first..first + count { seededRun(seed, steps, totals) }
+    // A campaign that never exercised a fault proves nothing about it.
+    if count >= 4 {
+        check(totals.sent > 0 && totals.delivered > 0, "seeded campaign never moved traffic")
+        check(totals.malformed > 0 && totals.duplicates > 0 && totals.spurious > 0 && totals.missed > 0, "seeded campaign missed a fault class")
+    }
+    print("SEEDED PASS seeds " + Text(first) + ".." + Text(first + count - 1) + ", " + Text(steps) + " steps each: " + Text(totals.sent) + " frames sent, " + Text(totals.delivered) + " delivered, " + Text(totals.malformed) + " malformed dropped, " + Text(totals.duplicates) + " duplicate completions refused, " + Text(totals.missed) + " missed and " + Text(totals.spurious) + " spurious interrupts")
 }
 
 function main(): Integer {
