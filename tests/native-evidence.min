@@ -105,6 +105,8 @@ public function close(context: Context, failed: Boolean) {
 }
 public function expect(context: Context, condition: Boolean, message: Text) { if !condition { close(context, true); fail(message) } }
 public function run(context: Context, command: List<Text>, phase: Text, timeout: Integer, checked: Boolean): test.Result {
+    // Record the same multiplier test.run applies; pass the base limit below.
+    let timeoutScale = test.scaledSeconds(1); let effectiveTimeout = timeout * timeoutScale
     context.serial += 1; let executable = locate(context, command[0]); let hash = data.nullValue()
     if executable != "" && files.pathSize(executable) >= 0 { hash = data.text(executableHash(context, executable)) }
     let environment = data.object([], [])
@@ -112,17 +114,20 @@ public function run(context: Context, command: List<Text>, phase: Text, timeout:
         let position = port.find(entry, "=", 0)
         if position >= 0 { let raw = Bytes(entry); let key = Text(raw.slice(0, position)); if port.starts(key, "MINYAR_") || key == "ASAN_OPTIONS" || key == "UBSAN_OPTIONS" || key == "MSYS2_ARG_CONV_EXCL" { data.set(environment, key, data.text(Text(raw.slice(position + 1, raw.length)))) } }
     }
-    let row = data.object(["command", "cwd", "timeout", "phase", "stdout_captured", "stderr_captured", "stdin", "executable", "executable_sha256", "empty_environment", "environment", "removed_environment", "timed_out"], [data.strings(command), data.text(context.root), data.integer(timeout), data.text(phase), data.boolean(true), data.boolean(true), data.object(["mode"], [data.text("eof")]), data.text(executable), hash, data.boolean(false), environment, data.array([]), data.boolean(false)])
+    // Shared replay reads timeout as the actual bound. Older native records put
+    // the misleading unscaled base there; preserve that base in configured_timeout.
+    let row = data.object(["command", "cwd", "timeout", "configured_timeout", "effective_timeout", "timeout_scale", "phase", "stdout_captured", "stderr_captured", "stdin", "executable", "executable_sha256", "empty_environment", "environment", "removed_environment", "timed_out"], [data.strings(command), data.text(context.root), data.integer(effectiveTimeout), data.integer(timeout), data.integer(effectiveTimeout), data.integer(timeoutScale), data.text(phase), data.boolean(true), data.boolean(true), data.object(["mode"], [data.text("eof")]), data.text(executable), hash, data.boolean(false), environment, data.array([]), data.boolean(false)])
     context.commands.add(row)
     let actual = ["/bin/sh", "-c", "exec \"$@\" </dev/null", "minyar"]
     for item in command { actual.add(item) }
     let log = context.path + "/command" + Text(context.serial); let start = system.monotonicNanoseconds()
     let result = test.run(actual, system.environment(), context.root, log, timeout)
     data.set(row, "returncode", data.integer(result.status)); data.set(row, "stdout_base64", data.text(base64(io.readBytesFile(log)))); data.set(row, "stderr_base64", data.text(base64(io.readBytesFile(log + ".err"))))
-    data.set(row, "elapsed_seconds", data.decimal(Float(system.monotonicNanoseconds() - start) / 1000000000.0))
+    let elapsed = Float(system.monotonicNanoseconds() - start) / 1000000000.0
+    data.set(row, "elapsed_seconds", data.decimal(elapsed))
     if result.status == 124 || result.status == 137 {
         data.set(row, "timed_out", data.boolean(true)); data.set(row, "exception", data.text("TimeoutExpired"))
-        expect(context, false, "test command timed out after " + Text(timeout) + " seconds")
+        expect(context, false, "test command timed out in phase " + quote(phase) + " (effective limit " + Text(effectiveTimeout) + "s; configured " + Text(timeout) + "s; scale " + Text(timeoutScale) + "; elapsed " + Text(elapsed) + "s)\ncommand: " + serialize(data.strings(command)) + "\nevidence: " + context.path + "/evidence.json")
     }
     if checked && result.status != 0 { data.set(row, "exception", data.text("CalledProcessError")); expect(context, false, phase + " failed with status " + Text(result.status) + "\n" + result.errorOutput) }
     return result

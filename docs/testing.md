@@ -23,13 +23,22 @@ make check-changed-export CHECK_CHANGED_EXPORT=target/changes-1
 /path/to/bx agentdx env CHECK_CHANGED_INPUT=target/changes-1 make check-changed
 ```
 
-Each export needs a new directory under `target/`. Source content and executable modes, changed
-paths and previous modules are validated before and after checks; re-export
+Each export needs a new directory under `target/`. Source content and executable
+modes, changed paths and previous modules are validated before and after checks; re-export
 after editing. Generated `build/`, `target/` and Python bytecode are excluded.
 The export is an input capture, not a passing gate or a staged snapshot.
 Checks reuse the working tree's warm build and retain the existing commit-check
 logs and JSON results. `make check-changed-inputs` tests Git/input handling
 without compiling the language; `make check-check-selection` tests the policy.
+
+For a smaller deterministic fuzz loop, use `make check-fuzz-expressions`,
+`check-fuzz-language`, `check-fuzz-semantic`, `check-fuzz-hostile`,
+`check-fuzz-regressions`, `check-fuzz-seeds` or `check-fuzz-modules`. Each runs
+the existing `--stage` with its ordinary seed, counts and O0/O2 assertions.
+The complete `check-fuzz` gate still includes every stage and its harness and
+stateful List controls. One named regression can run with
+`make check-regressions-case CHECK_REGRESSION_CASE=Regressions.test_integer_boundaries`;
+missing or unknown case names fail instead of selecting an empty suite.
 
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and
@@ -171,6 +180,12 @@ The real finite e1000 guest is opt-in: see [kernel development](os-development.m
 Every harness process limit can be multiplied with `MINYAR_TEST_TIMEOUT_SCALE`
 (an integer from 1 to 20, default 1) on heavily loaded machines. It only widens
 hang detection; it never changes what a test asserts.
+Deterministic fuzzing applies the scale to fractional hostile limits too and
+records base/effective bounds and scale in its report. Exact evidence replay
+uses the recorded effective request and does not multiply it again. Native
+regression evidence likewise records the effective `timeout`, keeps the base
+in `configured_timeout`, and reports phase, elapsed time, command and retained
+evidence path on a timeout.
 
 `make check-record-capabilities` checks structural equality, nominal type
 boundaries, finite-shape rejection and lexicographic ordering of records. It

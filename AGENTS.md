@@ -11,6 +11,9 @@
 - Keep a warm build directory. Use the existing check runner for concurrent
   targets; separate raw Make processes must use separate build directories.
   `make -j8` alone does not parallelize this repository (`.NOTPARALLEL`).
+- Narrow deterministic fuzzing with `check-fuzz-expressions`, `check-fuzz-hostile`
+  or the other documented stage targets. Use `check-regressions-case` with
+  `CHECK_REGRESSION_CASE=Regressions.test_name` for one existing regression.
 - A timeout is a failure. Isolate it, retain its log, and compare CPU with wall
   time before changing limits. `MINYAR_TEST_TIMEOUT_SCALE=2` widens harness hang
   detection on loaded hosts without changing correctness assertions.
@@ -20,5 +23,8 @@
 - Follow the active run's coordination charter for build hosts, status and
   landing. During the 2026-10-20 moonshot, all builds/suites run through `bx`
   (macOS-only lanes have an explicit exception); use `gate.sh` then `land.sh`.
+  The inherited pre-commit hook builds locally. Under a remote-only charter,
+  commit after remote checks with `git -c core.hooksPath=/dev/null commit ...`;
+  this one-command override still requires the complete remote landing gate.
 - Use one-line Conventional Commits: `type(scope): short plain message`, with
   no body or trailers. Do not push unless the user explicitly authorizes it.

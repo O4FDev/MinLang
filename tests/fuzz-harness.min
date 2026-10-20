@@ -52,6 +52,44 @@ function lastCommand(observed: Campaign): json.Value {
     test.check(commands.length > 0, "campaign recorded no commands")
     return commands[commands.length - 1]
 }
+function number(value: json.Value, key: Text, expected: Float, label: Text) {
+    let actual = json.member(value, key)
+    // JSON decimal decoding and compiled Float literals can differ by rounding.
+    let difference = actual.number - expected
+    test.check(actual.kind == json.NUMBER && difference > -1.0e-9 && difference < 1.0e-9, label + ": " + key + " expected " + Text(expected) + ", got " + actual.text)
+}
+function exactNumber(value: json.Value, key: Text, expected: Float, label: Text) {
+    let actual = json.member(value, key)
+    test.check(actual.kind == json.NUMBER && actual.number == expected, label + ": " + key + " expected " + Text(expected) + ", got " + actual.text)
+}
+function timeouts(observed: Campaign, scale: Integer, retained: Boolean) {
+    exactNumber(observed.report, "timeout_scale", Float(scale), "campaign scale")
+    let hostile = json.member(observed.report, "hostile_timeout_seconds")
+    test.check(hostile.kind == json.NUMBER, "campaign base hostile timeout")
+    number(observed.report, "effective_hostile_timeout_seconds", hostile.number * Float(scale), "campaign effective hostile timeout")
+    let commands = json.member(observed.report, "commands").items
+    test.check(commands.length > 0, "scaled campaign recorded no commands")
+    for command in commands {
+        let base = json.member(command, "base_timeout_seconds")
+        test.check(base.kind == json.NUMBER && base.number > 0.0, "command base timeout")
+        exactNumber(command, "timeout_scale", Float(scale), "command scale")
+        number(command, "timeout_seconds", base.number * Float(scale), "command effective timeout")
+    }
+    if retained {
+        let record = json.parse(io.readTextFile(observed.directory + "/evidence.json"))
+        test.check(record.kind == json.OBJECT, "retained timeout evidence")
+        let arguments = json.member(json.member(record, "controls"), "arguments")
+        exactNumber(arguments, "timeout_scale", Float(scale), "evidence scale control")
+        exactNumber(arguments, "hostile_timeout", hostile.number, "evidence base hostile control")
+        number(arguments, "effective_hostile_timeout", hostile.number * Float(scale), "evidence effective hostile control")
+        let rows = json.member(record, "commands").items
+        test.check(rows.length == commands.length, "evidence and report command counts differ")
+        for index in 0..rows.length {
+            // The low-level request must receive the effective value, not only report it.
+            exactNumber(rows[index], "timeout", json.member(commands[index], "timeout_seconds").number, "exact evidence timeout")
+        }
+    }
+}
 function corpusRoot(root: Text, name: Text): Text {
     let directory = root + "/" + name
     for path in [directory, directory + "/tests", directory + "/tests/fuzz-regressions"] { test.check(files.makeDirectory(path) == 0, "corpus directory") }
@@ -74,10 +112,13 @@ let emitter = root + "/emitting-compiler"
 script(emitter, "#!/bin/sh\nprintf 'fake\\n' > \"$2\"\n")
 let linker = root + "/fake-clang"
 script(linker, "#!/bin/sh\nout=; ll=; previous=\nfor item do\n  if [ \"$previous\" = -o ]; then out=$item; fi\n  case $item in *.ll) ll=$item;; esac\n  previous=$item\ndone\nprintf '#!/bin/sh\\ncat \"%s\"\\n' \"${ll%.ll}.expected.stdout\" > \"$out\"\nif [ \"$FAKE_WARN\" = 1 ]; then printf 'echo \"runtime warning\" >&2\\n' >> \"$out\"; fi\nchmod 755 \"$out\"\n")
-let quiet = campaign(fuzz, root, "quiet-oracle", ["--stage", "expressions", "--cases", "1", "--seed", "42", "--compiler", emitter, "--clang", linker], ["MINYAR_TEST_RUNTIME", "FAKE_WARN"], [runtime, "0"], "")
+let quiet = campaign(fuzz, root, "quiet-oracle", ["--stage", "expressions", "--cases", "1", "--seed", "42", "--compiler", emitter, "--clang", linker], ["MINYAR_TEST_RUNTIME", "FAKE_WARN", "MINYAR_TEST_TIMEOUT_SCALE"], [runtime, "0", "1"], "")
 passed(quiet, "exact fake execution")
-let noisy = campaign(fuzz, root, "noisy-oracle", ["--stage", "expressions", "--cases", "1", "--seed", "42", "--compiler", emitter, "--clang", linker], ["MINYAR_TEST_RUNTIME", "FAKE_WARN"], [runtime, "1"], "")
+test.check(json.string(quiet.report, "stage") == "expressions" && test.contains(quiet.result.output, "passed: expressions stage"), "focused campaign reports only its selected stage")
+timeouts(quiet, 1, false)
+let noisy = campaign(fuzz, root, "noisy-oracle", ["--stage", "expressions", "--cases", "1", "--seed", "42", "--compiler", emitter, "--clang", linker], ["MINYAR_TEST_RUNTIME", "FAKE_WARN", "MINYAR_TEST_TIMEOUT_SCALE"], [runtime, "1", "3"], "")
 failed(noisy, "correct stdout with runtime diagnostics", "changed meaning at -O0")
+timeouts(noisy, 3, true)
 test.check(test.contains(json.string(noisy.report, "failure"), "runtime warning"), "runtime diagnostics are reported")
 
 let corpus = corpusRoot(root, "corpus")
@@ -114,14 +155,29 @@ let resolved = test.run(["/bin/sh", "-c", "cd \"$(dirname \"$1\")\" && printf '%
 test.check(json.string(deliberate.report, "compiler") == resolved.output, "report compiler is the resolved candidate")
 test.check(json.string(deliberate.report, "status") == "failed" && json.member(deliberate.report, "compiler_sha256").kind == json.STRING, "machine-readable failure report")
 
+// An immediate failure exposes both the report and exact request without a timing oracle.
+let scaled = campaign(fuzz, root, "scaled-hostile", ["--stage", "hostile", "--cases", "1", "--hostile-timeout", "0.25", "--compiler", status], ["MINYAR_TEST_RUNTIME", "FAKE_STATUS", "FAKE_STDERR", "MINYAR_TEST_TIMEOUT_SCALE"], [runtime, "37", "", "3"], "")
+failed(scaled, "scaled hostile request", "unexpected compiler status 37 on hostile input 0")
+test.check(json.string(scaled.report, "stage") == "hostile", "failed campaign records its selected stage")
+timeouts(scaled, 3, true)
+number(lastCommand(scaled), "base_timeout_seconds", 0.25, "fractional hostile base")
+number(lastCommand(scaled), "timeout_seconds", 0.75, "fractional hostile effective")
+for value in ["0", "-1", "21", "1.5", "invalid"] {
+    let output = root + "/invalid-scale-" + value
+    let result = test.run([fuzz, "--stage", "hostile", "--cases", "1", "--output-dir", output], environment(["MINYAR_TEST_TIMEOUT_SCALE", "MINYAR_TEST_COMPILER"], [value, "/must-not-run/compiler"]), "", root + "/invalid-scale-" + value + ".log", 120)
+    test.check(result.status != 0 && test.contains(result.errorOutput, "MINYAR_TEST_TIMEOUT_SCALE must be an integer from 1 to 20"), "invalid scale was not rejected: " + value)
+    test.check(files.pathSize(output) < 0, "invalid scale opened a campaign: " + value)
+}
+
 let marker = root + "/orphan-wrote-file"
 let hanging = root + "/hanging-compiler"
 script(hanging, "#!/bin/sh\n(sleep 0.5; echo orphan > \"$FAKE_MARKER\") &\nsleep 10\n")
-let hung = campaign(fuzz, root, "hanging", ["--stage", "hostile", "--cases", "1", "--hostile-timeout", "0.1", "--compiler", hanging], ["MINYAR_TEST_RUNTIME", "FAKE_MARKER"], [runtime, marker], "")
+let hung = campaign(fuzz, root, "hanging", ["--stage", "hostile", "--cases", "1", "--hostile-timeout", "0.1", "--compiler", hanging], ["MINYAR_TEST_RUNTIME", "FAKE_MARKER", "MINYAR_TEST_TIMEOUT_SCALE"], [runtime, marker, "1"], "")
 failed(hung, "hanging compiler", "compiler hung on hostile input 0")
 test.require(test.run(["/bin/sleep", "0.7"], system.environment(), "", root + "/sleep", 10), "sleep")
 test.check(files.pathSize(marker) < 0, "timeout left a descendant running")
 test.check(json.member(lastCommand(hung), "timed_out").truth, "timeout was not recorded")
+timeouts(hung, 1, true)
 
 test.removeTree(root)
-print("fuzz harness: 13 fault-injection checks passed")
+print("fuzz harness: fault injection and timeout scaling checks passed")

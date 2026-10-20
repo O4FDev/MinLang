@@ -59,6 +59,12 @@ function strayProgram() {
     evidence.executes(context, "print(42)\n", "42\n", 0, "", [], [])
     evidence.close(context, false)
 }
+function timeoutProgram() {
+    let context = evidence.context("regression", "ScaledTimeout.runTest", "tests/native-evidence-harness.min")
+    // A finite child exercises timeout diagnostics and retained output, without an elapsed bound.
+    evidence.run(context, ["/bin/sh", "-c", "printf timeout-ready; exec /bin/sleep 6"], "timeout-probe", 1, false)
+    evidence.close(context, false)
+}
 
 function fileOutputsRequireFreshExactBytesForEveryOptimization(self: Text, scratch: Text, clang: Text) {
     let destination = scratch + "/result.bin"
@@ -89,19 +95,50 @@ function correctStdoutWithUnexpectedStderrIsRejectedAndRetained(self: Text, scra
     test.check(failedManifests(stray.base) == 1, "unexpected stderr did not retain exactly one failed manifest")
 }
 
-test.check(processInfo.argumentCount() >= 1, "usage: native-evidence-harness SELF | --file-program PATH CONTENTS | --stray-program")
+function scaledTimeoutRecordsEffectiveLimitAndExactFailure(self: Text, scratch: Text) {
+    let scaled = child(self, scratch, "scaled-timeout", "--timeout-program", [],
+        ["MINYAR_TEST_TIMEOUT_SCALE=3", "MINYAR_TEST_COMPILER=/bin/true", "MINYAR_TEST_RUNTIME=/dev/null"])
+    test.check(scaled.result.status != 0 && scaled.result.status != 124 && scaled.result.status != 137, "scaled child did not report its own timeout failure")
+    test.check(failedManifests(scaled.base) == 1, "scaled timeout did not retain exactly one failed manifest")
+    let manifest = ""
+    for name in files.list(scaled.base) {
+        let candidate = scaled.base + "/" + name + "/evidence.json"
+        if files.pathSize(candidate) >= 0 { manifest = candidate }
+    }
+    let report = json.parse(io.readTextFile(manifest))
+    let commands = json.member(report, "commands")
+    test.check(commands.kind == json.ARRAY && commands.items.length == 1, "scaled timeout command count")
+    let row = commands.items[0]
+    test.check(json.member(row, "timeout").number == 3.0 && json.member(row, "configured_timeout").number == 1.0, "replay uses effective timeout and preserves configured base")
+    test.check(json.member(row, "effective_timeout").number == 3.0 && json.member(row, "timeout_scale").number == 3.0, "scaled timeout evidence")
+    test.check(json.string(row, "phase") == "timeout-probe" && json.member(row, "timed_out").truth && json.string(row, "exception") == "TimeoutExpired", "scaled timeout phase/status evidence")
+    test.check(json.string(row, "stdout_base64") == "dGltZW91dC1yZWFkeQ==", "scaled timeout lost partial output")
+    let command = "[\"/bin/sh\",\"-c\",\"printf timeout-ready; exec /bin/sleep 6\"]"
+    test.check(evidence.serialize(json.member(row, "command")) == command, "scaled timeout recorded the wrong command")
+    let diagnostics = scaled.result.errorOutput
+    test.check(test.contains(diagnostics, "phase \"timeout-probe\" (effective limit 3s; configured 1s; scale 3; elapsed "), "scaled timeout diagnostic limits/phase\n" + diagnostics)
+    test.check(test.contains(diagnostics, "elapsed " + json.member(row, "elapsed_seconds").text + "s)"), "scaled timeout diagnostic elapsed time\n" + diagnostics)
+    test.check(test.contains(diagnostics, "command: " + command), "scaled timeout diagnostic command\n" + diagnostics)
+    test.check(test.contains(diagnostics, "evidence: " + manifest) && json.string(report, "workspace") + "/evidence.json" == manifest, "scaled timeout diagnostic evidence path\n" + diagnostics)
+}
+
+test.check(processInfo.argumentCount() >= 1, "usage: native-evidence-harness SELF | --file-program PATH CONTENTS | --stray-program | --timeout-program")
 let mode = processInfo.argument(0)
 if mode == "--file-program" {
     test.check(processInfo.argumentCount() == 3, "usage: --file-program PATH CONTENTS")
     fileProgram(processInfo.argument(1), processInfo.argument(2))
 } else if mode == "--stray-program" {
     strayProgram()
+} else if mode == "--timeout-program" {
+    test.check(processInfo.argumentCount() == 1, "usage: --timeout-program")
+    timeoutProgram()
 } else {
     test.check(processInfo.argumentCount() == 1, "usage: native-evidence-harness SELF")
     let scratch = test.scratch()
     let clang = test.setting("MINYAR_TEST_CLANG", "clang")
     fileOutputsRequireFreshExactBytesForEveryOptimization(mode, scratch, clang)
     correctStdoutWithUnexpectedStderrIsRejectedAndRetained(mode, scratch)
+    scaledTimeoutRecordsEffectiveLimitAndExactFailure(mode, scratch)
     test.removeTree(scratch)
-    print("native evidence harness: 2 cases passed")
+    print("native evidence harness: 3 cases passed")
 }
