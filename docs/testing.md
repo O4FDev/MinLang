@@ -1154,6 +1154,13 @@ contracts also run in `check-syntax-tree` at O0/O2. `check-bootstrap-native`
 checks the runtime-native bridge used by the compiler, including native Text,
 Boolean and Integer results, void calls and malformed native bodies.
 
+`make check-c-import` imports selected C headers through Clang and runs their
+generated scalar/aggregate wrappers at O0/O2. It checks enums, macro expressions,
+constants, target options, nested/packed layouts, range failures, layout drift,
+unsupported interfaces, preserved outputs and exact normal-return ownership.
+The header-lantern gallery uses the same generated module and C adapter.
+`check-c-import-smoke` selects the constants, scalar, record and rejection cases.
+
 The diagnostics corpus also checks spelling suggestions, ambiguous names,
 private fields/methods/members, block and function scope, missing match cases,
 named record mismatches and argument/return expression spans. The lantern

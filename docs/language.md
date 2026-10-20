@@ -1595,6 +1595,13 @@ Imported modules cannot contain executable top-level statements. Imports are
 resolved relative to the importing file, declarations are private unless
 marked `public`, and cycles are rejected. See [modules](modules.md).
 
+C headers can supply ordinary modules through the
+[C header importer](c-interop.md). Select the functions, fixed-layout structs,
+enums and integer constants you need. Clang checks their declarations and
+layouts; generated wrappers check narrow integer conversions and use the
+existing native calling convention. Pointer ownership needs an explicit C
+facade. No additional language syntax is required.
+
 A statement ends at the end of its line, using LF or CRLF. A bare CR is whitespace,
 not a line boundary. The end of the source file also ends
 the final complete statement, without requiring a trailing newline. A line ends a statement when its last
