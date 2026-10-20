@@ -385,6 +385,17 @@ Cases include truncated and malformed responses, split headers, bodyless and
 informational responses, bounded downloads and read deadlines. macOS also runs
 the same bounded API through NSURLSession. The socket fixture requires POSIX.
 
+`make check-http-chunked` runs the portable client's private parser tests and
+independent Python socket peers at explicit generated/native/runtime O0/O2.
+Every split, binary bytes, extensions, discarded trailers, ambiguous framing,
+size/metadata bounds, incomplete input and absolute deadlines have exact oracles.
+Linux also uses a private fixture CA through the unchanged OpenSSL root provider
+for TLS 1.3 responses and an untrusted-certificate rejection control.
+`check-http-chunked-sanitize` repeats with generated/native/runtime ASan/UBSan
+and leak detection enabled. Raw commands, peer requests, bodies, reports and
+hashes remain in fresh run directories under `build/http-chunked` (override
+`HTTP_CHUNKED_ARTIFACTS`). No public network or macOS-provider proof is inferred.
+
 `make check-debug-info` verifies Minyar DWARF line tables with `llvm-dwarfdump`,
 checks direct and cached builds, sanitizer compatibility and release exclusion,
 and uses LLDB on macOS to resolve imported `.min` source lines after temporary

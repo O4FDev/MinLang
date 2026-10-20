@@ -101,3 +101,17 @@ ifeq ($(shell uname -s),Linux)
 check check-portable: check-os-providers
 check-sanitize: check-os-providers-sanitize
 endif
+
+# Contextual private-parser tests and independent public socket/TLS controls.
+.PHONY: check-http-chunked check-http-chunked-sanitize
+HTTP_CHUNKED_ARTIFACTS ?= build/http-chunked
+check-http-chunked: build/minyarc
+	$(LIMITED) python3 tests/http-chunked.py --artifacts "$(HTTP_CHUNKED_ARTIFACTS)"
+
+check-http-chunked-sanitize: build/minyarc
+	$(SANITIZER_LIMITED) python3 tests/http-chunked.py --profiles sanitize --artifacts "$(HTTP_CHUNKED_ARTIFACTS)"
+
+ifneq ($(OS),Windows_NT)
+check check-portable: check-http-chunked
+check-sanitize: check-http-chunked-sanitize
+endif
