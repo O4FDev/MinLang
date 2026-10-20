@@ -624,6 +624,11 @@ fallback. Eight public launcher builds check eager and system selection through
 direct and incremental compilation, in default and release modes, by inspecting
 the actual generated LLVM and checking exact alias output. The module-driver
 option checks cover forwarding, conflicting modes and flag-shaped library values.
+Adjacent plain-borrow tests require only the lasting local/return cells, retain
+traced barriers, preserve aliases through field replacement and later arguments,
+and compare a fallback function with its exact original LLVM. A pending-cycle
+probe verifies return service at O0/O2; removing that poll must fail its explicit
+status/diagnostic oracle, also under ASan/UBSan.
 `make check-scope-ownership-sanitize` instruments the direct fixtures' generated LLVM
 and both runtimes with ASan/UBSan. `make check-scope-fixed-point` checks that a
 scope-lowered compiler emits exactly its own LLVM. The native and fixed-point

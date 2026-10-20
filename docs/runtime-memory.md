@@ -214,6 +214,12 @@ exits. Cleanup visits only cells that can be live there. A producer that could
 repeat before cleanup, or a function needing more than 256 cells, keeps the
 ordinary frame representation.
 
+A plain temporary borrow immediately retained into a local or returned value
+shares that lasting owner's count. This requires adjacent emitted operations;
+intervening calls, branches and traced borrows keep their temporary owners.
+Local cleanup polls remain, and a coalesced return explicitly services pending
+work before unlinking its scope.
+
 A 24-byte stack header links the cells for compiler diagnostics. Diagnostics
 release these roots before jumping back to their native recovery boundary;
 normal returns clear cells explicitly and unlink the header. Neither the header

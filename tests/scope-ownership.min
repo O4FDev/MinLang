@@ -44,6 +44,33 @@ function buildRuntime(compiler: test.Compiler, cycle: Boolean, environment: List
     source += "\n#include <assert.h>\n__attribute__((destructor)) static void check_scope_cleanup(void) {\n"
     source += "  assert(rc_scopes == NULL);\n  assert(rc_frames == NULL);\n  assert(rc_pending_count == 0);\n"
     source += "  assert(rc_object_count == 0);\n  assert(rc_immortal_object_count == 0);\n  assert(rc_bytes == 0);\n}\n"
+    source += program([
+        "static size_t scope_return_before;",
+        "MinyarRecord *minyar_runtime_scopeArmBorrow(MinyarRecord *box) {",
+        "  minyar_rc_retain(box);",
+        "#ifdef MINYAR_CYCLE_LOCAL_PROOFS",
+        "  MinyarRecord *ring = minyar_record_new_traced(512);",
+        "  minyar_record_set_reference_traced(ring, 0, (long long)(uintptr_t)ring);",
+        "  rc_drop(ring);",
+        "  assert(rc_cycle_pending);",
+        "  scope_return_before = rc_cycle_units;",
+        "#endif",
+        "  return box;",
+        "}",
+        "long long minyar_runtime_scopeBorrowProgress(MinyarText *value) {",
+        "  (void)value;",
+        "#ifdef MINYAR_CYCLE_LOCAL_PROOFS",
+        "  if (rc_cycle_units <= scope_return_before) {",
+        "    fputs(\"scope return did not service pending cycles\\n\", stderr);",
+        "    _Exit(73);",
+        "  }",
+        "  assert(rc_cycle_units - scope_return_before <= 32);",
+        "#else",
+        "  (void)scope_return_before; assert(0);",
+        "#endif",
+        "  return 1;",
+        "}"
+    ])
     let path = compiler.directory + "/" + name
     io.writeTextFile(path + ".c", source)
     let command = [compiler.clang, "-O1"]
@@ -84,6 +111,7 @@ function executes(compiler: test.Compiler, source: Text, expected: Text, environ
 
 let names = ["test_direct_owners_and_borrowed_parameter_moves", "test_condition_owners_on_both_branches", "test_loop_false_exit_break_continue_and_nested_loops", "test_early_return_and_try_cleanup", "test_aliases_survive_later_argument_mutation", "test_escaping_closure_and_cycle_owners", "test_repeated_and_nested_diagnostic_unwind", "test_large_function_keeps_legacy_fallback", "test_scope_modes_and_private_symbols", "test_mixed_scoped_and_legacy_diagnostic_unwind", "test_module_state_replay_lowers_cached_owners", "test_recoverable_call_depth_cleans_scope_owners", "test_large_cycle_drains_at_final_scope"]
 names.add("test_eager_launcher_selects_scope_owners")
+names.add("test_plain_borrows_share_local_and_return_owners")
 fixtures.validate("ScopeOwnership", names)
 let compiler = test.compiler()
 compiler.compileTimeout = 30
@@ -313,6 +341,9 @@ if fixtures.selected("ScopeOwnership", "test_large_function_keeps_legacy_fallbac
     let emitted = body(llvm, "wide")
     test.check(test.contains(emitted, "call void @minyar_rc_enter("), "oversized ownership function must retain its safe legacy fallback")
     test.check(!test.contains(emitted, "call void @minyar_rc_scope_enter_v1("), "oversized ownership function must not partially lower")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    test.require(test.run([compiler.executable, path + ".min", path + ".legacy.ll", "--library", "library"], environment, "", path + ".legacy", compiler.compileTimeout), "compile legacy fallback comparison")
+    test.check(body(io.readTextFile(path + ".legacy.ll"), "wide") == emitted, "scope fallback must preserve the complete original function")
 }
 
 if fixtures.selected("ScopeOwnership", "test_scope_modes_and_private_symbols") {
@@ -523,6 +554,84 @@ if fixtures.selected("ScopeOwnership", "test_eager_launcher_selects_scope_owners
                 }
             }
         }
+    }
+}
+
+if fixtures.selected("ScopeOwnership", "test_plain_borrows_share_local_and_return_owners") {
+    let source = program([
+        "record Box { text: Text; values: List<Integer> }",
+        "function selected(box: Box): Text { return box.text }",
+        "function listLength(box: Box): Integer {",
+        "let held = box.values",
+        "return held.length",
+        "}",
+        "function projected(box: Box): Text {",
+        "let alias = box.text",
+        "box.text = box.text + \"?\"",
+        "return alias",
+        "}",
+        "function replace(box: Box): Text { box.text = \"after\"; return \"!\" }",
+        "function combined(value: Text, suffix: Text): Text { return value + suffix }",
+        "function separated(box: Box): Text { return combined(box.text, replace(box)) }",
+        "let box = Box { text: \"seed\" + \"!\"; values: [3, 7] }",
+        "print(selected(box))",
+        "print(listLength(box))",
+        "print(projected(box))",
+        "print(box.text)",
+        "print(separated(box))",
+        "print(box.text)"
+    ])
+    let llvm = executes(compiler, source, "seed!\n2\nseed!\nseed!?\nseed!?!\nafter\n", environment, ordinary, cycle)
+    for name in ["selected", "listLength", "projected", "separated"] { checkLowered(llvm, name) }
+    let returned = body(llvm, "selected")
+    test.check(test.contains(returned, "%rc.scope.cells = alloca [0 x ptr]"), "direct borrowed return must keep only its return owner")
+    test.check(test.contains(returned, "call void @minyar_rc_retain("), "direct borrowed return must retain its lasting owner")
+    test.check(test.contains(returned, "call void @minyar_rc_scope_poll_v1()\n  call void @minyar_rc_scope_leave_v1("), "coalesced return must retain cleanup progress")
+    test.check(!test.contains(returned, "call void @minyar_rc_scope_release_v1("), "direct borrowed return must omit a redundant temporary release")
+    test.check(test.contains(body(llvm, "listLength"), "%rc.scope.cells = alloca [1 x ptr]"), "plain projection must keep its local owner without a temporary cell")
+    let traced = executes(compiler, program([
+        "record Link { edges: List<Link> }",
+        "function tracedAlias(value: Link): List<Link> {",
+        "let edges = value.edges",
+        "return edges",
+        "}",
+        "let node = Link { edges: [] }",
+        "node.edges.add(node)",
+        "print(tracedAlias(node).length)"
+    ]), "1\n", environment, ordinary, cycle)
+    let tracedBody = body(traced, "tracedAlias")
+    test.check(test.contains(tracedBody, "%rc.scope.cells = alloca [2 x ptr]"), "traced projection must retain both local and temporary cells")
+    test.check(test.contains(tracedBody, "call void @minyar_rc_retain_traced("), "traced projection must keep its retain barrier")
+    let progress = executes(compiler, program([
+        "record Box { text: Text }",
+        "record Link { edges: List<Link> }",
+        "function scopeArmBorrow(box: Box): Box { native \"runtime\" }",
+        "function scopeBorrowProgress(value: Text): Integer { native \"runtime\" }",
+        "function returned(box: Box): Text { return box.text }",
+        "let node = Link { edges: [] }",
+        "node.edges.add(node)",
+        "let box = Box { text: \"service\" + \"!\" }",
+        "print(scopeBorrowProgress(returned(scopeArmBorrow(box))))",
+        "print(box.text)"
+    ]), "1\nservice!\n", environment, ordinary, cycle)
+    let progressBody = body(progress, "returned")
+    test.check(test.contains(progressBody, "%rc.scope.cells = alloca [0 x ptr]"), "pending-work probe must exercise a return with no temporary cells")
+    let parts = progress.split(progressBody)
+    test.check(parts.length == 2, "pending-work mutation must identify exactly one return body")
+    let withoutPoll = joinText(progressBody.split("  call void @minyar_rc_scope_poll_v1()\n"))
+    test.check(withoutPoll != progressBody, "pending-work mutation must remove the return poll")
+    let mutant = parts[0] + withoutPoll + parts[1]
+    if test.addressEnabled(compiler.flags) { mutant = test.instrument(mutant) }
+    let path = compiler.directory + "/missing-return-poll"
+    io.writeTextFile(path + ".ll", mutant)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        let executable = path + optimization + ".exe"
+        for item in [path + ".ll", cycle, "-lm", "-o", executable] { command.add(item) }
+        test.require(test.run(command, environment, "", executable + ".link", compiler.linkTimeout), "link pending-work mutation " + optimization)
+        let observed = test.run([executable], environment, "", executable + ".run", compiler.runTimeout)
+        test.check(observed.status == 73 && test.contains(observed.errorOutput, "scope return did not service pending cycles"), "missing return poll must fail the pending-cycle oracle " + optimization + "\n" + observed.output + observed.errorOutput)
     }
 }
 
