@@ -32,8 +32,11 @@ collector units and retain all snapshot/mutation barriers.
 
 Objects, frames, chunks (and an activated cycle job) have round-robin service.
 The object queue alternates a captured finite old batch with recent arrivals.
-With three continuously ready queues, each gets a unit within three units;
-the corresponding traced bound is four. Captured object predecessors are finite.
+In general dispatch, three continuously ready queues each get a unit within
+three units; the corresponding traced bound is four. The existing object-only
+batch may delay a newly requested cycle job until its bounded batch returns.
+That unchanged exception is not a three/four-unit service guarantee. Captured
+object predecessors are finite.
 Progress requires continued service points; K bounds cleanup units, not allocator
 latency, copying, page faults, OS scheduling, or elapsed operation time. See
 [the complete operation table](../bounded-runtime-contract.md#the-work-budget).
@@ -75,11 +78,14 @@ decrements the count once and drops no owner. Therefore an increase ends the
 run; an unchanged count or a finalization's decrease can safely continue. This
 replaces repeated object/collector readiness loads without weakening the guard.
 
-For a maximal run of r sole-queue units, selection executes once instead of r
-times. Total unit work stays O(F + L + T + C + E + O); selection overhead becomes
-O(R + X), where R is the number of sole-queue runs and X is units performed with
-competition. This is a constant-factor improvement, not an asymptotic graph
-traversal improvement. Each poll still performs at most min(requested,K) units.
+For a run of r batched owner units within one poll, selection executes once
+instead of r times. Let B count batched owner units, R owner-batch invocations
+(split at poll/K boundaries), and U all other generic-dispatch units. U includes
+units that become sole-object work partway through a general-dispatch poll.
+Selection count changes B + U to R + U; total cleanup work remains
+O(F + L + T + C + E + O). With K1, R can equal B. This is a workload-dependent
+constant-factor improvement, not an asymptotic graph traversal improvement.
+Each poll still performs at most min(requested,K) units.
 Existing round-robin and captured-batch fairness bounds follow by equivalence.
 
 ## Validation and measurement plan

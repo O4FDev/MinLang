@@ -1,7 +1,8 @@
 # Matched runtime measurements
 
-All results here are Linux x86_64/LLVM 23.1.2 user-space hardware instructions,
-with seven retained observations and one warmup per role. Counters run
+Historical campaigns below use Linux x86_64/LLVM 23.1.2 user-space hardware
+instructions; the final section records a separate LLVM 23.1.3 repeat. All use
+seven retained observations and one warmup per role. Counters run
 continuously without scaling. Product and native studies pin one allowed CPU;
 the self runner pins its hardware event rather than CPU affinity. No wall-time,
 RSS, universal speedup or target-platform latency claim follows from these counts.
@@ -171,3 +172,54 @@ See [the reproduction guide](../../experiments/perfcs/README.md). Complete froze
 inputs, executables, LLVM, raw logs/counters and failed preparations are retained
 under the 2026-10-20 perfcs coordination archive. JSON paths identify the original
 remote artifacts; they are not executable laptop instructions.
+
+## LLVM 23.1.3 matched runtime repeat
+
+Control runtime is repairpack `4ff252015`; candidate runtime is `b7375a015`.
+The same frozen compiler LLVM/input/library and product inputs isolate runtime
+changes. This does not attribute unrelated current compiler or product-HEAD
+improvements. The subsequently landed `ce0775824` seven explicit NaN casts are
+a separate strict-warning baseline repair; these measurements precede that
+source-only spelling repair, while the final landing gates include it.
+
+| Workload/profile | Control | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Self default | 15,278,643,768 | 14,690,625,511 | -3.84863% |
+| Self eager | 4,559,017,837 | 4,559,017,595 | unchanged |
+| JS create default | 169,368,995 | 164,777,087 | -2.71119% |
+| JS create eager | 95,615,231 | 95,614,995 | unchanged |
+| jsmn16 default | 11,149,279,356 | 10,796,870,073 | -3.16083% |
+| jsmn16 eager | 5,419,818,598 | 5,419,818,241 | unchanged |
+| jsmn1024 default | 6,459,142,551 | 6,021,821,298 | -6.77058% |
+| jsmn1024 eager | 2,957,318,187 | 2,957,318,123 | unchanged |
+| jsmn16384 default | 10,535,612,055 | 9,814,717,702 | -6.84245% |
+| jsmn16384 eager | 4,776,857,625 | 4,776,857,632 | unchanged |
+| JPEG default, instrumented | 12,707,538,137 | 12,524,064,823 | -1.44381% |
+| JPEG eager, instrumented | 8,126,381,400 | 8,126,380,459 | unchanged |
+| PNG default, instrumented | 7,132,490,626 | 7,132,480,734 | unchanged |
+| PNG eager, instrumented | 6,270,840,512 | 6,270,841,329 | unchanged |
+| zlib default, instrumented | 5,310,822,211 | 5,310,811,023 | unchanged |
+| zlib eager, instrumented | 4,747,509,973 | 4,747,509,147 | unchanged |
+
+All 32 self executions emit the same 17,171,630-byte LLVM/hash recorded above.
+All 272 product counters and 12 complete codec-byte comparisons pass. Shipping
+JS/jsmn accounting remains disabled, separate same-object ownership links pass,
+and safelibs still requires instrumented accounting. Eager/PNG/zlib changes are
+small measurement variation, not exact instruction equality or claimed gains.
+Raw reports and complete build manifests are
+[current-self.json](../../experiments/perfcs/results/current-self.json),
+[current-self-manifest.json](../../experiments/perfcs/results/current-self-manifest.json),
+[current-products.json](../../experiments/perfcs/results/current-products.json) and
+[current-products-manifest.json](../../experiments/perfcs/results/current-products-manifest.json).
+
+A separate [source/data audit](current-data-audit.md) independently recomputes
+all 16 rows, all 304 counters, sample/order/output/accounting assertions, shared
+link objects and exact runtime-tree Git identities. It found no numerical or
+accounting error; accepted selection-count/general-dispatch wording refinements
+are reflected in the design. It did not rerun workloads or qualify the final
+gates. The parent separately verified all 773 immutable manifest files against
+the downloaded measured-artifact archive; its
+[coverage receipt](../../experiments/perfcs/results/current-archive-coverage.json)
+and coordination archive index identify that byte audit. Measured binaries,
+LLVM, inputs and raw output are retained offbox; proof-source/log archives
+explicitly omit reproducible ELF/object files.
