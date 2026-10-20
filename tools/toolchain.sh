@@ -276,6 +276,10 @@ bootstrap() {
     fi
     split_words make_options "${MINYAR_MAKE_FLAGS-}" MINYAR_MAKE_FLAGS
     eval "set -- $make_options $targets"
+    # Launchers may be called by a Make recipe through a process API that closes
+    # jobserver descriptors. Use our explicit options instead of stale parent
+    # recursion state, which makes nested Make warn about missing descriptors.
+    unset MAKEFLAGS MFLAGS MAKELEVEL
     lock=$project/build/bootstrap.lock
     if find_command lockf >/dev/null; then
         exec lockf -k "$lock" make -s -C "$project" "$@"
