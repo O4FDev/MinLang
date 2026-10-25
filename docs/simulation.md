@@ -146,7 +146,9 @@ prefix of the WAL, and checks the recovered rows against the acknowledged
 history. `minyar sim --manifest-path tests/neodb-sim durable --seeds 5000 --jobs 4`
 passed 5,000 universes in 243 ms on a 4-vCPU Linux box; the planted `early-ack`
 scenario, which acknowledges before durability, fails most seeds with an exact
-replay.
+replay. `two-crashes` adds work and a second power loss after recovery. These
+universes keep prefixes of the WAL only, so they do not cover scattered sector
+tearing.
 
 ## A disk with explicit durability
 

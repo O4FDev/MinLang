@@ -95,25 +95,22 @@ function open(): engine.Engine {
     return engine.openWithOptions("/db", engine.Options { checkpointWalBytes: 1073741824; checkpointIntervalMs: 0; noPrealloc: true })
 }
 
-// `earlyAck` is the planted mistake: statements count as acknowledged before
-// their commit is durable.
-public deterministic function run(world: simulation.World, earlyAck: Boolean): Text {
-    dbio.bind(world)
-    let e = open()
+record Round { problem: Text; acknowledged: Rows; inFlight: Text }
+
+// Statements, one in flight, and a crash, on top of `rows`, the state the
+// engine holds now. Afterwards `rows` includes the in-flight statement and the
+// result's `acknowledged` does not.
+function round(world: simulation.World, e: engine.Engine, rows: Rows, earlyAck: Boolean): Round {
     let session = engine.newSession(e, "sim", "sim")
-    let problem = execute(e, session, world, "CREATE TABLE cargo (id INTEGER, weight INTEGER)", true)
-    if problem == "" { problem = execute(e, session, world, "INSERT INTO cargo VALUES (0, 0)", true) }
-    if problem != "" { return problem }
-    let rows = Rows { ids: [0]; values: [0] }
     for serial in 0..1 + simulation.choose(world, 12) {
         let text = statement(world, rows, serial)
-        problem = execute(e, session, world, text, !earlyAck)
-        if problem != "" { return problem }
+        let problem = execute(e, session, world, text, !earlyAck)
+        if problem != "" { return Round { problem: problem; acknowledged: rows; inFlight: "" } }
     }
-    let before = copyRows(rows)
+    let acknowledged = copyRows(rows)
     let inFlight = statement(world, rows, 99)
     let issued = execute(e, session, world, inFlight, false)
-    if issued != "" { return issued }
+    if issued != "" { return Round { problem: issued; acknowledged: acknowledged; inFlight: inFlight } }
     // Let the in-flight write and sync complete partly, fully or not at all.
     engine.afterLoopIteration(e)
     for step in 0..simulation.choose(world, simulation.pendingCount(world) + 1) {
@@ -127,14 +124,43 @@ public deterministic function run(world: simulation.World, earlyAck: Boolean): T
         simulation.persistPrefix(world, file, kept)
     }
     dbio.crash()
-    let recovered = open()
+    return Round { problem: ""; acknowledged: acknowledged; inFlight: inFlight }
+}
+
+// "before" or "after" the in-flight statement, or a description of the loss.
+function compare(recovered: engine.Engine, before: Rows, after: Rows, inFlight: Text): Text {
     let reader = engine.newSession(recovered, "sim", "sim")
     let count = scalar(recovered, reader, "SELECT count(*) FROM cargo")
     let sum = scalar(recovered, reader, "SELECT sum(weight) FROM cargo")
-    if count == before.ids.length && sum == total(before) { return "" }
-    if count == rows.ids.length && sum == total(rows) {
-        simulation.reached(world, "in-flight statement survived")
-        return ""
-    }
+    if count == before.ids.length && sum == total(before) { return "before" }
+    if count == after.ids.length && sum == total(after) { return "after" }
     return "recovered " + Text(count) + " rows weighing " + Text(sum) + "; acknowledged " + Text(before.ids.length) + " rows weighing " + Text(total(before)) + ", in-flight " + inFlight
+}
+
+// `earlyAck` is the planted mistake: statements count as acknowledged before
+// their commit is durable. Each universe survives `crashes` power losses.
+public deterministic function run(world: simulation.World, earlyAck: Boolean, crashes: Integer): Text {
+    dbio.bind(world)
+    let e = open()
+    let session = engine.newSession(e, "sim", "sim")
+    let problem = execute(e, session, world, "CREATE TABLE cargo (id INTEGER, weight INTEGER)", true)
+    if problem == "" { problem = execute(e, session, world, "INSERT INTO cargo VALUES (0, 0)", true) }
+    if problem != "" { return problem }
+    let rows = Rows { ids: [0]; values: [0] }
+    for crash in 0..crashes {
+        let result = round(world, e, rows, earlyAck)
+        if result.problem != "" { return result.problem }
+        e = open()
+        let outcome = compare(e, result.acknowledged, rows, result.inFlight)
+        if outcome == "before" {
+            rows.ids = result.acknowledged.ids
+            rows.values = result.acknowledged.values
+        } else if outcome == "after" {
+            simulation.reached(world, "in-flight statement survived")
+        } else {
+            return "after crash " + Text(crash + 1) + ": " + outcome
+        }
+        if crash > 0 { simulation.reached(world, "recovered after a second crash") }
+    }
+    return ""
 }
