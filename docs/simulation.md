@@ -90,8 +90,8 @@ error: deterministic function 'simulate' can reach the host clock: simulate -> o
   = help: called from cover (raftkv.min:230, column 10); use the simulation World's virtual time (simulation.now or simulation.wallTime) and pass the World in
 ```
 
-The marked function must be a named, top-level, non-generic Minyar function. It
-may call generic functions and methods. Its callers keep ordinary host effects,
+The marked function must be a named, non-generic Minyar function or record
+method; the functions it calls may be generic. Its callers keep ordinary host effects,
 so a driver can read arguments, time a run or write reports around the
 proved part. The check reads the final LLVM module, adds no instructions or
 runtime calls, and runs only when a program uses the modifier. Programs that
