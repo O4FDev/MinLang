@@ -10,7 +10,7 @@ comma := ,
 check-minyar-repl: build/tooling/tools/repl-cli build/minyarc
 	python3 tests/repl.py "$(CURDIR)/minyar"
 
-.PHONY: check-live-programming check-live-transform check-live-hot
+.PHONY: check-live-programming check-live-transform check-live-hot check-live-patch-load
 check-live-programming: build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyarc-modules build/minyar-module-build build/minyar-default-runtime.o build/minyar-default-runtime-release.ll
 	python3 tests/live-programming.py "$(CURDIR)/minyar"
 
@@ -20,4 +20,8 @@ check-live-transform: build/tooling/tests/live-transform
 check-live-hot: build/tooling/tools/project-cli build/tooling/tools/live-build-cli build/tooling/tools/clang-driver build/minyarc-modules build/minyar-module-build build/minyar-default-runtime.o
 	python3 tests/live-hot.py "$(CURDIR)/minyar"
 
-check: check-live-programming check-live-transform check-live-hot check-minyar-repl
+# A function update under HTTP load: no failed request, counter state continues.
+check-live-patch-load: build/tooling/tools/project-cli build/tooling/tools/live-build-cli build/tooling/tools/clang-driver build/minyarc-modules build/minyar-module-build build/minyar-default-runtime.o
+	python3 tests/live-patch-load.py "$(CURDIR)/minyar"
+
+check: check-live-programming check-live-transform check-live-hot check-live-patch-load check-minyar-repl
