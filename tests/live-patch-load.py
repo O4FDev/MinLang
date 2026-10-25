@@ -248,6 +248,47 @@ def check_idle_patches(launcher, memory=""):
     print("idle patches" + (" (" + memory + ")" if memory else "") + ": two publications without calls between them both apply")
 
 
+def check_foreign_patch(launcher):
+    """A copy pointed at another build's live state keeps its own code."""
+    source = launcher.parent / "benchmarks/livepatch/server"
+    with tempfile.TemporaryDirectory(prefix="minyar-live-foreign-") as temporary:
+        project = Path(temporary) / "server"
+        (project / "src").mkdir(parents=True)
+        (project / "Minyar.toml").write_text((source / "Minyar.toml").read_text())
+        main = project / "src/main.min"
+        main.write_text((source / "src/main.min").read_text())
+        target = project / "target/debug"
+
+        def build():
+            built = subprocess.run([str(launcher), "build", "--hot", "--manifest-path", str(project)],
+                                   capture_output=True, timeout=600 * SCALE)
+            assert built.returncode == 0, built
+        build()
+        shutil.copy2(target / "livepatch-server", Path(temporary) / "first-build")
+        build()
+        main.write_text(main.read_text().replace('"version=1 served="', '"version=2 served="'))
+        patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project)], capture_output=True,
+                                 timeout=600 * SCALE)
+        assert patched.returncode == 0, patched
+        state = Path((target / "livepatch-server.live").read_text())
+        server = subprocess.Popen([str(Path(temporary) / "first-build")], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  env=dict(os.environ, LIVEPATCH_PORT="0", MINYAR_LIVE_STATE=str(state)))
+        try:
+            port = int(server.stdout.readline().split()[1])
+            client = Client(port, threading.Event())
+            with socket.create_connection(("127.0.0.1", port), timeout=30 * SCALE) as connection:
+                client.exchange(connection)
+            assert client.responses == [(1, 1)], client.responses
+        finally:
+            server.kill()
+            server.wait()
+        refused = server.stderr.read()
+        # Generation-specific symbol names make another build's image fail to load.
+        assert b"cannot load update" in refused, refused
+        assert refused.count(b"minyar live:") == 1, ("a refused update is reported once", refused)
+    print("foreign patch: a copy pointed at another build's state keeps its own code")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("launcher", type=Path)
@@ -259,6 +300,7 @@ def main():
     if args.mode != "watch":
         check_idle_patches(args.launcher.resolve())
         check_idle_patches(args.launcher.resolve(), "eager")
+        check_foreign_patch(args.launcher.resolve())
         check(args.launcher.resolve(), args.profile == "release", True)
         check(args.launcher.resolve(), args.profile == "release", True, True)
 

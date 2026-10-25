@@ -91,6 +91,8 @@ static void live_refresh(void) {
     long long retry_elapsed = live_elapsed(&now, &live_retry_checked);
     if (live_have_failed && live_same(&info, &live_failed) &&
         retry_elapsed >= 0 && retry_elapsed < 1000000000LL) return;
+    // Retries of the same failing publication stay quiet after the first report.
+    int repeated = live_have_failed && live_same(&info, &live_failed);
     live_failed = info; live_have_failed = 1; live_retry_checked = now;
     int fd = open(live_manifest, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
@@ -130,7 +132,8 @@ static void live_refresh(void) {
     void *handle = dlopen(located ? located : path, RTLD_NOW | RTLD_LOCAL);
     free(located);
     if (!handle) {
-        fprintf(stderr, "minyar live: cannot load update: %s\n", dlerror());
+        const char *problem = dlerror();
+        if (!repeated) fprintf(stderr, "minyar live: cannot load update: %s\n", problem);
         free(entries); free(image); free(storage); return;
     }
     int valid = 1;
