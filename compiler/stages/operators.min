@@ -389,8 +389,16 @@ function parseBinary(context: CompilerContext, localNames: List<Text>, localType
         if resultType.length > 1 {
             leftOwner = resultType[1]
         }
-        if isRecordType(leftType) && !isScalarChoiceType(leftType) { borrowReference(output, state, left, leftType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes) }
-        if leftType == 2 && isOrderedOperator(operator) { borrowReference(output, state, left, leftType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes) }
+        // The left operand must outlive the right operand and the operator. Its
+        // count is reserved and taken only if either can run code that could
+        // replace its holder: a call token, a user call or a capability method.
+        let leftPiece = -1
+        let leftValue = left
+        let leftCalls = context.callTargets.length
+        if (isRecordType(leftType) && !isScalarChoiceType(leftType)) || (leftType == 2 && isOrderedOperator(operator)) {
+            leftPiece = output.length
+            output.add("")
+        }
         if isMapType(leftType) || isSetType(leftType) {
             let declaration = "declare zeroext i1 @minyar_maps_are_equal(ptr, ptr, i64)\n"
             if findText(globals, declaration) < 0 { globals.add(declaration) }
@@ -399,6 +407,10 @@ function parseBinary(context: CompilerContext, localNames: List<Text>, localType
         setType(resultType, 0)
         let right = parseBinary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, level + 1)
         left = emitBinary(context, globals, output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType, tokenLines, operatorLocation)
+        if leftPiece >= 0 {
+            if tokensMakeCall(tokenKinds, tokenTexts, operatorLocation + 1, state[0]) { context.callTargets.add(-1) }
+            settleBorrow(context, output, state, leftPiece, leftValue, leftType, leftCalls)
+        }
         endSyntaxNode(context.syntax, syntaxNode, state[0], resultType[0])
         level = operatorLevel(tokenKinds, tokenTexts, state)
     }
@@ -723,6 +735,15 @@ function bytesAccessWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Tex
 function listAppendWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
     if tokenTexts[position] != "." || tokenTexts[position + 1] != "add" || tokenKinds[position + 2] != 4 || tokenTexts[position + 2] != "(" { return false }
     return statementWithoutCalls(tokenKinds, tokenTexts, position + 3)
+}
+
+function tokensMakeCall(tokenKinds: List<Integer>, tokenTexts: List<Text>, start: Integer, end: Integer): Boolean {
+    let cursor = start
+    while cursor < end {
+        if callAt(tokenKinds, tokenTexts, cursor) { return true }
+        cursor = cursor + 1
+    }
+    return false
 }
 
 function statementWithoutCalls(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
