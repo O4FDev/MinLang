@@ -48,7 +48,10 @@ public record World {
     private pending: List<Pending>
     private nextId: Integer
     private error: Integer
-    private log: List<Text>
+    // The transcript as fixed-width events [kind, a, b, c]; Text arguments
+    // live in `texts`. Lines are rendered only when transcript() is called.
+    private events: List<Integer>
+    private texts: List<Text>
 }
 
 public function create(seed: Integer): World {
@@ -58,7 +61,7 @@ public function create(seed: Integer): World {
     return World {
         random: state; time: 0; wallOffset: 0; history: []; script: []
         replaying: false; continuing: false; cursor: 0; files: []; names: []; faults: []; links: []
-        pending: []; nextId: 1; error: 0; log: []
+        pending: []; nextId: 1; error: 0; events: []; texts: []
     }
 }
 
@@ -81,7 +84,7 @@ public function replay(seed: Integer, script: List<Decision>): World {
 public function fork(seed: Integer, script: List<Decision>): World {
     let world = replay(seed, script)
     world.continuing = true
-    world.log.add("fork " + Text(script.length))
+    note(world, EVENT_FORK, script.length, 0, 0)
     return world
 }
 public function finished(world: World): Boolean {
@@ -112,25 +115,84 @@ public function choose(world: World, options: Integer): Integer {
         }
     }
     world.history.add(Decision { options: options; selected: selected })
-    world.log.add("choose " + Text(options) + " " + Text(selected))
+    note(world, EVENT_CHOOSE, options, selected, 0)
     return selected
 }
 public function transcript(world: World): List<Text> {
     let result: List<Text> = []
-    for line in world.log { result.add(line) }
+    let at = 0
+    while at < world.events.length {
+        result.add(eventLine(world, at))
+        at += 4
+    }
     return result
+}
+constant EVENT_FORK = 1
+constant EVENT_CHOOSE = 2
+constant EVENT_ADVANCE = 3
+constant EVENT_CLOCK = 4
+constant EVENT_FAULT = 5
+constant EVENT_CREATE = 6
+constant EVENT_READ = 7
+constant EVENT_WRITE = 8
+constant EVENT_RESIZE = 9
+constant EVENT_SYNC = 10
+constant EVENT_RENAME = 11
+constant EVENT_REMOVE = 12
+constant EVENT_DIRECTORY = 13
+constant EVENT_PERSIST = 14
+constant EVENT_CRASH = 15
+constant EVENT_PARTITION = 16
+constant EVENT_SUBMIT = 17
+constant EVENT_CANCEL = 18
+constant EVENT_COMPLETE = 19
+function note(world: World, kind: Integer, a: Integer, b: Integer, c: Integer) {
+    world.events.add(kind)
+    world.events.add(a)
+    world.events.add(b)
+    world.events.add(c)
+}
+// Record a Text argument and return its index for an event field.
+function noteText(world: World, text: Text): Integer {
+    world.texts.add(text)
+    return world.texts.length - 1
+}
+function eventLine(world: World, at: Integer): Text {
+    let kind = world.events[at]
+    let a = world.events[at + 1]
+    let b = world.events[at + 2]
+    let c = world.events[at + 3]
+    if kind == EVENT_FORK { return "fork " + Text(a) }
+    if kind == EVENT_CHOOSE { return "choose " + Text(a) + " " + Text(b) }
+    if kind == EVENT_ADVANCE { return "advance " + Text(a) }
+    if kind == EVENT_CLOCK { return "clock " + Text(a) }
+    if kind == EVENT_FAULT { return "fault " + Text(a) + " " + Text(b) }
+    if kind == EVENT_CREATE { return "create " + world.texts[a] + " " + Text(b) }
+    if kind == EVENT_READ { return "read " + Text(a) + " " + Text(b) + " " + Text(c) }
+    if kind == EVENT_WRITE { return "write " + Text(a) + " " + Text(b) + " " + Text(c) }
+    if kind == EVENT_RESIZE { return "resize " + Text(a) + " " + Text(b) }
+    if kind == EVENT_SYNC { return "sync " + Text(a) }
+    if kind == EVENT_RENAME { return "rename " + world.texts[a] + " " + world.texts[b] }
+    if kind == EVENT_REMOVE { return "remove " + world.texts[a] }
+    if kind == EVENT_DIRECTORY { return "directory " + world.texts[a] }
+    if kind == EVENT_PERSIST { return "persist " + Text(a) + " " + Text(b) }
+    if kind == EVENT_CRASH { return "crash" }
+    if kind == EVENT_PARTITION { return "partition " + Text(a) + " " + Text(b == 1) }
+    if kind == EVENT_SUBMIT { return "submit " + Text(a) + " " + Text(b) + " " + Text(c) }
+    if kind == EVENT_CANCEL { return "cancel " + Text(a) }
+    return "complete " + Text(a) + " " + Text(b) + " " + Text(c)
 }
 public function now(world: World): Integer { return world.time }
 public function wallTime(world: World): Integer { return world.time + world.wallOffset }
 public function advance(world: World, milliseconds: Integer) {
     if milliseconds < 0 { fail("simulation: monotonic time cannot move backwards") }
     world.time += milliseconds
-    world.log.add("advance " + Text(milliseconds))
+    note(world, EVENT_ADVANCE, milliseconds, 0, 0)
 }
 // Wall-clock faults never move monotonic deadlines.
 public function jumpClock(world: World, milliseconds: Integer) {
     world.wallOffset += milliseconds
-    world.log.add("clock " + Text(milliseconds))
+    note(world, EVENT_CLOCK, milliseconds, 0, 0)
 }
 public function lastError(world: World): Integer { return world.error }
 
@@ -139,7 +201,7 @@ public function lastError(world: World): Integer { return world.error }
 public function injectError(world: World, kind: Integer, code: Integer) {
     if kind < READ || kind > PACKET || code >= 0 { fail("simulation: an I/O fault needs a valid operation and negative error code") }
     world.faults.add(Fault { kind: kind; code: code })
-    world.log.add("fault " + Text(kind) + " " + Text(code))
+    note(world, EVENT_FAULT, kind, code, 0)
 }
 function fault(world: World, kind: Integer): Integer {
     let remaining: List<Fault> = []
@@ -196,7 +258,7 @@ public function openFile(world: World, path: Text, create: Boolean): Integer {
     world.files.add(File { data: Bytes(); durable: Bytes() })
     let id = world.files.length
     world.names[index].live = id
-    world.log.add("create " + path + " " + Text(id))
+    note(world, EVENT_CREATE, noteText(world, path), id, 0)
     return id
 }
 public function size(world: World, file: Integer): Integer {
@@ -211,7 +273,7 @@ public function read(world: World, file: Integer, position: Integer, length: Int
     let data = world.files[file - 1].data
     if position >= data.length { return Bytes() }
     let count = min(length, data.length - position)
-    world.log.add("read " + Text(file) + " " + Text(position) + " " + Text(count))
+    note(world, EVENT_READ, file, position, count)
     return data.slice(position, position + count)
 }
 public function write(world: World, file: Integer, position: Integer, data: Bytes): Integer {
@@ -225,7 +287,7 @@ public function write(world: World, file: Integer, position: Integer, data: Byte
     let source = data.slice(0, data.length)
     if position + source.length > destination.length { destination.resize(position + source.length) }
     for index in 0..source.length { destination[position + index] = source[index] }
-    world.log.add("write " + Text(file) + " " + Text(position) + " " + Text(source.length))
+    note(world, EVENT_WRITE, file, position, source.length)
     return source.length
 }
 public function resize(world: World, file: Integer, length: Integer): Integer {
@@ -234,7 +296,7 @@ public function resize(world: World, file: Integer, length: Integer): Integer {
     if length < 0 { world.error = -22; return world.error }
     if length > MAX_FILE_BYTES { world.error = -27; return world.error }
     world.files[file - 1].data.resize(length)
-    world.log.add("resize " + Text(file) + " " + Text(length))
+    note(world, EVENT_RESIZE, file, length, 0)
     return 0
 }
 public function syncFile(world: World, file: Integer): Integer {
@@ -242,7 +304,7 @@ public function syncFile(world: World, file: Integer): Integer {
     if !validFile(world, file) { return world.error }
     let contents = world.files[file - 1]
     contents.durable = contents.data.slice(0, contents.data.length)
-    world.log.add("sync " + Text(file))
+    note(world, EVENT_SYNC, file, 0, 0)
     return 0
 }
 public function rename(world: World, from: Text, to: Text): Integer {
@@ -253,7 +315,7 @@ public function rename(world: World, from: Text, to: Text): Integer {
     let destination = ensureName(world, to)
     world.names[destination].live = world.names[source].live
     world.names[source].live = 0
-    world.log.add("rename " + from + " " + to)
+    note(world, EVENT_RENAME, noteText(world, from), noteText(world, to), 0)
     return 0
 }
 public function remove(world: World, path: Text): Integer {
@@ -261,13 +323,13 @@ public function remove(world: World, path: Text): Integer {
     let index = nameIndex(world, path)
     if index < 0 || world.names[index].live == 0 { world.error = -2; return world.error }
     world.names[index].live = 0
-    world.log.add("remove " + path)
+    note(world, EVENT_REMOVE, noteText(world, path), 0, 0)
     return 0
 }
 public function syncDirectory(world: World, directory: Text): Integer {
     if fault(world, SYNC) < 0 { return world.error }
     for item in world.names { if parent(item.path) == directory { item.durable = item.live } }
-    world.log.add("directory " + directory)
+    note(world, EVENT_DIRECTORY, noteText(world, directory), 0, 0)
     return 0
 }
 public function names(world: World, directory: Text): List<Text> {
@@ -285,7 +347,7 @@ public function persistPrefix(world: World, file: Integer, length: Integer) {
     if length < 0 || length > contents.data.length { fail("simulation: torn-write prefix is outside the file") }
     if length > contents.durable.length { contents.durable.resize(length) }
     for index in 0..length { contents.durable[index] = contents.data[index] }
-    world.log.add("persist " + Text(file) + " " + Text(length))
+    note(world, EVENT_PERSIST, file, length, 0)
 }
 public function crash(world: World) {
     for item in world.files { item.data = item.durable.slice(0, item.durable.length) }
@@ -293,11 +355,13 @@ public function crash(world: World) {
     world.pending = []
     world.faults = []
     world.error = 0
-    world.log.add("crash")
+    note(world, EVENT_CRASH, 0, 0, 0)
 }
 
 public function partition(world: World, channel: Integer, blocked: Boolean) {
-    world.log.add("partition " + Text(channel) + " " + Text(blocked))
+    let flag = 0
+    if blocked { flag = 1 }
+    note(world, EVENT_PARTITION, channel, flag, 0)
     for link in world.links { if link.channel == channel { link.blocked = blocked; return } }
     world.links.add(Link { channel: channel; blocked: blocked })
 }
@@ -314,7 +378,7 @@ function submit(world: World, kind: Integer, target: Integer, position: Integer,
         id: id; token: token; kind: kind; target: target; position: position; length: length
         data: data.slice(0, data.length); at: world.time + delay
     })
-    world.log.add("submit " + Text(id) + " " + Text(kind) + " " + Text(token))
+    note(world, EVENT_SUBMIT, id, kind, token)
     return id
 }
 public function submitRead(world: World, file: Integer, position: Integer, length: Integer, token: Integer): Integer {
@@ -342,7 +406,7 @@ function removePending(world: World, id: Integer): Boolean {
 }
 public function cancel(world: World, id: Integer): Boolean {
     let found = removePending(world, id)
-    world.log.add("cancel " + Text(id))
+    note(world, EVENT_CANCEL, id, 0, 0)
     return found
 }
 // The earliest deadline runs first. Equal deadlines are chosen by the seed (or
@@ -373,7 +437,7 @@ public function next(world: World): Completion {
         if result == 0 && blocked(world, operation.target) { result = -110 }
         if result == 0 { data = operation.data; result = data.length }
     }
-    world.log.add("complete " + Text(operation.id) + " " + Text(result) + " " + Text(world.time))
+    note(world, EVENT_COMPLETE, operation.id, result, world.time)
     return Completion {
         id: operation.id; token: operation.token; kind: operation.kind; target: operation.target
         result: result; data: data; at: world.time
