@@ -68,7 +68,9 @@ int main(int argc, char **argv) {
         return 99;
     }
     assert(argc == 3);
-#if defined(MINYAR_BOUNDED_HEAP) && !defined(MINYAR_COMPILER_ARENA)
+    /* One growth step from the last capacity must overflow size_t: bounded
+       heaps and the compiler arena double, other large Lists grow fourfold. */
+#if defined(MINYAR_BOUNDED_HEAP) || defined(MINYAR_COMPILER_ARENA)
     const unsigned long long factor = 2;
 #else
     const unsigned long long factor = 4;
