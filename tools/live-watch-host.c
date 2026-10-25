@@ -449,6 +449,25 @@ static int lw_reset_record(const char *path) {
 // Builders prepare a candidate table, then write candidate\0current\0 here.
 // Only this supervisor promotes it, after accepting the completed generation.
 // A stale/failed build loses its candidate without touching the current table.
+// Hot programs map `<current>.epoch`; a new value makes their next call load
+// the update that was just promoted.
+static void lw_bump_epoch(const char *current) {
+    size_t length = strlen(current);
+    char *path = malloc(length + sizeof ".epoch");
+    if (!path) return;
+    memcpy(path, current, length);
+    memcpy(path + length, ".epoch", sizeof ".epoch");
+    int descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    free(path);
+    if (descriptor < 0) return;
+    uint64_t epoch = 0;
+    if (pread(descriptor, &epoch, sizeof epoch, 0) != (ssize_t)sizeof epoch) epoch = 0;
+    epoch++;
+    if (pwrite(descriptor, &epoch, sizeof epoch, 0) != (ssize_t)sizeof epoch)
+        fprintf(stderr, "[watch] Cannot announce update: %s\n", strerror(errno));
+    close(descriptor);
+}
+
 static int lw_publication(const char *path, int promote) {
     int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (descriptor < 0) return -1;
@@ -483,6 +502,7 @@ static int lw_publication(const char *path, int promote) {
         if (!lw_owned(&info)) { errno = EINVAL; result = -1; goto done; }
     } else if (errno != ENOENT) { result = -1; goto done; }
     result = rename(data, current);
+    if (!result) lw_bump_epoch(current);
 done: {
         int saved = errno;
         free(data); errno = saved; return result;

@@ -1,5 +1,10 @@
 // Development-only function dispatch. Loaded images stay resident: an older
 // frame, closure or literal can still refer to any successful generation.
+// Each generated wrapper calls through its own slot. The watcher bumps a
+// counter in `<manifest>.epoch` after it publishes an update; wrappers compare
+// that mapped counter with the last one seen, so an ordinary call costs a few
+// loads and no system call, and the first call after a publication loads it.
+// Hot mode only accepts single-threaded programs.
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif
@@ -11,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -28,10 +34,15 @@ static int live_have_seen;
 static struct stat live_failed;
 static int live_have_failed;
 static struct timespec live_retry_checked;
-static struct timespec live_checked;
-static unsigned live_generation;
-struct live_cached { const char *key; void *address; unsigned generation; };
-static struct live_cached live_cache[1024];
+// Every wrapper slot that has been bound, so an update can retarget it.
+struct live_slot { void **slot; const char *key; void *initial; };
+static struct live_slot *live_slots;
+static size_t live_slot_count, live_slot_capacity;
+static int live_mapped;
+static uint64_t live_epoch_unmapped;
+// Read by every generated wrapper.
+const uint64_t *minyar_live_epoch = &live_epoch_unmapped;
+uint64_t minyar_live_epoch_seen;
 
 static int live_compare(const void *left, const void *right) {
     return strcmp(((const struct live_entry *)left)->key,
@@ -56,25 +67,19 @@ static int live_same(const struct stat *a, const struct stat *b) {
         a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
 #endif
 }
-// Every call reads this clock, so prefer the coarse variants: they read a
-// kernel-maintained value instead of the hardware clock source. Updates are
-// still noticed within 25 ms plus one clock tick.
-static int live_clock(struct timespec *now) {
-#if defined(CLOCK_MONOTONIC_COARSE)
-    return clock_gettime(CLOCK_MONOTONIC_COARSE, now);
-#elif defined(CLOCK_MONOTONIC_RAW_APPROX)
-    return clock_gettime(CLOCK_MONOTONIC_RAW_APPROX, now);
-#else
-    return clock_gettime(CLOCK_MONOTONIC, now);
-#endif
-}
 static long long live_elapsed(const struct timespec *now, const struct timespec *before) {
     return (long long)(now->tv_sec - before->tv_sec) * 1000000000LL + now->tv_nsec - before->tv_nsec;
 }
-static void live_refresh(struct timespec now) {
-    long long elapsed = live_elapsed(&now, &live_checked);
-    if (elapsed >= 0 && elapsed < 25000000) return;
-    live_checked = now;
+static void *live_lookup(const char *key, void *initial) {
+    struct live_entry needle = { key, NULL };
+    struct live_entry *found = live_count ?
+        bsearch(&needle, live_entries, live_count, sizeof *live_entries, live_compare) : NULL;
+    return found ? found->address : initial;
+}
+// Called with live_lock held.
+static void live_refresh(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
     struct stat info;
     if (stat(minyar_live_manifest, &info) ||
         (live_have_seen && live_same(&info, &live_seen))) return;
@@ -134,27 +139,60 @@ static void live_refresh(struct timespec now) {
     image->handle = handle; image->previous = live_images; live_images = image;
     free(live_entries); free(live_storage);
     live_entries = entries; live_count = count; live_storage = storage;
-    ++live_generation;
+    for (size_t i = 0; i < live_slot_count; ++i)
+        __atomic_store_n(live_slots[i].slot, live_lookup(live_slots[i].key, live_slots[i].initial),
+                         __ATOMIC_RELEASE);
     live_seen = info; live_have_seen = 1; live_have_failed = 0;
     fprintf(stderr, "Reloaded %zu functions; program state preserved\n", count);
 }
-// Every function call resolves its target here. Hot mode only accepts
-// single-threaded programs, so between update checks the published table
-// cannot change: lookups skip the lock and are cached by key address.
-void *minyar_live_resolve(const char *key, void *initial) {
-    struct timespec now;
-    if (!live_clock(&now) && live_elapsed(&now, &live_checked) >= 25000000) {
-        pthread_mutex_lock(&live_lock);
-        live_refresh(now);
-        pthread_mutex_unlock(&live_lock);
+static void live_map(void) {
+    live_mapped = 1;
+    size_t length = strlen(minyar_live_manifest);
+    char *path = malloc(length + sizeof ".epoch");
+    int descriptor = -1;
+    if (path) {
+        memcpy(path, minyar_live_manifest, length);
+        memcpy(path + length, ".epoch", sizeof ".epoch");
+        descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        free(path);
     }
-    if (!live_count) return initial;
-    struct live_cached *slot = &live_cache[((uint64_t)(uintptr_t)key * UINT64_C(0x9E3779B97F4A7C15)) >> 54];
-    if (slot->key == key && slot->generation == live_generation) return slot->address;
-    struct live_entry needle = { key, NULL };
-    struct live_entry *found =
-        bsearch(&needle, live_entries, live_count, sizeof *live_entries, live_compare);
-    slot->key = key; slot->generation = live_generation;
-    slot->address = found ? found->address : initial;
-    return slot->address;
+    struct stat info;
+    void *page = MAP_FAILED;
+    if (descriptor >= 0 && !fstat(descriptor, &info) &&
+        (info.st_size >= (off_t)sizeof(uint64_t) || !ftruncate(descriptor, sizeof(uint64_t))))
+        page = mmap(NULL, sizeof(uint64_t), PROT_READ, MAP_SHARED, descriptor, 0);
+    if (descriptor >= 0) close(descriptor);
+    if (page == MAP_FAILED) {
+        fprintf(stderr, "minyar live: cannot watch for updates; keeping current code\n");
+        return;
+    }
+    minyar_live_epoch_seen = __atomic_load_n((const uint64_t *)page, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&minyar_live_epoch, (const uint64_t *)page, __ATOMIC_RELEASE);
+}
+// Wrappers call here for their first call and after each publication: load
+// any new update, retarget every bound slot, then bind this one.
+void *minyar_live_bind(const char *key, void *initial, void **slot) {
+    pthread_mutex_lock(&live_lock);
+    if (!live_mapped) live_map();
+    uint64_t epoch = __atomic_load_n(minyar_live_epoch, __ATOMIC_ACQUIRE);
+    if (epoch != minyar_live_epoch_seen) {
+        live_refresh();
+        minyar_live_epoch_seen = epoch;
+    }
+    void *address = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
+    if (!address) {
+        address = live_lookup(key, initial);
+        if (live_slot_count == live_slot_capacity) {
+            size_t capacity = live_slot_capacity ? live_slot_capacity * 2 : 256;
+            struct live_slot *grown = realloc(live_slots, capacity * sizeof *grown);
+            if (grown) { live_slots = grown; live_slot_capacity = capacity; }
+        }
+        // Without room the slot stays empty and the next call binds again.
+        if (live_slot_count < live_slot_capacity) {
+            live_slots[live_slot_count++] = (struct live_slot){ slot, key, initial };
+            __atomic_store_n(slot, address, __ATOMIC_RELEASE);
+        }
+    }
+    pthread_mutex_unlock(&live_lock);
+    return address;
 }

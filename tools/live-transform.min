@@ -241,8 +241,20 @@ function rootCell(line: Text, initial: Boolean): Rewritten {
 function wrapper(function: Function, index: Integer, generation: Integer): Text {
     let key = "minyar.live." + Text(generation) + ".key." + Text(index)
     let output: List<Text> = ["@" + key + " = private unnamed_addr constant [" + Text(function.raw.byteLength + 1) + " x i8] c\"" + escaped(function.raw) + "\\00\"\n"]
+    // Each wrapper keeps its current target in a slot. The runtime fills it on
+    // the first call and retargets it when a publication's epoch is first
+    // seen, so an ordinary call costs a few loads and an indirect branch.
+    let slot = "minyar.live." + Text(generation) + ".slot." + Text(index)
+    output.add("@" + slot + " = internal global ptr null, align 8\n")
     output.add("define " + function.result + " @" + function.wrapper + "(" + function.parameters + ") noinline uwtable {\nentry:\n")
-    output.add("  %live.target = call ptr @minyar_live_resolve(ptr @" + key + ", ptr @" + function.body + ")\n")
+    output.add("  %live.page = load ptr, ptr @minyar_live_epoch, align 8\n")
+    output.add("  %live.epoch = load atomic i64, ptr %live.page acquire, align 8\n")
+    output.add("  %live.seen = load i64, ptr @minyar_live_epoch_seen, align 8\n")
+    output.add("  %live.cached = load ptr, ptr @" + slot + ", align 8\n")
+    output.add("  %live.current = icmp eq i64 %live.epoch, %live.seen\n  %live.bound = icmp ne ptr %live.cached, null\n")
+    output.add("  %live.ready = and i1 %live.current, %live.bound\n  br i1 %live.ready, label %live.call, label %live.bind\nlive.bind:\n")
+    output.add("  %live.resolved = call ptr @minyar_live_bind(ptr @" + key + ", ptr @" + function.body + ", ptr @" + slot + ")\n  br label %live.call\nlive.call:\n")
+    output.add("  %live.target = phi ptr [ %live.cached, %entry ], [ %live.resolved, %live.bind ]\n")
     if function.returned == "void" {
         output.add("  call void %live.target(" + function.arguments + ")\n  ret void\n}\n")
     } else {
@@ -303,7 +315,7 @@ public function transform(llvm: Text, generation: Integer, initial: Boolean): Im
         if line.startsWith("; minyar-native-library: ") || line == "; minyar-cycle-runtime: 1" || line == "; minyar-callback-runtime: 1" || line == "; minyar-sort-callback-runtime: 1" { field(signatures, line) }
         output.add(result + "\n")
     }
-    output.add("declare ptr @minyar_live_resolve(ptr, ptr)\n")
+    output.add("declare ptr @minyar_live_bind(ptr, ptr, ptr)\n@minyar_live_epoch = external global ptr\n@minyar_live_epoch_seen = external global i64\n")
     for index in 0..functions.length { if functions[index].language { output.add(wrapper(functions[index], index, generation)) } }
     return Image { llvm: joinText(output); names: names; symbols: symbols; signature: joinText(signatures); error: "" }
 }

@@ -79,7 +79,11 @@ long long minyar_replhost_evaluate(const MinyarText *path_value, const MinyarTex
 
 /* Every submission recompiles the current function declarations. Its calls
  * resolve to that image's own bodies; no previous top-level action is replayed. */
-void *minyar_live_resolve(const char *key, void *fallback) {
+static const long long repl_epoch;
+const long long *minyar_live_epoch = &repl_epoch;
+long long minyar_live_epoch_seen;
+void *minyar_live_bind(const char *key, void *fallback, void **slot) {
     (void)key;
+    __atomic_store_n(slot, fallback, __ATOMIC_RELEASE);
     return fallback;
 }
