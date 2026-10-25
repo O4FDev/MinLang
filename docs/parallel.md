@@ -14,8 +14,87 @@ Read/write pairs and pairs of outputs are checked before dispatch; adjacent
 views remain usable.
 The [language guide](language.md#parallel-ranges) describes the supported syntax.
 
-On macOS and Linux, persistent pthread workers claim chunks of 128 indices
-from separate queues and steal unfinished chunks. The caller also works, then
+## Windows, scratch space and records
+
+An iteration that produces several values writes a window,
+`out.window(index, width)`: slots `index * width` up to
+`index * width + width` of a captured output. Disjointness is proved at compile
+time from the shape alone: the first argument must be the loop index token, and
+the width must be an Integer literal or a captured binding (captures are
+snapshots), the same token for every window of that buffer in the loop. Two
+iterations `i != j` then own `[i·w, i·w + w)` and `[j·w, j·w + w)`, which do
+not meet. The only runtime cost is one check per window taken (the product is
+overflow-checked and must lie in `0..length - width`); every access through the
+window keeps the ordinary per-access bounds check against `width`, so no write
+leaves it. The window is a five-word header in the worker's entry block, laid
+out like a Bytes view (negative capacity) and a List (`{ values, length,
+capacity }`), pointing into the owner's storage; it owns nothing and no
+ownership operation reaches it. The windowed buffer is otherwise untouchable in
+that loop except for `.length`, so no direct-index access can reach another
+iteration's slots. Windowed outputs join the alias guards: every input read
+in the loop (even at the loop index), every other output of the same type and
+every buffer reachable through a captured record is compared with them before
+dispatch, and Bytes windows count as read away from the index for the
+backing-range check.
+
+Writable parameters extend this to functions. A parallel function that writes
+a buffer parameter (by index or a Bytes `set` method) marks that parameter as
+written; passing a parameter on to a written parameter marks it too, to a
+fixed point over the whole program. Each call made inside a safe loop records
+what it passes to buffer parameters, and a written parameter must receive this
+iteration's window there. A captured buffer, an element of a `List<Bytes>`, or a
+buffer field of a record reaches a callee read-only, so passing one to a
+written parameter is rejected: "'fill' writes its parameter 'slots', so it
+needs this iteration's window". Ordinary code is single-threaded and may pass
+any buffer. Raw `parallelEntry` callers pass Integers, so functions with buffer
+or record parameters cannot be raw entries.
+
+Per-iteration scratch space is a window of an owner-allocated buffer:
+`scratch.window(index, size)` over `count * size` slots. Nothing is allocated
+in workers: allocation and ownership tracking are single-threaded, so a worker
+cannot create managed values. Scratch is per iteration rather than per worker,
+which costs `count * size` slots but keeps results independent of scheduling.
+
+Records reach parallel code read-only, as loop captures or parallel function
+parameters. A field read is a plain load of the record's slot
+(`.minyar.record.get.checked`), without a retain, in every ownership mode
+(legacy frames, `--bounded-owners`, `--scope-owners`, release): the owner thread
+is blocked in the dispatch until every worker joins, so no field can be
+reassigned and no value released while a worker holds it, and workers cannot
+assign fields. The effect audit admits that reader but not the field writer.
+Reachable fields may be Integer, Float, Boolean, Character, Bytes, scalar Lists
+and nested records; Text, Maps, Lists of managed values, record methods and
+records whose fields lead back to their own type are rejected, the last because
+the buffers a record can reach must be finite to guard them: before dispatch,
+every Bytes or List field reachable from a captured record is compared with each
+output of its type. The Bytes elements of a captured `List<Bytes>` are compared
+with every Bytes output in the same way, one comparison per element.
+
+The diagnostics, in the order the checks run:
+
+| rejection | diagnostic |
+|---|---|
+| `x.window(...)` outside a safe loop | window is available only inside a parallel for body |
+| first argument not the index | the first window argument must be the loop index 'index' |
+| width computed in the loop | a window width must be an Integer literal or a value from outside the loop |
+| two widths for one buffer | every window of 'out' in one loop needs the same width |
+| window of a non-captured or managed buffer | a window divides a captured Bytes or List of Integers, Floats, Booleans or Characters |
+| window used as a value | bind a window with let … or pass it whole to a parallel function |
+| other use of a window binding | a window can be indexed, measured with .length, read or written with Bytes get and set methods, or passed whole to a parallel function |
+| reassigning a window binding | the window 'w' cannot be reassigned |
+| touching the windowed buffer | 'out' is divided into windows in this loop |
+| read-only buffer to a written parameter | 'f' writes its parameter 'p', so it needs this iteration's window |
+| record field to a written parameter | parallel function 'f' passes a buffer field of record 'r' to 'g', which writes its parameter 'p' |
+| field write / buffer-field write | records are read-only here / buffers inside records are read-only here |
+| Text or other managed field | only Integer, Float, Boolean, Character, Bytes, scalar List and record fields can be read |
+| self-referential record | its record's fields lead back to their own type |
+| window too large at run time | parallel for window i of width w does not fit in a buffer of length n |
+
+On macOS and Linux, persistent pthread workers claim chunks of up to 128
+indices from separate queues and steal unfinished chunks. A range shorter than
+four chunks per thread uses smaller chunks, down to one index, so a loop with
+one long iteration per segment still spreads over the workers; reductions keep
+128-index chunks so Float grouping stays independent of the thread count. The caller also works, then
 waits for every worker to acknowledge completion. Worker LLVM contains no
 ownership or call-depth operations. Capture storage is allocated once per
 lexical loop in the caller's entry block, so repeated dispatch has fixed stack

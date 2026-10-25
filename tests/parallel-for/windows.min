@@ -1,0 +1,93 @@
+// Per-iteration windows: each segment keeps its own top three scores in a
+// window of the result buffers, and sorts candidates in a scratch window.
+// A read-only record describes the query; Bytes windows hold typed values.
+record Weights {
+    boost: Float
+    terms: List<Integer>
+}
+record Query {
+    weights: Weights
+    limit: Integer
+}
+
+parallel function score(query: Query, value: Integer): Float {
+    let total = 0.0
+    for term in 0..query.weights.terms.length {
+        if value % query.weights.terms[term] == 0 { total += query.weights.boost }
+    }
+    return total + Float(value % 97) / 100.0
+}
+
+// Keeps the best `ids.length` scores seen so far, best first.
+parallel function offer(scores: List<Float>, ids: List<Integer>, candidate: Float, id: Integer) {
+    let slot = scores.length
+    while slot > 0 && candidate > scores[slot - 1] { slot -= 1 }
+    if slot == scores.length { return }
+    let move = scores.length - 1
+    while move > slot {
+        scores[move] = scores[move - 1]
+        ids[move] = ids[move - 1]
+        move -= 1
+    }
+    scores[slot] = candidate
+    ids[slot] = id
+}
+
+parallel function best(query: Query, segment: Bytes, scores: List<Float>, ids: List<Integer>, scratch: List<Integer>): Integer {
+    for k in 0..scores.length { scores[k] = -1.0; ids[k] = -1 }
+    let seen = 0
+    for row in 0..segment.length / 8 {
+        let value = segment.getInt64(row * 8)
+        if value % query.limit != 0 {
+            scratch[seen % scratch.length] = value
+            seen += 1
+            offer(scores, ids, score(query, value), value)
+        }
+    }
+    return seen
+}
+
+let segments: List<Bytes> = []
+for s in 0..37 {
+    let segment = Bytes(8 * (40 + s))
+    for row in 0..40 + s { segment.setInt64(row * 8, (row * 7919 + s * 104729) % 100003) }
+    segments.add(segment)
+}
+let query = Query { weights: Weights { boost: 2.5, terms: [3, 5, 7] }, limit: 11 }
+let top = 3
+let scores: List<Float> = []
+let ids: List<Integer> = []
+for slot in 0..segments.length * top { scores.add(0.0); ids.add(0) }
+let scratch: List<Integer> = []
+for slot in 0..segments.length * 16 { scratch.add(0) }
+let seen: List<Integer> = []
+let packed = Bytes(segments.length * 16)
+for s in 0..segments.length { seen.add(0) }
+parallel for s in 0..segments.length {
+    let mine = scratch.window(s, 16)
+    let raw = packed.window(s, 16)
+    seen[s] = best(query, segments[s], scores.window(s, top), ids.window(s, top), mine)
+    raw.setInt64(0, mine[0] + mine.length)
+    raw.setFloat64(8, Float(raw.getInt64(0)) * 0.5)
+}
+
+// The same work on the owner, segment by segment.
+let same = true
+for s in 0..segments.length {
+    let serialScores = [0.0, 0.0, 0.0]
+    let serialIds = [0, 0, 0]
+    let serialScratch: List<Integer> = []
+    for slot in 0..16 { serialScratch.add(0) }
+    let count = best(query, segments[s], serialScores, serialIds, serialScratch)
+    if count != seen[s] || packed.getInt64(s * 16) != serialScratch[0] + 16 { same = false }
+    for k in 0..top {
+        if serialScores[k] != scores[s * top + k] || serialIds[k] != ids[s * top + k] { same = false }
+    }
+}
+let merged = [-1.0, -1.0, -1.0]
+let mergedIds = [-1, -1, -1]
+for slot in 0..scores.length { offer(merged, mergedIds, scores[slot], ids[slot]) }
+print(same)
+print(mergedIds[0])
+print(merged[0])
+print(packed.getFloat64(8))

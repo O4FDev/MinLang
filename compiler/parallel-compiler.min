@@ -1,3 +1,11 @@
+// Captured outputs a loop divides with `.window(index, width)`, their widths
+// and the `let` names bound to windows.
+record ParallelWindows {
+    bases: List<Text>
+    widths: List<Text>
+    locals: List<Text>
+}
+
 // Safe data parallelism deliberately has a narrower effect set than the raw
 // parallel ABI. In particular, an Integer must never smuggle a write address.
 function parallelScalar(type: Integer): Boolean {
@@ -21,10 +29,10 @@ function parallelDirectIndex(context: CompilerContext, first: Integer, after: In
     return after == first + 4 && texts[first] == name && texts[first + 1] == "[" && texts[first + 2] == index && texts[first + 3] == "]"
 }
 
-function checkParallelBody(context: CompilerContext, firstNode: Integer, body: Integer, index: Text, captures: List<Text>, types: List<Integer>, reduction: Text) {
+function checkParallelBody(context: CompilerContext, firstNode: Integer, body: Integer, index: Text, captures: List<Text>, types: List<Integer>, reduction: Text, windows: ParallelWindows) {
     let nodes = context.syntax.nodes
     let texts = context.tokenTexts
-    let written = parallelWrittenBuffers(context, firstNode, body, captures, types)
+    let written = parallelWrittenBuffers(context, firstNode, body, captures, types, windows)
     let node = firstNode
     while node < nodes.length {
         let kind = nodes[node].kind
@@ -49,10 +57,13 @@ function checkParallelBody(context: CompilerContext, firstNode: Integer, body: I
             if kind == 200 && reduction != "" && texts[start] == reduction {
                 parallelRace(context, start, "the reduction binding '" + reduction + "' can only be updated with +=; compute its contribution without reading it")
             }
-            if kind == 214 && !parallelReductionTarget(context, node, reduction) {
+            if kind == 214 && findText(windows.locals, texts[start]) >= 0 {
+                if nodes[node].end == start + 1 { parallelRace(context, start, "the window '" + texts[start] + "' cannot be reassigned; write its slots, such as " + texts[start] + "[0]") }
+            } else if kind == 214 && !parallelReductionTarget(context, node, reduction) {
                 let name = texts[start]
                 if name == index { parallelRace(context, start, "the loop index '" + index + "' cannot be changed; each iteration owns its original slot") }
                 let capture = findText(captures, name)
+                if findText(windows.bases, name) >= 0 { parallelWindowedRace(context, start, name) }
                 if capture >= 0 {
                     if !parallelBuffer(types[capture]) {
                         let help = "use a buffer with one slot per iteration"
@@ -68,17 +79,32 @@ function checkParallelBody(context: CompilerContext, firstNode: Integer, body: I
                     }
                 }
             }
+            if kind == 213 && findText(windows.bases, texts[start]) >= 0 && nodes[node].end > start + 1 && texts[start + 1] == "[" { parallelWindowedRace(context, start, texts[start]) }
             if isReferenceType(nodes[node].type) {
                 let name = texts[start]
                 let capture = findText(captures, name)
                 let allowed = kind == 200 && capture >= 0
                 let parent = nodes[node].parent
-                if allowed && parallelViewList(types[capture]) {
-                    // A Bytes element of a captured List<Bytes> is a read-only view.
-                    allowed = parent >= 0 && nodes[parent].kind == 213 && nodes[parent].start == start && parallelViewUse(context, parent)
-                    if allowed && parallelWritesBytes(written, captures, types) {
-                        parallelRace(context, start, "a loop reading Bytes from '" + name + "' cannot also write Bytes; write the results to a List of Integers or Floats")
+                if findText(windows.locals, name) >= 0 && kind == 200 {
+                    // A window binding: its slots belong to this iteration.
+                    allowed = parallelWindowUse(context, node)
+                    if !allowed { parallelRace(context, start, "a window can be indexed, measured with .length, read or written with Bytes get and set methods, or passed whole to a parallel function") }
+                } else if parallelWindowCall(context, start) && (kind == 212 || kind == 200) {
+                    allowed = true
+                } else if capture >= 0 && parallelRecord(context, types[capture]) && texts[start - 1] != "." {
+                    // Field chains are checked once, at the record's own name.
+                    if kind == 200 {
+                        let chain = parallelFieldChain(context, start, types[capture])
+                        let problem = parallelRecordUse(context, start, chain[0], chain[1])
+                        if problem != "" { parallelRace(context, start, "'" + name + "' is shared read-only; " + problem) }
                     }
+                    allowed = true
+                } else if allowed && findText(windows.bases, name) >= 0 && !(parent >= 0 && nodes[parent].kind == 212 && nodes[parent].end == start + 3 && texts[start + 2] == "length") {
+                    parallelWindowedRace(context, start, name)
+                } else if allowed && parallelViewList(types[capture]) {
+                    // A Bytes element of a captured List<Bytes> is a read-only view;
+                    // parallelReadGuards checks every element against Bytes outputs.
+                    allowed = parent >= 0 && nodes[parent].kind == 213 && nodes[parent].start == start && parallelViewUse(context, parent)
                 } else if kind == 213 && capture >= 0 && parallelViewList(types[capture]) {
                     allowed = true
                 } else {
@@ -128,13 +154,33 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
     let parts: List<Integer> = [0, 0, 0, 0, 0, 0, -1, 0, -1]
     let blocks: List<Text> = []
     state[0] = start + 1
+    let outerIndex = context.parallelIndex
+    context.parallelIndex = index
     compileForParts(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, parts, blocks)
+    context.parallelIndex = outerIndex
     if parts[3] >= 0 { parallelRace(context, start, "use an Integer range such as 0..count") }
     let body = parts[5]
     let reduction = ""
     if parts[8] >= 0 { reduction = context.tokenTexts[parts[8]] }
-    checkParallelBody(context, firstNode, body, index, captures, types, reduction)
-    let guards = parallelReadGuards(context, firstNode, body, index, captures, types)
+    let windows = parallelWindowScan(context, body, state[0], index, captures, types)
+    checkParallelBody(context, firstNode, body, index, captures, types, reduction, windows)
+    // Anything but this iteration's window reaches a callee read-only.
+    let arguments = parallelArguments(globals, body, state[0])
+    let argument = 0
+    while argument < arguments.length {
+        let first = arguments[argument + 2]
+        let window = parallelWindowCall(context, first) || (arguments[argument + 3] == first + 1 && findText(windows.locals, context.tokenTexts[first]) >= 0)
+        if !window { globals.add("; minyar-parallel-readonly: " + context.functionNames[arguments[argument]] + "|" + Text(arguments[argument + 1]) + "|" + Text(first) + "|\n") }
+        argument = argument + 4
+    }
+    let guards = parallelReadGuards(context, firstNode, body, index, captures, types, windows)
+    let records: List<Text> = []
+    let capture = 0
+    while capture < captures.length {
+        if parallelRecord(context, types[capture]) && parallelCaptureUsed(context, body, state[0], captures[capture]) { records.add(captures[capture]) }
+        capture = capture + 1
+    }
+    parallelRecordGuards(context, captures, types, parallelWrittenBuffers(context, firstNode, body, captures, types, windows), records, guards)
     // Bounds execute on the owner thread. Only body calls need the effect proof.
     let node = firstNode
     while node < context.syntax.nodes.length {
@@ -169,8 +215,13 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
     }
 }
 
-function parallelWrittenBuffers(context: CompilerContext, firstNode: Integer, body: Integer, captures: List<Text>, types: List<Integer>): List<Text> {
+function parallelWrittenBuffers(context: CompilerContext, firstNode: Integer, body: Integer, captures: List<Text>, types: List<Integer>, windows: ParallelWindows): List<Text> {
     let result: List<Text> = []
+    let window = 0
+    while window < windows.bases.length {
+        if findText(result, windows.bases[window]) < 0 { result.add(windows.bases[window]) }
+        window = window + 1
+    }
     let node = firstNode
     while node < context.syntax.nodes.length {
         let target = context.syntax.nodes[node]
@@ -186,12 +237,13 @@ function parallelWrittenBuffers(context: CompilerContext, firstNode: Integer, bo
     return result
 }
 
-function parallelReadGuards(context: CompilerContext, firstNode: Integer, body: Integer, index: Text, captures: List<Text>, types: List<Integer>): List<Integer> {
-    let written = parallelWrittenBuffers(context, firstNode, body, captures, types)
+function parallelReadGuards(context: CompilerContext, firstNode: Integer, body: Integer, index: Text, captures: List<Text>, types: List<Integer>, windows: ParallelWindows): List<Integer> {
+    let written = parallelWrittenBuffers(context, firstNode, body, captures, types, windows)
     let result: List<Integer> = []
     let seen: List<Text> = []
     let byteNames: List<Text> = []
     let offIndex: List<Text> = []
+    let byteLists: List<Text> = []
     let node = firstNode
     while node < context.syntax.nodes.length {
         let access = context.syntax.nodes[node]
@@ -199,14 +251,18 @@ function parallelReadGuards(context: CompilerContext, firstNode: Integer, body: 
         if access.start >= body && (access.kind == 213 || access.kind == 214 || whole) {
             let name = context.tokenTexts[access.start]
             let read = findText(captures, name)
+            if read >= 0 && parallelViewList(types[read]) && findText(byteLists, name) < 0 { byteLists.add(name) }
             if read >= 0 && !parallelBuffer(types[read]) { read = -1 }
             if read >= 0 && types[read] == 8 && findText(byteNames, name) < 0 { byteNames.add(name) }
-            if read >= 0 && (whole || (access.kind == 213 && !parallelDirectIndex(context, access.start, access.end, name, index))) {
-                if findText(offIndex, name) < 0 { offIndex.add(name) }
+            let offRead = whole || (access.kind == 213 && !parallelDirectIndex(context, access.start, access.end, name, index))
+            if read >= 0 && offRead && findText(offIndex, name) < 0 { offIndex.add(name) }
+            if read >= 0 && findText(windows.bases, name) < 0 {
+                // A window covers other iterations' indices, so even a
+                // direct-index read must not alias a windowed output.
                 let output = 0
                 while output < written.length {
                     let write = findText(captures, written[output])
-                    if types[read] != 8 && types[read] == types[write] {
+                    if types[read] != 8 && types[read] == types[write] && (offRead || findText(windows.bases, written[output]) >= 0) {
                         let pair = Text(read) + "/" + Text(write)
                         if findText(seen, pair) < 0 { seen.add(pair); result.add(read); result.add(write); result.add(0) }
                     }
@@ -215,6 +271,41 @@ function parallelReadGuards(context: CompilerContext, firstNode: Integer, body: 
             }
         }
         node = node + 1
+    }
+    // Windowed outputs are written away from the index: they must not alias
+    // another output either.
+    let windowed = 0
+    while windowed < windows.bases.length {
+        let base = windows.bases[windowed]
+        let window = findText(captures, base)
+        if types[window] == 8 {
+            if findText(byteNames, base) < 0 { byteNames.add(base) }
+            if findText(offIndex, base) < 0 { offIndex.add(base) }
+        } else {
+            let other = 0
+            while other < written.length {
+                let target = findText(captures, written[other])
+                let pair = Text(window) + "/" + Text(target)
+                if written[other] != base && types[target] == types[window] && findText(seen, pair) < 0 && findText(seen, Text(target) + "/" + Text(window)) < 0 {
+                    seen.add(pair); result.add(window); result.add(target); result.add(0)
+                }
+                other = other + 1
+            }
+        }
+        windowed = windowed + 1
+    }
+    // Elements of a captured List<Bytes> are inputs read at any index: each
+    // is checked against every Bytes output before dispatch (one comparison
+    // per element).
+    let list = 0
+    while list < byteLists.length {
+        let output = 0
+        while output < written.length {
+            let target = findText(captures, written[output])
+            if types[target] == 8 { result.add(findText(captures, byteLists[list])); result.add(target); result.add(20) }
+            output = output + 1
+        }
+        list = list + 1
     }
     // C-layout fields can expose distinct Bytes headers over overlapping
     // storage. Direct-index reads and two outputs need this check too.
@@ -246,11 +337,25 @@ function emitParallelAliasGuards(types: List<Integer>, ids: List<Integer>, guard
         let write = guards[pair + 1]
         let kind = guards[pair + 2]
         let input = loadLocal(output, textState, state, ids[read], types[read])
+        if kind >= 10 && kind < 20 {
+            // A buffer reached through a captured record's fields.
+            let depth = guards[pair + 3]
+            let step = 0
+            while step < depth {
+                let raw = emitInstruction(output, textState, state, "call i64 @.minyar.record.get.checked(ptr " + input + ", i64 " + Text(guards[pair + 4 + step]) + ")")
+                input = emitInstruction(output, textState, state, "inttoptr i64 " + raw + " to ptr")
+                step = step + 1
+            }
+            pair = pair + 1 + depth
+            kind = kind - 10
+        }
         let target = loadLocal(output, textState, state, ids[write], types[write])
         let callee = "minyar_parallel_no_alias"
         let parameters = "ptr, ptr, i64, i64"
         let extra = ""
-        if kind != 0 { callee = "minyar_parallel_bytes_no_overlap"; parameters = parameters + ", i64"; extra = ", i64 " + Text(kind - 1) }
+        if kind == 20 {
+            callee = "minyar_parallel_bytes_list_no_overlap"
+        } else if kind != 0 { callee = "minyar_parallel_bytes_no_overlap"; parameters = parameters + ", i64"; extra = ", i64 " + Text(kind - 1) }
         let declaration = "declare void @" + callee + "(" + parameters + ")\n"
         if findText(globals, declaration) < 0 { globals.add(declaration) }
         output.add("  call void @" + callee + "(ptr " + input + ", ptr " + target + ", i64 " + first + ", i64 " + after + extra + ")\n")
@@ -258,8 +363,46 @@ function emitParallelAliasGuards(types: List<Integer>, ids: List<Integer>, guard
     }
 }
 
+// Every buffer a captured record can reach is an input read at any index:
+// guard it against each output of its type. Entries are record, output,
+// 10 + kind, path length, then field positions.
+function parallelRecordGuards(context: CompilerContext, captures: List<Text>, types: List<Integer>, written: List<Text>, records: List<Text>, guards: List<Integer>) {
+    let record = 0
+    while record < records.length {
+        let capture = findText(captures, records[record])
+        let output = 0
+        while output < written.length {
+            let path: List<Integer> = []
+            parallelRecordPaths(context, types[capture], types[findText(captures, written[output])], capture, findText(captures, written[output]), path, 0, guards)
+            output = output + 1
+        }
+        record = record + 1
+    }
+}
+
+function parallelRecordPaths(context: CompilerContext, type: Integer, target: Integer, capture: Integer, write: Integer, path: List<Integer>, depth: Integer, guards: List<Integer>) {
+    let index = recordTypeIndex(type)
+    let offset = functionParameterOffset(context.functionParameterCounts, index)
+    let field = 0
+    while field < context.functionParameterCounts[index] {
+        let fieldType = context.functionParameterTypes[offset + field]
+        if path.length == depth { path.add(field) } else { path[depth] = field }
+        if parallelRecord(context, fieldType) {
+            parallelRecordPaths(context, fieldType, target, capture, write, path, depth + 1, guards)
+        } else if fieldType == target && parallelBuffer(fieldType) {
+            guards.add(capture); guards.add(write)
+            if fieldType == 8 { guards.add(11) } else { guards.add(10) }
+            guards.add(depth + 1)
+            let step = 0
+            while step <= depth { guards.add(path[step]); step = step + 1 }
+        }
+        field = field + 1
+    }
+}
+
 function parallelLoopRuntime(callee: Text): Boolean {
-    return parallelRuntimeAllowed(callee) || callee == "minyar_bytes_get" || callee == "minyar_bytes_set" || callee == "minyar_bytes_length" || callee == "minyar_rc_borrow" || callee == "minyar_rc_step" || callee == "minyar_rc_idle" || callee == "minyar_rc_local" || callee == "minyar_rc_retain" || callee == "minyar_rc_release"
+    // Window bindings own nothing; the worker drops these ownership calls.
+    return parallelRuntimeAllowed(callee) || callee == "minyar_rc_local_take" || callee == "minyar_bytes_get" || callee == "minyar_bytes_set" || callee == "minyar_bytes_length" || callee == "minyar_rc_borrow" || callee == "minyar_rc_step" || callee == "minyar_rc_idle" || callee == "minyar_rc_local" || callee == "minyar_rc_retain" || callee == "minyar_rc_release"
 }
 
 function checkParallelRuntime(context: CompilerContext, text: Text, position: Integer) {
@@ -365,12 +508,17 @@ function parallelViewReader(member: Text): Boolean {
 // A parallel function borrows its Bytes and List parameters from a caller that
 // keeps them alive and unchanged. Each use must read through an index, .length
 // or a typed getter, or pass the whole view on to another parallel function.
-function checkParallelViews(context: CompilerContext, first: Integer, after: Integer, names: List<Text>, types: List<Integer>, owner: Text) {
+function checkParallelViews(context: CompilerContext, globals: List<Text>, first: Integer, after: Integer, names: List<Text>, types: List<Integer>, owner: Text) {
     let texts = context.tokenTexts
     let kinds = context.tokenKinds
     let token = first
     while token < after {
         let parameter = findText(names, texts[token])
+        if kinds[token] == 1 && parameter >= 0 && parameter < types.length && texts[token - 1] != "." && parallelRecord(context, types[parameter]) {
+            let chain = parallelFieldChain(context, token, types[parameter])
+            let problem = parallelRecordUse(context, token, chain[0], chain[1])
+            if problem != "" { failAtToken(context.tokenLines, token, "parallel function '" + readableDeclarationName(owner) + "' reads record '" + texts[token] + "' read-only; " + problem) }
+        }
         if kinds[token] == 1 && parameter >= 0 && parameter < types.length && texts[token - 1] != "." {
             if parallelBuffer(types[parameter]) {
                 let name = texts[token]
@@ -386,11 +534,15 @@ function checkParallelViews(context: CompilerContext, first: Integer, after: Int
                     }
                     let operator = texts[close + 1]
                     if operator.length >= 1 && operator[operator.length - 1] == '=' && operator != "==" && operator != "!=" && operator != "<=" && operator != ">=" {
-                        failAtToken(context.tokenLines, token, help + "write results through the loop's own slots instead")
+                        // A written parameter is a window: every caller in a
+                        // parallel context must pass one (checkParallelWrites).
+                        parallelNoteWrite(globals, owner, parameter)
                     }
                 } else if next == "." {
-                    if !parallelViewReader(texts[token + 2]) {
-                        failAtToken(context.tokenLines, token, help + "only indexing, .length and get methods are allowed, not ." + texts[token + 2])
+                    if parallelViewWriter(texts[token + 2]) {
+                        parallelNoteWrite(globals, owner, parameter)
+                    } else if !parallelViewReader(texts[token + 2]) {
+                        failAtToken(context.tokenLines, token, help + "only indexing, .length and get or set methods are allowed, not ." + texts[token + 2])
                     }
                 } else if !((texts[token - 1] == "(" || texts[token - 1] == ",") && (next == "," || next == ")")) {
                     failAtToken(context.tokenLines, token, help + "read it by index or pass it whole to another parallel function")
@@ -399,20 +551,82 @@ function checkParallelViews(context: CompilerContext, first: Integer, after: Int
         }
         token = token + 1
     }
+    // A buffer parameter passed on whole is written wherever the callee writes it.
+    let arguments = parallelArguments(globals, first, after)
+    let argument = 0
+    while argument < arguments.length {
+        let start = arguments[argument + 2]
+        let parameter = findText(names, texts[start])
+        if arguments[argument + 3] == start + 1 && parameter >= 0 && parameter < types.length && parallelBuffer(types[parameter]) {
+            let forward = "; minyar-parallel-forward: " + owner + "|" + Text(parameter) + "|" + context.functionNames[arguments[argument]] + "|" + Text(arguments[argument + 1]) + "\n"
+            if findText(globals, forward) < 0 { globals.add(forward) }
+        } else {
+            // A buffer field of a record parameter stays read-only.
+            globals.add("; minyar-parallel-readonly: " + context.functionNames[arguments[argument]] + "|" + Text(arguments[argument + 1]) + "|" + Text(start) + "|" + owner + "\n")
+        }
+        argument = argument + 4
+    }
+}
+
+function parallelNoteWrite(globals: List<Text>, owner: Text, parameter: Integer) {
+    let marker = "; minyar-parallel-writes: " + owner + "|" + Text(parameter) + "\n"
+    if findText(globals, marker) < 0 { globals.add(marker) }
+}
+
+// Calls to parallel functions record each buffer or record argument's token
+// range, so loop and function checks can see what reaches a written parameter.
+function noteParallelArguments(context: CompilerContext, globals: List<Text>, call: Integer, function: Integer, types: List<Integer>) {
+    let child = context.syntax.nodes[call].firstChild
+    let argument = 0
+    while child >= 0 && argument < types.length {
+        if parallelBuffer(types[argument]) {
+            globals.add("; minyar-parallel-argument: " + Text(function) + "|" + Text(argument) + "|" + Text(context.syntax.nodes[child].start) + "|" + Text(context.syntax.nodes[child].end) + "\n")
+        }
+        child = context.syntax.nodes[child].nextSibling
+        argument = argument + 1
+    }
+}
+
+// Argument markers whose tokens lie in [first, after): function, argument,
+// start and end, four Integers each.
+function parallelArguments(globals: List<Text>, first: Integer, after: Integer): List<Integer> {
+    let result: List<Integer> = []
+    let prefix = "; minyar-parallel-argument: "
+    let marker = 0
+    while marker < globals.length {
+        let text = globals[marker]
+        if text.length > prefix.length && text.startsWith(prefix) {
+            let fields = parallelMarkerIntegers(text, prefix.length)
+            if fields.length == 4 && fields[2] >= first && fields[2] < after {
+                result.add(fields[0]); result.add(fields[1]); result.add(fields[2]); result.add(fields[3])
+            }
+        }
+        marker = marker + 1
+    }
+    return result
+}
+
+function parallelMarkerIntegers(text: Text, first: Integer): List<Integer> {
+    let result: List<Integer> = []
+    let value = 0
+    let cursor = first
+    while cursor < text.length {
+        let character = text[cursor]
+        if character == '|' || character == '\n' {
+            result.add(value)
+            value = 0
+        } else {
+            value = value * 10 + (Integer(character) - 48)
+        }
+        cursor = cursor + 1
+    }
+    return result
 }
 
 function parallelViewList(type: Integer): Boolean {
     return isListType(type) && listElementType(type) == 8
 }
 
-function parallelWritesBytes(written: List<Text>, captures: List<Text>, types: List<Integer>): Boolean {
-    let position = 0
-    while position < written.length {
-        if types[findText(captures, written[position])] == 8 { return true }
-        position = position + 1
-    }
-    return false
-}
 
 // A buffer expression used read-only: a typed getter's receiver or a whole
 // argument of a call. Calls in a safe loop reach only parallel functions,
@@ -427,6 +641,288 @@ function parallelViewUse(context: CompilerContext, node: Integer): Boolean {
     return (texts[start - 1] == "(" || texts[start - 1] == ",") && (texts[end] == "," || texts[end] == ")")
 }
 
+// Writers reach only window parameters: checkParallelViews records each
+// written parameter, and checkParallelWrites requires windows for them.
 function parallelViewHelper(callee: Text): Boolean {
-    return callee.startsWith(".minyar.bytes.get.") || callee == ".minyar.bytes.length" || callee == ".minyar.list.get.checked" || callee == ".minyar.list.length"
+    return callee.startsWith(".minyar.bytes.get.") || callee.startsWith(".minyar.bytes.set.") || callee == ".minyar.list.set.scalar.checked" || callee == ".minyar.record.get.checked" || callee == ".minyar.bytes.length" || callee == ".minyar.list.get.checked" || callee == ".minyar.list.length"
+}
+
+// `buffer.window(index, width)` is one iteration's own slots of a captured
+// output: `width` elements starting at `index * width`. Iterations take
+// windows of one buffer with one loop-invariant width, so their slots are
+// disjoint by construction; creating the window checks once that it fits.
+// The view header lives in the worker's entry block and owns nothing.
+function parseParallelWindow(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, receiverType: Integer, memberLocation: Integer, resultType: List<Integer>): Text {
+    let tokenTexts = context.tokenTexts
+    if context.parallelIndex == "" {
+        failAtToken(context.tokenLines, memberLocation, "window is available only inside a parallel for body, where it names one iteration's own slots")
+    }
+    if recoveryEnabled(state) {
+        failAtToken(context.tokenLines, memberLocation, "parallel for windows are not available in recoverable execution yet")
+    }
+    let indexLocation = state[0]
+    let indexType: List<Integer> = [0]
+    let index = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, indexType)
+    if state[0] != indexLocation + 1 || tokenTexts[indexLocation] != context.parallelIndex {
+        failAtToken(context.tokenLines, indexLocation, "parallel for: the first window argument must be the loop index '" + context.parallelIndex + "'; each iteration may take only its own slots")
+    }
+    expectToken(context.tokenKinds, tokenTexts, context.tokenLines, state, ",")
+    let widthLocation = state[0]
+    let widthType: List<Integer> = [0]
+    let width = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, widthType)
+    if widthType[0] != 1 { requireContextType(context, widthLocation, widthType[0], 1, "a window width is an Integer") }
+    expectToken(context.tokenKinds, tokenTexts, context.tokenLines, state, ")")
+    let marker = "; minyar-parallel-window: 1\n"
+    if findText(globals, marker) < 0 { globals.add(marker); globals.add(parallelWindowHelper()) }
+    let header = "%parallel.window." + Text(newLabel(state))
+    // outlineParallelFor moves this to the worker's entry block.
+    output.add("  " + header + " = alloca [5 x i64], align 8\n")
+    let scale = "8"
+    if receiverType == 8 { scale = "1" }
+    let value = valueName(textState, newTemporary(state))
+    output.add("  " + value + " = call ptr @.minyar.parallel.window(ptr " + receiver + ", i64 " + index + ", i64 " + width + ", i64 " + scale + ", ptr " + header + ")\n")
+    setType(resultType, receiverType)
+    return value
+}
+
+// A window header has the Bytes view layout (negative capacity) and the List
+// prefix { values, length, capacity }; it cannot grow, and nothing releases it.
+function parallelWindowHelper(): Text {
+    return "declare void @minyar_parallel_window_stop(i64, i64, i64)
+define internal ptr @.minyar.parallel.window(ptr %buffer, i64 %index, i64 %width, i64 %scale, ptr %header) alwaysinline {
+entry:
+  %length.pointer = getelementptr inbounds { ptr, i64, i64 }, ptr %buffer, i32 0, i32 1
+  %length = load i64, ptr %length.pointer
+  %product = call { i64, i1 } @llvm.smul.with.overflow.i64(i64 %index, i64 %width)
+  %start = extractvalue { i64, i1 } %product, 0
+  %overflow = extractvalue { i64, i1 } %product, 1
+  %start.valid = icmp ule i64 %start, %length
+  %room = sub i64 %length, %start
+  %width.valid = icmp ule i64 %width, %room
+  %fits = and i1 %start.valid, %width.valid
+  %exact = xor i1 %overflow, true
+  %valid = and i1 %fits, %exact
+  br i1 %valid, label %good, label %bad, !prof !{!\"branch_weights\", !\"expected\", i32 2000, i32 1}
+good:
+  %data = load ptr, ptr %buffer
+  %offset = mul nuw nsw i64 %start, %scale
+  %first = getelementptr i8, ptr %data, i64 %offset
+  store ptr %first, ptr %header
+  %length.slot = getelementptr inbounds [5 x i64], ptr %header, i64 0, i64 1
+  store i64 %width, ptr %length.slot
+  %capacity.slot = getelementptr inbounds [5 x i64], ptr %header, i64 0, i64 2
+  store i64 -1, ptr %capacity.slot
+  %offsets.slot = getelementptr inbounds [5 x i64], ptr %header, i64 0, i64 3
+  store i64 0, ptr %offsets.slot
+  %backing.slot = getelementptr inbounds [5 x i64], ptr %header, i64 0, i64 4
+  store i64 0, ptr %backing.slot
+  ret ptr %header
+bad:
+  call void @minyar_parallel_window_stop(i64 %index, i64 %width, i64 %length)
+  unreachable
+}
+"
+}
+
+function parallelWindowCall(context: CompilerContext, start: Integer): Boolean {
+    let texts = context.tokenTexts
+    return start + 3 < texts.length && context.tokenKinds[start] == 1 && texts[start + 1] == "." && texts[start + 2] == "window" && texts[start + 3] == "("
+}
+
+function parallelWindowedRace(context: CompilerContext, position: Integer, name: Text) {
+    parallelRace(context, position, "'" + name + "' is divided into windows in this loop; use this iteration's window instead of '" + name + "' itself")
+}
+
+function parallelWindowScan(context: CompilerContext, body: Integer, after: Integer, index: Text, captures: List<Text>, types: List<Integer>): ParallelWindows {
+    let texts = context.tokenTexts
+    let kinds = context.tokenKinds
+    let bases: List<Text> = []
+    let widths: List<Text> = []
+    let locals: List<Text> = []
+    let windows = ParallelWindows { bases: bases, widths: widths, locals: locals }
+    let token = body
+    while token + 3 < after {
+        if kinds[token] == 1 && texts[token] == "window" && texts[token - 1] == "." && texts[token + 1] == "(" {
+            let base = token - 2
+            let capture = findText(captures, texts[base])
+            if kinds[base] != 1 || texts[base - 1] == "." || capture < 0 || !parallelBuffer(types[capture]) {
+                parallelRace(context, base, "a window divides a captured Bytes or List of Integers, Floats, Booleans or Characters")
+            }
+            // parseParallelWindow has checked `(index,` and the Integer width.
+            let width = token + 4
+            if texts[width + 1] != ")" || !(kinds[width] == 2 || (kinds[width] == 1 && texts[width] != index && findText(captures, texts[width]) >= 0)) {
+                parallelRace(context, width, "a window width must be an Integer literal or a value from outside the loop, so every iteration gets the same width")
+            }
+            let name = texts[base]
+            let known = findText(windows.bases, name)
+            if known < 0 {
+                windows.bases.add(name)
+                windows.widths.add(texts[width])
+            } else if windows.widths[known] != texts[width] {
+                parallelRace(context, width, "every window of '" + name + "' in one loop needs the same width; '" + windows.widths[known] + "' was used before")
+            }
+            if texts[base - 1] == "=" && kinds[base - 2] == 1 && texts[base - 3] == "let" {
+                windows.locals.add(texts[base - 2])
+            } else if !((texts[base - 1] == "(" || texts[base - 1] == ",") && (texts[width + 2] == "," || texts[width + 2] == ")")) {
+                parallelRace(context, base, "bind a window with let, such as let slots = " + name + ".window(" + index + ", " + texts[width] + "), or pass it whole to a parallel function")
+            }
+        }
+        token = token + 1
+    }
+    return windows
+}
+
+// How a loop may use a window binding: index it (read or write), measure it,
+// call a Bytes get or set method, or pass it whole to a parallel function.
+function parallelWindowUse(context: CompilerContext, node: Integer): Boolean {
+    let texts = context.tokenTexts
+    let end = context.syntax.nodes[node].end
+    if parallelViewUse(context, node) || texts[end] == "[" { return true }
+    if texts[end] == "." && texts[end + 2] == "(" && parallelViewWriter(texts[end + 1]) { return true }
+    return texts[end] == "." && texts[end + 1] == "length"
+}
+
+function parallelViewWriter(member: Text): Boolean {
+    return member == "setInt64" || member == "setInt32" || member == "setUInt32" || member == "setInt16" || member == "setUInt16" || member == "setFloat64" || member == "setFloat32"
+}
+
+// Infers which parallel function parameters are written, directly or by
+// passing them on, and rejects a read-only buffer reaching one: a captured
+// input, a List<Bytes> element or a buffer the loop does not divide.
+function checkParallelWrites(context: CompilerContext, globals: List<Text>) {
+    let written: List<Text> = []
+    let forwards: List<Text> = []
+    let readonly: List<Text> = []
+    let marker = 0
+    while marker < globals.length {
+        let text = globals[marker]
+        if text.startsWith("; minyar-parallel-writes: ") { written.add(markerValue(text, "; minyar-parallel-writes: ")) }
+        if text.startsWith("; minyar-parallel-forward: ") { forwards.add(markerValue(text, "; minyar-parallel-forward: ")) }
+        if text.startsWith("; minyar-parallel-readonly: ") { readonly.add(markerValue(text, "; minyar-parallel-readonly: ")) }
+        marker = marker + 1
+    }
+    if written.length == 0 { return }
+    let changed = true
+    while changed {
+        changed = false
+        let forward = 0
+        while forward < forwards.length {
+            // owner|parameter|callee|argument
+            let parts = forwards[forward].split("|")
+            let target = parts[2] + "|" + parts[3]
+            let source = parts[0] + "|" + parts[1]
+            if findText(written, target) >= 0 && findText(written, source) < 0 {
+                written.add(source)
+                changed = true
+            }
+            forward = forward + 1
+        }
+    }
+    let use = 0
+    while use < readonly.length {
+        // callee|argument|token
+        let parts = readonly[use].split("|")
+        if findText(written, parts[0] + "|" + parts[1]) >= 0 {
+            let callee = findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, parts[0])
+            let parameter = parts[1]
+            if callee >= 0 {
+                let offset = functionParameterOffset(context.functionParameterCounts, callee)
+                parameter = context.functionParameterNames[offset + spanNatural(parts[1], 0, parts[1].length)]
+            }
+            let position = spanNatural(parts[2], 0, parts[2].length)
+            if parts.length > 3 && parts[3] != "" {
+                failAtToken(context.tokenLines, position, "parallel function '" + readableDeclarationName(parts[3]) + "' passes a buffer field of record '" + context.tokenTexts[position] + "' to '" + readableDeclarationName(parts[0]) + "', which writes its parameter '" + parameter + "'; records are read-only in parallel code, so pass a window instead")
+            }
+            parallelRace(context, position, "'" + readableDeclarationName(parts[0]) + "' writes its parameter '" + parameter + "', so it needs this iteration's window, such as " + context.tokenTexts[position] + ".window(index, width); other buffers reach it read-only")
+        }
+        use = use + 1
+    }
+}
+
+// Ordinary records reach parallel code read-only: a parallel function's
+// parameter or a loop capture. Field reads are plain loads of the record's
+// slots (.minyar.record.get.checked); the owner keeps the record alive and
+// nothing can assign a field until every worker has joined.
+function parallelRecord(context: CompilerContext, type: Integer): Boolean {
+    if !parallelPlainRecord(context, type) { return false }
+    let visiting: List<Integer> = []
+    return parallelRecordAcyclic(context, type, visiting, 0)
+}
+
+// A record declared with `record`: not a choice, Result, callback or C layout.
+function parallelPlainRecord(context: CompilerContext, type: Integer): Boolean {
+    if !isRecordType(type) || isScalarChoiceType(type) || isCRecord(context, type) { return false }
+    let name = context.functionNames[recordTypeIndex(type)]
+    return !name.startsWith("#") && !resultTypeName(type, context.functionNames) && choiceCases(context, type).length == 0
+}
+
+// Records whose fields lead back to their own type would make the reachable
+// buffers (and the alias guards over them) unbounded.
+function parallelRecordAcyclic(context: CompilerContext, type: Integer, visiting: List<Integer>, depth: Integer): Boolean {
+    let seen = 0
+    while seen < depth {
+        if visiting[seen] == type { return false }
+        seen = seen + 1
+    }
+    if visiting.length == depth { visiting.add(type) } else { visiting[depth] = type }
+    let record = recordTypeIndex(type)
+    if record < 0 || record >= context.functionParameterCounts.length { return false }
+    let offset = functionParameterOffset(context.functionParameterCounts, record)
+    let field = 0
+    while field < context.functionParameterCounts[record] {
+        let fieldType = context.functionParameterTypes[offset + field]
+        if parallelPlainRecord(context, fieldType) && !parallelRecordAcyclic(context, fieldType, visiting, depth + 1) { return false }
+        field = field + 1
+    }
+    return true
+}
+
+// Follows `name.field.field` from a record-typed token: the token after the
+// chain, then the type there.
+function parallelFieldChain(context: CompilerContext, token: Integer, type: Integer): List<Integer> {
+    let texts = context.tokenTexts
+    let position = token + 1
+    let current = type
+    while parallelPlainRecord(context, current) && texts[position] == "." && context.tokenKinds[position + 1] == 1 && texts[position + 2] != "(" {
+        let field = findRecordField(context.functionParameterCounts, context.functionParameterNames, current, texts[position + 1])
+        if field < 0 { return [position, current] }
+        current = context.functionParameterTypes[field]
+        position = position + 2
+    }
+    return [position, current]
+}
+
+// How parallel code may use a record or one of its fields, from `start` to
+// the chain's end: "" when allowed, otherwise the correction to show.
+function parallelRecordUse(context: CompilerContext, start: Integer, end: Integer, type: Integer): Text {
+    let texts = context.tokenTexts
+    let next = texts[end]
+    let whole = (texts[start - 1] == "(" || texts[start - 1] == ",") && (next == "," || next == ")")
+    if parallelScalar(type) {
+        if isAssignmentOperator(next) { return "records are read-only here; compute the value into a window or the loop's own slot" }
+        return ""
+    }
+    if parallelBuffer(type) {
+        if next == "[" {
+            let depth = 1
+            let close = end
+            while close + 1 < texts.length && depth > 0 {
+                close = close + 1
+                if texts[close] == "[" || texts[close] == "(" { depth = depth + 1 }
+                if texts[close] == "]" || texts[close] == ")" { depth = depth - 1 }
+            }
+            if isAssignmentOperator(texts[close + 1]) { return "buffers inside records are read-only here; write a window instead" }
+            return ""
+        }
+        if next == "." && parallelViewReader(texts[end + 1]) { return "" }
+        if whole { return "" }
+        return "read a buffer field by index, .length or a get method, or pass it whole to a parallel function"
+    }
+    if parallelRecord(context, type) {
+        if whole { return "" }
+        if next == "." && texts[end + 2] == "(" { return "record methods are not parallel functions; read the fields instead" }
+        return "read the record's fields or pass it whole to a parallel function"
+    }
+    if parallelPlainRecord(context, type) { return "this record's fields lead back to its own type, so the buffers it can reach are unbounded" }
+    return "only Integer, Float, Boolean, Character, Bytes, scalar List and record fields can be read"
 }

@@ -116,13 +116,45 @@ let borrow = "parallel function total(values: List<Integer>): Integer { let sum 
 traps(compiler, "function gather(output: List<Integer>, input: List<Integer>) { parallel for index in 0..output.length { output[index] = total(input) } }\n" + borrow + "let values = [7, 11, 13, 17]\ngather(values, values)\n", "aliases a buffer written by parallel for")
 traps(compiler, "let output = Bytes(10003)\nlet alias = output\nparallel for index in 0..output.length { output[index] = alias.getInt32(0) % 256 }\n", "aliases a buffer written by parallel for")
 rejects(compiler, borrow + "let output = [0, 0]\nparallel for index in 0..2 { output[index] = total(output) }\n", "as a whole while writing it")
-rejects(compiler, "parallel function clear(values: Bytes) { values[0] = 1 }\nlet output = [0]\nparallel for index in 0..1 { output[index] = 0 }\n", "borrows 'values' read-only")
-rejects(compiler, "parallel function grow(values: List<Integer>) { values.add(1) }\nlet output = [0]\nparallel for index in 0..1 { output[index] = 0 }\n", "only indexing, .length and get methods")
+rejects(compiler, "parallel function clear(values: Bytes) { values[0] = 1 }\nlet input = Bytes(4)\nlet output = [0]\nparallel for index in 0..1 { clear(input); output[index] = 0 }\n", "'clear' writes its parameter 'values', so it needs this iteration's window")
+rejects(compiler, "parallel function grow(values: List<Integer>) { values.add(1) }\nlet output = [0]\nparallel for index in 0..1 { output[index] = 0 }\n", "only indexing, .length and get or set methods")
 rejects(compiler, "parallel function keep(values: Bytes): Integer { let copy = values; return 0 }\nlet output = [0]\nparallel for index in 0..1 { output[index] = 0 }\n", "pass it whole to another parallel function")
 rejects(compiler, "parallel function names(values: List<Text>): Integer { return values.length }\nlet output = [0]\nparallel for index in 0..1 { output[index] = 0 }\n", "may use only Integer")
-rejects(compiler, "let segments: List<Bytes> = [Bytes(4)]\nlet output = Bytes(1)\nparallel for index in 0..1 { output[index] = segments[0][index] }\n", "cannot also write Bytes")
+executes(compiler, "let segments: List<Bytes> = [Bytes(4), Bytes(4)]\nsegments[1][0] = 9\nlet output = Bytes(2)\nparallel for index in 0..2 { output[index] = segments[index][0] }\nprint(output[1])\n", "9\n")
+traps(compiler, "let output = Bytes(2)\nlet segments: List<Bytes> = [Bytes(4), output]\nparallel for index in 0..2 { output[index] = segments[index][0] }\n", "aliases a buffer written by parallel for")
 rejects(compiler, "let segments: List<Bytes> = [Bytes(4)]\nlet output = [0]\nparallel for index in 0..1 { let segment = segments[index]; output[index] = 0 }\n", "parallel for:")
 rejects(compiler, "let segments: List<Bytes> = [Bytes(4)]\nlet output = [0]\nparallel for index in 0..1 { segments[index][0] = 1; output[index] = 0 }\n", "parallel for:")
+// Per-iteration windows, writable window parameters and read-only records.
+executes(compiler, io.readTextFile("tests/parallel-for/windows.min"), "true\n72555\n8.46\n42547.0\n")
+let windowed = "let out = [0, 0, 0, 0, 0, 0, 0, 0]\nlet input = [1, 2, 3, 4, 5, 6, 7, 8]\nlet width = 2\nparallel function fill(slots: List<Integer>) { slots[0] = 1 }\nparallel function relay(values: List<Integer>) { fill(values) }\n"
+executes(compiler, windowed + "parallel for index in 0..4 { let mine = out.window(index, width); mine[0] = input[index]; mine[1] = mine.length; relay(out.window(index, width)) }\nprint(out[6]); print(out[7])\n", "1\n2\n")
+executes(compiler, windowed + "parallel for index in 0..4 { let mine = out.window(index, width); mine[1] = out.length }\nprint(out[7])\n", "8\n")
+rejects(compiler, windowed + "parallel for index in 0..4 { let mine = out.window(index, width); out[index] = 1 }\n", "'out' is divided into windows in this loop")
+rejects(compiler, windowed + "parallel for index in 0..4 { let mine = out.window(index, width); let value = out[index] }\n", "'out' is divided into windows in this loop")
+rejects(compiler, windowed + "parallel for index in 0..4 { let mine = out.window(index + 1, width) }\n", "the first window argument must be the loop index 'index'")
+rejects(compiler, windowed + "parallel for index in 0..4 { let size = 2; let mine = out.window(index, size) }\n", "a window width must be an Integer literal or a value from outside the loop")
+rejects(compiler, windowed + "parallel for index in 0..4 { let a = out.window(index, width); let b = out.window(index, 3) }\n", "every window of 'out' in one loop needs the same width")
+rejects(compiler, windowed + "parallel for index in 0..4 { out.window(index, width) }\n", "bind a window with let")
+rejects(compiler, windowed + "parallel for index in 0..4 { let a = out.window(index, width); let b = a }\n", "a window can be indexed, measured with .length")
+rejects(compiler, windowed + "parallel for index in 0..4 { let a = out.window(index, width); a.add(1) }\n", "a window can be indexed, measured with .length")
+rejects(compiler, windowed + "parallel for index in 0..4 { relay(input); out[index] = 0 }\n", "'relay' writes its parameter 'values', so it needs this iteration's window")
+rejects(compiler, windowed + "let mine = out.window(0, 2)\n", "window is available only inside a parallel for body")
+rejects(compiler, "let segments: List<Bytes> = [Bytes(4)]\nparallel for index in 0..1 { let mine = segments[index].window(index, 1) }\n", "a window divides a captured Bytes or List")
+traps(compiler, windowed + "parallel for index in 0..5 { let mine = out.window(index, width); mine[0] = 1 }\n", "parallel for window 4 of width 2 does not fit in a buffer of length 8")
+traps(compiler, windowed + "parallel for index in 0..4 { let mine = out.window(index, width); mine[2] = 1 }\n", "List position 2 is outside its length of 2")
+traps(compiler, windowed + "let alias = out\nparallel for index in 0..4 { let mine = out.window(index, width); mine[1] = alias[index] }\n", "aliases a buffer written by parallel for")
+traps(compiler, windowed + "let raw = Bytes(64)\nlet alias = raw\nparallel for index in 0..4 { let mine = raw.window(index, 16); mine.setInt64(0, alias[index]) }\n", "aliases a buffer written by parallel for")
+let boxed = "record Box { values: List<Integer>; data: Bytes; count: Integer; name: Text }\nlet box = Box { values: [1, 2, 3, 4], data: Bytes(32), count: 4, name: \"box\" }\nlet out = [0, 0, 0, 0]\n"
+executes(compiler, boxed + "parallel function peek(b: Box, at: Integer): Integer { return b.values[at] + b.data.getInt64(0) + b.count }\nparallel for index in 0..4 { out[index] = peek(box, index) + box.values[3 - index] }\nbox.values = [5, 6, 7, 8]\nparallel for index in 0..4 { out[index] += peek(box, index) }\nprint(out[0])\n", "18\n")
+rejects(compiler, boxed + "parallel function f(b: Box): Integer { b.count = 1; return 0 }\n", "reads record 'b' read-only; records are read-only here")
+rejects(compiler, boxed + "parallel function f(b: Box): Integer { b.values[0] = 1; return 0 }\n", "buffers inside records are read-only here")
+rejects(compiler, boxed + "parallel function f(b: Box): Integer { return b.name.length }\n", "only Integer, Float, Boolean, Character, Bytes, scalar List and record fields can be read")
+rejects(compiler, boxed + "parallel function f(b: Box): Integer { let v = b.values; return 0 }\n", "read a buffer field by index, .length or a get method")
+rejects(compiler, boxed + "parallel function g(v: List<Integer>) { v[0] = 1 }\nparallel function f(b: Box): Integer { g(b.values); return 0 }\nparallel for index in 0..4 { out[index] = f(box) }\n", "passes a buffer field of record 'b' to 'g', which writes its parameter 'v'")
+rejects(compiler, boxed + "parallel for index in 0..4 { box.count = index; out[index] = 0 }\n", "iterations would write shared 'box'")
+rejects(compiler, "record Node { value: Integer; next: Node }\nparallel function f(n: Node): Integer { return n.value }\n", "its record's fields lead back to their own type")
+traps(compiler, boxed + "box.values = out\nparallel for index in 0..4 { out[index] = box.values[3 - index] }\n", "aliases a buffer written by parallel for")
+traps(compiler, boxed + "let raw = Bytes(32)\nlet holder = Box { values: [0], data: raw, count: 0, name: \"\" }\nparallel for index in 0..4 { let mine = raw.window(index, 8); mine.setInt64(0, holder.data.getInt64(0)) }\n", "aliases a buffer written by parallel for")
 let views = "record Window native \"c_packed\" { data: Bytes[10003] }\nlet backing = Bytes(15003)\nlet first = cBytes(cView(Window, backing, 0))\nlet second = cBytes(cView(Window, backing, 5000))\n"
 for body in ["first[index] = 1; second[index] = 2", "first[index] = second[index]", "second[index] = first[index]"] {
     traps(compiler, views + "parallel for index in 0..10003 { " + body + " }\n", "overlap at different indices")
@@ -172,6 +204,10 @@ for signature in ["value: Integer): Integer", "value: Float): Integer", "value: 
 }
 rejects(compiler, "parallel function pow(value: Float): Float { native \"runtime\" }\nparallel for index in 0..1 {}\n", "needs two Float parameters and a Float result")
 rejects(compiler, "parallel function write() { native \"fail\" }\nparallel for index in 0..1 { write() }\n", "cannot use the runtime")
+// Records from another module, and fields that ordinary code reassigns, are read in place by parallel functions.
+let mapModule = compiler.directory + "/slots-map.min"
+io.writeTextFile(mapModule, "public record Slots { keys: List<Integer>; mask: Integer }\npublic record Holder { slots: Slots; count: Integer }\npublic function replace(holder: Holder) { holder.slots = Slots { keys: [5, 6, 7, 8], mask: 3 } }\n")
+executes(compiler, "use \"./slots-map.min\" as map\nparallel function find(slots: map.Slots, key: Integer): Integer { return slots.keys[key & slots.mask] }\nparallel function look(holder: map.Holder, key: Integer): Integer { return find(holder.slots, key) + holder.count }\nlet holder = map.Holder { slots: map.Slots { keys: [1, 2, 3, 4], mask: 3 }, count: 10 }\nlet out = [0, 0, 0, 0]\nparallel for index in 0..4 { out[index] = look(holder, index) }\nmap.replace(holder)\nparallel for index in 0..4 { out[index] += look(holder, index) }\nprint(out[3])\n", "32\n")
 if test.setting("MINYAR_PARALLEL_MODULES", "0") == "1" {
     let module = compiler.directory + "/cached-shade.min"
     let source = "use \"./cached-shade.min\" as shade\nlet output = [0]\nparallel for index in 0..1 { output[index] = shade.value(41) }\nprint(output[0])\n"

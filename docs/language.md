@@ -1732,9 +1732,51 @@ element can be one of its outputs. Passing a buffer the loop writes is rejected:
 other iterations could be changing it. `continue` skips one
 iteration; `break` is allowed only inside a nested ordinary loop.
 
-On macOS and Linux, a persistent thread pool distributes fixed chunks of 128
-indices. Idle workers steal chunks from other workers; the calling thread also
-works, and returns only after every worker has finished. Set
+When an iteration produces several values, give it a window: its own run of
+slots in an output buffer. `out.window(index, width)` is the `width` slots
+starting at `out[index * width]`:
+
+```minyar
+let segments: List<Bytes> = [Bytes(24), Bytes(24)]
+segments[1].setInt64(8, 42)
+let top = 3
+let scores: List<Integer> = []
+for slot in 0..segments.length * top { scores.add(0) }
+parallel for index in 0..segments.length {
+    let best = scores.window(index, top)
+    for k in 0..top { best[k] = segments[index].getInt64(k * 8) }
+}
+print(scores[4]) // 42
+```
+
+The first argument is the loop index itself, and the width is an Integer
+literal or a value from outside the loop; every window of one buffer in a loop
+uses the same width. Iterations therefore own disjoint slots, and taking a
+window checks once that it fits inside the buffer, with an overflow-checked
+`index * width`. A window can be bound with `let` or passed straight to a
+parallel function. It is indexed, read and written like the buffer, measured
+with `.length` (the width), used with Bytes `get` and `set` methods, or passed
+whole to a parallel function; its ordinary bounds checks keep every write inside
+it. A window cannot be stored, reassigned, resized or returned. The windowed
+buffer itself can only be measured with `.length` in that loop. A window of a
+second buffer serves as per-iteration scratch space: allocate
+`count * size` slots before the loop and take `scratch.window(index, size)`.
+Windows are not yet available in recoverable execution.
+
+A captured record is shared read-only: the body may read its Integer, Float,
+Boolean and Character fields, read its Bytes and scalar List fields by index,
+`.length` or get methods, follow fields of nested records, and pass the record
+or a buffer field whole to a parallel function. Assigning a field, Text and
+other managed fields, and records whose fields lead back to their own type are
+rejected. Buffers reachable through the record are checked before dispatch
+against every output of the same type, as are the Bytes elements of a captured
+`List<Bytes>` against Bytes outputs (one comparison per element).
+
+On macOS and Linux, a persistent thread pool distributes chunks of up to 128
+indices; short ranges use smaller chunks, down to one index, so a loop over a
+few long iterations still uses every worker. Idle workers steal chunks from
+other workers; the calling thread also works, and returns only after every
+worker has finished. Set
 `MINYAR_PARALLEL_THREADS` to 1–64 to choose the total number of participating
 threads; the default is the online processor count, capped at 64. Freestanding
 OS builds use the processor-entry scheduler after the processors are started.
@@ -1777,15 +1819,22 @@ A `parallel function` may run on several processors at once. The runtime's
 ownership tracking is single-threaded, so a parallel function stays outside it:
 its locals and results are `Integer`, `Float`, `Boolean` or `Character`, and it
 calls only other parallel functions, `machine` intrinsics and scalar functions
-declared `parallel`, including those in `math`. Parameters may also be `Bytes`
-or Lists of those scalars. The function borrows them read-only from a caller
-that keeps them alive: it may index them, read `.length`, call Bytes getters
-such as `getInt64` and `getUInt16`, or pass them whole to another parallel
-function. Writing, resizing, keeping a buffer in a local and returning it are
-rejected, and so are buffer parameters of native parallel functions. A
-function with buffer parameters cannot be started through `parallelEntry`,
-whose callers pass raw Integers. The compiler checks this and compiles the
-function with no call-depth or ownership frame.
+declared `parallel`, including those in `math`. Parameters may also be `Bytes`,
+Lists of those scalars or records. The function borrows them from a caller that
+keeps them alive: it may index buffers, read `.length`, call Bytes getters such
+as `getInt64` and `getUInt16`, read record fields as a safe loop body does, or
+pass them whole to another parallel function. A function may also write a
+buffer parameter, by index or with Bytes `set` methods; that parameter is then
+a window parameter, and so is a parameter it passes to one. Inside a
+`parallel for`, a window parameter must receive this iteration's window
+(`out.window(index, width)` or a window binding); any other buffer, including a
+buffer field of a record, is rejected there because other iterations may be
+reading it. Ordinary single-threaded code may pass any buffer. Resizing,
+keeping a buffer or record in a local, assigning record fields and returning a
+buffer are rejected, and so are buffer and record parameters of native parallel
+functions. A function with buffer or record parameters cannot be started
+through `parallelEntry`, whose callers pass raw Integers. The compiler checks
+this and compiles the function with no call-depth or ownership frame.
 
 ```minyar
 parallel function ones(postings: Bytes, first: Integer, words: Integer): Integer {

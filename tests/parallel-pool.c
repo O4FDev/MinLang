@@ -34,6 +34,16 @@ static void edge(long long first, long long after, void *argument) {
     atomic_fetch_add(&bounds->total, (uint64_t)after - (uint64_t)first);
 }
 
+/* A few long iterations (one per segment) must still spread over workers. */
+static _Atomic int short_foreign;
+static void short_range(long long first, long long after, void *argument) {
+    (void)argument;
+    assert(first < after);
+    struct timespec pause = { 0, 20000000 };
+    nanosleep(&pause, NULL);
+    if (!pthread_equal(owner, pthread_self())) atomic_store(&short_foreign, 1);
+}
+
 static void *independent_owner(void *argument) {
     (void)argument;
     int values[2003] = {0};
@@ -68,6 +78,8 @@ int main(void) {
     int requested = atoi(getenv("MINYAR_PARALLEL_THREADS"));
     assert(parallel_pool.count == (size_t)requested);
     assert(atomic_load(&foreign) == (requested > 1));
+    minyar_parallel_run(short_range, 0, 8, NULL);
+    assert(atomic_load(&short_foreign) == (requested > 1));
     assert(minyar_parallel_reduce(sum_indices, 0, 5003, NULL, 1, 5) == 12512508);
     assert(minyar_parallel_reduce(sum_indices, -1000, 1001, NULL, 1, 42) == 42);
     assert(minyar_parallel_reduce(sum_indices, 4, 1, NULL, 1, 42) == 42);

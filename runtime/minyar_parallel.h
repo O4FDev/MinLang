@@ -7,7 +7,7 @@ typedef void (*MinyarParallelEntry)(long long, long long, void *);
 void minyar_parallel_no_alias(const void *input, const void *output,
                               long long first, long long after) {
     if (first < after && input == output)
-        minyar_stop("a parallel input read at another index aliases a buffer written by parallel for; use a separate input buffer.");
+        minyar_stop("a parallel input read at another index or beside a window aliases a buffer written by parallel for; use a separate input buffer.");
 }
 
 void minyar_parallel_bytes_no_overlap(const MinyarText *left, const MinyarText *right,
@@ -23,19 +23,41 @@ void minyar_parallel_bytes_no_overlap(const MinyarText *left, const MinyarText *
     if (overlaps) {
         if (same_index)
             minyar_stop("parallel for buffers overlap at different indices; use separate Bytes storage or copy a view before writing.");
-        minyar_stop("a parallel input read at another index aliases a buffer written by parallel for; use a separate input buffer.");
+        minyar_stop("a parallel input read at another index or beside a window aliases a buffer written by parallel for; use a separate input buffer.");
     }
+}
+
+/* Bytes elements of a List<Bytes> that a loop reads must not overlap a Bytes
+ * output; the check costs one comparison per element. */
+void minyar_parallel_bytes_list_no_overlap(const MinyarList *list, const MinyarText *output,
+                                           long long first, long long after) {
+    if (first >= after) return;
+    for (long long index = 0; index < list->length; ++index)
+        minyar_parallel_bytes_no_overlap((const MinyarText *)(uintptr_t)list->values[index], output,
+                                         first, after, 0);
+}
+
+/* A window is iteration index's own `width` slots, starting at index * width. */
+void minyar_parallel_window_stop(long long index, long long width, long long length) {
+    char message[200];
+    if (width < 0)
+        snprintf(message, sizeof(message), "a parallel for window cannot have the negative width %lld.", width);
+    else
+        snprintf(message, sizeof(message),
+                 "parallel for window %lld of width %lld does not fit in a buffer of length %lld; give the buffer one window per iteration.",
+                 index, width, length);
+    minyar_stop(message);
 }
 
 #define MINYAR_PARALLEL_LIMIT 64
 #define MINYAR_PARALLEL_GRAIN 128
 
 static void parallel_chunk(MinyarParallelEntry entry, void *environment,
-                           long long first, long long after, uint64_t chunk) {
+                           long long first, long long after, uint64_t chunk, uint64_t grain) {
     uint64_t distance = (uint64_t)after - (uint64_t)first;
-    uint64_t offset = chunk * MINYAR_PARALLEL_GRAIN;
+    uint64_t offset = chunk * grain;
     uint64_t count = distance - offset;
-    if (count > MINYAR_PARALLEL_GRAIN) count = MINYAR_PARALLEL_GRAIN;
+    if (count > grain) count = grain;
     entry((long long)((uint64_t)first + offset),
           (long long)((uint64_t)first + offset + count), environment);
 }
@@ -43,16 +65,15 @@ static void parallel_chunk(MinyarParallelEntry entry, void *environment,
 #include "minyar_parallel_backend.h"
 
 static void parallel_serial(MinyarParallelEntry entry, long long first,
-                            long long after, void *environment) {
+                            long long after, void *environment, uint64_t grain) {
     uint64_t distance = (uint64_t)after - (uint64_t)first;
-    uint64_t chunks = distance / MINYAR_PARALLEL_GRAIN +
-                      (distance % MINYAR_PARALLEL_GRAIN != 0);
+    uint64_t chunks = distance / grain + (distance % grain != 0);
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(MINYAR_FREESTANDING)
     int previous = minyar_parallel_active;
     minyar_parallel_active = 1;
 #endif
     for (uint64_t chunk = 0; chunk < chunks; ++chunk)
-        parallel_chunk(entry, environment, first, after, chunk);
+        parallel_chunk(entry, environment, first, after, chunk, grain);
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(MINYAR_FREESTANDING)
     minyar_parallel_active = previous;
 #endif
@@ -82,6 +103,7 @@ typedef struct {
     void *environment;
     long long first;
     long long after;
+    uint64_t grain;
 } MinyarParallelPool;
 
 static MinyarParallelPool parallel_pool = {
@@ -102,7 +124,7 @@ static void parallel_work(size_t own) {
         MinyarParallelLane *lane = &pool->lanes[victim];
         uint64_t chunk = atomic_fetch_add_explicit(&lane->next, 1, memory_order_relaxed);
         while (chunk < lane->after) {
-            parallel_chunk(pool->entry, pool->environment, pool->first, pool->after, chunk);
+            parallel_chunk(pool->entry, pool->environment, pool->first, pool->after, chunk, pool->grain);
             chunk = atomic_fetch_add_explicit(&lane->next, 1, memory_order_relaxed);
         }
     }
@@ -168,20 +190,29 @@ static void parallel_initialize(void) {
 }
 #endif
 
-void minyar_parallel_run(MinyarParallelEntry entry, long long first,
-                         long long after, void *environment) {
+/* Reductions keep 128-index chunks so Float grouping is independent of the
+ * thread count. Other loops shrink chunks for short ranges, down to one index,
+ * so a few long iterations (one per segment, say) still use every worker. */
+static void parallel_run_grain(MinyarParallelEntry entry, long long first,
+                               long long after, void *environment, int fixed) {
     if (first >= after) return;
     if (parallel_backend_run(entry, first, after, environment)) return;
 #if (defined(__APPLE__) || defined(__linux__)) && !defined(MINYAR_FREESTANDING)
     pthread_once(&parallel_once, parallel_initialize);
     MinyarParallelPool *pool = &parallel_pool;
-    if (pool->count == 1) { parallel_serial(entry, first, after, environment); return; }
     uint64_t distance = (uint64_t)after - (uint64_t)first;
-    uint64_t chunks = distance / MINYAR_PARALLEL_GRAIN +
-                      (distance % MINYAR_PARALLEL_GRAIN != 0);
-    if (chunks == 1) { parallel_serial(entry, first, after, environment); return; }
+    uint64_t grain = MINYAR_PARALLEL_GRAIN;
+    if (!fixed) {
+        grain = distance / ((uint64_t)pool->count * 4);
+        if (grain < 1) grain = 1;
+        if (grain > MINYAR_PARALLEL_GRAIN) grain = MINYAR_PARALLEL_GRAIN;
+    }
+    if (pool->count == 1) { parallel_serial(entry, first, after, environment, grain); return; }
+    uint64_t chunks = distance / grain + (distance % grain != 0);
+    if (chunks == 1) { parallel_serial(entry, first, after, environment, grain); return; }
     pthread_mutex_lock(&pool->admission);
     pthread_mutex_lock(&pool->mutex);
+    pool->grain = grain;
     pool->entry = entry;
     pool->environment = environment;
     pool->first = first;
@@ -208,8 +239,14 @@ void minyar_parallel_run(MinyarParallelEntry entry, long long first,
     pthread_mutex_unlock(&pool->mutex);
     pthread_mutex_unlock(&pool->admission);
 #else
-    parallel_serial(entry, first, after, environment);
+    (void)fixed;
+    parallel_serial(entry, first, after, environment, MINYAR_PARALLEL_GRAIN);
 #endif
+}
+
+void minyar_parallel_run(MinyarParallelEntry entry, long long first,
+                         long long after, void *environment) {
+    parallel_run_grain(entry, first, after, environment, 0);
 }
 
 typedef long long (*MinyarParallelReduceEntry)(long long, long long, void *);
@@ -238,7 +275,7 @@ long long minyar_parallel_reduce(MinyarParallelReduceEntry entry, long long firs
      * Each worker writes only the scalar word for its unique chunk. */
     long long *partials = data_allocate((size_t)chunks * sizeof(*partials), sizeof(*partials));
     MinyarParallelReduction job = { entry, environment, first, partials };
-    minyar_parallel_run(parallel_reduce_chunk, first, after, &job);
+    parallel_run_grain(parallel_reduce_chunk, first, after, &job, 1);
     long long result = initial;
     if (type == 1) {
         for (uint64_t chunk = 0; chunk < chunks; ++chunk) {

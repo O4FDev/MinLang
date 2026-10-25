@@ -26,7 +26,8 @@ static void parallel_dispatch(long long item, long long argument) {
                       (distance % MINYAR_PARALLEL_GRAIN != 0);
     if (item < 0 || (uint64_t)item >= chunks)
         minyar_stop("the native parallel scheduler supplied an invalid chunk.");
-    parallel_chunk(job->entry, job->environment, job->first, job->after, (uint64_t)item);
+    parallel_chunk(job->entry, job->environment, job->first, job->after, (uint64_t)item,
+                   MINYAR_PARALLEL_GRAIN);
 #if defined(__APPLE__) || defined(__linux__)
     minyar_parallel_active = previous;
 #endif

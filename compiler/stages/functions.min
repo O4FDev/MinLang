@@ -381,6 +381,7 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
         globals.add("; minyar-machine: " + name + "\n")
     }
     let parallel = findText(globals, "; minyar-parallel: " + name + "\n") >= 0
+    context.parallelFunction = parallel
     state[1] = 0
     state[2] = 0
     state[3] = 0
@@ -511,12 +512,16 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
         let parallelReferences = state[6] == 1 || isReferenceType(returnType)
         let parallelParameter = 0
         while parallelParameter < parameterNames.length {
-            // Scalar buffers are read-only views of a Minyar body; native code could keep or change them.
-            if isReferenceType(parameterTypes[parallelParameter]) && (nativeBody || !parallelBuffer(parameterTypes[parallelParameter])) { parallelReferences = true }
-            if parallelBuffer(parameterTypes[parallelParameter]) && findText(globals, "; minyar-parallel-views: " + name + "\n") < 0 { globals.add("; minyar-parallel-views: " + name + "\n") }
+            // Buffers and records are borrowed by a Minyar body; native code could keep or change them.
+            let parallelView = parallelBuffer(parameterTypes[parallelParameter]) || parallelRecord(context, parameterTypes[parallelParameter])
+            if isReferenceType(parameterTypes[parallelParameter]) && (nativeBody || !parallelView) { parallelReferences = true }
+            if !nativeBody && parallelPlainRecord(context, parameterTypes[parallelParameter]) && !parallelView {
+                failAtToken(tokenLines, bodyStart, "parallel function '" + readableDeclarationName(name) + "' cannot borrow '" + parameterNames[parallelParameter] + "': its record's fields lead back to their own type, so the buffers it reaches are unbounded")
+            }
+            if parallelView && findText(globals, "; minyar-parallel-views: " + name + "\n") < 0 { globals.add("; minyar-parallel-views: " + name + "\n") }
             parallelParameter = parallelParameter + 1
         }
-        checkParallelViews(context, bodyStart, state[0], parameterNames, parameterTypes, name)
+        checkParallelViews(context, globals, bodyStart, state[0], parameterNames, parameterTypes, name)
         finishParallelFunction(output, globals, entrySlot, bodySlot, name, parallelReferences, recoveryEnabled(state))
         recordRuntimeTrace(context, ".minyar.thread.bridge." + name, traceReadableName(context.traces, name, sourceSpan(tokenLines, tokenLines.inputPath, debugOrigin + 1, debugOrigin + 2)), debugOrigin + 1, false)
     }
@@ -543,6 +548,7 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
         treeSlots.add(output.length)
     }
     endSyntaxNode(context.syntax, syntaxFunction, state[0], returnType)
+    context.parallelFunction = false
     output.add("}\n\n")
 }
 
