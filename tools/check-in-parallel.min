@@ -1,0 +1,111 @@
+use "io" as io
+use "process" as processInfo
+use "system" as system
+use "files" as files
+use "json" as json
+use "text" as text
+use "errors" as errors
+use "./testing.min" as test
+use "./check-runner.min" as runner
+
+// Runs Make check targets through the shared check runner. Shared file prerequisites build once first;
+// then every phony check and phony prerequisite runs as its own `make -j1` process, longest known first.
+// The aggregate passes exactly when `make -k <targets>` would. Results and per-check wall/CPU times are
+// retained under build/check-in-parallel; durations also feed the next run's ordering.
+function number(value: Text): Integer {
+    let parsed = text.parseInteger(value)
+    test.check(errors.integerOk(parsed), "expected an integer: " + value)
+    return errors.integerValue(parsed)
+}
+function padded(value: Text, width: Integer): Text {
+    let result = value
+    while result.length < width { result = " " + result }
+    return result
+}
+
+let jobs = 8
+let timeout = 1800
+let retries = 0
+let targets: List<Text> = []
+let index = 0
+while index < processInfo.argumentCount() {
+    let option = processInfo.argument(index)
+    if option == "--jobs" || option == "--timeout" || option == "--retries" {
+        test.check(index + 1 < processInfo.argumentCount(), "option requires a value: " + option)
+        let value = number(processInfo.argument(index + 1))
+        if option == "--jobs" { jobs = value }
+        else if option == "--timeout" { timeout = value }
+        else { retries = value }
+        index += 2
+        continue
+    }
+    test.check(!runner.begins(option, "-"), "unknown option: " + option)
+    targets.add(option)
+    index += 1
+}
+test.check(targets.length > 0, "usage: check-in-parallel [--jobs N] [--timeout SECONDS] [--retries N] TARGET...")
+let root = test.resolvePath(".")
+let environment: List<Text> = []
+for entry in system.environment() {
+    if !entry.startsWith("MAKEFLAGS=") && !entry.startsWith("MFLAGS=") && !entry.startsWith("MAKELEVEL=") { environment.add(entry) }
+}
+// As in CI: the runner owns concurrency, so harnesses neither fan out nor pause themselves for host load.
+environment = runner.environment(environment, "MINYAR_TEST_JOBS", "1")
+environment = runner.environment(environment, "MINYAR_TEST_SHARED_HOST", "1")
+environment = runner.environment(environment, "DEBUGINFOD_URLS", "")
+let plan = runner.plan(jobs, timeout, retries)
+plan.elastic = true
+let main = runner.addVariant(plan, "", root, environment, ["make", "-j1"])
+for target in targets { runner.addCheck(plan, main, target) }
+let output = root + "/build/check-in-parallel"
+test.check(files.makeDirectory(output) == 0, "cannot create check results directory")
+let retained = output + "/run-" + Text(system.monotonicNanoseconds())
+test.require(test.run(["mv", "--", plan.scratch, retained], environment, root, output + "/move-run", 10), "retain check logs")
+plan.scratch = retained
+let history = root + "/build/tooling/check-durations"
+runner.prioritize(plan, history)
+print("Parallel checks: " + Text(plan.checks.length) + " checks, " + Text(plan.goals.length) + " shared builds, jobs=" + Text(jobs) + "; logs: " + retained)
+let started = system.monotonicNanoseconds()
+let passed = runner.run(plan)
+let elapsed = (system.monotonicNanoseconds() - started) / 1000000
+runner.remember(plan, history)
+
+let order: List<Integer> = []
+for position in 0..plan.checks.length { order.add(position) }
+for first in 0..order.length {
+    let best = first
+    let next = first + 1
+    for other in next..order.length { if plan.checks[order[other]].wall > plan.checks[order[best]].wall { best = other } }
+    let swap = order[first]; order[first] = order[best]; order[best] = swap
+}
+let rows = ""
+let table = "target\twall_ms\tcpu_ms\tpassed\n"
+let failed: List<Text> = []
+let busy = 0
+for position in order {
+    let check = plan.checks[position]
+    if rows != "" { rows += ", " }
+    rows += "{\"target\": " + json.quote(check.label) + ", \"passed\": " + Text(check.state == 2) + ", \"wall_ms\": " + Text(check.wall) +
+        ", \"cpu_ms\": " + Text(check.cpu) + ", \"log\": " + json.quote(check.log) + "}"
+    table += check.label + "\t" + Text(check.wall) + "\t" + Text(check.cpu) + "\t" + Text(check.state == 2) + "\n"
+    if check.state != 2 { failed.add(check.label) }
+    busy += check.wall
+}
+io.writeTextFile(retained + "/results.json", "{\"passed\": " + Text(passed) + ", \"wall_ms\": " + Text(elapsed) + ", \"checks\": [" + rows + "]}\n")
+io.writeTextFile(retained + "/times.tsv", table)
+print("Slowest checks (wall ms, cpu ms):")
+let shown = 0
+for position in order {
+    if shown == 15 { break }
+    let check = plan.checks[position]
+    print(padded(Text(check.wall), 9) + " " + padded(Text(check.cpu), 9) + "  " + check.label)
+    shown += 1
+}
+print("Sum of check wall time " + Text(busy / 1000) + " s; elapsed " + Text(elapsed / 1000) + " s; table: " + retained + "/times.tsv")
+if passed {
+    print("Parallel checks passed")
+    exit(0)
+}
+for label in failed { print("Failed check: " + label) }
+print("Parallel checks failed: " + Text(failed.length) + " of " + Text(plan.checks.length))
+exit(1)

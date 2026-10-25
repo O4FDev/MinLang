@@ -34,6 +34,18 @@ Checks reuse the working tree's warm build and retain the existing commit-check
 logs and JSON results. `make check-changed-inputs` tests Git/input handling
 without compiling the language; `make check-check-selection` tests the policy.
 
+The top-level Makefile is `.NOTPARALLEL`, so `make -j8 check-portable` still runs
+one check at a time (about 48 minutes on an 8-vCPU Linux box). `make check-in-parallel`
+runs the same checks through the shared check runner: shared file prerequisites
+build once, then every phony check runs as its own `make -j1` process, longest
+known first (`CHECK_JOBS`, default 8). It passes exactly when every check passes,
+prints the slowest checks and keeps per-check logs, wall and CPU times under
+`build/check-in-parallel`. `CHECKS` selects other aggregates or a list of targets,
+for example `make check-in-parallel CHECKS="check-portable check-suite-catalogue"`.
+As in CI, harnesses do not add their own parallelism or pause for host load.
+Checks must not rebuild shared artefacts with a different toolchain: a launcher
+test that needs another Clang identity uses a private copy of the tree.
+
 `make check-foundations-proofs` selects the Lean version pinned by
 `proofs/lean-toolchain`, builds the ownership and effect semantics, checks the
 required soundness theorem signatures, and audits every project declaration for

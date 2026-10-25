@@ -99,3 +99,11 @@ build/tooling/tests/mutation-score build/tooling/tests/mutation-score-harness: b
 
 build/tooling/tests/maps-baseline: build/tooling/tests/maps-baseline.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c tests/maps-baseline-runtime.c
 	"$(LLVM_CC)" $(LLVM_FLAGS) $(shell pkg-config --cflags libcrypto) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) runtime/native/sha256.c tests/maps-baseline-runtime.c -pthread -lm $(shell pkg-config --libs libcrypto) -o $@
+
+# Runs CHECKS (default check-portable) through the shared check runner: shared
+# builds first, then each phony check as its own `make -j1` process.
+CHECKS ?= check-portable
+CHECK_JOBS ?= 8
+.PHONY: check-in-parallel
+check-in-parallel: build/tooling/tools/check-in-parallel
+	./build/tooling/tools/check-in-parallel --jobs $(CHECK_JOBS) $(CHECKS)
