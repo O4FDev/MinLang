@@ -473,7 +473,7 @@ check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-
 
 .PHONY: check-incremental-module-mutation
 check-incremental-module-mutation: build/minyarc-modules build/module-compiler.min build/minyarc build/minyar-compiler-runtime.ll build/tooling/tests/incremental-module-mutation
-	$(LIMITED) ./build/tooling/tests/incremental-module-mutation
+	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS="$(COMPILER_LTO_FLAGS)" $(LIMITED) ./build/tooling/tests/incremental-module-mutation
 
 .PHONY: check-toolchain-stamp check-toolchain-portability check-fuzz-harness check-coverage-harness check-runtime-bytes check-runtime-bytes-sanitize check-compiler-hardening check-incremental-language-hardening check-module-driver-options check-native-graphics
 TOOLCHAIN_TEST_TOOLS = build/tooling/tests/toolchain-stamp build/tooling/tests/toolchain-portability build/tooling/tests/native-object-cache
