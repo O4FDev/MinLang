@@ -505,8 +505,8 @@ pending and the frame holds no temporaries, its service points would do nothing,
 so the remaining iterations run as one inner loop without them, letting LLVM
 hoist loop-invariant List and record loads. Otherwise each iteration is serviced
 as before, and the loop re-asks after each service. A `while` loop counts its
-iterations in a local for this; a `continue` that services cleanup keeps the
-loop unversioned. The eager cycle collector is never idle.
+iterations in a local for this; its `continue` paths share the loop's one
+back-edge service point. The eager cycle collector is never idle.
 
 Compiler-arena builds retain storage until process exit and compile away ownership
 hooks. Their short-slice cache can evict an entry without invalidating aliases
