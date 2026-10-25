@@ -151,13 +151,17 @@ never reaches or labels.
 `tests/neodb-sim` is such a project for the pinned production neo-db engine.
 Each universe runs random autocommit statements, acknowledging each only once
 its commit is durable, leaves one statement in flight, crashes keeping a random
-prefix of the WAL, and checks the recovered rows against the acknowledged
+prefix of every file, and checks the recovered rows against the acknowledged
 history. `minyar sim --manifest-path tests/neodb-sim durable --seeds 5000 --jobs 4`
 passed 5,000 universes in 243 ms on a 4-vCPU Linux box; the planted `early-ack`
 scenario, which acknowledges before durability, fails most seeds with an exact
 replay. `two-crashes` adds random checkpoints and a second power loss after
 recovery, and tears every file in 512-byte sectors with `persistSectors`;
-100,000 such universes passed in 11 s on 4 processes.
+`transactions` also groups two to four statements in BEGIN/COMMIT, which must
+recover all or nothing. Before each crash the live engine must hold the
+acknowledged state, with or without the in-flight unit, and recovery is
+compared row count and weight for every id. 100,000 `transactions` universes
+passed in 17 s on 4 processes.
 
 ## A disk with explicit durability
 

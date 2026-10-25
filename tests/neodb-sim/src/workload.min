@@ -18,12 +18,6 @@ function copyRows(rows: Rows): Rows {
     return result
 }
 
-function total(rows: Rows): Integer {
-    let sum = 0
-    for value in rows.values { sum += value }
-    return sum
-}
-
 // Apply one statement to the model and return its SQL.
 function statement(world: simulation.World, rows: Rows, serial: Integer): Text {
     let id = 1 + simulation.choose(world, 6)
@@ -97,9 +91,6 @@ function open(): engine.Engine {
 
 record Round { problem: Text; acknowledged: Rows; inFlight: Text }
 
-// Statements, one in flight, and a crash, on top of `rows`, the state the
-// engine holds now. Afterwards `rows` includes the in-flight statement and the
-// result's `acknowledged` does not.
 // A checkpoint publishes a snapshot and lets the WAL restart in a new segment.
 function checkpoint(e: engine.Engine, session: engine.Session, world: simulation.World): Text {
     let requested = engine.simpleQuery(e, session, "CHECKPOINT")
@@ -113,21 +104,63 @@ function checkpoint(e: engine.Engine, session: engine.Session, world: simulation
     return ""
 }
 
-function round(world: simulation.World, e: engine.Engine, rows: Rows, earlyAck: Boolean, sectors: Boolean, checkpoints: Boolean): Round {
+// What one universe exercises.
+public record Mix { earlyAck: Boolean; crashes: Integer; sectors: Boolean; checkpoints: Boolean; transactions: Boolean }
+
+record Unit { text: Text; problem: Text }
+
+// One autocommit statement or, with transactions, sometimes BEGIN, two to four
+// statements and COMMIT. `rows` changes only if the unit commits; the COMMIT
+// waits for durability when `wait` is set.
+function unit(world: simulation.World, e: engine.Engine, session: engine.Session, rows: Rows, mix: Mix, wait: Boolean): Unit {
+    if !mix.transactions || simulation.choose(world, 3) != 0 {
+        let text = statement(world, rows, 0)
+        return Unit { text: text; problem: execute(e, session, world, text, wait) }
+    }
+    let staged = copyRows(rows)
+    let parts: List<Text> = ["BEGIN"]
+    let problem = execute(e, session, world, "BEGIN", false)
+    for index in 0..2 + simulation.choose(world, 3) {
+        if problem == "" {
+            let text = statement(world, staged, index)
+            parts.add(text)
+            problem = execute(e, session, world, text, false)
+        }
+    }
+    parts.add("COMMIT")
+    if problem == "" { problem = execute(e, session, world, "COMMIT", wait) }
+    rows.ids = staged.ids
+    rows.values = staged.values
+    simulation.reached(world, "transaction committed")
+    let text = ""
+    for index in 0..parts.length {
+        if index > 0 { text += "; " }
+        text += parts[index]
+    }
+    return Unit { text: text; problem: problem }
+}
+
+// Units, one in flight, and a crash, on top of `rows`, the state the engine
+// holds now. Afterwards `rows` includes the in-flight unit and the result's
+// `acknowledged` does not.
+function round(world: simulation.World, e: engine.Engine, rows: Rows, mix: Mix): Round {
     let session = engine.newSession(e, "sim", "sim")
     for serial in 0..1 + simulation.choose(world, 12) {
-        if checkpoints && simulation.choose(world, 8) == 0 {
+        if mix.checkpoints && simulation.choose(world, 8) == 0 {
             let problem = checkpoint(e, session, world)
             if problem != "" { return Round { problem: problem; acknowledged: rows; inFlight: "" } }
         }
-        let text = statement(world, rows, serial)
-        let problem = execute(e, session, world, text, !earlyAck)
-        if problem != "" { return Round { problem: problem; acknowledged: rows; inFlight: "" } }
+        let done = unit(world, e, session, rows, mix, !mix.earlyAck)
+        if done.problem != "" { return Round { problem: done.problem; acknowledged: rows; inFlight: "" } }
     }
     let acknowledged = copyRows(rows)
-    let inFlight = statement(world, rows, 99)
-    let issued = execute(e, session, world, inFlight, false)
-    if issued != "" { return Round { problem: issued; acknowledged: acknowledged; inFlight: inFlight } }
+    let flying = unit(world, e, session, rows, mix, false)
+    let inFlight = flying.text
+    if flying.problem != "" { return Round { problem: flying.problem; acknowledged: acknowledged; inFlight: inFlight } }
+    // Before the crash the engine holds the acknowledged state, with or without
+    // the in-flight unit: a commit becomes visible once it is durable.
+    let live = compare(e, acknowledged, rows, inFlight)
+    if live != "before" && live != "after" { return Round { problem: "before the crash, the live engine holds " + live; acknowledged: acknowledged; inFlight: inFlight } }
     // Let the in-flight write and sync complete partly, fully or not at all.
     engine.afterLoopIteration(e)
     for step in 0..simulation.choose(world, simulation.pendingCount(world) + 1) {
@@ -136,7 +169,7 @@ function round(world: simulation.World, e: engine.Engine, rows: Rows, earlyAck: 
     // The power loss reaches every file: WAL segments, snapshots and manifests.
     for name in simulation.names(world, "/db") {
         let file = simulation.openFile(world, "/db/" + name, false)
-        if file > 0 && sectors {
+        if file > 0 && mix.sectors {
             simulation.persistSectors(world, file, 512)
         } else if file > 0 {
             let size = simulation.size(world, file)
@@ -149,22 +182,43 @@ function round(world: simulation.World, e: engine.Engine, rows: Rows, earlyAck: 
     return Round { problem: ""; acknowledged: acknowledged; inFlight: inFlight }
 }
 
-// "before" or "after" the in-flight statement, or a description of the loss.
-function compare(recovered: engine.Engine, before: Rows, after: Rows, inFlight: Text): Text {
-    let reader = engine.newSession(recovered, "sim", "sim")
-    let count = scalar(recovered, reader, "SELECT count(*) FROM cargo")
-    let sum = scalar(recovered, reader, "SELECT sum(weight) FROM cargo")
-    if count == before.ids.length && sum == total(before) { return "before" }
-    if count == after.ids.length && sum == total(after) { return "after" }
-    return "recovered " + Text(count) + " rows weighing " + Text(sum) + "; acknowledged " + Text(before.ids.length) + " rows weighing " + Text(total(before)) + ", in-flight " + inFlight
+// Rows and total weight for each id 0..6, the shape compare() checks.
+function modelShape(rows: Rows): Text {
+    let parts: List<Text> = []
+    for id in 0..7 {
+        let count = 0
+        let weight = 0
+        for index in 0..rows.ids.length { if rows.ids[index] == id { count += 1; weight += rows.values[index] } }
+        parts.add(Text(id) + ":" + Text(count) + "/" + Text(weight) + " ")
+    }
+    return joinText(parts)
 }
 
-// `earlyAck` is the planted mistake: statements count as acknowledged before
-// their commit is durable. Each universe survives `crashes` power losses,
-// which keep either a WAL prefix or, with `sectors`, any subset of its
-// unsynced 512-byte sectors and either file length.
-public deterministic function run(world: simulation.World, earlyAck: Boolean, crashes: Integer, sectors: Boolean): Text {
-    let checkpoints = crashes > 1
+function engineShape(e: engine.Engine, reader: engine.Session): Text {
+    let parts: List<Text> = []
+    for id in 0..7 {
+        let count = scalar(e, reader, "SELECT count(*) FROM cargo WHERE id = " + Text(id))
+        let weight = 0
+        if count != 0 { weight = scalar(e, reader, "SELECT sum(weight) FROM cargo WHERE id = " + Text(id)) }
+        parts.add(Text(id) + ":" + Text(count) + "/" + Text(weight) + " ")
+    }
+    return joinText(parts)
+}
+
+// "before" or "after" the in-flight unit, or a description of the difference.
+// Per-id counts and weights tell apart states whose totals happen to match.
+function compare(recovered: engine.Engine, before: Rows, after: Rows, inFlight: Text): Text {
+    let shape = engineShape(recovered, engine.newSession(recovered, "sim", "sim"))
+    if shape == modelShape(before) { return "before" }
+    if shape == modelShape(after) { return "after" }
+    return "id:rows/weight " + shape + "instead of " + modelShape(before) + "(in-flight " + inFlight + ")"
+}
+
+// `mix.earlyAck` is the planted mistake: units count as acknowledged before
+// their commit is durable. Each universe survives `mix.crashes` power losses,
+// which keep a random prefix of every file or, with `mix.sectors`, any subset
+// of its unsynced 512-byte sectors and either file length.
+public deterministic function run(world: simulation.World, mix: Mix): Text {
     dbio.bind(world)
     let e = open()
     let session = engine.newSession(e, "sim", "sim")
@@ -172,8 +226,8 @@ public deterministic function run(world: simulation.World, earlyAck: Boolean, cr
     if problem == "" { problem = execute(e, session, world, "INSERT INTO cargo VALUES (0, 0)", true) }
     if problem != "" { return problem }
     let rows = Rows { ids: [0]; values: [0] }
-    for crash in 0..crashes {
-        let result = round(world, e, rows, earlyAck, sectors, checkpoints)
+    for crash in 0..mix.crashes {
+        let result = round(world, e, rows, mix)
         if result.problem != "" { return result.problem }
         e = open()
         let outcome = compare(e, result.acknowledged, rows, result.inFlight)
@@ -181,7 +235,7 @@ public deterministic function run(world: simulation.World, earlyAck: Boolean, cr
             rows.ids = result.acknowledged.ids
             rows.values = result.acknowledged.values
         } else if outcome == "after" {
-            simulation.reached(world, "in-flight statement survived")
+            simulation.reached(world, "in-flight unit survived")
         } else {
             return "after crash " + Text(crash + 1) + ": " + outcome
         }
