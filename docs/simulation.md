@@ -166,7 +166,8 @@ recovery, and tears every file in 512-byte sectors with `persistSectors`;
 recover all or nothing. Before each crash the live engine must hold the
 acknowledged state, with or without the in-flight unit, and recovery is
 compared row count and weight for every id. 100,000 `transactions` universes
-passed in 17 s on 4 processes.
+passed in 17 s on 4 processes. In `group-commit`, up to three sessions each
+leave a commit in flight; recovery must keep a prefix of them in commit order.
 
 ## A disk with explicit durability
 

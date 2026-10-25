@@ -19,8 +19,8 @@ function copyRows(rows: Rows): Rows {
 }
 
 // Apply one statement to the model and return its SQL.
-function statement(world: simulation.World, rows: Rows, serial: Integer): Text {
-    let id = 1 + simulation.choose(world, 6)
+function statement(world: simulation.World, rows: Rows, base: Integer): Text {
+    let id = base + 1 + simulation.choose(world, 6)
     let kind = simulation.choose(world, 3)
     if kind == 0 || rows.ids.length < 2 {
         let value = simulation.choose(world, 1000)
@@ -89,7 +89,8 @@ function open(): engine.Engine {
     return engine.openWithOptions("/db", engine.Options { checkpointWalBytes: 1073741824; checkpointIntervalMs: 0; noPrealloc: true })
 }
 
-record Round { problem: Text; acknowledged: Rows; inFlight: Text }
+// `states[k]` is the state with the first k in-flight commits applied.
+record Round { problem: Text; states: List<Rows>; inFlight: Text }
 
 // A checkpoint publishes a snapshot and lets the WAL restart in a new segment.
 function checkpoint(e: engine.Engine, session: engine.Session, world: simulation.World): Text {
@@ -105,16 +106,16 @@ function checkpoint(e: engine.Engine, session: engine.Session, world: simulation
 }
 
 // What one universe exercises.
-public record Mix { earlyAck: Boolean; crashes: Integer; sectors: Boolean; checkpoints: Boolean; transactions: Boolean }
+public record Mix { earlyAck: Boolean; crashes: Integer; sectors: Boolean; checkpoints: Boolean; transactions: Boolean; sessions: Integer }
 
 record Unit { text: Text; problem: Text }
 
 // One autocommit statement or, with transactions, sometimes BEGIN, two to four
 // statements and COMMIT. `rows` changes only if the unit commits; the COMMIT
 // waits for durability when `wait` is set.
-function unit(world: simulation.World, e: engine.Engine, session: engine.Session, rows: Rows, mix: Mix, wait: Boolean): Unit {
+function unit(world: simulation.World, e: engine.Engine, session: engine.Session, rows: Rows, mix: Mix, wait: Boolean, base: Integer): Unit {
     if !mix.transactions || simulation.choose(world, 3) != 0 {
-        let text = statement(world, rows, 0)
+        let text = statement(world, rows, base)
         return Unit { text: text; problem: execute(e, session, world, text, wait) }
     }
     let staged = copyRows(rows)
@@ -122,7 +123,7 @@ function unit(world: simulation.World, e: engine.Engine, session: engine.Session
     let problem = execute(e, session, world, "BEGIN", false)
     for index in 0..2 + simulation.choose(world, 3) {
         if problem == "" {
-            let text = statement(world, staged, index)
+            let text = statement(world, staged, base)
             parts.add(text)
             problem = execute(e, session, world, text, false)
         }
@@ -140,27 +141,37 @@ function unit(world: simulation.World, e: engine.Engine, session: engine.Session
     return Unit { text: text; problem: problem }
 }
 
-// Units, one in flight, and a crash, on top of `rows`, the state the engine
-// holds now. Afterwards `rows` includes the in-flight unit and the result's
-// `acknowledged` does not.
+// Acknowledged units, in-flight units from one or more sessions, and a crash,
+// on top of `rows`, the state the engine holds now. Afterwards `rows` includes
+// every in-flight unit and the result lists the states in commit order.
 function round(world: simulation.World, e: engine.Engine, rows: Rows, mix: Mix): Round {
     let session = engine.newSession(e, "sim", "sim")
     for serial in 0..1 + simulation.choose(world, 12) {
         if mix.checkpoints && simulation.choose(world, 8) == 0 {
             let problem = checkpoint(e, session, world)
-            if problem != "" { return Round { problem: problem; acknowledged: rows; inFlight: "" } }
+            if problem != "" { return Round { problem: problem; states: [rows]; inFlight: "" } }
         }
-        let done = unit(world, e, session, rows, mix, !mix.earlyAck)
-        if done.problem != "" { return Round { problem: done.problem; acknowledged: rows; inFlight: "" } }
+        let done = unit(world, e, session, rows, mix, !mix.earlyAck, 0)
+        if done.problem != "" { return Round { problem: done.problem; states: [rows]; inFlight: "" } }
     }
-    let acknowledged = copyRows(rows)
-    let flying = unit(world, e, session, rows, mix, false)
-    let inFlight = flying.text
-    if flying.problem != "" { return Round { problem: flying.problem; acknowledged: acknowledged; inFlight: inFlight } }
-    // Before the crash the engine holds the acknowledged state, with or without
-    // the in-flight unit: a commit becomes visible once it is durable.
-    let live = compare(e, acknowledged, rows, inFlight)
-    if live != "before" && live != "after" { return Round { problem: "before the crash, the live engine holds " + live; acknowledged: acknowledged; inFlight: inFlight } }
+    // One unit in flight per session, each session in its own id range, so a
+    // later session never depends on an earlier session's unfinished commit.
+    let states: List<Rows> = [copyRows(rows)]
+    let inFlight = ""
+    for index in 0..1 + simulation.choose(world, mix.sessions) {
+        let other = session
+        if index > 0 { other = engine.newSession(e, "sim", "sim") }
+        let flying = unit(world, e, other, rows, mix, false, index * 10)
+        if inFlight != "" { inFlight += " | " }
+        inFlight += flying.text
+        if flying.problem != "" { return Round { problem: flying.problem; states: states; inFlight: inFlight } }
+        states.add(copyRows(rows))
+        if index > 0 { simulation.reached(world, "several commits in flight") }
+    }
+    // Before the crash the engine holds the acknowledged state plus a prefix of
+    // the in-flight commits: a commit becomes visible once it is durable.
+    let live = compare(e, states, inFlight)
+    if live < 0 { return Round { problem: "before the crash, the live engine holds " + mismatch(e, states, inFlight); states: states; inFlight: inFlight } }
     // Let the in-flight write and sync complete partly, fully or not at all.
     engine.afterLoopIteration(e)
     for step in 0..simulation.choose(world, simulation.pendingCount(world) + 1) {
@@ -179,39 +190,47 @@ function round(world: simulation.World, e: engine.Engine, rows: Rows, mix: Mix):
         }
     }
     dbio.crash()
-    return Round { problem: ""; acknowledged: acknowledged; inFlight: inFlight }
+    return Round { problem: ""; states: states; inFlight: inFlight }
 }
 
-// Rows and total weight for each id 0..6, the shape compare() checks.
+// Ids 0..SHAPE_IDS - 1 cover every session's id range (10 per session).
+constant SHAPE_IDS = 27
+
+// Rows and total weight for each id that has rows, the shape compare() checks.
 function modelShape(rows: Rows): Text {
     let parts: List<Text> = []
-    for id in 0..7 {
+    for id in 0..SHAPE_IDS {
         let count = 0
         let weight = 0
         for index in 0..rows.ids.length { if rows.ids[index] == id { count += 1; weight += rows.values[index] } }
-        parts.add(Text(id) + ":" + Text(count) + "/" + Text(weight) + " ")
+        if count != 0 { parts.add(Text(id) + ":" + Text(count) + "/" + Text(weight) + " ") }
     }
     return joinText(parts)
 }
 
 function engineShape(e: engine.Engine, reader: engine.Session): Text {
     let parts: List<Text> = []
-    for id in 0..7 {
+    for id in 0..SHAPE_IDS {
         let count = scalar(e, reader, "SELECT count(*) FROM cargo WHERE id = " + Text(id))
         let weight = 0
-        if count != 0 { weight = scalar(e, reader, "SELECT sum(weight) FROM cargo WHERE id = " + Text(id)) }
-        parts.add(Text(id) + ":" + Text(count) + "/" + Text(weight) + " ")
+        if count != 0 {
+            weight = scalar(e, reader, "SELECT sum(weight) FROM cargo WHERE id = " + Text(id))
+            parts.add(Text(id) + ":" + Text(count) + "/" + Text(weight) + " ")
+        }
     }
     return joinText(parts)
 }
 
-// "before" or "after" the in-flight unit, or a description of the difference.
-// Per-id counts and weights tell apart states whose totals happen to match.
-function compare(recovered: engine.Engine, before: Rows, after: Rows, inFlight: Text): Text {
-    let shape = engineShape(recovered, engine.newSession(recovered, "sim", "sim"))
-    if shape == modelShape(before) { return "before" }
-    if shape == modelShape(after) { return "after" }
-    return "id:rows/weight " + shape + "instead of " + modelShape(before) + "(in-flight " + inFlight + ")"
+// How many in-flight commits the engine's state includes, or -1. Per-id counts
+// and weights tell apart states whose totals happen to match.
+function compare(e: engine.Engine, states: List<Rows>, inFlight: Text): Integer {
+    let shape = engineShape(e, engine.newSession(e, "sim", "sim"))
+    for index in 0..states.length { if shape == modelShape(states[index]) { return index } }
+    return -1
+}
+
+function mismatch(e: engine.Engine, states: List<Rows>, inFlight: Text): Text {
+    return "id:rows/weight " + engineShape(e, engine.newSession(e, "sim", "sim")) + "instead of " + modelShape(states[0]) + "(in-flight " + inFlight + ")"
 }
 
 // `mix.earlyAck` is the planted mistake: units count as acknowledged before
@@ -230,15 +249,12 @@ public deterministic function run(world: simulation.World, mix: Mix): Text {
         let result = round(world, e, rows, mix)
         if result.problem != "" { return result.problem }
         e = open()
-        let outcome = compare(e, result.acknowledged, rows, result.inFlight)
-        if outcome == "before" {
-            rows.ids = result.acknowledged.ids
-            rows.values = result.acknowledged.values
-        } else if outcome == "after" {
-            simulation.reached(world, "in-flight unit survived")
-        } else {
-            return "after crash " + Text(crash + 1) + ": " + outcome
-        }
+        let kept = compare(e, result.states, result.inFlight)
+        if kept < 0 { return "after crash " + Text(crash + 1) + ": " + mismatch(e, result.states, result.inFlight) }
+        if kept > 0 { simulation.reached(world, "in-flight unit survived") }
+        if kept > 0 && kept < result.states.length - 1 { simulation.reached(world, "some in-flight commits survived, later ones did not") }
+        rows.ids = result.states[kept].ids
+        rows.values = result.states[kept].values
         if crash > 0 { simulation.reached(world, "recovered after a second crash") }
     }
     return ""
