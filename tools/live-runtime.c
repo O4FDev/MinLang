@@ -40,7 +40,6 @@ static struct stat live_seen;
 static int live_have_seen;
 static struct stat live_failed;
 static int live_have_failed;
-static struct timespec live_retry_checked;
 // Every wrapper slot that has been bound, so an update can retarget it.
 struct live_slot { void **slot; const char *key; void *initial; };
 static struct live_slot *live_slots;
@@ -74,9 +73,6 @@ static int live_same(const struct stat *a, const struct stat *b) {
         a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
 #endif
 }
-static long long live_elapsed(const struct timespec *now, const struct timespec *before) {
-    return (long long)(now->tv_sec - before->tv_sec) * 1000000000LL + now->tv_nsec - before->tv_nsec;
-}
 static void *live_lookup(const char *key, void *initial) {
     struct live_entry needle = { key, NULL };
     struct live_entry *found = live_count ?
@@ -85,17 +81,12 @@ static void *live_lookup(const char *key, void *initial) {
 }
 // Called with live_lock held.
 static void live_refresh(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
     struct stat info;
     if (stat(live_manifest, &info) ||
         (live_have_seen && live_same(&info, &live_seen))) return;
-    long long retry_elapsed = live_elapsed(&now, &live_retry_checked);
-    if (live_have_failed && live_same(&info, &live_failed) &&
-        retry_elapsed >= 0 && retry_elapsed < 1000000000LL) return;
     // Retries of the same failing publication stay quiet after the first report.
     int repeated = live_have_failed && live_same(&info, &live_failed);
-    live_failed = info; live_have_failed = 1; live_retry_checked = now;
+    live_failed = info; live_have_failed = 1;
     int fd = open(live_manifest, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
     if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size <= 0 ||
@@ -121,12 +112,13 @@ static void live_refresh(void) {
         // `minyar patch --undo` back to the original program: every slot returns
         // to the executable's own body.
         free(storage);
+        int replaced = live_count != 0;
         free(live_entries);
         live_entries = NULL; live_count = 0;
         for (size_t i = 0; i < live_slot_count; ++i)
             __atomic_store_n(live_slots[i].slot, live_slots[i].initial, __ATOMIC_RELEASE);
         live_seen = info; live_have_seen = 1; live_have_failed = 0;
-        fprintf(stderr, "Restored original functions; program state preserved\n");
+        if (replaced) fprintf(stderr, "Restored original functions; program state preserved\n");
         return;
     }
     if (!path || count % 2 || !count) { free(storage); return; }
@@ -226,16 +218,11 @@ void *minyar_live_bind(const char *key, void *initial, void **slot) {
     if (!live_mapped) live_map();
     uint64_t epoch = __atomic_load_n(minyar_live_epoch, __ATOMIC_ACQUIRE);
     if (epoch != minyar_live_epoch_seen) {
-        // A publication that fails to load (its files may still be arriving)
-        // is retried at most once a second until it loads or another arrives.
-        struct timespec now;
-        long long waited = 0;
-        if (live_have_failed && !clock_gettime(CLOCK_MONOTONIC, &now))
-            waited = live_elapsed(&now, &live_retry_checked);
-        if (!live_have_failed || waited < 0 || waited >= 1000000000LL) {
-            live_refresh();
-            if (!live_have_failed) __atomic_store_n(&minyar_live_epoch_seen, epoch, __ATOMIC_RELAXED);
-        }
+        // Each epoch is tried once, so calls stay on the fast path even when a
+        // publication cannot load yet (say, its files are still arriving); the
+        // failure is reported and the next epoch bump retries it.
+        live_refresh();
+        __atomic_store_n(&minyar_live_epoch_seen, epoch, __ATOMIC_RELAXED);
     }
     void *address = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (!address) {

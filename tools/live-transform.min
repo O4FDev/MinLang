@@ -339,6 +339,7 @@ function parse(llvm: Text, generation: Integer, initial: Boolean): Parsed {
     if host.hasText(llvm, "; minyar-thread-runtime: 1") { result.error = "live reload does not support managed threads yet"; return result }
     let seen = Map<Text, Boolean>()
     let inFunction = false
+    let continuing = ""
     for position in 0..result.lines.length {
         let line = result.lines[position]
         if line.startsWith("define ") {
@@ -360,8 +361,14 @@ function parse(llvm: Text, generation: Integer, initial: Boolean): Parsed {
             inFunction = false
         } else if !inFunction && line.startsWith("@") {
             let global = symbol(Bytes(line), 1)
-            if global.error == "" { result.globals[global.raw] = line; result.variables.add(global.raw) }
-        }
+            continuing = ""
+            if global.error == "" { result.globals[global.raw] = line; result.variables.add(global.raw); continuing = global.raw }
+        } else if !inFunction && continuing != "" && line != "" && !line.startsWith("declare ") && !line.startsWith("%") &&
+                !line.startsWith(";") && !line.startsWith("!") && !line.startsWith("attributes ") {
+            // A table initializer can span lines (say, an integer dispatch table):
+            // its later lines belong to the same global's fingerprint.
+            result.globals[continuing] = result.globals[continuing] + "\n" + line
+        } else if !inFunction { continuing = "" }
     }
     if inFunction { result.error = "generated LLVM is missing a function closing brace"; return result }
     if result.functions.length == 0 { result.error = "generated LLVM contains no functions"; return result }
@@ -376,6 +383,31 @@ function signatureLine(signatures: List<Text>, line: Text) {
     if line.startsWith("%") && host.hasText(line, " = type ") { field(signatures, line) }
     if line.startsWith("; minyar-c-layout: ") || line.startsWith("; minyar-c-value: ") { field(signatures, line) }
     if line.startsWith("; minyar-native-library: ") || line == "; minyar-cycle-runtime: 1" || line == "; minyar-callback-runtime: 1" || line == "; minyar-sort-callback-runtime: 1" { field(signatures, line) }
+}
+// The ABI signature and fingerprints cover every language function, reachable
+// or not, so a body edit that starts or stops calling one is still a body edit.
+function imageSignature(parsed: Parsed): Text {
+    let signatures: List<Text> = ["live-image-v1\n"]
+    let current = 0
+    for line in parsed.lines {
+        if line.startsWith("define ") {
+            if parsed.functions[current].language { field(signatures, parsed.functions[current].signature) }
+            current += 1
+        }
+        signatureLine(signatures, line)
+    }
+    return joinText(signatures)
+}
+function imageDigests(parsed: Parsed): Text {
+    let keys: List<Text> = []
+    let values: List<Text> = []
+    for index in 0..parsed.functions.length {
+        if parsed.functions[index].language {
+            keys.add(parsed.functions[index].raw)
+            values.add(digest(bodyText(parsed, index), parsed.globals))
+        }
+    }
+    return encodePairs(keys, values)
 }
 function publicDefinition(line: Text, from: Text, to: Text): Text {
     let result = host.replaceText(line, "@" + from + "(", "@" + to + "(")
@@ -428,9 +460,7 @@ function transformWith(llvm: Text, generation: Integer, initial: Boolean, prune:
     let output: List<Text> = []
     let names: List<Text> = []
     let symbols: List<Text> = []
-    let signatures: List<Text> = ["live-image-v1\n"]
     let digestKeys: List<Text> = []
-    let digestValues: List<Text> = []
     let exportValues: List<Text> = []
     let current = 0
     let skipping = false
@@ -455,20 +485,17 @@ function transformWith(llvm: Text, generation: Integer, initial: Boolean, prune:
                 result = publicDefinition(result, function.wrapper, function.body)
                 names.add(function.raw)
                 symbols.add(function.body)
-                field(signatures, function.signature)
                 digestKeys.add(function.raw)
-                digestValues.add(digest(bodyText(parsed, current), parsed.globals))
                 exportValues.add(function.wrapper)
             }
             current += 1
         }
-        signatureLine(signatures, line)
         output.add(result + "\n")
     }
     output.add("declare ptr @minyar_live_bind(ptr, ptr, ptr)\n@minyar_live_epoch = external global ptr\n@minyar_live_epoch_seen = external global i64\n")
     for index in 0..functions.length { if functions[index].language && kept[index] { output.add(wrapper(functions[index], index, generation)) } }
-    return Image { llvm: joinText(output); names: names; symbols: symbols; signature: joinText(signatures);
-        digests: encodePairs(digestKeys, digestValues); exports: encodePairs(digestKeys, exportValues); error: "" }
+    return Image { llvm: joinText(output); names: names; symbols: symbols; signature: imageSignature(parsed);
+        digests: imageDigests(parsed); exports: encodePairs(digestKeys, exportValues); error: "" }
 }
 
 // An update image holds the functions whose fingerprint differs from the
@@ -482,23 +509,19 @@ public function transformUpdate(llvm: Text, generation: Integer, published: Map<
     let kept = reachable(parsed)
     let namesBySymbol = Map<Text, Text>()
     let changed: List<Boolean> = []
-    let digestKeys: List<Text> = []
-    let digestValues: List<Text> = []
     for index in 0..functions.length {
         let function = functions[index]
         if !kept[index] { changed.add(false); continue }
         if !function.language { namesBySymbol[function.raw] = function.wrapper; changed.add(true); continue }
-        if !exports.has(function.raw) { return failed("hot reload changed a compiled function signature; stop and run again") }
+        // Functions the original program never reached were left out of it.
+        if !exports.has(function.raw) { return failed("hot reload cannot add a call to " + function.raw + ", which the running program does not contain; stop and run again") }
         namesBySymbol[function.raw] = exports[function.raw]
         let fingerprint = digest(bodyText(parsed, index), parsed.globals)
-        digestKeys.add(function.raw)
-        digestValues.add(fingerprint)
         changed.add(!published.has(function.raw) || published[function.raw] != fingerprint)
     }
     let output: List<Text> = []
     let names: List<Text> = []
     let symbols: List<Text> = []
-    let signatures: List<Text> = ["live-image-v1\n"]
     let current = -1
     let skipping = false
     for position in 0..parsed.lines.length {
@@ -506,9 +529,7 @@ public function transformUpdate(llvm: Text, generation: Integer, published: Map<
         if line.startsWith("define ") {
             current += 1
             skipping = !kept[current] || (functions[current].language && !changed[current])
-            if functions[current].language && kept[current] { field(signatures, functions[current].signature) }
         }
-        signatureLine(signatures, line)
         if skipping {
             if position == parsed.ends[current] { skipping = false }
             continue
@@ -533,6 +554,6 @@ public function transformUpdate(llvm: Text, generation: Integer, published: Map<
         if function.parameters != "" { for parameter in function.parameters.split(", ") { types.add(host.words(parameter)[0]) } }
         output.add("declare " + function.result + " @" + exports[function.raw] + "(" + host.joined(types, ", ") + ")\n")
     }
-    return Image { llvm: joinText(output); names: names; symbols: symbols; signature: joinText(signatures);
-        digests: encodePairs(digestKeys, digestValues); exports: ""; error: "" }
+    return Image { llvm: joinText(output); names: names; symbols: symbols; signature: imageSignature(parsed);
+        digests: imageDigests(parsed); exports: ""; error: "" }
 }

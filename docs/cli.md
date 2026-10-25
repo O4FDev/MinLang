@@ -375,8 +375,8 @@ patches. The binary records the absolute path of its live state directory
 point `MINYAR_LIVE_STATE` at the copy. Patch on the build machine, then ship
 the new `generation-*` directories, then `current`, then write `current.epoch`
 in place (for example `rsync --inplace`); running copies load the update on
-their next call. A publication that cannot load yet is retried about once a
-second.
+their next call. A publication that cannot load yet (say, its files were still
+arriving) is reported once; writing `current.epoch` again retries it.
 
 `minyar repl` opens a persistent native session. Enter an expression to see its
 value, a `let` binding to keep a value, or a function declaration to define or

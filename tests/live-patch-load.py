@@ -17,6 +17,7 @@ import selectors
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import tempfile
 import threading
@@ -89,8 +90,9 @@ def wait_for(process, selector, output, marker, seconds):
 
 
 def ship(state, host):
-    """Ship a patch as files, deliberately out of order: the table and epoch arrive
-    before the generation they name, so the running copy must retry the load."""
+    """Ship a patch as files, first out of order: the table and epoch arrive before
+    the generation they name, so the load fails; once the generation is there,
+    writing the epoch again retries it."""
     shutil.copyfile(state / "current", host / "current.incoming")
     (host / "current.incoming").replace(host / "current")
     with open(host / "current.epoch", "r+b") as epoch:
@@ -99,6 +101,8 @@ def ship(state, host):
     for generation in state.glob("generation-*"):
         if not (host / generation.name).exists():
             shutil.copytree(generation, host / generation.name)
+    with open(host / "current.epoch", "r+b") as epoch:
+        epoch.write(struct.pack("<Q", struct.unpack("<Q", (state / "current.epoch").read_bytes())[0] + 1000))
 
 
 def check(launcher, release, deploy, relocate=False):
