@@ -213,17 +213,21 @@ control bounds, copying/shrinking contracts and measurement costs.
 minyar sim                        # every sim/*.min universe, seeds 0..9999
 minyar sim lanterns --seeds 100000 --jobs 8
 minyar sim lanterns --seed 4711    # run and explain one seed
+minyar sim vault --explore         # fork runs from moments marked with reached()
+minyar sim vault --replay FILE     # rerun saved decisions
 ```
 
 `sim` runs the deterministic universes in a project's `sim/*.min` files; its
 optional filter matches a file name. Each file declares
-`public function universe(seed: Integer): Text` and returns `""` for a correct
-run or a description of what went wrong. Minyar calls it through a generated
-`deterministic function`, so a universe that can reach the host clock, files,
-randomness or other host effects does not compile. `--jobs` shares the seeds
-between processes. On a failure, `sim` prints the count, the lowest failing
-seed and its message, replays that seed twice to confirm the same result,
-and exits with status 1. Builds always use the release profile. See
+`public function universe(world: simulation.World): Text` and returns `""` for
+a correct run or a description of what went wrong. Minyar calls it through a
+generated `deterministic function`, so a universe that can reach the host
+clock, files, randomness or other host effects does not compile. `--jobs`
+shares the seeds between processes. On a failure, `sim` prints the count, the
+lowest failing seed and its message, replays its saved decisions twice to
+confirm the same result, and exits with status 1. `--explore` forks half of the
+runs from recorded moments and stops at the first failure. Builds always use
+the release profile. See
 [deterministic simulation](simulation.md#running-many-universes).
 
 `clean` only removes a generated `target` directory bearing Minyar's ownership

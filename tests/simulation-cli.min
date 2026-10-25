@@ -16,30 +16,70 @@ io.writeTextFile(application + "/src/main.min", "print(\"the harbour is home\")\
 io.writeTextFile(application + "/sim/lanterns.min", #"""
     use "simulation" as sim
 
-    // Every seventh universe from seed 3 loses its lantern.
-    public function universe(seed: Integer): Text {
-        let world = sim.create(seed)
+    // About one universe in seven loses its lantern.
+    public function universe(world: sim.World): Text {
         sim.advance(world, sim.choose(world, 10))
-        if seed % 7 == 3 { return "lost the lantern at \(sim.now(world)) ms, seed \(seed)" }
+        if sim.choose(world, 7) == 3 { return "lost the lantern at \(sim.now(world)) ms" }
         return ""
     }
     """#)
-io.writeTextFile(application + "/sim/quiet.min", "public function universe(seed: Integer): Text { return \"\" }\n")
+io.writeTextFile(application + "/sim/quiet.min", "use \"simulation\" as sim\npublic function universe(world: sim.World): Text { return \"\" }\n")
+// The vault opens only after three rare moments in order; seeded runs almost
+// never get there, while exploration forks from each recorded moment.
+io.writeTextFile(application + "/sim/vault.min", #"""
+    use "simulation" as sim
+
+    public function universe(world: sim.World): Text {
+        let stage = 0
+        for step in 0..40 {
+            let roll = sim.choose(world, 200)
+            if stage == 0 && roll == 7 { stage = 1; sim.reached(world, "first tumbler") }
+            else if stage == 1 && roll == 3 { stage = 2; sim.reached(world, "second tumbler") }
+            else if stage == 2 && roll == 11 { stage = 3; sim.reached(world, "third tumbler") }
+            else if stage == 3 && roll == 0 { return "the vault opened at step \(step)" }
+        }
+        return ""
+    }
+    """#)
+
+// The text after `prefix` up to the end of its line.
+function lineAfter(text: Text, prefix: Text): Text {
+    let start = text.find(prefix)
+    if start < 0 { return "" }
+    let rest = text.slice(start + prefix.length, text.length)
+    let end = rest.find("\n")
+    if end < 0 { return rest }
+    return rest.slice(0, end)
+}
 
 let environment = system.environment()
-let both = test.run([launcher, "sim", "--seeds", "50", "--jobs", "3"], environment, application, work + "/both", 600)
+let both = test.run([launcher, "sim", "lanterns", "--seeds", "50", "--jobs", "3"], environment, application, work + "/both", 600)
 test.check(both.status == 1, "a failing universe makes sim exit with status one\n" + both.output + both.errorOutput)
-test.check(test.contains(both.output, "sim lanterns: 7 of 50 universes failed (seeds 0..49, 3 jobs, "), "failures across three jobs are counted once\n" + both.output)
-test.check(test.contains(both.output, "  first: seed 3: lost the lantern at "), "the first failing seed is the lowest\n" + both.output)
-test.check(test.contains(both.output, "  replayed seed 3 twice: same result\n  reproduce: minyar sim lanterns --seed 3\n"), "the first failure is replayed and reproducible\n" + both.output)
-test.check(test.contains(both.output, "sim quiet: 50 universes passed (seeds 0..49, 3 jobs, "), "a passing scenario still runs after a failing one\n" + both.output)
+test.check(test.contains(both.output, "sim lanterns: ") && test.contains(both.output, " of 50 universes failed (seeds 0..49, 3 jobs, "), "failures across three jobs are counted once\n" + both.output)
+let first = lineAfter(both.output, "  first: seed ")
+let colon = first.find(": ")
+test.check(colon > 0 && test.contains(first, "lost the lantern at "), "the first failure names its seed and message\n" + both.output)
+let seed = first.slice(0, colon)
+let message = first.slice(colon + 2, first.length)
+test.check(test.contains(both.output, "  replayed its decisions twice: same result\n  reproduce: minyar sim lanterns --seed " + seed + "\n"), "the first failure is replayed and reproducible\n" + both.output)
+let saved = lineAfter(both.output, "  decisions: ")
+test.check(saved != "" && test.contains(both.output, "  replay: minyar sim lanterns --replay " + saved + "\n"), "the failing decisions are saved\n" + both.output)
 
-let failing = test.run([launcher, "sim", "lanterns", "--seed", "10"], environment, application, work + "/failing", 600)
-test.check(failing.status == 1 && test.contains(failing.output, "sim lanterns: seed 10 failed: lost the lantern at ") && test.contains(failing.output, "seed 10\n"), "one failing seed explains itself\n" + failing.output + failing.errorOutput)
-let passing = test.run([launcher, "sim", "lanterns", "--seed", "11"], environment, application, work + "/passing", 600)
-test.check(passing.status == 0 && passing.output == "sim lanterns: seed 11 passed\n", "one passing seed\n" + passing.output + passing.errorOutput)
+let failing = test.run([launcher, "sim", "lanterns", "--seed", seed], environment, application, work + "/failing", 600)
+test.check(failing.status == 1 && failing.output == "sim lanterns: seed " + seed + " failed: " + message + "\n", "the reported seed fails again alone\n" + failing.output + failing.errorOutput)
+let replayed = test.run([launcher, "sim", "lanterns", "--replay", saved], environment, application, work + "/replayed", 600)
+test.check(replayed.status == 1 && replayed.output == "sim lanterns: the recorded run failed: " + message + "\n", "saved decisions fail again\n" + replayed.output + replayed.errorOutput)
 let filtered = test.run([launcher, "sim", "quiet", "--seeds", "5", "--first", "100"], environment, application, work + "/filtered", 600)
-test.check(filtered.status == 0 && test.contains(filtered.output, "sim quiet: 5 universes passed (seeds 100..104, 1 jobs, ") && !test.contains(filtered.output, "lanterns"), "filter and first seed\n" + filtered.output + filtered.errorOutput)
+test.check(filtered.status == 0 && test.contains(filtered.output, "sim quiet: ran 5 universes, no failures (seeds 100..104, 1 jobs, ") && !test.contains(filtered.output, "lanterns"), "filter and first seed\n" + filtered.output + filtered.errorOutput)
+
+let explored = test.run([launcher, "sim", "vault", "--explore", "--seeds", "3000"], environment, application, work + "/explored", 600)
+test.check(explored.status == 1 && test.contains(explored.output, "sim vault: explored ") && test.contains(explored.output, "universes; one failed (") && test.contains(explored.output, "forked from recorded moments)"), "exploration reaches the vault\n" + explored.output + explored.errorOutput)
+test.check(test.contains(explored.output, "  replayed its decisions twice: same result\n") && test.contains(explored.output, "  moments reached: first tumbler, second tumbler, third tumbler\n"), "explored failures replay and report their moments\n" + explored.output)
+let vaultMessage = lineAfter(explored.output, "  first: seed ")
+let vaultFile = lineAfter(explored.output, "  decisions: ")
+let vaultReplay = test.run([launcher, "sim", "vault", "--replay", vaultFile], environment, application, work + "/vault-replay", 600)
+let vaultOpened = vaultMessage.slice(vaultMessage.find(": ") + 2, vaultMessage.length)
+test.check(vaultReplay.status == 1 && vaultReplay.output == "sim vault: the recorded run failed: " + vaultOpened + "\n", "an explored failure reproduces from its decisions\n" + vaultReplay.output + explored.output)
 
 let unmatched = test.run([launcher, "sim", "no such scenario"], environment, application, work + "/unmatched", 60)
 test.check(unmatched.status != 0 && test.contains(unmatched.errorOutput, "no simulation in sim/ matched no such scenario"), "unmatched filter\n" + unmatched.errorOutput)
@@ -52,7 +92,7 @@ test.check(misplaced.status != 0 && test.contains(misplaced.errorOutput, "--seed
 
 // A universe that reads the host clock never runs: the generated driver's
 // deterministic wrapper makes it a compile error.
-io.writeTextFile(application + "/sim/clock.min", "use \"system\" as system\npublic function universe(seed: Integer): Text { if system.monotonicNanoseconds() % 2 == 0 { return \"even\" }; return \"\" }\n")
+io.writeTextFile(application + "/sim/clock.min", "use \"simulation\" as sim\nuse \"system\" as system\npublic function universe(world: sim.World): Text { if system.monotonicNanoseconds() % 2 == 0 { return \"even\" }; return \"\" }\n")
 let clock = test.run([launcher, "sim", "clock"], environment, application, work + "/clock", 600)
 test.check(clock.status == 1 && test.contains(clock.errorOutput, "deterministic function 'attempt' can reach the host clock: attempt -> universe -> monotonicNanoseconds (native \"system\")") && !test.contains(clock.output, "universes"), "host clock rejected before any universe runs\n" + clock.output + clock.errorOutput)
 test.removeTree(work)
