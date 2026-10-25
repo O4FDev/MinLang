@@ -107,3 +107,9 @@ CHECK_JOBS ?= 8
 .PHONY: check-in-parallel
 check-in-parallel: build/tooling/tools/check-in-parallel
 	./build/tooling/tools/check-in-parallel --jobs $(CHECK_JOBS) $(CHECKS)
+
+.PHONY: check-in-parallel-tool
+check-in-parallel-tool: build/tooling/tools/check-in-parallel build/tooling/tests/check-in-parallel
+	$(LIMITED) ./build/tooling/tests/check-in-parallel "$(CURDIR)/build/tooling/tools/check-in-parallel"
+
+check check-portable: check-in-parallel-tool
