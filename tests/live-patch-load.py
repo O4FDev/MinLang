@@ -89,14 +89,16 @@ def wait_for(process, selector, output, marker, seconds):
 
 
 def ship(state, host):
-    """Copy new generations, then the table, then the epoch in place, as `rsync --inplace` would."""
-    for generation in state.glob("generation-*"):
-        if not (host / generation.name).exists():
-            shutil.copytree(generation, host / generation.name)
+    """Ship a patch as files, deliberately out of order: the table and epoch arrive
+    before the generation they name, so the running copy must retry the load."""
     shutil.copyfile(state / "current", host / "current.incoming")
     (host / "current.incoming").replace(host / "current")
     with open(host / "current.epoch", "r+b") as epoch:
         epoch.write((state / "current.epoch").read_bytes())
+    time.sleep(0.5)
+    for generation in state.glob("generation-*"):
+        if not (host / generation.name).exists():
+            shutil.copytree(generation, host / generation.name)
 
 
 def check(launcher, release, deploy, relocate=False):

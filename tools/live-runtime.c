@@ -208,8 +208,16 @@ void *minyar_live_bind(const char *key, void *initial, void **slot) {
     if (!live_mapped) live_map();
     uint64_t epoch = __atomic_load_n(minyar_live_epoch, __ATOMIC_ACQUIRE);
     if (epoch != minyar_live_epoch_seen) {
-        live_refresh();
-        minyar_live_epoch_seen = epoch;
+        // A publication that fails to load (its files may still be arriving)
+        // is retried at most once a second until it loads or another arrives.
+        struct timespec now;
+        long long waited = 0;
+        if (live_have_failed && !clock_gettime(CLOCK_MONOTONIC, &now))
+            waited = live_elapsed(&now, &live_retry_checked);
+        if (!live_have_failed || waited < 0 || waited >= 1000000000LL) {
+            live_refresh();
+            if (!live_have_failed) minyar_live_epoch_seen = epoch;
+        }
     }
     void *address = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (!address) {
