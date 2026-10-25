@@ -18,6 +18,52 @@ function loopAssignmentDeclaresLocal(tokenKinds: List<Integer>, tokenTexts: List
     return tokenKinds[start] == 1 && tokenTexts[start] == "let"
 }
 
+// A parallel function uses only scalars and never calls the runtime, so a call
+// to one cannot release a managed object or create cleanup debt.
+function noteParallelFunctions(context: CompilerContext) {
+    let borrows = context.valueBorrows
+    let tokenKinds = context.tokenKinds
+    let tokenTexts = context.tokenTexts
+    while borrows.parallelFunctions.length < context.functionNames.length { borrows.parallelFunctions.add(false) }
+    let scan = 0
+    while scan + 3 < tokenKinds.length {
+        if tokenKinds[scan] == 6 && tokenTexts[scan] == "parallel" {
+            let name = scan + 2
+            if tokenTexts[scan + 1] == "public" { name = scan + 3 }
+            if tokenTexts[name - 1] == "function" && tokenKinds[name] == 1 {
+                let index = findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, tokenTexts[name])
+                if index >= 0 && index < context.functionIRNames.length {
+                    borrows.parallelFunctions[index] = true
+                    borrows.parallelCallees.add("@" + context.functionIRNames[index] + "(")
+                }
+            }
+        }
+        scan = scan + 1
+    }
+}
+
+function parallelCallee(context: CompilerContext, callee: Text): Boolean {
+    let callees = context.valueBorrows.parallelCallees
+    let index = 0
+    while index < callees.length {
+        if callee.startsWith(callees[index]) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+// Whether a call target other than a parallel function was recorded since.
+function userCallsSince(context: CompilerContext, calls: Integer): Boolean {
+    let parallel = context.valueBorrows.parallelFunctions
+    let index = calls
+    while index < context.callTargets.length {
+        let target = context.callTargets[index]
+        if target < 0 || target >= parallel.length || !parallel[target] { return true }
+        index = index + 1
+    }
+    return false
+}
+
 // Checked accessors and arithmetic helpers whose only runtime call stops the
 // program; none allocates, releases or runs user code.
 function pureLoopCallee(callee: Text): Boolean {
@@ -27,7 +73,7 @@ function pureLoopCallee(callee: Text): Boolean {
 
 // Loop code that calls only those helpers cannot release, allocate or run
 // user code, so it creates no cleanup debt.
-function pureLoopCode(output: List<Text>, start: Integer, end: Integer): Boolean {
+function pureLoopCode(context: CompilerContext, output: List<Text>, start: Integer, end: Integer): Boolean {
     // One call can span several output pieces, so scan the joined code. Large
     // bodies are not candidates, keeping deeply nested loops linear.
     if end - start > 2000 { return false }
@@ -46,7 +92,7 @@ function pureLoopCode(output: List<Text>, start: Integer, end: Integer): Boolean
         // an indirect call through % may run any code.
         let at = rest.find("@")
         let indirect = rest.find("%")
-        if at < 0 || (indirect >= 0 && indirect < at) || !pureLoopCallee(rest.slice(at, rest.length)) { return false }
+        if at < 0 || (indirect >= 0 && indirect < at) || !(pureLoopCallee(rest.slice(at, rest.length)) || parallelCallee(context, rest.slice(at, rest.length))) { return false }
         call = rest.find("call ")
     }
     return true
@@ -159,7 +205,7 @@ function settleValueBorrows(context: CompilerContext, output: List<Text>, state:
     let index = borrows.count - 1
     while index >= mark {
         let piece = borrows.pieces[index]
-        if always || context.callTargets.length != borrows.calls[index] || !loopBodyCallsAllowed(output, piece, true) {
+        if always || userCallsSince(context, borrows.calls[index]) || !loopBodyCallsAllowed(context, output, piece, true) {
             state[6] = 1
             state[7] = state[7] + 1
             noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, piece, borrows.types[index], 0)
@@ -170,8 +216,80 @@ function settleValueBorrows(context: CompilerContext, output: List<Text>, state:
     borrows.count = mark
 }
 
+// `let name = root[index]` in a block, where `root` is a local the block never
+// reassigns, can borrow its element: the binding never owns it. A hidden guard
+// local reserved here takes a count only if code in the rest of the block can
+// release the element (settleBindingGuards).
+function guardableElementBinding(context: CompilerContext, localNames: List<Text>, localLengths: List<Integer>, state: List<Integer>, start: Integer, end: Integer, name: Text, resultType: List<Integer>): Boolean {
+    let tokenKinds = context.tokenKinds
+    let tokenTexts = context.tokenTexts
+    let borrows = context.valueBorrows
+    if !borrows.enabled || borrows.blocks == 0 || recoveryEnabled(state) || state[15] / 4 % 2 != 0 { return false }
+    if !isReferenceType(resultType[0]) || possibleCycleType(resultType[0], context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes) { return false }
+    if tokenKinds[start] != 1 || tokenTexts[start + 1] != "[" || tokenTexts[end - 1] != "]" { return false }
+    let depth = 0
+    let position = start + 1
+    while position < end - 1 {
+        if tokenTexts[position] == "[" { depth = depth + 1 }
+        if tokenTexts[position] == "]" { depth = depth - 1 }
+        if depth == 0 { return false }
+        position = position + 1
+    }
+    let root = tokenTexts[start]
+    if findLocal(localNames, localLengths, state, root) < 0 { return false }
+    return !blockAssignsName(tokenKinds, tokenTexts, end, root) && !blockAssignsName(tokenKinds, tokenTexts, end, name)
+}
+
+function reserveBindingGuard(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>, value: Text, type: Integer) {
+    let guard = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " guard", type, guard)
+    let guards = context.valueBorrows.guards
+    if guards.count == guards.pieces.length {
+        guards.pieces.add(0)
+        guards.slots.add(0)
+        guards.values.add("")
+        guards.calls.add(0)
+        guards.levels.add(0)
+    }
+    guards.pieces[guards.count] = output.length
+    guards.slots[guards.count] = ownershipSlot(state, guard)
+    guards.values[guards.count] = value
+    guards.calls[guards.count] = context.callTargets.length
+    guards.levels[guards.count] = context.valueBorrows.blocks
+    guards.count = guards.count + 1
+    state[6] = 1
+    output.add("")
+}
+
+// At the end of a block: a guard whose block made a user call or a releasing
+// runtime call takes its count; otherwise its piece and its clears are removed.
+function settleBindingGuards(context: CompilerContext, output: List<Text>) {
+    let guards = context.valueBorrows.guards
+    while guards.count > 0 && guards.levels[guards.count - 1] >= context.valueBorrows.blocks {
+        let index = guards.count - 1
+        let piece = guards.pieces[index]
+        let slot = Text(guards.slots[index])
+        if userCallsSince(context, guards.calls[index]) || !loopBodyCallsAllowed(context, output, piece + 1, true) {
+            output[piece] = "  call void @minyar_rc_local(i64 " + slot + ", ptr " + guards.values[index] + ")\n"
+        } else {
+            let cursor = piece
+            while cursor + 4 < output.length {
+                if output[cursor] == "  call void @minyar_rc_local(i64 " && output[cursor + 1] == slot && output[cursor + 2] == ", ptr " && output[cursor + 3] == "null" && output[cursor + 4] == ")\n" {
+                    output[cursor] = ""
+                    output[cursor + 1] = ""
+                    output[cursor + 2] = ""
+                    output[cursor + 3] = ""
+                    output[cursor + 4] = ""
+                }
+                cursor = cursor + 1
+            }
+        }
+        guards.count = index
+    }
+}
+
 // Whether every call in the compiled body is a loopBodyCallee.
-function loopBodyCallsAllowed(output: List<Text>, start: Integer, containers: Boolean): Boolean {
+function loopBodyCallsAllowed(context: CompilerContext, output: List<Text>, start: Integer, containers: Boolean): Boolean {
     if output.length - start > 2000 { return false }
     let pieces: List<Text> = []
     let index = start
@@ -186,7 +304,7 @@ function loopBodyCallsAllowed(output: List<Text>, start: Integer, containers: Bo
         rest = rest.slice(call + 5, rest.length)
         let at = rest.find("@")
         let indirect = rest.find("%")
-        if at < 0 || (indirect >= 0 && indirect < at) || !loopBodyCallee(rest.slice(at, rest.length), containers) { return false }
+        if at < 0 || (indirect >= 0 && indirect < at) || !(loopBodyCallee(rest.slice(at, rest.length), containers) || parallelCallee(context, rest.slice(at, rest.length))) { return false }
         call = rest.find("call ")
     }
     return true
@@ -915,9 +1033,9 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     let bodyStart = output.length
     let bodyReturns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
     if collectionPiece >= 0 || elementPiece >= 0 {
-        let userCode = context.callTargets.length != callsBefore
-        let slots = userCode || !loopBodyCallsAllowed(output, bodyStart, false)
-        if collectionPiece >= 0 && (slots || !loopBodyCallsAllowed(output, bodyStart, true)) { rootLocalAt(context, output, state, collectionPiece, collection, source, sourceType[0]) }
+        let userCode = userCallsSince(context, callsBefore)
+        let slots = userCode || !loopBodyCallsAllowed(context, output, bodyStart, false)
+        if collectionPiece >= 0 && (slots || !loopBodyCallsAllowed(context, output, bodyStart, true)) { rootLocalAt(context, output, state, collectionPiece, collection, source, sourceType[0]) }
         if elementPiece >= 0 && slots { rootLocalAt(context, output, state, elementPiece, variable, element, elementType) }
     }
     output.add("; minyar-debug-scope: end\n")
@@ -932,7 +1050,7 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     let stepPiece = output.length
     output.add("  call void @minyar_rc_step()\n")
     output.add("  br label %for.condition." + Text(loopLabel) + "\n\nfor.end." + Text(endLabel) + ":\n")
-    if pure && pureLoopCode(output, entryPiece + 2, stepPiece) {
+    if pure && pureLoopCode(context, output, entryPiece + 2, stepPiece) {
         versionPureLoop(output, entryPiece, testPiece, stepPiece, loopLabel, bodyLabel, endLabel, strip, continuing, position)
     }
     textState[0] = "for.end." + Text(endLabel)

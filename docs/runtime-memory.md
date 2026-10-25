@@ -224,6 +224,12 @@ both endpoints of traced ownership operations use the physical payload type.
   settle on their own; pattern conditions, and statements containing nested
   statements, always take the count. `--scope-owners` keeps the borrows: its lowering derives
   scope cells from them.
+  A block's `let name = local[index]` binding (the root local not reassigned in
+  the block) borrows its element like a parameter. A hidden guard owner is
+  reserved at the binding and filled at the end of the block only if later code
+  made a user call or a releasing runtime call; otherwise the guard and its
+  clears are removed. Calls to `parallel` functions count as neither: they use
+  only scalars and never call the runtime.
 - `minyar_rc_local` retains a new local value before releasing the previous
   value, making aliases and self-assignment safe. Synchronous calls borrow
   parameters protected by caller or ancestor owners; incoming parameter ownership

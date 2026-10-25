@@ -226,6 +226,19 @@ test.executes(compiler, "choice Label { Named(text: Text)\n Empty }\nrecord Box 
 let parsing = deferred.slice(deferred.find("parse(ptr %argument.0"), deferred.length)
 parsing = parsing.slice(0, parsing.find("\n}\n"))
 test.check(!test.contains(parsing, "call void @minyar_rc_borrow("), "element values passed to builtins took a temporary count")
+// `let b = bodies[i]` borrows its element when the rest of its block cannot
+// release it (a parallel function call cannot); a store that replaces the
+// element makes the hidden guard keep it alive.
+test.executes(compiler, "record Body { x: Float; v: Float }\nparallel function half(value: Float): Float { return value / 2.0 }\nfunction advance(bodies: List<Body>) { for i in 0..bodies.length { let b = bodies[i]; b.x = half(b.x) + b.v } }\nfunction swap(bodies: List<Body>): Float { let b = bodies[0]; bodies[0] = Body { x: 9.0; v: 0.0 }; return b.x }\nlet bodies = [Body { x: 4.0; v: 1.0 }, Body { x: 2.0; v: 1.0 }]\nadvance(bodies)\nprint(bodies[0].x)\nprint(swap(bodies))\nprint(bodies[0].x)\n", "3.0\n3.0\n9.0\n")
+let guarded = generated(compiler)
+let advancing = guarded.slice(guarded.find("advance(ptr %argument.0"), guarded.length)
+advancing = advancing.slice(0, advancing.find("\n}\n"))
+let advanceOwners = 0
+for line in test.lines(advancing) { if test.contains(line, "call void @minyar_rc_local(i64 ") && !test.contains(line, ", ptr null)") { advanceOwners += 1 } }
+test.check(advanceOwners == 0 && test.contains(advancing, "call i1 @minyar_rc_idle()"), "an unreleased element binding must borrow, and its loop must stay call-free")
+let swapping = guarded.slice(guarded.find("swap(ptr %argument.0"), guarded.length)
+swapping = swapping.slice(0, swapping.find("\n}\n"))
+test.check(test.contains(swapping, "call void @minyar_rc_local(i64 "), "a binding whose element is replaced must keep a guard count")
 test.executes(compiler, "function sum(values: List<Integer>): Integer { let total = 0; let index = 0; while index < values.length { total += values[index]; index += 1 }; return total }\nprint(sum([1, 2, 3]))\n", "6\n")
 let path = compiler.directory + "/case" + Text(compiler.serial)
 // Keep this exact-count oracle on one scalar iteration; ordinary O0/O2
