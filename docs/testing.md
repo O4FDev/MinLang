@@ -776,6 +776,13 @@ each checksum and complete timing output. Timing is separate from correctness.
 
 ## Memory contracts
 
+`make check-httpserver-idle-memory` builds `benchmarks/livepatch/server` in release
+mode, completes one request on each of 256 keep-alive connections, leaves them
+open and bounds the server's resident-memory growth at 16 KiB per idle
+connection (a 64 KiB read reservation once cost 66,810 bytes each). It reads
+`VmRSS` from Linux `/proc` and reports a skip on hosts without it; it belongs to
+`check-portable` everywhere except Windows.
+
 ## Peer-derived tests and failure evidence
 
 The independent HTTP/2, gRPC, yamux and device reference peers build with
