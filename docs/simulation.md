@@ -151,6 +151,42 @@ ten starting seeds. Exploration helps when failures lie behind rare
 intermediate states that the scenario labels; it cannot help with states it
 never reaches or labels.
 
+A scenario with timed faults can declare them as fault windows instead of
+drawing each number itself. `windows(world, WindowLimits { most, kinds, nodes,
+horizon, shortest, longest })` draws up to `most` values
+`Window { kind, node, other, at, length }`: a scenario-defined kind, the node
+it hits, a different node for faults between two nodes, a start before
+`horizon` and a length from `shortest` to `longest`. A universe declares its
+windows once, and `schedule(world)` returns them with the decision count at
+which they were drawn. With `--explore`, a scenario that declares windows is
+explored by changing them, as the 10-20 guided explorer did for raftkv. After
+plain seeds (a tenth of each process's runs, at most 1,000), half of the runs
+take a kept run and apply one to three changes: shift, resize or retarget one
+window, change its kind, add a short window near another, remove one, splice
+one from another kept run, or continue with a new random state. Kept runs are
+those that reached a moment no earlier run reached, plus one run in a hundred,
+and runs with rarely reached moments are picked more often. Every change stays
+within the declared limits. `plan(stream, prefix, windows)` builds such a run:
+it replays `prefix`, takes `windows` and continues from the random state
+`stream`. A `Schedule`'s stream continues exactly like the run it came from.
+The windows are recorded as the decisions that would have drawn them, so a
+failure's saved decisions replay without the explorer.
+
+On raftkv's planted forget-vote mistake (minyar-sim, up to four isolation,
+cut and crash windows of 1–600 ms; 8-vCPU Linux box), plain seeds failed 12
+times in 6,400,000 universes, about one in 530,000. In 64 independent
+explorers of at most 100,000 universes each, 23 failed, after 5,215,606
+universes in total: 4.4 failures per million, 2.35 times the plain rate
+(one-sided p ≈ 0.01). Each explored universe cost about 8% more CPU time.
+The 10-20 explorer looked stronger because it let a schedule grow to 12
+windows while its random runs had at most 4. When the scenario declares up to
+12 windows, plain seeds fail once in about 12,200 universes (523 in
+6,400,000), and exploration is only modestly faster: 64 explorers took a
+median of 5,200 and a mean of 9,700 universes to the first failure, against
+8,500 and 12,200 expected from plain seeds (one-sided p ≈ 0.05). Scenarios whose planted mistakes fail most seeds gain nothing: kvlog's
+fails 63% of seeds and neo-db early acknowledgement 98%, so both are found in
+one or two universes either way.
+
 `tests/neodb-sim` is such a project for the pinned production neo-db engine.
 It sets `memory = "eager"`, which ran these universes about 1.5 times faster
 than the default profile.

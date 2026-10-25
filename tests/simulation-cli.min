@@ -42,6 +42,32 @@ io.writeTextFile(application + "/sim/vault.min", #"""
     }
     """#)
 
+// Three windows of one kind on one beacon at a common moment fail a run.
+// Plain seeds rarely draw that; exploration mutates the declared windows of
+// runs that reached the overlapping-pair moment.
+io.writeTextFile(application + "/sim/beacons.min", #"""
+    use "simulation" as sim
+
+    public function universe(world: sim.World): Text {
+        let windows = sim.windows(world, sim.WindowLimits { most: 4; kinds: 2; nodes: 3; horizon: 1000; shortest: 1; longest: 100 })
+        for a in 0..windows.length {
+            for b in a + 1..windows.length {
+                let x = windows[a]
+                let y = windows[b]
+                if x.kind != y.kind || x.node != y.node || x.at >= y.at + y.length || y.at >= x.at + x.length { continue }
+                sim.reached(world, "two dark windows overlap")
+                for c in b + 1..windows.length {
+                    let z = windows[c]
+                    if z.kind == x.kind && z.node == x.node && max(max(x.at, y.at), z.at) < min(min(x.at + x.length, y.at + y.length), z.at + z.length) {
+                        return "beacon \(x.node) was dark three times over"
+                    }
+                }
+            }
+        }
+        return ""
+    }
+    """#)
+
 // The text after `prefix` up to the end of its line.
 function lineAfter(text: Text, prefix: Text): Text {
     let start = text.find(prefix)
@@ -87,6 +113,15 @@ let vaultFile = lineAfter(explored.output, "  decisions: ")
 let vaultReplay = test.run([launcher, "sim", "vault", "--replay", vaultFile], environment, application, work + "/vault-replay", 600)
 let vaultOpened = vaultMessage.slice(vaultMessage.find(": ") + 2, vaultMessage.length)
 test.check(vaultReplay.status == 1 && vaultReplay.output == "sim vault: the recorded run failed: " + vaultOpened + "\n", "an explored failure reproduces from its decisions\n" + vaultReplay.output + explored.output)
+
+let plainBeacons = test.run([launcher, "sim", "beacons", "--seeds", "3000"], environment, application, work + "/beacons-plain", 600)
+test.check(plainBeacons.status == 0 && test.contains(plainBeacons.output, "sim beacons: ran 3000 universes, no failures"), "plain seeds miss the beacons\n" + plainBeacons.output + plainBeacons.errorOutput)
+let beacons = test.run([launcher, "sim", "beacons", "--explore", "--seeds", "3000"], environment, application, work + "/beacons", 600)
+test.check(beacons.status == 1 && test.contains(beacons.output, "universes; one failed (") && test.contains(beacons.output, " from mutated fault windows)") && test.contains(beacons.output, "was dark three times over"), "mutating declared fault windows finds the beacons\n" + beacons.output + beacons.errorOutput)
+test.check(test.contains(beacons.output, "  replayed its decisions twice: same result\n"), "a mutated run replays from its decisions\n" + beacons.output)
+let beaconsFile = lineAfter(beacons.output, "  decisions: ")
+let beaconsReplay = test.run([launcher, "sim", "beacons", "--replay", beaconsFile], environment, application, work + "/beacons-replay", 600)
+test.check(beaconsReplay.status == 1 && test.contains(beaconsReplay.output, "sim beacons: the recorded run failed: beacon "), "a mutated failure reproduces from its saved decisions\n" + beaconsReplay.output + beaconsReplay.errorOutput)
 
 let unmatched = test.run([launcher, "sim", "no such scenario"], environment, application, work + "/unmatched", 60)
 test.check(unmatched.status != 0 && test.contains(unmatched.errorOutput, "no simulation in sim/ matched no such scenario"), "unmatched filter\n" + unmatched.errorOutput)

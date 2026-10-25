@@ -5,7 +5,7 @@ use "io" as io
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
 let levels = ["-O0", "-O2"]
-let cases = ["seed", "replay", "ordering", "causality", "durability", "namespace", "torn-write", "faults", "packets", "clock-cancel", "invalid", "gallery", "determinism", "sectors", "guide"]
+let cases = ["seed", "replay", "ordering", "causality", "durability", "namespace", "torn-write", "faults", "packets", "clock-cancel", "invalid", "gallery", "determinism", "sectors", "guide", "windows"]
 fixtures.validate("simulation", cases)
 // Each source joins a shared header and must fail at compile time.
 function rejectNondeterministic(frontend: fixtures.Frontend, source: Text, diagnostic: Text) {
@@ -397,14 +397,22 @@ if fixtures.selected("simulation", "invalid") {
         "sim.injectError(sim.create(1), sim.WRITE, 5)",
         "sim.persistPrefix(sim.create(1), 1, 0)",
         "let world = sim.create(1); let file = sim.openFile(world, \"page\", true); sim.persistPrefix(world, file, -1)",
-        "let world = sim.create(1); let file = sim.openFile(world, \"page\", true); sim.persistPrefix(world, file, 1)"
+        "let world = sim.create(1); let file = sim.openFile(world, \"page\", true); sim.persistPrefix(world, file, 1)",
+        "let windows = sim.windows(sim.create(1), sim.WindowLimits { most: 2; kinds: 0; nodes: 1; horizon: 10; shortest: 1; longest: 5 })",
+        "let world = sim.create(1); let limits = sim.WindowLimits { most: 2; kinds: 1; nodes: 1; horizon: 10; shortest: 1; longest: 5 }; let first = sim.windows(world, limits); let second = sim.windows(world, limits)",
+        "let windows = sim.windows(sim.plan(5, [], [sim.Window { kind: 0; node: 0; other: 0; at: 11; length: 2 }]), sim.WindowLimits { most: 2; kinds: 1; nodes: 1; horizon: 10; shortest: 1; longest: 5 })",
+        "let windows = sim.windows(sim.plan(5, [], [sim.Window { kind: 0; node: 1; other: 1; at: 1; length: 2 }]), sim.WindowLimits { most: 2; kinds: 1; nodes: 2; horizon: 10; shortest: 1; longest: 5 })",
+        "let world = sim.plan(0, [], [])"
     ]
     let diagnostics = [
         "choice count must be between 1 and 2147483646", "choice count must be between 1 and 2147483646", "choice count must be between 1 and 2147483646",
         "replay ran out of decisions", "replay decision does not match the available choices", "replay decision does not match the available choices", "replay decision does not match the available choices",
         "no operation is pending", "monotonic time cannot move backwards", "an operation delay cannot be negative", "an operation delay cannot be negative",
         "an I/O fault needs a valid operation and negative error code", "an I/O fault needs a valid operation and negative error code", "an I/O fault needs a valid operation and negative error code", "an I/O fault needs a valid operation and negative error code",
-        "torn-write fault needs an open file", "torn-write prefix is outside the file", "torn-write prefix is outside the file"
+        "torn-write fault needs an open file", "torn-write prefix is outside the file", "torn-write prefix is outside the file",
+        "window limits need most >= 0, kinds, nodes and horizon >= 1, and 0 <= shortest <= longest", "a universe declares its fault windows once",
+        "a planned fault window lies outside the scenario's limits", "a planned window's other node must be another of the scenario's nodes",
+        "a planned stream is a random state between 1 and 2147483646"
     ]
     test.check(invalidSources.length == diagnostics.length, "invalid fixture oracle count")
     for index in 0..invalidSources.length {
@@ -470,6 +478,59 @@ if fixtures.selected("simulation", "guide") {
         print("guide: passed")
 
         """#, "guide: passed\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "windows") {
+    fixtures.executes(frontend, prelude + #"""
+        // Fault windows are drawn within their limits, recorded as decisions,
+        // and a plan takes given windows and continues like the run it came from.
+        let limits = sim.WindowLimits { most: 3; kinds: 2; nodes: 3; horizon: 100; shortest: 5; longest: 20 }
+        let drawnAny = false
+        for seed in 1..40 {
+            let world = sim.create(seed)
+            let before = sim.choose(world, 7)
+            let windows = sim.windows(world, limits)
+            check(windows.length <= 3, "at most `most` windows")
+            for item in windows {
+                drawnAny = true
+                check(item.kind >= 0 && item.kind < 2 && item.node >= 0 && item.node < 3 && item.other >= 0 && item.other < 3 && item.other != item.node, "window nodes and kinds are within limits")
+                check(item.at >= 0 && item.at < 100 && item.length >= 5 && item.length <= 20, "window times are within limits")
+            }
+            let drawn = sim.schedule(world)
+            check(drawn.start == 1 && drawn.windows.length == windows.length && drawn.limits.horizon == 100, "the schedule records where its windows were drawn")
+            let after: List<Integer> = []
+            for index in 0..5 { after.add(sim.choose(world, 1000)) }
+            let replayed = sim.replay(0, sim.choices(world))
+            check(sim.choose(replayed, 7) == before, "replay follows the prefix")
+            let again = sim.windows(replayed, limits)
+            check(again.length == windows.length, "replay draws the same windows")
+            for index in 0..again.length { check(again[index].at == windows[index].at && again[index].other == windows[index].other, "replayed windows match") }
+            let prefix = [sim.choices(world)[0]]
+            let planned = sim.plan(drawn.stream, prefix, drawn.windows)
+            check(sim.choose(planned, 7) == before, "a plan replays its prefix")
+            let same = sim.windows(planned, limits)
+            check(same.length == windows.length, "a plan takes its windows")
+            for index in 0..5 { check(sim.choose(planned, 1000) == after[index], "an unchanged plan continues like its source run") }
+            check(sim.choices(planned).length == sim.choices(world).length, "a plan records the decisions that draw its windows")
+        }
+        check(drawnAny, "some seeds draw windows")
+        let world = sim.create(3)
+        let chosen = [sim.Window { kind: 1; node: 2; other: 0; at: 99; length: 20 }, sim.Window { kind: 0; node: 0; other: 1; at: 0; length: 5 }]
+        let planned = sim.plan(77, [], chosen)
+        let taken = sim.windows(planned, limits)
+        check(taken.length == 2 && taken[0].node == 2 && taken[0].other == 0 && taken[0].at == 99 && taken[1].length == 5, "a plan's windows are returned as given")
+        chosen[0].at = 1
+        check(sim.schedule(planned).windows[0].at == 99, "a plan copies its windows")
+        let tail = sim.choose(planned, 1000)
+        check(tail == sim.choose(sim.create(77), 1000), "after its windows a plan continues from its stream")
+        let replayed = sim.replay(0, sim.choices(planned))
+        let back = sim.windows(replayed, limits)
+        check(back.length == 2 && back[0].node == 2 && back[0].other == 0 && back[0].at == 99 && back[1].at == 0 && back[1].length == 5, "a planned run replays from its decisions")
+        check(sim.choose(replayed, 1000) == tail, "and so does its continuation")
+        check(sim.schedule(sim.create(1)).start == -1, "a run without windows has no schedule")
+        print("windows: passed")
+
+        """#, "windows: passed\n", levels, 0, "", true)
 }
 
 if fixtures.selected("simulation", "determinism") {

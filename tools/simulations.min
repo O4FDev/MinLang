@@ -13,7 +13,7 @@ use "io" as io
 // saved decision list reproduces any reported run.
 
 record Batch { first: Integer; count: Integer; result: Text; script: Text; handle: Integer }
-record Summary { runs: Integer; failures: Integer; firstSeed: Integer; forks: Integer; lastPrint: Integer; moments: List<Text>; message: Text; script: Text }
+record Summary { runs: Integer; failures: Integer; firstSeed: Integer; forks: Integer; mutated: Integer; lastPrint: Integer; moments: List<Text>; message: Text; script: Text }
 
 function scenarios(root: Text, filter: Text): List<Text> {
     let result: List<Text> = []
@@ -57,6 +57,114 @@ function driverSource(name: Text): Text {
                     }
                 }
             }
+        }
+
+        // A run kept for its fault windows: the decisions before them, the
+        // windows, the random state that continued after them, and its moments.
+        record Entry { stream: Integer; prefix: List<simulation.Decision>; windows: List<simulation.Window>; limits: simulation.WindowLimits; labels: List<Text> }
+
+        // Runs that reached rare moments are picked more often: each label adds
+        // 1 / (runs that reached it), and every entry keeps a small weight.
+        function pick(entries: List<Entry>, counts: Map<Text, Integer>, chooser: simulation.World): Entry {
+            let weights: List<Float> = []
+            let total = 0.0
+            for entry in entries {
+                let weight = 0.001
+                for label in entry.labels { weight += 1.0 / Float(counts[label]) }
+                weights.add(weight)
+                total += weight
+            }
+            let point = Float(simulation.choose(chooser, 1000000000)) / 1000000000.0 * total
+            for index in 0..entries.length {
+                if point < weights[index] { return entries[index] }
+                point -= weights[index]
+            }
+            return entries[entries.length - 1]
+        }
+
+        function sameLimits(left: simulation.WindowLimits, right: simulation.WindowLimits): Boolean {
+            return left.most == right.most && left.kinds == right.kinds && left.nodes == right.nodes && left.horizon == right.horizon && left.shortest == right.shortest && left.longest == right.longest
+        }
+
+        function within(value: Integer, low: Integer, high: Integer): Integer { return min(high, max(low, value)) }
+
+        function otherNode(limits: simulation.WindowLimits, node: Integer, chooser: simulation.World): Integer {
+            if limits.nodes < 2 { return node }
+            return (node + 1 + simulation.choose(chooser, limits.nodes - 1)) % limits.nodes
+        }
+
+        // One to three semantic changes to a kept run's windows, as the 10-20
+        // guided explorer made: shift, resize or retarget a window, change its
+        // kind, add a short window near another, remove one, splice one from
+        // another kept run, or continue from a new random state. Every change
+        // stays within the scenario's declared limits.
+        function mutate(parent: Entry, entries: List<Entry>, counts: Map<Text, Integer>, chooser: simulation.World): Entry {
+            let limits = parent.limits
+            let windows: List<simulation.Window> = []
+            for item in parent.windows { windows.add(simulation.Window { kind: item.kind; node: item.node; other: item.other; at: item.at; length: item.length }) }
+            let stream = parent.stream
+            for step in 0..1 + simulation.choose(chooser, 3) {
+                let choice = simulation.choose(chooser, 8)
+                if choice == 0 || windows.length == 0 && (choice == 1 || choice == 2 || choice == 3 || choice == 4 || choice == 6) {
+                    stream = 1 + simulation.choose(chooser, 2147483646)
+                } else if choice == 1 {
+                    let item = windows[simulation.choose(chooser, windows.length)]
+                    let reach = max(1, limits.horizon / 20)
+                    item.at = within(item.at + simulation.choose(chooser, 2 * reach + 1) - reach, 0, limits.horizon - 1)
+                } else if choice == 2 {
+                    let item = windows[simulation.choose(chooser, windows.length)]
+                    item.length = within(item.length * (10 + simulation.choose(chooser, 141)) / 100, limits.shortest, limits.longest)
+                } else if choice == 3 {
+                    let item = windows[simulation.choose(chooser, windows.length)]
+                    item.node = simulation.choose(chooser, limits.nodes)
+                    item.other = otherNode(limits, item.node, chooser)
+                } else if choice == 4 {
+                    let item = windows[simulation.choose(chooser, windows.length)]
+                    if limits.kinds > 1 { item.kind = (item.kind + 1 + simulation.choose(chooser, limits.kinds - 1)) % limits.kinds }
+                } else if choice == 5 {
+                    if windows.length < limits.most {
+                        let near = simulation.choose(chooser, limits.horizon)
+                        if windows.length > 0 { near = windows[simulation.choose(chooser, windows.length)].at }
+                        let reach = max(1, limits.horizon / 30)
+                        let node = simulation.choose(chooser, limits.nodes)
+                        windows.add(simulation.Window {
+                            kind: simulation.choose(chooser, limits.kinds); node: node; other: otherNode(limits, node, chooser)
+                            at: within(near + simulation.choose(chooser, 2 * reach + 1) - reach, 0, limits.horizon - 1)
+                            length: limits.shortest + simulation.choose(chooser, (limits.longest - limits.shortest) / 5 + 1)
+                        })
+                    }
+                } else if choice == 6 {
+                    let kept: List<simulation.Window> = []
+                    let removed = simulation.choose(chooser, windows.length)
+                    for index in 0..windows.length { if index != removed { kept.add(windows[index]) } }
+                    windows = kept
+                } else {
+                    let donor = pick(entries, counts, chooser)
+                    if windows.length < limits.most && donor.windows.length > 0 && sameLimits(donor.limits, limits) {
+                        let item = donor.windows[simulation.choose(chooser, donor.windows.length)]
+                        windows.add(simulation.Window { kind: item.kind; node: item.node; other: item.other; at: item.at; length: item.length })
+                    }
+                }
+            }
+            return Entry { stream: stream; prefix: parent.prefix; windows: windows; limits: limits; labels: [] }
+        }
+
+        // Count the run's moments; keep a run with windows when it reached a
+        // moment no earlier run did, and one in a hundred others.
+        function keep(world: simulation.World, entries: List<Entry>, counts: Map<Text, Integer>, chooser: simulation.World) {
+            let labels: List<Text> = []
+            let fresh = false
+            for moment in simulation.moments(world) {
+                labels.add(moment.label)
+                if !counts.has(moment.label) { counts[moment.label] = 0; fresh = true }
+                counts[moment.label] = counts[moment.label] + 1
+            }
+            let drawn = simulation.schedule(world)
+            if drawn.start < 0 || !fresh && simulation.choose(chooser, 100) != 0 { return }
+            let recorded = simulation.choices(world)
+            let prefix: List<simulation.Decision> = []
+            for index in 0..drawn.start { prefix.add(recorded[index]) }
+            entries.add(Entry { stream: drawn.stream; prefix: prefix; windows: drawn.windows; limits: drawn.limits; labels: labels })
         }
 
         function script(world: simulation.World): Text {
@@ -183,24 +291,39 @@ function driverSource(name: Text): Text {
             let explore = mode == "explore"
             let labels: List<Text> = []
             let corpus: List<List<simulation.Decision>> = []
+            let entries: List<Entry> = []
+            let counts: Map<Text, Integer> = Map()
             let chooser = simulation.create(first * 7919 + 17)
             let runs = 0
             let failures = 0
             let firstSeed = -1
             let forks = 0
+            let mutated = 0
             let message = ""
             let lastPrint = 0
+            // A scenario that declares fault windows is explored by mutating
+            // them, after plain seeds have built a corpus; others fork from moments.
+            let windowed = false
+            let warmup = min(1000, count / 10)
             for run in 0..count {
                 let seed = first + run
                 let world = simulation.create(seed)
-                if explore && corpus.length > 0 && simulation.choose(chooser, 2) == 1 {
+                if explore && windowed {
+                    if run >= warmup && entries.length > 0 && simulation.choose(chooser, 2) == 1 {
+                        let child = mutate(pick(entries, counts, chooser), entries, counts, chooser)
+                        world = simulation.plan(child.stream, child.prefix, child.windows)
+                        mutated += 1
+                    }
+                } else if explore && corpus.length > 0 && simulation.choose(chooser, 2) == 1 {
                     world = simulation.fork(seed, corpus[simulation.choose(chooser, corpus.length)])
                     forks += 1
                 }
                 let outcome = attempt(world)
                 if run == count - 1 { lastPrint = fingerprint(world, outcome) }
                 runs += 1
-                remember(world, labels, corpus, explore)
+                if simulation.schedule(world).start >= 0 { windowed = true }
+                if explore && windowed { keep(world, entries, counts, chooser) }
+                remember(world, labels, corpus, explore && !windowed)
                 if outcome != "" {
                     if failures == 0 {
                         firstSeed = seed
@@ -211,7 +334,7 @@ function driverSource(name: Text): Text {
                     if explore { break }
                 }
             }
-            let parts = [Text(runs) + " " + Text(failures) + " " + Text(firstSeed) + " " + Text(forks) + " " + Text(lastPrint) + Text(Character(10))]
+            let parts = [Text(runs) + " " + Text(failures) + " " + Text(firstSeed) + " " + Text(forks) + " " + Text(mutated) + " " + Text(lastPrint) + Text(Character(10))]
             for index in 0..labels.length {
                 if index > 0 { parts.add(Text(Character(9))) }
                 parts.add(labels[index])
@@ -244,7 +367,7 @@ function finish(batch: Batch): Summary {
     let second = rest.find("\n")
     if second < 0 { host.stop("unreadable simulation result: " + batch.result) }
     let fields = host.words(text.slice(0, first))
-    if fields.length != 5 { host.stop("unreadable simulation result: " + batch.result) }
+    if fields.length != 6 { host.stop("unreadable simulation result: " + batch.result) }
     let moments: List<Text> = []
     let labels = rest.slice(0, second)
     let start = 0
@@ -254,7 +377,7 @@ function finish(batch: Batch): Summary {
             start = index + 1
         }
     }
-    return Summary { runs: Integer(fields[0]); failures: Integer(fields[1]); firstSeed: Integer(fields[2]); forks: Integer(fields[3]); lastPrint: Integer(fields[4]); moments: moments; message: rest.slice(second + 1, rest.length); script: batch.script }
+    return Summary { runs: Integer(fields[0]); failures: Integer(fields[1]); firstSeed: Integer(fields[2]); forks: Integer(fields[3]); mutated: Integer(fields[4]); lastPrint: Integer(fields[5]); moments: moments; message: rest.slice(second + 1, rest.length); script: batch.script }
 }
 
 function replayOutcome(executable: Text, root: Text, script: Text, result: Text): Text {
@@ -351,7 +474,7 @@ public function run(graph: project.Graph, filters: List<Text>, first: Integer, s
                 next += count
             }
         }
-        let total = Summary { runs: 0; failures: 0; firstSeed: -1; forks: 0; lastPrint: 0; moments: []; message: ""; script: "" }
+        let total = Summary { runs: 0; failures: 0; firstSeed: -1; forks: 0; mutated: 0; lastPrint: 0; moments: []; message: ""; script: "" }
         let firstPrint = 0
         for batch in batches {
             let summary = finish(batch)
@@ -359,6 +482,7 @@ public function run(graph: project.Graph, filters: List<Text>, first: Integer, s
             total.runs += summary.runs
             total.failures += summary.failures
             total.forks += summary.forks
+            total.mutated += summary.mutated
             for label in summary.moments { if !host.listed(total.moments, label) { total.moments.add(label) } }
             if summary.failures > 0 && total.firstSeed < 0 { total.firstSeed = summary.firstSeed; total.message = summary.message; total.script = summary.script }
         }
@@ -367,7 +491,7 @@ public function run(graph: project.Graph, filters: List<Text>, first: Integer, s
         let verb = "ran"
         if explore { verb = "explored" }
         let detail = ""
-        if explore { detail = ", " + Text(total.forks) + " forked from recorded moments" }
+        if explore && total.mutated > 0 { detail = ", " + Text(total.mutated) + " from mutated fault windows" } else if explore { detail = ", " + Text(total.forks) + " forked from recorded moments" }
         // The static proof does not cover state that universes share through
         // module globals: the first batch's last seed must run the same alone.
         if !explore && batches[0].count > 1 {

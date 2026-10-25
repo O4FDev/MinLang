@@ -11,6 +11,15 @@ constant RANDOM_RANGE = 2147483646
 public record Decision { options: Integer; selected: Integer }
 // A labelled moment and how many decisions the run had made when it first got there.
 public record Moment { label: Text; decisions: Integer }
+// A fault window: a scenario-defined kind, the node it hits, a second node for
+// faults between two nodes, when it starts and how long it lasts.
+public record Window { kind: Integer; node: Integer; other: Integer; at: Integer; length: Integer }
+// What fault windows a scenario allows: at most `most` windows of `kinds` kinds
+// on `nodes` nodes, starting before `horizon` and lasting shortest..longest.
+public record WindowLimits { most: Integer; kinds: Integer; nodes: Integer; horizon: Integer; shortest: Integer; longest: Integer }
+// A run's fault windows, the decision count before they were drawn (-1 when
+// the run declared none) and the random state that continued after them.
+public record Schedule { start: Integer; limits: WindowLimits; windows: List<Window>; stream: Integer }
 record File { data: Bytes; durable: Bytes }
 record Name { path: Text; live: Integer; durable: Integer }
 record Fault { kind: Integer; code: Integer }
@@ -57,6 +66,9 @@ public record World {
     private texts: List<Text>
     private momentLabels: List<Text>
     private momentDecisions: List<Integer>
+    private drawn: Schedule
+    private planned: List<Window>
+    private planning: Boolean
 }
 
 public function create(seed: Integer): World {
@@ -67,6 +79,8 @@ public function create(seed: Integer): World {
         random: state; time: 0; wallOffset: 0; history: []; script: []
         replaying: false; guiding: false; continuing: false; cursor: 0; files: []; names: []; faults: []; links: []
         pending: []; nextId: 1; error: 0; events: []; texts: []; momentLabels: []; momentDecisions: []
+        drawn: Schedule { start: -1; limits: WindowLimits { most: 0; kinds: 1; nodes: 1; horizon: 1; shortest: 1; longest: 1 }; windows: []; stream: state }
+        planned: []; planning: false
     }
 }
 
@@ -103,6 +117,80 @@ public function guide(seed: Integer, script: List<Decision>): World {
     world.guiding = true
     note(world, EVENT_GUIDE, script.length, 0, 0)
     return world
+}
+// Plan a run: replay `prefix` exactly, take `windows` as the run's fault
+// windows instead of drawing them, then continue from random state `stream`
+// (a Schedule's stream reproduces the continuation of the run it came from).
+// The windows are recorded as the decisions that would have drawn them, so
+// choices() replays a planned run exactly.
+public function plan(stream: Integer, prefix: List<Decision>, windows: List<Window>): World {
+    if stream < 1 || stream > RANDOM_RANGE { fail("simulation: a planned stream is a random state between 1 and 2147483646") }
+    let world = fork(stream, prefix)
+    world.planning = true
+    world.drawn.stream = stream
+    for item in windows { world.planned.add(copyWindow(item)) }
+    return world
+}
+function copyWindow(item: Window): Window {
+    return Window { kind: item.kind; node: item.node; other: item.other; at: item.at; length: item.length }
+}
+// Draw the run's fault windows within `limits`, or take the planned ones. A
+// universe declares its windows once; an explorer can then shift, resize,
+// retarget, add, remove or splice windows instead of changing raw decisions.
+// `other` is a node different from `node` when there are two or more nodes.
+public function windows(world: World, limits: WindowLimits): List<Window> {
+    if limits.most < 0 || limits.kinds < 1 || limits.nodes < 1 || limits.horizon < 1 || limits.shortest < 0 || limits.longest < limits.shortest {
+        fail("simulation: window limits need most >= 0, kinds, nodes and horizon >= 1, and 0 <= shortest <= longest")
+    }
+    if world.drawn.start >= 0 { fail("simulation: a universe declares its fault windows once") }
+    let scripted = world.replaying && !(world.continuing && world.cursor >= world.script.length)
+    if world.planning && scripted { fail("simulation: a planned run reached its fault windows before the end of its prefix") }
+    world.drawn.start = world.history.length
+    world.drawn.limits = WindowLimits { most: limits.most; kinds: limits.kinds; nodes: limits.nodes; horizon: limits.horizon; shortest: limits.shortest; longest: limits.longest }
+    let result: List<Window> = []
+    if world.planning {
+        world.replaying = false
+        if world.planned.length > limits.most { fail("simulation: a plan has more fault windows than the scenario allows") }
+        take(world, limits.most + 1, world.planned.length)
+        for item in world.planned {
+            take(world, limits.kinds, item.kind)
+            take(world, limits.nodes, item.node)
+            if limits.nodes > 1 {
+                if item.other < 0 || item.other >= limits.nodes || item.other == item.node { fail("simulation: a planned window's other node must be another of the scenario's nodes") }
+                take(world, limits.nodes - 1, (item.other - item.node - 1 + limits.nodes) % limits.nodes)
+            } else if item.other != item.node { fail("simulation: a planned fault window lies outside the scenario's limits") }
+            take(world, limits.horizon, item.at)
+            take(world, limits.longest - limits.shortest + 1, item.length - limits.shortest)
+            result.add(copyWindow(item))
+        }
+        world.random = world.drawn.stream
+    } else {
+        for index in 0..choose(world, limits.most + 1) {
+            let kind = choose(world, limits.kinds)
+            let node = choose(world, limits.nodes)
+            let other = node
+            if limits.nodes > 1 { other = (node + 1 + choose(world, limits.nodes - 1)) % limits.nodes }
+            let at = choose(world, limits.horizon)
+            let length = limits.shortest + choose(world, limits.longest - limits.shortest + 1)
+            result.add(Window { kind: kind; node: node; other: other; at: at; length: length })
+        }
+        world.drawn.stream = world.random
+    }
+    for item in result { world.drawn.windows.add(copyWindow(item)) }
+    return result
+}
+// Record a planned value as the decision that would have drawn it.
+function take(world: World, options: Integer, selected: Integer) {
+    if selected < 0 || selected >= options { fail("simulation: a planned fault window lies outside the scenario's limits") }
+    world.history.add(Decision { options: options; selected: selected })
+    note(world, EVENT_CHOOSE, options, selected, 0)
+}
+// The run's fault windows so far, as copies.
+public function schedule(world: World): Schedule {
+    let limits = world.drawn.limits
+    let result = Schedule { start: world.drawn.start; limits: WindowLimits { most: limits.most; kinds: limits.kinds; nodes: limits.nodes; horizon: limits.horizon; shortest: limits.shortest; longest: limits.longest }; windows: []; stream: world.drawn.stream }
+    for item in world.drawn.windows { result.windows.add(copyWindow(item)) }
+    return result
 }
 public function finished(world: World): Boolean {
     return !world.replaying || world.cursor == world.script.length
