@@ -8,6 +8,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 out=${1:-build/general}; repeats=${2:-3}; shift 2 2>/dev/null || shift $#
 mkdir -p "$out"
+[[ $(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null || echo 0) -le 1 ]] || sudo -n sysctl -q kernel.perf_event_paranoid=1 || true
 CC=${CC:-clang}
 MINYAR=${MINYAR:-minyar}
 workloads=("$@")
