@@ -12,7 +12,7 @@ mkdir -p "$out"
 CC=${CC:-clang}
 MINYAR=${MINYAR:-minyar}
 workloads=("$@")
-(( ${#workloads[@]} )) || workloads=(wordfreq logstats orders service matrix nbody)
+(( ${#workloads[@]} )) || workloads=(wordfreq logstats orders service matrix nbody sortrows)
 "$CC" -O2 "$here/gen.c" -o "$out/gen"
 [[ -s "$out/words.txt" ]] || "$out/gen" words 50000000 > "$out/words.txt"
 [[ -s "$out/log.csv" ]] || "$out/gen" log 1000000 > "$out/log.csv"
