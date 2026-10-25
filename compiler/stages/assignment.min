@@ -18,11 +18,32 @@ function loopAssignmentDeclaresLocal(tokenKinds: List<Integer>, tokenTexts: List
     return tokenKinds[start] == 1 && tokenTexts[start] == "let"
 }
 
+// A field or element store such as `totals[key] += 1` or `row.count = 0`.
+function loopAssignmentHasPath(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
+    let start = position - 1
+    while start > 0 && tokenKinds[start - 1] != 6 && !(tokenKinds[start - 1] == 4 && (tokenTexts[start - 1] == "{" || tokenTexts[start - 1] == "}")) {
+        start = start - 1
+    }
+    return tokenKinds[start] == 1 && assignmentOperatorPosition(tokenKinds, tokenTexts, start) == position
+}
+
+// Path stores that can release a reference held by a List, record or Map.
+function replacedReference(output: List<Text>, start: Integer): Boolean {
+    let index = start
+    while index < output.length {
+        let text = output[index]
+        if text.find("@minyar_list_set") >= 0 || text.find("@minyar_record_replace") >= 0 || text.find("@minyar_record_append_text") >= 0 || text.find("@minyar_map_") >= 0 { return true }
+        index = index + 1
+    }
+    return false
+}
+
 // When a loop body makes no call tokens and assigns only plain local names,
-// other than the loop name and the source name, it can change the collection
-// it walks only through user code without a call token (capability operators,
-// Map key callbacks, record iteration). The loop lowering reserves both owners
-// and fills them if compiling the body ran such code.
+// other than the loop name and the source name, or field and element paths,
+// it can change the collection it walks only through user code without a call
+// token (capability operators, Map key callbacks, record iteration) or a path
+// store that replaces a reference. The loop lowering reserves both owners and
+// fills them if compiling the body emitted either; scalar stores release nothing.
 function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer, source: Text, loopName: Text): Boolean {
     if tokenKinds[position] != 4 || tokenTexts[position] != "{" { return false }
     let cursor = position + 1
@@ -39,7 +60,11 @@ function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>
             if isAssignmentOperator(text) && !loopAssignmentDeclaresLocal(tokenKinds, tokenTexts, cursor) {
                 let previous = tokenKinds[cursor - 2]
                 let boundary = previous == 6 || (previous == 4 && (tokenTexts[cursor - 2] == "{" || tokenTexts[cursor - 2] == "}"))
-                if tokenKinds[cursor - 1] != 1 || !boundary || tokenTexts[cursor - 1] == source || tokenTexts[cursor - 1] == loopName { return false }
+                if tokenKinds[cursor - 1] == 1 && boundary {
+                    if tokenTexts[cursor - 1] == source || tokenTexts[cursor - 1] == loopName { return false }
+                } else {
+                    if !loopAssignmentHasPath(tokenKinds, tokenTexts, cursor) { return false }
+                }
             }
         }
         cursor = cursor + 1
@@ -705,7 +730,7 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     let callsBefore = context.callTargets.length
     let bodyStart = output.length
     let bodyReturns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
-    if (collectionPiece >= 0 || elementPiece >= 0) && ranUserCode(context, output, bodyStart, callsBefore) {
+    if (collectionPiece >= 0 || elementPiece >= 0) && (ranUserCode(context, output, bodyStart, callsBefore) || replacedReference(output, bodyStart)) {
         if collectionPiece >= 0 { rootLocalAt(context, output, state, collectionPiece, collection, source, sourceType[0]) }
         if elementPiece >= 0 { rootLocalAt(context, output, state, elementPiece, variable, element, elementType) }
     }

@@ -278,10 +278,12 @@ instruction counts. Preserve this distinction when reporting results.
 
 A `for` loop over a List or Bytes reads the length through the same inline
 helper on every iteration, so the loop header makes no runtime call. When the
-body makes no calls and assigns only plain local names, nothing in it can
-change the collection: the loop name borrows each element instead of retaining
-and releasing it, and a plain variable source that the body does not reassign
-needs no extra count of its own. A function whose only owners were those then
+body makes no calls and assigns only plain local names or scalar fields and
+elements (`totals[key] += amount`, `row.count = 0`), nothing in it can change
+the collection: the loop name borrows each element instead of retaining and
+releasing it, and a plain variable source that the body does not reassign
+needs no extra count of its own. A body whose store replaces a reference (a
+List element, record field, Text field append or Map entry) keeps both counts. A function whose only owners were those then
 needs no ownership frame or loop service points. Summing two fields over a
 1,000-element `List<Point>` 100,000 times fell from 0.29 to 0.06 seconds
 (checked C with pointers to heap structs: 0.04).
