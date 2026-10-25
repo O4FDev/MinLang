@@ -380,6 +380,24 @@ MINYAR_HOT void *data_allocate(size_t size, size_t alignment) {
     return arena_allocate(&data_arena, size, alignment);
 }
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
+/* glibc raises its mmap threshold each time a mapped block is freed, so once
+ * the compiler releases a token stage, later large Lists would come from the
+ * heap, where realloc copies them. A fixed threshold keeps them mapped: realloc
+ * moves their pages with mremap and free returns them to the system. */
+static void large_list_storage_setup(void) {
+#if defined(__GLIBC__)
+    static int ready;
+    if (!ready) {
+        ready = 1;
+        mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+    }
+#endif
+}
+
 /* Moves a List's storage to room for capacity entries. Small Lists live in
  * the list arena and grow in place while they are its newest allocation. A
  * large List owns a malloc block instead: realloc grows it in place or remaps
@@ -390,6 +408,7 @@ MINYAR_HOT long long *list_arena_resize(long long *values, long long length,
                                         long long current, long long capacity) {
     size_t size = (size_t)capacity * sizeof(*values);
     if (capacity >= LARGE_LIST_CAPACITY) {
+        large_list_storage_setup();
         long long *grown = realloc(current >= LARGE_LIST_CAPACITY ? values : NULL, size);
         if (!grown)
             out_of_memory();
