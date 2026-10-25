@@ -5,6 +5,7 @@ use "../tools/test-runtime.min" as runtime
 use "../tools/check-runner.min" as runner
 use "./frontend-fixtures.min" as fixtures
 use "system" as system
+use "files" as files
 
 function program(lines: List<Text>): Text {
     let pieces: List<Text> = []
@@ -658,6 +659,16 @@ if fixtures.selected("ScopeOwnership", "test_eager_launcher_selects_scope_owners
     for setting in ["MINYAR_CLANG_FLAGS", "MINYAR_RUNTIME_FLAGS", "MINYAR_NATIVE_FLAGS"] {
         launchEnvironment = runner.environment(launchEnvironment, setting, "-O2 -Wno-override-module")
     }
+    // The capture shim is a new Clang identity, so the launcher rebuilds its toolchain. Use a private
+    // copy of the tree so the shared compiler and its toolchain stamp stay untouched.
+    let launcherRoot = compiler.directory + "/launcher-project"
+    test.check(files.makeDirectory(launcherRoot) == 0, "create scope launcher project")
+    for name in ["compiler", "bootstrap", "runtime", "vendor", "tools", "scripts", "build-support", "library", "Makefile", "minyar"] {
+        test.require(test.run(["cp", "-RLp", name, launcherRoot + "/" + name], environment, "", shim + ".copy", 120), "copy scope launcher tree " + name)
+    }
+    // Reusing the shared ThinLTO cache keeps the private bootstrap to about ten seconds.
+    let cache = "mkdir -p \"$1/build\" && if [ -d build/thinlto-cache ]; then cp -Rp build/thinlto-cache \"$1/build/\"; fi"
+    test.require(test.run(["/bin/sh", "-c", cache, "minyar", launcherRoot], environment, "", shim + ".cache", 120), "copy scope launcher LTO cache")
     let platform = test.run(["uname", "-s"], environment, "", shim + ".platform", 10)
     test.require(platform, "identify scope launcher linker platform")
     for profile in ["eager", "system"] {
@@ -677,11 +688,14 @@ if fixtures.selected("ScopeOwnership", "test_eager_launcher_selects_scope_owners
                 }
                 selectedEnvironment = runner.environment(selectedEnvironment, "MINYAR_CACHE_DIR", path + "-cache")
                 selectedEnvironment = runner.environment(selectedEnvironment, "MINYAR_MODULE_CACHE", path + "-modules")
-                let command = ["./minyar", "--memory-profile", profile]
+                let command = [launcherRoot + "/minyar", "--memory-profile", profile]
                 if incremental { command.add("--incremental") }
                 if release { command.add("--release") }
                 for item in [source, "-o", path + ".exe"] { command.add(item) }
-                test.require(test.run(command, selectedEnvironment, "", path + ".build", 120), "public scope launcher build " + label)
+                // The first build bootstraps the private toolchain.
+                let limit = 120
+                if files.pathSize(launcherRoot + "/build/minyarc") < 0 { limit = 900 }
+                test.require(test.run(command, selectedEnvironment, "", path + ".build", limit), "public scope launcher build " + label)
                 let observed = test.run([path + ".exe"], selectedEnvironment, "", path + ".run", compiler.runTimeout)
                 test.require(observed, "public scope launcher execution " + label)
                 test.check(observed.output == "root.!/root.!?\nroot.\n" && observed.errorOutput == "", "public scope launcher changed alias output " + label + "\n" + observed.output + observed.errorOutput)
