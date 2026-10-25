@@ -258,6 +258,13 @@ def check_idle_patches(launcher, memory=""):
             refused = undo()
             assert refused.returncode != 0 and b"nothing to undo" in refused.stderr, refused
             assert ask() == (1, 14), client.responses
+            # A binary replaced by an ordinary build is not patched through the old session.
+            plain = subprocess.run([str(launcher), "build", "--manifest-path", str(project)], capture_output=True,
+                                   timeout=600 * SCALE)
+            assert plain.returncode == 0, plain
+            stale = subprocess.run([str(launcher), "patch", "--manifest-path", str(project)], capture_output=True,
+                                   timeout=600 * SCALE)
+            assert stale.returncode != 0 and b"not built by its recorded live session" in stale.stderr, stale
         finally:
             server.kill()
             server.wait()

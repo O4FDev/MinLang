@@ -370,7 +370,8 @@ same rules apply: function-body edits only, no managed threads,
 and each accepted generation stays resident. An incompatible edit is refused
 and running copies keep their current code. Another `build --hot` starts a new
 session: copies of earlier builds keep running their code but receive no later
-patches. The binary records the absolute path of its live state directory
+patches. `minyar patch` refuses a binary that a later ordinary build or
+`run --watch` replaced. The binary records the absolute path of its live state directory
 (named in `<name>.live`). To run a copy elsewhere, copy that directory too and
 point `MINYAR_LIVE_STATE` at the copy. Patch on the build machine, then ship
 the new `generation-*` directories, then `current`, then write `current.epoch`
