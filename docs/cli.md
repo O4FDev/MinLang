@@ -175,6 +175,14 @@ bookkeeping. Builds and tests of the package pass the choice to the compiler as
 eager used 25-30% less CPU per transaction, while freeing a large structure
 happens all at once instead of in bounded steps.
 
+A binary package can also choose the x86-64 level its programs are compiled for
+with `cpu = "x86-64-v3"` (or `x86-64`, `x86-64-v2`, `x86-64-v4`) under
+`[package]`. The release link then generates code for that level, so for
+example a population count written with masks and shifts becomes one `POPCNT`
+and loops may use AVX2. The programs need a processor of that level; other
+architectures ignore the setting. neo-db's full-text index measured 0.92 ns per
+64-bit AND+popcount word at the default level and 0.28 ns at `x86-64-v3`.
+
 `--error-format json` selects compiler diagnostics as JSON lines on standard
 error for `build`, `run`, `check`, `test`, `bench` and `install`. This includes discovery
 and compilation of embedded module tests and documentation examples. Each
