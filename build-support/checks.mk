@@ -414,7 +414,7 @@ check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtim
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/production-frame-oracle
 	$(LIMITED) ./build/bounded-list-capacity
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/bounded-list-capacity-sanitize
-	$(LIMITED) ./build/tooling/tests/bounded-configurations
+	$(SANITIZER_LIMITED) ./build/tooling/tests/bounded-configurations
 	MINYAR_TEST_RUNTIME=./build/minyar-runtime-bounded.o $(LIMITED) ./build/tooling/tests/recursive-data
 	MINYAR_TEST_RUNTIME=./build/minyar-runtime-bounded.o $(LIMITED) ./build/tooling/tests/production-memory
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/bounded-ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/recursive-data
