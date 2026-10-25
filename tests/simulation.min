@@ -5,8 +5,13 @@ use "io" as io
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
 let levels = ["-O0", "-O2"]
-let cases = ["seed", "replay", "ordering", "causality", "durability", "namespace", "torn-write", "faults", "packets", "clock-cancel", "invalid", "gallery"]
+let cases = ["seed", "replay", "ordering", "causality", "durability", "namespace", "torn-write", "faults", "packets", "clock-cancel", "invalid", "gallery", "determinism"]
 fixtures.validate("simulation", cases)
+// Each source joins a shared header and must fail at compile time.
+function rejectNondeterministic(frontend: fixtures.Frontend, source: Text, diagnostic: Text) {
+    fixtures.rejects(frontend, "use \"simulation\" as sim\nuse \"system\" as system\n" + source + "\nprint(\"unreachable\")\n", diagnostic, true)
+}
+
 let prelude = #"""
     use "simulation" as sim
     function check(condition: Boolean, message: Text) { if !condition { fail(message) } }
@@ -409,6 +414,101 @@ if fixtures.selected("simulation", "invalid") {
 
 if fixtures.selected("simulation", "gallery") {
     fixtures.executes(frontend, io.readTextFile("examples/gallery/the-harbour-remembers.min"), "There is a light on the shore.\nThe unfinished bell is quiet.\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "determinism") {
+    // A deterministic function may use the World, collections, closures,
+    // generic helpers, contracts, pure natives and globals whose initializers
+    // are themselves deterministic; its callers keep ordinary host effects.
+    fixtures.executes(frontend, #"""
+        use "simulation" as sim
+        use "math" as math
+
+        global SQUARES: List<Integer> = squares()
+
+        function squares(): List<Integer> {
+            let result: List<Integer> = []
+            for index in 0..8 { result.add(index * index) }
+            return result
+        }
+
+        record Handler { apply: (Integer) -> Integer }
+
+        function largest<Item: Ordered>(items: List<Item>): Item {
+            let best = items[0]
+            for item in items { if item > best { best = item } }
+            return best
+        }
+
+        deterministic function universe(seed: Integer): Integer requires(seed > 0) {
+            let world = sim.create(seed)
+            let counts: Map<Text, Integer> = Map()
+            let offset = 3
+            let handler = Handler { apply: function(value) { return value + offset } }
+            let values: List<Integer> = []
+            for step in 0..20 {
+                sim.advance(world, sim.choose(world, 5))
+                values.add(handler.apply(sim.choose(world, 100)) + SQUARES[step % 8])
+                counts["steps"] = step + 1
+            }
+            return largest(values) * 1000 + sim.now(world) + counts["steps"] + Integer(math.sqrt(16.0))
+        }
+
+        let first = universe(7)
+        print(first == universe(7))
+        print(first != universe(8))
+        // deterministic stays an ordinary identifier elsewhere.
+        let deterministic = 2
+        print(deterministic)
+
+        """#, "true\ntrue\n2\n", levels, 0, "", true)
+
+    rejectNondeterministic(frontend, #"""
+        function stamp(world: sim.World): Integer { return sim.now(world) + system.wallClockMicroseconds() % 2 }
+        function step(world: sim.World): Integer { return stamp(world) }
+        deterministic function universe(seed: Integer): Integer { return step(sim.create(seed)) }
+        """#, "deterministic function 'universe' can reach the host clock: universe -> step -> stamp -> wallClockMicroseconds (native \"system\")")
+    rejectNondeterministic(frontend, #"""
+        global STARTED: Integer = system.monotonicNanoseconds()
+        deterministic function universe(seed: Integer): Integer { return seed + STARTED % 2 }
+        """#, "deterministic function 'universe' can reach the host clock: universe -> global STARTED -> monotonicNanoseconds (native \"system\")")
+    rejectNondeterministic(frontend, #"""
+        record Hooks { now: () -> Integer }
+        deterministic function universe(seed: Integer, hooks: Hooks): Integer { return seed + hooks.now() % 2 }
+        let hooks = Hooks { now: function() { return system.wallClockMicroseconds() } }
+        print(universe(1, hooks))
+        """#, "deterministic function 'universe' can reach the host clock: universe -> a callback that may be an anonymous function -> wallClockMicroseconds (native \"system\")")
+    rejectNondeterministic(frontend, #"""
+        use "random" as random
+        deterministic function universe(seed: Integer): Integer { return seed + random.bytes(1).length }
+        """#, "deterministic function 'universe' can reach host randomness: universe -> bytes (native \"runtime\")")
+    rejectNondeterministic(frontend, #"""
+        use "process" as process
+        deterministic function universe(seed: Integer): Integer { return seed + process.argumentCount() }
+        """#, "deterministic function 'universe' can reach the program's arguments: universe -> argumentCount (native \"runtime\")")
+    rejectNondeterministic(frontend, #"""
+        use "io" as io
+        function load(): Text { return io.readTextFile("state") }
+        public deterministic function universe(seed: Integer): Integer { return seed + load().length }
+        """#, "deterministic function 'universe' can reach host files: universe -> load -> readTextFile (native \"runtime\")")
+    rejectNondeterministic(frontend, #"""
+        deterministic function universe(seed: Integer): Integer { return seed + system.getenv("HOME").length }
+        """#, "deterministic function 'universe' can reach the process environment: universe -> getenv (native \"system\")")
+    rejectNondeterministic(frontend, #"""
+        function tick(): Integer { native "host_clock" }
+        deterministic function universe(seed: Integer): Integer { return seed + tick() }
+        """#, "deterministic function 'universe' can reach native code: universe -> tick (native \"host_clock\")")
+    rejectNondeterministic(frontend, #"""
+        deterministic function tick(): Integer { native "host_clock" }
+        """#, "a native function cannot be deterministic; mark the Minyar function that calls it")
+    rejectNondeterministic(frontend, #"""
+        deterministic function first<Item>(items: List<Item>): Item { return items[0] }
+        print(first([1]))
+        """#, "a deterministic function cannot be generic yet; mark a concrete function that calls it")
+    rejectNondeterministic(frontend, #"""
+        record Box { value: Integer }
+        deterministic function Box.twice(): Integer { return self.value * 2 }
+        """#, "a deterministic function must be a top-level function, not a record method")
 }
 
 test.removeTree(frontend.compiler.directory)

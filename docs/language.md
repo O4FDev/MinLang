@@ -754,6 +754,10 @@ For reproducible system tests, import `simulation`. Its explicit I/O boundary
 provides seeded completion ordering, virtual time, disk and network faults,
 durable file/name models and replayable decisions. It performs no host I/O.
 See [deterministic simulation](simulation.md) for its contracts and costs.
+Mark the function that runs one simulated universe `deterministic function`;
+the compiler then proves that nothing it can reach reads a host clock,
+randomness, files, sockets, the environment or threads. See
+[deterministic functions](simulation.md#deterministic-functions).
 
 Import `pages` for fixed-size byte images, bounded named regions and typed
 little-endian fields. Invalid ranges return Results, and copied input/output

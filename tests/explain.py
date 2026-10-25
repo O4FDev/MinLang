@@ -31,7 +31,7 @@ CODES = (
     "E0408", "E0409", "E0410", "E0411",
     "E0501", "E0502",
     "E0601", "E0602", "E0603",
-    "E0701", "E0801",
+    "E0701", "E0801", "E0901",
 )
 FIELDS = {
     "version", "severity", "code", "message", "file", "line", "column",
@@ -209,6 +209,19 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
     completion_native.write_text('function begin(): Integer { native "protocol" }\n', encoding="utf-8")
     diagnostic(completion_native, "E0801", expected_help=completion_repair,
                expected_message="protocol primitives need the canonical completion declaration and exact signature")
+
+    # Determinism rejections name the reachable host effect and the whole path.
+    determinism_source = ('use "system" as system\n'
+                          'deterministic function universe(seed: Integer): Integer { return seed + system.wallClockMicroseconds() }\n')
+    determinism_path = root / "deterministic-clock.min"
+    determinism_path.write_text(determinism_source, encoding="utf-8")
+    diagnostic(determinism_path, "E0901",
+               expected_help=("use the simulation World's virtual time (simulation.now or simulation.wallTime) "
+                              "and pass the World in"),
+               expected_message=("deterministic function 'universe' can reach the host clock: "
+                                 "universe -> wallClockMicroseconds (native \"system\")"),
+               expected_span=(2, 24, 2, 32), expected_source_lines=determinism_source.splitlines(),
+               exact_output=True)
 
     # Existing rejections prove code identities across unrelated front-end
     # paths. Complete presentation remains covered by check-diagnostics.

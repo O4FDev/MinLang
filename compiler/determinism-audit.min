@@ -1,0 +1,447 @@
+// `deterministic function` promises that a call's behavior depends only on its
+// arguments. The audit proves that no host clock, randomness, file, network,
+// process, environment, thread or unclassified native code is reachable from
+// the function in the final module. It reads the same LLVM text that is
+// compiled, so generic instantiations, closures, contract helpers and global
+// initializers are covered without a separate effect type system. It adds no
+// runtime code. Module contents that code outside the function mutates and
+// resource exhaustion (memory, stack) are outside this proof.
+function isDeterministicFunctionAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    if position < 1 || kinds[position] != 1 || texts[position] != "function" { return false }
+    let previous = position - 1
+    if texts[previous] == "public" { previous = previous - 1 }
+    return previous >= 0 && kinds[previous] == 6 && texts[previous] == "deterministic"
+}
+
+function collectDeterministicRoots(context: CompilerContext, roots: List<Integer>, origins: List<Integer>) {
+    let kinds = context.tokenKinds
+    let texts = context.tokenTexts
+    let lines = context.tokenLines
+    let position = 1
+    while position + 2 < kinds.length {
+        if texts[position] == "function" && isDeterministicFunctionAt(kinds, texts, position) {
+            if kinds[position + 1] != 1 || texts[position + 1] == "(" { failAtToken(lines, position, "a deterministic function needs a name") }
+            if texts[position + 2] == "<" { failAtToken(lines, position + 1, "a deterministic function cannot be generic yet; mark a concrete function that calls it") }
+            let symbol = findCompiledSymbol(context.functionNames, context.symbolKinds, lines.symbolLookup, texts[position + 1], 1)
+            if symbol < 0 { failAtToken(lines, position + 1, "a deterministic function needs its own ordinary function declaration") }
+            if determinismNativeLibrary(context, symbol) != "" { failAtToken(lines, position + 1, "a native function cannot be deterministic; mark the Minyar function that calls it") }
+            roots.add(symbol)
+            origins.add(position + 1)
+        }
+        position = position + 1
+    }
+}
+
+record DeterminismModule {
+    text: Text
+    names: List<Text>
+    kinds: List<Integer>
+    starts: List<Integer>
+    ends: List<Integer>
+    signatures: List<Text>
+    addressTaken: List<Boolean>
+    lookup: List<Integer>
+    zeros: List<Integer>
+    sourceSymbols: List<Integer>
+}
+
+function determinismNameCharacter(character: Character): Boolean {
+    return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '.' || character == '_' || character == '$' || character == '-'
+}
+
+// The position after the symbol that starts at text[at] == '@'.
+function determinismNameEnd(text: Text, at: Integer): Integer {
+    let position = at + 1
+    if position < text.length && text[position] == '"' {
+        position = position + 1
+        while position < text.length && text[position] != '"' && text[position] != '\n' { position = position + 1 }
+        return position + 1
+    }
+    while position < text.length && determinismNameCharacter(text[position]) { position = position + 1 }
+    return position
+}
+
+function determinismName(text: Text, at: Integer, end: Integer): Text {
+    if at + 1 < end && text[at + 1] == '"' { return text.slice(at + 2, end - 1) }
+    return text.slice(at + 1, end)
+}
+
+// Skip a c"..." constant so source text kept for traces is never read as code.
+function determinismSkipString(text: Text, position: Integer): Integer {
+    if text[position] == 'c' && position + 1 < text.length && text[position + 1] == '"' {
+        let end = position + 2
+        while end < text.length && text[end] != '"' && text[end] != '\n' { end = end + 1 }
+        return end + 1
+    }
+    return position
+}
+
+function determinismLineEnd(text: Text, position: Integer): Integer {
+    let end = position
+    while end < text.length && text[end] != '\n' { end = end + 1 }
+    return end
+}
+
+function determinismStartsWith(text: Text, position: Integer, prefix: Text): Boolean {
+    if position + prefix.length > text.length { return false }
+    let index = 0
+    while index < prefix.length {
+        if text[position + index] != prefix[index] { return false }
+        index = index + 1
+    }
+    return true
+}
+
+function determinismFind(text: Text, start: Integer, end: Integer, wanted: Text): Integer {
+    let position = start
+    while position + wanted.length <= end {
+        if text[position] == wanted[0] && determinismStartsWith(text, position, wanted) { return position }
+        position = position + 1
+    }
+    return -1
+}
+
+// The last word before `end`: the result type of `define T @f` or `call T @f`.
+function determinismWordBefore(text: Text, end: Integer): Text {
+    let last = end
+    while last > 0 && text[last - 1] == ' ' { last = last - 1 }
+    let first = last
+    while first > 0 && text[first - 1] != ' ' { first = first - 1 }
+    return text.slice(first, last)
+}
+
+// Argument or parameter types inside text[open] == '(' .. its ')': the first
+// word of each top-level comma-separated item.
+function determinismTypes(text: Text, open: Integer): Text {
+    let parts: List<Text> = []
+    let depth = 0
+    let position = open + 1
+    let itemStart = position
+    let done = false
+    while position < text.length && !done {
+        let character = text[position]
+        if character == '(' || character == '{' || character == '[' || character == '<' { depth = depth + 1 }
+        if (character == ')' || character == '}' || character == ']' || character == '>') && depth > 0 {
+            depth = depth - 1
+        } else {
+            if (character == ',' && depth == 0) || character == ')' {
+                let first = itemStart
+                while first < position && text[first] == ' ' { first = first + 1 }
+                let last = first
+                while last < position && text[last] != ' ' { last = last + 1 }
+                if last > first {
+                    if parts.length > 0 { parts.add(",") }
+                    parts.add(text.slice(first, last))
+                }
+                itemStart = position + 1
+                if character == ')' { done = true }
+            }
+        }
+        position = position + 1
+    }
+    return joinText(parts)
+}
+
+function parseDeterminismModule(context: CompilerContext, output: List<Text>): DeterminismModule {
+    let text = joinText(output)
+    let names: List<Text> = []
+    let kinds: List<Integer> = []
+    let starts: List<Integer> = []
+    let ends: List<Integer> = []
+    let signatures: List<Text> = []
+    let position = 0
+    while position < text.length {
+        let lineEnd = determinismLineEnd(text, position)
+        let kind = 0
+        if determinismStartsWith(text, position, "define ") { kind = 1 }
+        if determinismStartsWith(text, position, "@") { kind = 2 }
+        if determinismStartsWith(text, position, "declare ") { kind = 3 }
+        let at = position
+        if kind == 1 || kind == 3 {
+            at = determinismFind(text, position, lineEnd, "@")
+            if at < 0 { kind = 0 }
+        }
+        if kind > 0 {
+            let nameEnd = determinismNameEnd(text, at)
+            names.add(determinismName(text, at, nameEnd))
+            kinds.add(kind)
+            let signature = ""
+            if kind != 2 && nameEnd < lineEnd && text[nameEnd] == '(' { signature = determinismWordBefore(text, at) + "(" + determinismTypes(text, nameEnd) }
+            signatures.add(signature)
+            starts.add(position)
+            let end = lineEnd
+            if kind == 1 {
+                // A definition ends at its first line holding only '}'.
+                let close = determinismFind(text, lineEnd, text.length, "\n}\n")
+                if close < 0 { close = text.length - 2 }
+                end = close + 2
+            }
+            ends.add(end)
+            position = end
+        }
+        position = determinismLineEnd(text, position) + 1
+    }
+    let zeros: List<Integer> = []
+    let addressTaken: List<Boolean> = []
+    let index = 0
+    while index < names.length { zeros.add(0); addressTaken.add(false); index = index + 1 }
+    let lookup = buildDeclarationIndex(names, zeros)
+    // A function whose address is taken anywhere may be the target of any
+    // indirect call with its signature.
+    index = 0
+    while index < names.length {
+        if kinds[index] != 3 {
+            let scan = starts[index]
+            if kinds[index] == 1 { scan = determinismLineEnd(text, scan) }
+            while scan < ends[index] {
+                let skipped = determinismSkipString(text, scan)
+                if skipped != scan { scan = skipped } else if text[scan] == '@' {
+                    let end = determinismNameEnd(text, scan)
+                    let first = scan + 1
+                    let last = end
+                    if first < end && text[first] == '"' { first = first + 1; last = end - 1 }
+                    let target = findIndexedSymbolRange(lookup, names, zeros, text, first, last, 0)
+                    if target >= 0 && kinds[target] == 1 && !(end < text.length && text[end] == '(') { addressTaken[target] = true }
+                    scan = end
+                } else {
+                    scan = scan + 1
+                }
+            }
+        }
+        index = index + 1
+    }
+    // Map final symbols back to source declarations for readable names and
+    // native classification.
+    let sourceSymbols: List<Integer> = []
+    index = 0
+    while index < names.length { sourceSymbols.add(-1); index = index + 1 }
+    let symbol = 0
+    while symbol < context.functionIRNames.length {
+        if context.symbolKinds[symbol] == 1 {
+            let found = findIndexedSymbol(lookup, names, zeros, context.functionIRNames[symbol], 0)
+            if found >= 0 { sourceSymbols[found] = symbol }
+        }
+        symbol = symbol + 1
+    }
+    return DeterminismModule { text: text, names: names, kinds: kinds, starts: starts, ends: ends, signatures: signatures, addressTaken: addressTaken, lookup: lookup, zeros: zeros, sourceSymbols: sourceSymbols }
+}
+
+// The library of a function declared with a `native "library"` body, or "".
+function determinismNativeLibrary(context: CompilerContext, symbol: Integer): Text {
+    if symbol < 0 || symbol >= context.syntax.symbolNodes.length || context.symbolKinds[symbol] != 1 { return "" }
+    let declaration = context.syntax.symbolNodes[symbol]
+    if declaration < 0 { return "" }
+    let body = context.syntax.nodes[declaration].body
+    if body < 0 { return "" }
+    while body < context.tokenKinds.length && (context.tokenKinds[body] == 6 || (context.tokenKinds[body] == 4 && context.tokenTexts[body] == "{")) { body = body + 1 }
+    if body + 1 < context.tokenKinds.length && context.tokenKinds[body] == 1 && context.tokenTexts[body] == "native" && context.tokenKinds[body + 1] == 3 {
+        return context.tokenTexts[body + 1]
+    }
+    return ""
+}
+
+// Pure computations over their arguments. Everything else native is outside
+// the proof until it is classified here.
+function determinismNativeAllowed(library: Text, name: Text): Boolean {
+    if library == "unicode" || library == "aes" || library == "securecrypto" || library == "sha256" || library == "integer_overflow" { return true }
+    if library == "runtime" {
+        return name == "sqrt" || name == "sin" || name == "cos" || name == "tan" || name == "asin" || name == "acos" || name == "atan" || name == "exp" || name == "log" || name == "floor" || name == "ceil" || name == "round" || name == "atan2" || name == "pow" || name == "jsonNumber"
+    }
+    return false
+}
+
+function determinismNativeEffect(library: Text, name: Text): Text {
+    if name == "wallClockMicroseconds" || name == "monotonicNanoseconds" { return "the host clock" }
+    if library == "runtime" && name == "bytes" { return "host randomness" }
+    if name == "argument" || name == "argumentCount" { return "the program's arguments" }
+    if name == "getenv" || name == "environmentEntries" { return "the process environment" }
+    if name == "processId" { return "the process ID" }
+    if name == "sleepNanoseconds" { return "real time" }
+    if library == "runtime" || library == "files" { return "host files" }
+    if library == "net" || library == "http" || library == "quicinteropio" || library == "tlsverify" || library == "schannel" { return "the network" }
+    if library == "workers" || library == "completionio" || library == "callbackruntime" || library == "protocol" || library == "protocol_completion" { return "host threads and I/O completions" }
+    if library == "system" { return "the operating system" }
+    if library == "machine" || library == "machine_arm64" || library == "dma" || library == "dma_model" || library == "dma_queue" || library == "dma_pending" || library == "dma_cpu" { return "machine hardware" }
+    if library == "calldepth" { return "the host stack size" }
+    return "native code"
+}
+
+function determinismRuntimeEffect(name: Text): Text {
+    if resultPrefix(name, "minyar_thread_") || resultPrefix(name, "minyar_native_thread_") || resultPrefix(name, "minyar_frozen_channel_") || resultPrefix(name, "minyar_bytes_channel_") { return "threads" }
+    if resultPrefix(name, "minyar_parallel_") { return "parallel execution" }
+    if resultPrefix(name, "minyar_native_region") || resultPrefix(name, "minyar_machine_") || resultPrefix(name, "minyar_interrupt") || resultPrefix(name, "minyar_irq") || resultPrefix(name, "minyar_dma") { return "machine hardware" }
+    if name == "minyar_initialize_arguments" { return "the program's arguments" }
+    if resultPrefix(name, "minyar_calldepth_") { return "the host stack size" }
+    if name == "minyar_compiler_try" { return "native code" }
+    return ""
+}
+
+function determinismExternalEffect(name: Text): Text {
+    if resultPrefix(name, "minyar_") { return determinismRuntimeEffect(name) }
+    if resultPrefix(name, "llvm.") {
+        if resultPrefix(name, "llvm.readcyclecounter") || resultPrefix(name, "llvm.readsteadycounter") || resultPrefix(name, "llvm.x86.rdtsc") { return "the processor's cycle counter" }
+        if resultPrefix(name, "llvm.x86.rdrand") || resultPrefix(name, "llvm.x86.rdseed") || resultPrefix(name, "llvm.aarch64.rndr") { return "hardware randomness" }
+        if resultPrefix(name, "llvm.read_register") || resultPrefix(name, "llvm.read_volatile_register") || resultPrefix(name, "llvm.thread.pointer") { return "machine registers" }
+        return ""
+    }
+    if name == "memcpy" || name == "memmove" || name == "memset" || name == "memcmp" || name == "malloc" || name == "calloc" || name == "realloc" || name == "free" || name == "abort" { return "" }
+    return "native code"
+}
+
+function determinismHelp(effect: Text): Text {
+    if effect == "the host clock" || effect == "real time" { return "use the simulation World's virtual time (simulation.now or simulation.wallTime) and pass the World in" }
+    if effect == "host randomness" || effect == "hardware randomness" { return "draw choices from the simulation World with simulation.choose, so a seed reproduces them" }
+    if effect == "host files" { return "route storage through the simulation World (simulation.openFile, submitWrite, submitSync) or another facade passed in as a parameter" }
+    if effect == "the network" { return "send messages through the simulation World (simulation.submitPacket) instead of host sockets" }
+    if effect == "the program's arguments" || effect == "the process environment" || effect == "the process ID" { return "read it in the caller and pass the value in as a parameter" }
+    if effect == "threads" || effect == "parallel execution" || effect == "host threads and I/O completions" { return "keep scheduling inside the function, for example with simulation.choose; run independent universes in separate calls or processes" }
+    return "keep this call in the caller, or move a pure Minyar version of it inside the deterministic boundary"
+}
+
+function determinismReadable(context: CompilerContext, module: DeterminismModule, index: Integer): Text {
+    let symbol = module.sourceSymbols[index]
+    if symbol >= 0 { return readableDeclarationName(context.functionNames[symbol]) }
+    let name = module.names[index]
+    if resultPrefix(name, ".minyar.closure.") { return "an anonymous function" }
+    let constant = "minyar.constant|"
+    if resultPrefix(name, constant) {
+        let end = constant.length
+        while end < name.length && name[end] != '|' { end = end + 1 }
+        return "global " + readableDeclarationName(name.slice(constant.length, end))
+    }
+    return name
+}
+
+record DeterminismSearch {
+    parents: List<Integer>
+    indirectEdges: List<Boolean>
+    queue: List<Integer>
+    indirect: List<Text>
+    effect: Text
+    detail: Text
+    at: Integer
+}
+
+function determinismReach(search: DeterminismSearch, target: Integer, from: Integer, indirect: Boolean) {
+    if search.parents[target] != -2 { return }
+    search.parents[target] = from
+    search.indirectEdges[target] = indirect
+    search.queue.add(target)
+}
+
+function determinismViolation(search: DeterminismSearch, effect: Text, detail: Text, at: Integer) {
+    if search.effect != "" { return }
+    search.effect = effect
+    search.detail = detail
+    search.at = at
+}
+
+// Scan one reachable definition or global initializer.
+function determinismScan(context: CompilerContext, module: DeterminismModule, search: DeterminismSearch, index: Integer) {
+    let text = module.text
+    let symbol = module.sourceSymbols[index]
+    let library = determinismNativeLibrary(context, symbol)
+    if library != "" {
+        let name = readableDeclarationName(context.functionNames[symbol])
+        if !determinismNativeAllowed(library, name) {
+            determinismViolation(search, determinismNativeEffect(library, name), "(native \"" + library + "\")", index)
+        }
+        return
+    }
+    let position = module.starts[index]
+    let end = module.ends[index]
+    if module.kinds[index] == 1 { position = determinismLineEnd(text, position) }
+    let code = module.kinds[index] == 1
+    while position < end && search.effect == "" {
+        let character = text[position]
+        let skipped = determinismSkipString(text, position)
+        if skipped != position { position = skipped } else if character == '@' {
+            let nameEnd = determinismNameEnd(text, position)
+            let first = position + 1
+            let last = nameEnd
+            if first < nameEnd && text[first] == '"' { first = first + 1; last = nameEnd - 1 }
+            let target = findIndexedSymbolRange(module.lookup, module.names, module.zeros, text, first, last, 0)
+            if target >= 0 {
+                if module.kinds[target] == 3 {
+                    let effect = determinismExternalEffect(module.names[target])
+                    if effect != "" { determinismViolation(search, effect, module.names[target], index) }
+                } else {
+                    determinismReach(search, target, index, false)
+                }
+            }
+            position = nameEnd
+        } else if code {
+            if character == 'a' && determinismStartsWith(text, position, "asm ") && position > 0 && text[position - 1] == ' ' {
+                determinismViolation(search, "machine hardware", "inline assembly", index)
+            }
+            if character == 'v' && determinismStartsWith(text, position, "volatile ") && position > 0 && text[position - 1] == ' ' {
+                determinismViolation(search, "machine hardware", "a volatile memory access", index)
+            }
+            if character == 'c' && determinismStartsWith(text, position, "call ") && position > 0 && text[position - 1] == ' ' {
+                let lineEnd = determinismLineEnd(text, position)
+                let open = determinismFind(text, position, lineEnd, "(")
+                if open > 0 {
+                    let callee = determinismWordBefore(text, open)
+                    if callee.length > 0 && callee[0] == '%' {
+                        let signature = determinismWordBefore(text, open - callee.length) + "(" + determinismTypes(text, open)
+                        if findText(search.indirect, signature) < 0 {
+                            search.indirect.add(signature)
+                            let candidate = 0
+                            while candidate < module.names.length {
+                                if module.addressTaken[candidate] && module.signatures[candidate] == signature { determinismReach(search, candidate, index, true) }
+                                candidate = candidate + 1
+                            }
+                        }
+                    }
+                }
+            }
+            position = position + 1
+        } else {
+            position = position + 1
+        }
+    }
+}
+
+function auditDeterministicRoots(context: CompilerContext, output: List<Text>, roots: List<Integer>, origins: List<Integer>) {
+    if roots.length == 0 { return }
+    let module = parseDeterminismModule(context, output)
+    let root = 0
+    while root < roots.length {
+        let start = findIndexedSymbol(module.lookup, module.names, module.zeros, context.functionIRNames[roots[root]], 0)
+        if start >= 0 {
+            let parents: List<Integer> = []
+            let indirectEdges: List<Boolean> = []
+            let index = 0
+            while index < module.names.length { parents.add(-2); indirectEdges.add(false); index = index + 1 }
+            let search = DeterminismSearch { parents: parents, indirectEdges: indirectEdges, queue: [], indirect: [], effect: "", detail: "", at: -1 }
+            determinismReach(search, start, -1, false)
+            let next = 0
+            while next < search.queue.length && search.effect == "" {
+                determinismScan(context, module, search, search.queue[next])
+                next = next + 1
+            }
+            if search.effect != "" {
+                let chain: List<Text> = []
+                let step = search.at
+                while step >= 0 {
+                    let readable = determinismReadable(context, module, step)
+                    if search.indirectEdges[step] { readable = "a callback that may be " + readable }
+                    chain.add(readable)
+                    step = search.parents[step]
+                }
+                let path: List<Text> = []
+                let position = chain.length - 1
+                while position >= 0 {
+                    path.add(chain[position])
+                    if position > 0 { path.add(" -> ") }
+                    position = position - 1
+                }
+                if search.detail != "" && search.detail[0] == '(' { path.add(" " + search.detail) } else { path.add(" -> " + search.detail) }
+                let name = readableDeclarationName(context.functionNames[roots[root]])
+                failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, origins[root], origins[root] + 1), "deterministic function '" + name + "' can reach " + search.effect + ": " + joinText(path), "", determinismHelp(search.effect))
+            }
+        }
+        root = root + 1
+    }
+    diagnosticFinish()
+}

@@ -53,6 +53,52 @@ A decision script checks choice counts, not program identity: preserve the
 source revision, fault scenario and input with a failing script. `transcript`
 returns a copy of the operation log for retained evidence.
 
+## Deterministic functions
+
+A seed reproduces a run only if nothing else can change it. Mark the function
+that runs one universe `deterministic`, and the compiler proves it:
+
+```minyar
+use "simulation" as sim
+
+deterministic function universe(seed: Integer): Integer {
+    let world = sim.create(seed)
+    sim.advance(world, sim.choose(world, 10))
+    return sim.now(world)
+}
+
+print(universe(7) == universe(7)) // true
+```
+
+The compiler follows every call the function can make, including calls into
+other modules, generic instances, contract helpers, closures and the
+initializers of the globals it reads. Nothing reachable may use a host clock,
+randomness, files, sockets, process arguments, the environment, threads,
+parallel execution, inline assembly, volatile machine access or native code.
+Pure native libraries are allowed: `math`, `unicode`, `sha256`, `aes`,
+`securecrypto` and `json` number parsing. A call through a callback value counts
+as a call to every function whose address the program takes with that
+signature, so a callback built by the caller is checked too. The error names the
+whole path:
+
+```text
+error: deterministic function 'simulate' can reach the host clock: simulate -> onCrash -> cover -> monotonicNanoseconds (native "system")
+```
+
+The marked function must be a named, top-level, non-generic Minyar function. It
+may call generic functions and methods. Its callers keep ordinary host effects,
+so a driver can read arguments, time a run or write reports around the
+proved part. The check reads the final LLVM module, adds no instructions or
+runtime calls, and runs only when a program uses the modifier. Programs that
+use it compile with the complete frontend instead of reusing incremental
+module state.
+
+The proof covers effects, not every input. It does not track the contents
+of a List, record or Map global that code outside the function changes, and it does
+not make out-of-memory or stack exhaustion reproducible. Floating-point
+`math` results are fixed for one build on one platform. `deterministic` is an
+ordinary identifier everywhere except directly before `function`.
+
 ## A disk with explicit durability
 
 `openFile(world, path, create)` returns a positive file identity, or negative
