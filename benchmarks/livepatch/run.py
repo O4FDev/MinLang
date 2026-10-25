@@ -7,6 +7,8 @@ Modes (run from the repository root on Linux with go on PATH):
            on the same port (what a process-per-version deploy does).
   steady   no edit: hot-mode server versus the plain release binary.
   watch    no edit: minyar run --watch --release without --hot.
+  patch    minyar build --hot --release, run the binary, edit reply() and
+           publish it with minyar patch mid-load (no watcher process).
 Prints one JSON summary per run.
 """
 import json
@@ -201,6 +203,33 @@ def run_hot(base, edit, hot=True):
         server.stop()
 
 
+def run_patch(base):
+    project = project_copy(base)
+    profile = project / "target/release"
+    subprocess.run([str(LAUNCHER), "build", "--hot", "--release", "--manifest-path", str(project)], check=True,
+                   stdout=subprocess.DEVNULL)
+    server = Process([str(profile / "livepatch-server")], {"LIVEPATCH_PORT": "0"}, project)
+    try:
+        port = server.port()
+        output = base / "patch.csv"
+        counter = count_instructions(server.process.pid)
+        client = load(port, output)
+        time.sleep(EDIT_AT)
+        source = (project / "src/main.min").read_text()
+        edit_ns = time.time_ns()
+        publish(project / "src/main.min", edited(source, 2))
+        started = time.monotonic()
+        subprocess.run([str(LAUNCHER), "patch", "--release", "--manifest-path", str(project)], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        patch_seconds = time.monotonic() - started
+        while client.poll() is None:
+            server.pump(0.05)
+        print("# minyar patch took " + str(round(patch_seconds, 3)) + " s", flush=True)
+        summarize("patch", output, edit_ns, instructions(counter))
+    finally:
+        server.stop()
+
+
 def build(base, version):
     source = base / ("v" + str(version) + ".min")
     source.write_text(edited((HERE / "server/src/main.min").read_text(), version))
@@ -249,6 +278,8 @@ if __name__ == "__main__":
                 run_hot(work, True)
             elif mode == "restart":
                 run_restart(work, True)
+            elif mode == "patch":
+                run_patch(work)
             elif mode == "watch":
                 run_hot(work, False, hot=False)
             elif mode == "steady":

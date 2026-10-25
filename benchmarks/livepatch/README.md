@@ -7,6 +7,8 @@ global. `run.py` keeps eight keep-alive clients busy (`load.go`) and changes
 - `hot`: `minyar run --watch --hot --release`; the edit is a source save.
 - `restart`: two plain `--release` binaries; the edit stops v1 and starts v2 on
   the same port, as a process-per-version deploy does.
+- `patch`: `minyar build --hot --release`, run the binary without a watcher,
+  then publish the edit with `minyar patch`.
 - `steady` / `watch`: no edit; hot mode, the plain release binary and ordinary
   watch mode, for dispatch cost. `LIVEPATCH_PERF=1` adds the server's user-mode
   instructions per request (`perf stat`).
@@ -30,7 +32,13 @@ CPUs 0-3, load on 4-7; three rounds each):
 | --- | ---: | --- | ---: |
 | hot | 0, 0, 0 | continues (e.g. 299118 → 299119) | 0.60–1.17 s (compile) |
 | restart | 24, 16, 16 | resets to 1 | 2.7–4.6 ms (prebuilt) |
+| `minyar patch`¹ | 0, 0, 0 | continues (e.g. 377176 → 377177) | 0.69–0.98 s (the patch command) |
+
+¹ Measured on a 4-vCPU Boat box, server on CPUs 0-1 and load on 2-3; the
+instruction counts below come from both boxes and agree for the shared modes.
 
 Hot-mode dispatch, server user instructions per request (three rounds each):
-plain release 38.7–38.9k, watch without `--hot` 38.6–38.8k, hot 58.3–58.4k
-before the lock-free cached resolver in `tools/live-runtime.c`, 49.4–49.6k after.
+plain release 38.7–38.9k, watch without `--hot` 38.6–38.8k; hot 58.3–58.4k with
+the original locked resolver, 49.4–49.6k with a lock-free cached one, and
+42.0–42.1k with per-function slots and the published epoch (+8.5%). A
+`build --hot` binary patched mid-run: 42.2–42.4k.
