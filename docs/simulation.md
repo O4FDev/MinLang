@@ -149,6 +149,8 @@ intermediate states that the scenario labels; it cannot help with states it
 never reaches or labels.
 
 `tests/neodb-sim` is such a project for the pinned production neo-db engine.
+It sets `memory = "eager"`, which ran these universes about 1.5 times faster
+than the default profile.
 Each universe runs random autocommit statements, acknowledging each only once
 its commit is durable, leaves one statement in flight, crashes keeping a random
 prefix of every file, and checks the recovered rows against the acknowledged

@@ -237,7 +237,7 @@ lowest failing seed and its message, replays its saved decisions twice to
 confirm the same result, saves a shrunk decision list that still fails, and
 exits with status 1. `--explore` forks half of the
 runs from recorded moments and stops at the first failure. Builds always use
-the release profile. See
+the release profile and a binary package's `memory` setting. See
 [deterministic simulation](simulation.md#running-many-universes).
 
 `clean` only removes a generated `target` directory bearing Minyar's ownership
