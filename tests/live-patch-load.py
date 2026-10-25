@@ -6,12 +6,15 @@ a `minyar build --hot` binary updated by `minyar patch`, keeps several
 keep-alive HTTP clients busy, edits reply() mid-load and checks that every
 request succeeded, each connection moved from version 1 to version 2 exactly
 once, and the server's request counter continued across the update. The patch
-mode also checks that an incompatible edit is refused while serving continues.
+mode also checks that an incompatible edit is refused while serving continues,
+and that a copy deployed elsewhere (MINYAR_LIVE_STATE) takes a patch shipped as
+plain files.
 """
 import argparse
 import os
 from pathlib import Path
 import selectors
+import shutil
 import signal
 import socket
 import subprocess
@@ -85,7 +88,18 @@ def wait_for(process, selector, output, marker, seconds):
     raise AssertionError(("timed out waiting for", marker, output))
 
 
-def check(launcher, release, deploy):
+def ship(state, host):
+    """Copy new generations, then the table, then the epoch in place, as `rsync --inplace` would."""
+    for generation in state.glob("generation-*"):
+        if not (host / generation.name).exists():
+            shutil.copytree(generation, host / generation.name)
+    shutil.copyfile(state / "current", host / "current.incoming")
+    (host / "current.incoming").replace(host / "current")
+    with open(host / "current.epoch", "r+b") as epoch:
+        epoch.write((state / "current.epoch").read_bytes())
+
+
+def check(launcher, release, deploy, relocate=False):
     source = launcher.parent / "benchmarks/livepatch/server"
     with tempfile.TemporaryDirectory(prefix="minyar-live-patch-") as temporary:
         project = Path(temporary) / "server"
@@ -100,7 +114,16 @@ def check(launcher, release, deploy):
                                    capture_output=True, timeout=600 * SCALE)
             assert built.returncode == 0, built
             command = [str(project / "target" / ("release" if release else "debug") / "livepatch-server")]
-        process = subprocess.Popen(command, cwd=project, env=dict(os.environ, LIVEPATCH_PORT="0"),
+        environment = dict(os.environ, LIVEPATCH_PORT="0")
+        if relocate:
+            # A deployed copy: the binary and its live state elsewhere, patched by shipping files.
+            built_state = Path((project / "target" / ("release" if release else "debug") / "livepatch-server.live").read_text())
+            host = Path(temporary) / "host"
+            shutil.copytree(built_state, host / "state")
+            shutil.copy2(command[0], host / "server")
+            command = [str(host / "server")]
+            environment["MINYAR_LIVE_STATE"] = str(host / "state")
+        process = subprocess.Popen(command, cwd=project, env=environment,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
         selector = selectors.DefaultSelector()
@@ -126,6 +149,8 @@ def check(launcher, release, deploy):
                 patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project), *profile],
                                          capture_output=True, timeout=600 * SCALE)
                 assert patched.returncode == 0 and b"Published update" in patched.stderr, patched
+                if relocate:
+                    ship(built_state, host / "state")
             deadline = time.monotonic() + 300 * SCALE
             while not all(c.responses and c.responses[-1][0] == 2 for c in clients):
                 assert time.monotonic() < deadline, ("update never reached every client", output)
@@ -133,7 +158,7 @@ def check(launcher, release, deploy):
                 for key, _ in selector.select(0.1):
                     output[key.data] += key.fileobj.read() or b""
             time.sleep(0.5)
-            if deploy:
+            if deploy and not relocate:
                 # A changed record layout cannot be patched; the old code keeps serving.
                 source = main.read_text()
                 main.write_text(source.replace("served: Integer; keys", "served: Integer; extra: Integer; keys")
@@ -162,7 +187,7 @@ def check(launcher, release, deploy):
         served = sorted(served for _, served in responses)
         assert served == list(range(1, len(served) + 1)), "every request is counted exactly once"
         assert b"program state preserved" in output["stderr"], output["stderr"][-2000:]
-        print(("minyar patch" if deploy else "live patch") + " under load (" + ("release" if release else "debug") +
+        print(("shipped patch" if relocate else "minyar patch" if deploy else "live patch") + " under load (" + ("release" if release else "debug") +
               "): " + str(len(responses)) +
               " requests, 0 errors, update at request " + str(first_v2))
 
@@ -177,6 +202,7 @@ def main():
         check(args.launcher.resolve(), args.profile == "release", False)
     if args.mode != "watch":
         check(args.launcher.resolve(), args.profile == "release", True)
+        check(args.launcher.resolve(), args.profile == "release", True, True)
 
 
 if __name__ == "__main__":

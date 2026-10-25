@@ -332,8 +332,12 @@ The same rules apply: function-body edits only, single-threaded programs only,
 and each accepted generation stays resident. An incompatible edit is refused
 and running copies keep their current code. Another `build --hot` starts a new
 session: copies of earlier builds keep running their code but receive no later
-patches. The binary records the absolute state path, so patch it on the machine
-and checkout that built it.
+patches. The binary records the absolute path of its live state directory
+(named in `<name>.live`). To run a copy elsewhere, copy that directory too and
+point `MINYAR_LIVE_STATE` at the copy. Patch on the build machine, then ship
+the new `generation-*` directories, then `current`, then write `current.epoch`
+in place (for example `rsync --inplace`); running copies load the update on
+their next call.
 
 `minyar repl` opens a persistent native session. Enter an expression to see its
 value, a `let` binding to keep a value, or a function declaration to define or

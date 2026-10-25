@@ -22,6 +22,12 @@
 #include <unistd.h>
 
 extern const char minyar_live_manifest[];
+// MINYAR_LIVE_STATE relocates the live state directory recorded at build time,
+// for a copy of the binary and its state deployed elsewhere. Image paths in a
+// published table that lie under the recorded directory are read from it.
+static const char *live_manifest = minyar_live_manifest;
+static const char *live_relocated;
+static size_t live_recorded_length;
 struct live_entry { const char *key; void *address; };
 struct live_image { void *handle; struct live_image *previous; };
 static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -80,13 +86,13 @@ static void live_refresh(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
     struct stat info;
-    if (stat(minyar_live_manifest, &info) ||
+    if (stat(live_manifest, &info) ||
         (live_have_seen && live_same(&info, &live_seen))) return;
     long long retry_elapsed = live_elapsed(&now, &live_retry_checked);
     if (live_have_failed && live_same(&info, &live_failed) &&
         retry_elapsed >= 0 && retry_elapsed < 1000000000LL) return;
     live_failed = info; live_have_failed = 1; live_retry_checked = now;
-    int fd = open(minyar_live_manifest, O_RDONLY | O_CLOEXEC);
+    int fd = open(live_manifest, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return;
     if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size <= 0 ||
         info.st_size > 16 * 1024 * 1024) { close(fd); return; }
@@ -112,7 +118,17 @@ static void live_refresh(void) {
     struct live_entry *entries = calloc(count, sizeof *entries);
     struct live_image *image = malloc(sizeof *image);
     if (!entries || !image) { free(entries); free(image); free(storage); return; }
-    void *handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    char *located = NULL;
+    if (live_relocated && !strncmp(path, minyar_live_manifest, live_recorded_length) &&
+        path[live_recorded_length] == '/') {
+        size_t prefix = strlen(live_relocated), rest = strlen(path + live_recorded_length);
+        located = malloc(prefix + rest + 1);
+        if (!located) { free(entries); free(image); free(storage); return; }
+        memcpy(located, live_relocated, prefix);
+        memcpy(located + prefix, path + live_recorded_length, rest + 1);
+    }
+    void *handle = dlopen(located ? located : path, RTLD_NOW | RTLD_LOCAL);
+    free(located);
     if (!handle) {
         fprintf(stderr, "minyar live: cannot load update: %s\n", dlerror());
         free(entries); free(image); free(storage); return;
@@ -156,11 +172,24 @@ static void live_refresh(void) {
 }
 static void live_map(void) {
     live_mapped = 1;
-    size_t length = strlen(minyar_live_manifest);
+    const char *relocated = getenv("MINYAR_LIVE_STATE");
+    const char *slash = strrchr(minyar_live_manifest, '/');
+    if (relocated && *relocated && slash) {
+        size_t length = strlen(relocated);
+        char *manifest = malloc(length + strlen(slash) + 1);
+        if (manifest) {
+            memcpy(manifest, relocated, length);
+            strcpy(manifest + length, slash);
+            live_manifest = manifest;
+            live_relocated = relocated;
+            live_recorded_length = (size_t)(slash - minyar_live_manifest);
+        }
+    }
+    size_t length = strlen(live_manifest);
     char *path = malloc(length + sizeof ".epoch");
     int descriptor = -1;
     if (path) {
-        memcpy(path, minyar_live_manifest, length);
+        memcpy(path, live_manifest, length);
         memcpy(path + length, ".epoch", sizeof ".epoch");
         descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
         free(path);
