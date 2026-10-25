@@ -48,9 +48,9 @@ plus matched previous/current wall and CPU comparisons over three batches of
 Real resource qualification requires the owner macOS CI and matched inputs;
 Linux can run `./build/tooling/tests/self-compile-budget --functional`.
 The separate `check-performance` self-compile limits are 20 seconds wall,
-2 seconds CPU and 216 MiB peak memory. The memory ceiling follows the measured
-compiler: 179 MiB on Linux x86_64 on 2026-10-25, down from about 430 MiB, with
-about 20% headroom. Its compile-scaling phase allows 5.0x time for four times
+2 seconds CPU and 192 MiB peak memory. The memory ceiling follows the measured
+compiler: 129 MiB on Linux x86_64 on 2026-10-25, down from about 430 MiB. It
+leaves room for allocators without the glibc mmap-threshold pin. Its compile-scaling phase allows 5.0x time for four times
 as many functions or records; their retired instructions grow 4.0x.
 
 `make check-budget-functional` exercises the budget controls on every platform,
