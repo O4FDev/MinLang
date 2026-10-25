@@ -133,6 +133,20 @@ function atomic(path: Text, data: Bytes) {
     host.writeBytes(temporary, data)
     if files.rename(temporary, path) != 0 { host.stop("cannot publish live build: " + path) }
 }
+// Hot programs map this counter (see tools/live-runtime.c): a new value makes
+// their next call load `current`. Write in place; the mapping must stay valid.
+function announce(path: Text) {
+    let file = files.open(path, files.WRITE + files.CREATE)
+    if file < 0 { host.stop(host.osError(file, path)) }
+    let previous = files.readAt(file, 0, 8)
+    let epoch = 0
+    if previous.length == 8 { epoch = previous.getInt64(0) }
+    let next = Bytes(8)
+    next.setInt64(0, epoch + 1)
+    let written = files.writeAt(file, next, 0, 8, 0)
+    files.close(file)
+    if written != 8 { host.stop("cannot announce the live update: " + path) }
+}
 function llvmString(value: Text): Text {
     let hex = "0123456789ABCDEF"
     let pieces: List<Text> = []
@@ -149,11 +163,13 @@ function buildLive() {
     let libraries: List<Text> = []
     let manifests: List<Text> = []
     let format = ""
+    let publish = false
     let index = 0
     while index < process.argumentCount() {
         let item = process.argument(index)
         if item == "--release" { release = true }
         else if item == "--no-incremental" { incremental = false }
+        else if item == "--publish" { publish = true }
         else {
             if index + 1 >= process.argumentCount() { host.stop("missing live build option value: " + item) }
             index += 1
@@ -262,6 +278,13 @@ function buildLive() {
         atomic(staging + "/source-identity", Bytes("live-snapshot-v1\n" + identity + "\n" + host.hashFile(library) + "\n" + host.hashBytes(table) + "\n"))
         let candidate = staging + "/candidate"
         atomic(candidate, table)
+        if publish {
+            // minyar patch: no watcher supervises running copies, so promote here.
+            if files.rename(candidate, state + "/current") != 0 { host.stop("cannot publish live build: " + state + "/current") }
+            announce(state + "/current.epoch")
+            system.writeStandardError("Published update; running copies load it on their next call\n")
+            return
+        }
         let publication = system.getenv("MINYAR_WATCH_PUBLICATION")
         if publication == "" { host.stop("hot builds must be supervised by run --watch --hot") }
         let ready = Bytes(candidate); ready.add(0)

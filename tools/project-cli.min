@@ -25,6 +25,7 @@ function help() {
       build                       Build the current project
       app                         Build and sign a macOS app (minyar app --help)
       run                         Build and run; pass arguments after --
+      patch                       Update running copies of a build --hot binary
       check                       Check source and tests without linking
       test                        Run module, documentation and integration tests
       bench                       Measure module benchmarks in the release profile
@@ -58,7 +59,8 @@ function help() {
       --offline                   Use cached sources; never download
       --no-incremental            Disable module compilation caching
       --watch                     Rebuild and run after source edits (run only)
-      --hot                       Preserve state on function edits (--watch only)
+      --hot                       Preserve state on function edits (run --watch);
+                                  with build, make a binary that minyar patch updates
       --name NAME                 Set the project name for new/init
       --lib                       Create a library with new/init
       --root DIR                  Install in $MINYAR_HOME or ~/.minyar by default
@@ -123,14 +125,15 @@ function parse(): Options {
         else if option == "--force" { allowed = options.command == "install" }
         else if option == "--dry-run" || option == "--description" { allowed = options.command == "publish" }
         else if option == "--registry" { allowed = options.command == "search" || options.command == "info" }
-        else if option == "--watch" || option == "--hot" { allowed = options.command == "run" }
+        else if option == "--watch" { allowed = options.command == "run" }
+        else if option == "--hot" { allowed = options.command == "run" || options.command == "build" }
         else if option == "--manifest-path" { allowed = options.command != "new" && options.command != "init" && options.command != "uninstall" && options.command != "search" && options.command != "info" }
-        else if option == "--locked" { allowed = host.listed(["build", "run", "check", "test", "bench", "doc", "tree", "metadata", "install"], options.command) }
-        else if option == "--offline" { allowed = host.listed(["build", "run", "check", "test", "bench", "doc", "tree", "metadata", "install", "add", "remove", "search", "info"], options.command) }
-        else { allowed = host.listed(["build", "run", "check", "test", "bench", "doc", "install"], options.command) }
+        else if option == "--locked" { allowed = host.listed(["build", "run", "patch", "check", "test", "bench", "doc", "tree", "metadata", "install"], options.command) }
+        else if option == "--offline" { allowed = host.listed(["build", "run", "patch", "check", "test", "bench", "doc", "tree", "metadata", "install", "add", "remove", "search", "info"], options.command) }
+        else { allowed = host.listed(["build", "run", "patch", "check", "test", "bench", "doc", "install"], options.command) }
         if !allowed { host.stop(option + " is not supported by " + options.command) }
     }
-    if options.hot && !options.watch { host.stop("--hot requires run --watch") }
+    if options.hot && options.command == "run" && !options.watch { host.stop("--hot requires run --watch") }
     return options
 }
 function execute(arguments: List<Text>, directory: Text, environment: List<Text>): Integer {
@@ -244,11 +247,28 @@ function tests(root: Text): List<Text> {
     for name in names { if name.endsWith(".min") && host.isFile(root + "/tests/" + name) { result.add(name) } }
     return result
 }
+function liveFlags(options: Options): List<Text> {
+    let flags: List<Text> = []
+    if options.release { flags.add("--release") }
+    if options.locked { flags.add("--locked") }
+    if options.offline { flags.add("--offline") }
+    if !options.incremental { flags.add("--no-incremental") }
+    if options.errorFormat != "" { flags.add("--error-format"); flags.add(options.errorFormat) }
+    return flags
+}
 function build(graph: project.Graph, options: Options): Text {
     let package = graph.packages[0]
     let directory = outputDirectory(package.root, profile(options))
     let source = project.entry(package)
     let output = directory + "/" + package.name
+    if options.hot {
+        if !project.isBinary(package) { host.stop("build --hot requires src/main.min in a binary package") }
+        let status = live.buildPatchable(graph, compiler(), output, liveFlags(options))
+        if status != 0 { host.leave(status) }
+        live.publishRoots(graph)
+        print("Finished " + profile(options) + " " + package.name + " (update running copies with minyar patch)")
+        return output
+    }
     if project.isBinary(package) && project.hasLibrary(package) { compile(graph, options, project.library(package), "", true) }
     compile(graph, options, source, output, !project.isBinary(package))
     live.publishRoots(graph)
@@ -476,7 +496,7 @@ function dispatch() {
     if processInfo.argumentCount() == 0 { help(); return }
     if processInfo.argument(0) == "help" { help(); return }
     let options = parse()
-    if !host.listed(["new", "init", "build", "run", "check", "test", "bench", "doc", "clean", "add", "remove", "tree", "metadata", "install", "uninstall", "search", "info", "publish"], options.command) { host.stop("unknown command: " + options.command) }
+    if !host.listed(["new", "init", "build", "run", "patch", "check", "test", "bench", "doc", "clean", "add", "remove", "tree", "metadata", "install", "uninstall", "search", "info", "publish"], options.command) { host.stop("unknown command: " + options.command) }
     if options.command == "search" || options.command == "info" {
         let location = options.registry
         if location == "" { location = system.getenv("MINYAR_REGISTRY") }
@@ -542,6 +562,10 @@ function dispatch() {
     }
     if options.command == "install" { install(graph, options); return }
     if options.command == "build" { build(graph, options); return }
+    if options.command == "patch" {
+        if !project.isBinary(package) { host.stop("patch requires src/main.min in a binary package") }
+        exit(live.patch(graph, compiler(), outputDirectory(root, profile(options)) + "/" + package.name, liveFlags(options)))
+    }
     if options.command == "bench" {
         let filter = ""
         if options.positionals.length > 0 { filter = options.positionals[0] }
@@ -560,14 +584,8 @@ function dispatch() {
     if options.command == "run" {
         if !project.isBinary(package) { host.stop("run requires src/main.min in a binary package") }
         if options.watch {
-            let flags: List<Text> = []
-            if options.release { flags.add("--release") }
-            if options.locked { flags.add("--locked") }
-            if options.offline { flags.add("--offline") }
-            if !options.incremental { flags.add("--no-incremental") }
-            if options.errorFormat != "" { flags.add("--error-format"); flags.add(options.errorFormat) }
             let output = outputDirectory(root, profile(options)) + "/" + package.name
-            exit(live.run(graph, compiler(), output, options.arguments, flags, options.hot))
+            exit(live.run(graph, compiler(), output, options.arguments, liveFlags(options), options.hot))
         }
         let output = build(graph, options)
         let arguments = [output]

@@ -310,6 +310,29 @@ grows with edits until the session ends. This development mode does not add a
 runtime cost to ordinary builds. Native debugger/trace metadata for replacement
 generations is not yet registered.
 
+### Patching a running program
+
+`minyar build --hot` builds the same patchable program without a watcher. Each
+such build gets its own live state directory under `target/<profile>`, named in
+`target/<profile>/<name>.live`. Run the
+binary as usual; after editing function bodies, `minyar patch` (with the same
+`--release` choice) compiles the edit and publishes it. Every running copy of
+that binary loads the update on its next function call, keeping its process,
+connections, module globals and heap values:
+
+```sh
+minyar build --hot --release
+./target/release/server &
+minyar patch --release
+```
+
+The same rules apply: function-body edits only, single-threaded programs only,
+and each accepted generation stays resident. An incompatible edit is refused
+and running copies keep their current code. Another `build --hot` starts a new
+session: copies of earlier builds keep running their code but receive no later
+patches. The binary records the absolute state path, so patch it on the machine
+and checkout that built it.
+
 `minyar repl` opens a persistent native session. Enter an expression to see its
 value, a `let` binding to keep a value, or a function declaration to define or
 replace a function. Mutations persist, and successful earlier actions and

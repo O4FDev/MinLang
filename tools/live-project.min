@@ -2,6 +2,7 @@ use "./project.min" as project
 use "./driver-support.min" as host
 use "./live-watch.min" as watch
 use "system" as system
+use "files" as files
 
 // The build writes the current graph for the watcher, including newly selected
 // local dependencies. NUL separators retain unusual but valid directory names.
@@ -12,6 +13,18 @@ public function publishRoots(graph: project.Graph) {
     for package in graph.packages { bytes.addBytes(Bytes(package.root)); bytes.add(0) }
     host.writeBytes(path, bytes)
 }
+function liveBuild(graph: project.Graph, state: Text, output: Text, flags: List<Text>): List<Text> {
+    let command = ["live-build", "--state", state, "--source", project.entry(graph.packages[0]), "--output", output]
+    for package in graph.packages {
+        command.add("--manifest-file"); command.add(package.root + "/Minyar.toml")
+        if package.name == "main" && project.hasLibrary(package) { command.add("--library"); command.add(package.root + "/src") }
+    }
+    for package in graph.packages {
+        if package.name != "main" && project.hasLibrary(package) { command.add("--library"); command.add(package.root + "/src") }
+    }
+    for item in flags { if item != "--locked" && item != "--offline" { command.add(item) } }
+    return command
+}
 public function run(graph: project.Graph, launcher: Text, output: Text, arguments: List<Text>, flags: List<Text>, hot: Boolean): Integer {
     let root = graph.packages[0].root
     let roots: List<Text> = []
@@ -21,17 +34,44 @@ public function run(graph: project.Graph, launcher: Text, output: Text, argument
     let state = ""
     if hot {
         state = host.temporaryDirectory(host.parentPath(output), ".live-")
-        command = ["live-build", "--state", state, "--source", project.entry(graph.packages[0]), "--output", output]
-        for package in graph.packages {
-            command.add("--manifest-file"); command.add(package.root + "/Minyar.toml")
-            if package.name == "main" && project.hasLibrary(package) { command.add("--library"); command.add(package.root + "/src") }
-        }
-        for package in graph.packages {
-            if package.name != "main" && project.hasLibrary(package) { command.add("--library"); command.add(package.root + "/src") }
-        }
-        for item in flags { if item != "--locked" && item != "--offline" { command.add(item) } }
+        command = liveBuild(graph, state, output, flags)
     }
     let status = watch.run(launcher, root, roots, arguments, command, output, hot)
     if state != "" { host.release(state) }
     return status
+}
+
+// Each build --hot gets its own live state directory, recorded beside the
+// binary, so `minyar patch` publishes function-body updates that every running
+// copy of that build loads on its next call. Copies of earlier builds keep
+// their own state and never receive a later build's updates.
+function sessionFile(output: Text): Text { return output + ".live" }
+function liveEnvironment(running: Boolean): List<Text> {
+    let environment: List<Text> = []
+    for entry in system.environment() {
+        if !entry.startsWith("MINYAR_WATCH_RUNNING=") && !entry.startsWith("MINYAR_WATCH_PUBLICATION=") { environment.add(entry) }
+    }
+    if running { environment.add("MINYAR_WATCH_RUNNING=1") }
+    return environment
+}
+public function buildPatchable(graph: project.Graph, launcher: Text, output: Text, flags: List<Text>): Integer {
+    let state = host.temporaryDirectory(host.parentPath(output), ".live-")
+    let command = [launcher]
+    for item in liveBuild(graph, state, output, flags) { command.add(item) }
+    let status = host.spawn(command, liveEnvironment(false), false, "", "", 0)
+    if status != 0 { host.release(state); return status }
+    let temporary = sessionFile(output) + "." + Text(system.processId())
+    host.writeBytes(temporary, Bytes(state))
+    if files.rename(temporary, sessionFile(output)) != 0 { host.stop("cannot record the live session: " + sessionFile(output)) }
+    return 0
+}
+public function patch(graph: project.Graph, launcher: Text, output: Text, flags: List<Text>): Integer {
+    let session = sessionFile(output)
+    if !host.isFile(output) || !host.isFile(session) { host.stop("no patchable build at " + output + "; run minyar build --hot with the same profile first") }
+    let state = host.readText(session)
+    if !host.isFile(state + "/abi") { host.stop("the live session for " + output + " is missing; run minyar build --hot again") }
+    let command = [launcher]
+    for item in liveBuild(graph, state, output, flags) { command.add(item) }
+    command.add("--publish")
+    return host.spawn(command, liveEnvironment(true), false, "", "", 0)
 }

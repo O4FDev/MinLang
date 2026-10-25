@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """A function update reaches a serving process without dropping requests or state.
 
-Runs benchmarks/livepatch/server under `minyar run --watch --hot`, keeps several
+Serves benchmarks/livepatch/server either under `minyar run --watch --hot` or as
+a `minyar build --hot` binary updated by `minyar patch`, keeps several
 keep-alive HTTP clients busy, edits reply() mid-load and checks that every
 request succeeded, each connection moved from version 1 to version 2 exactly
-once, and the server's request counter continued across the update.
+once, and the server's request counter continued across the update. The patch
+mode also checks that an incompatible edit is refused while serving continues.
 """
 import argparse
 import os
@@ -77,13 +79,13 @@ def wait_for(process, selector, output, marker, seconds):
     while time.monotonic() < deadline:
         if marker in output["stdout"] or marker in output["stderr"]:
             return
-        assert process.poll() is None, ("watcher exited", output)
+        assert process.poll() is None, ("server exited", output)
         for key, _ in selector.select(0.1):
             output[key.data] += key.fileobj.read() or b""
     raise AssertionError(("timed out waiting for", marker, output))
 
 
-def check(launcher, release):
+def check(launcher, release, deploy):
     source = launcher.parent / "benchmarks/livepatch/server"
     with tempfile.TemporaryDirectory(prefix="minyar-live-patch-") as temporary:
         project = Path(temporary) / "server"
@@ -91,9 +93,13 @@ def check(launcher, release):
         (project / "Minyar.toml").write_text((source / "Minyar.toml").read_text())
         main = project / "src/main.min"
         main.write_text((source / "src/main.min").read_text())
-        command = [str(launcher), "run", "--watch", "--hot", "--manifest-path", str(project)]
-        if release:
-            command.append("--release")
+        profile = ["--release"] if release else []
+        command = [str(launcher), "run", "--watch", "--hot", "--manifest-path", str(project), *profile]
+        if deploy:
+            built = subprocess.run([str(launcher), "build", "--hot", "--manifest-path", str(project), *profile],
+                                   capture_output=True, timeout=600 * SCALE)
+            assert built.returncode == 0, built
+            command = [str(project / "target" / ("release" if release else "debug") / "livepatch-server")]
         process = subprocess.Popen(command, cwd=project, env=dict(os.environ, LIVEPATCH_PORT="0"),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
@@ -106,7 +112,8 @@ def check(launcher, release):
         clients = []
         try:
             wait_for(process, selector, output, b"LISTENING ", 300 * SCALE)
-            wait_for(process, selector, output, b"Watching for changes", 60 * SCALE)
+            if not deploy:
+                wait_for(process, selector, output, b"Watching for changes", 60 * SCALE)
             port = int(output["stdout"].split(b"LISTENING ", 1)[1].split(b"\n", 1)[0])
             clients = [Client(port, stop) for _ in range(CLIENTS)]
             for client in clients:
@@ -115,6 +122,10 @@ def check(launcher, release):
             replacement = main.with_name("main.min.replacement")
             replacement.write_text(main.read_text().replace('"version=1 served="', '"version=2 served="'))
             replacement.replace(main)
+            if deploy:
+                patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project), *profile],
+                                         capture_output=True, timeout=600 * SCALE)
+                assert patched.returncode == 0 and b"Published update" in patched.stderr, patched
             deadline = time.monotonic() + 300 * SCALE
             while not all(c.responses and c.responses[-1][0] == 2 for c in clients):
                 assert time.monotonic() < deadline, ("update never reached every client", output)
@@ -122,6 +133,16 @@ def check(launcher, release):
                 for key, _ in selector.select(0.1):
                     output[key.data] += key.fileobj.read() or b""
             time.sleep(0.5)
+            if deploy:
+                # A changed record layout cannot be patched; the old code keeps serving.
+                source = main.read_text()
+                main.write_text(source.replace("served: Integer; keys", "served: Integer; extra: Integer; keys")
+                                .replace("served: 0; keys", "served: 0; extra: 0; keys"))
+                refused = subprocess.run([str(launcher), "patch", "--manifest-path", str(project), *profile],
+                                         capture_output=True, timeout=600 * SCALE)
+                assert refused.returncode != 0 and b"function-body edits only" in refused.stderr, refused
+                time.sleep(0.3)
+                assert all(c.responses[-1][0] == 2 for c in clients) and process.poll() is None
         finally:
             stop.set()
             for client in clients:
@@ -141,7 +162,8 @@ def check(launcher, release):
         served = sorted(served for _, served in responses)
         assert served == list(range(1, len(served) + 1)), "every request is counted exactly once"
         assert b"program state preserved" in output["stderr"], output["stderr"][-2000:]
-        print("live patch under load (" + ("release" if release else "debug") + "): " + str(len(responses)) +
+        print(("minyar patch" if deploy else "live patch") + " under load (" + ("release" if release else "debug") +
+              "): " + str(len(responses)) +
               " requests, 0 errors, update at request " + str(first_v2))
 
 
@@ -149,8 +171,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("launcher", type=Path)
     parser.add_argument("--profile", choices=("debug", "release"), default="debug")
+    parser.add_argument("--mode", choices=("watch", "patch", "both"), default="both")
     args = parser.parse_args()
-    check(args.launcher.resolve(), args.profile == "release")
+    if args.mode != "patch":
+        check(args.launcher.resolve(), args.profile == "release", False)
+    if args.mode != "watch":
+        check(args.launcher.resolve(), args.profile == "release", True)
 
 
 if __name__ == "__main__":
