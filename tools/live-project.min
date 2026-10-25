@@ -13,8 +13,17 @@ public function publishRoots(graph: project.Graph) {
     for package in graph.packages { bytes.addBytes(Bytes(package.root)); bytes.add(0) }
     host.writeBytes(path, bytes)
 }
+// The launcher prepares the live build tool once per command; each build then
+// runs it directly instead of repeating the launcher's toolchain checks.
+function liveTool(launcher: Text): Text {
+    let status = host.spawn([launcher, "live-build", "--ready"], [], true, "", "", 0)
+    if status != 0 { host.leave(status) }
+    let root = system.getenv("MINYAR_PROJECT_DIR")
+    if root == "" { root = host.parentPath(launcher) }
+    return root + "/build/tooling/tools/live-build-cli"
+}
 function liveBuild(graph: project.Graph, state: Text, output: Text, flags: List<Text>): List<Text> {
-    let command = ["live-build", "--state", state, "--source", project.entry(graph.packages[0]), "--output", output]
+    let command = ["--state", state, "--source", project.entry(graph.packages[0]), "--output", output]
     for package in graph.packages {
         command.add("--manifest-file"); command.add(package.root + "/Minyar.toml")
         if package.name == "main" && project.hasLibrary(package) { command.add("--library"); command.add(package.root + "/src") }
@@ -34,11 +43,13 @@ public function run(graph: project.Graph, launcher: Text, output: Text, argument
     let command = ["build", "--manifest-path", root]
     for item in flags { command.add(item) }
     let state = ""
+    let builder = launcher
     if hot {
         state = host.temporaryDirectory(host.parentPath(output), ".live-")
         command = liveBuild(graph, state, output, flags)
+        builder = liveTool(launcher)
     }
-    let status = watch.run(launcher, root, roots, arguments, command, output, hot)
+    let status = watch.run(builder, root, roots, arguments, command, output, hot)
     if state != "" { host.release(state) }
     return status
 }
@@ -58,7 +69,7 @@ function liveEnvironment(running: Boolean): List<Text> {
 }
 public function buildPatchable(graph: project.Graph, launcher: Text, output: Text, flags: List<Text>): Integer {
     let state = host.temporaryDirectory(host.parentPath(output), ".live-")
-    let command = [launcher]
+    let command = [liveTool(launcher)]
     for item in liveBuild(graph, state, output, flags) { command.add(item) }
     let status = host.spawn(command, liveEnvironment(false), false, "", "", 0)
     if status != 0 { host.release(state); return status }
@@ -72,7 +83,7 @@ public function patch(graph: project.Graph, launcher: Text, output: Text, flags:
     if !host.isFile(output) || !host.isFile(session) { host.stop("no patchable build at " + output + "; run minyar build --hot with the same profile first") }
     let state = host.readText(session)
     if !host.isFile(state + "/abi") { host.stop("the live session for " + output + " is missing; run minyar build --hot again") }
-    let command = [launcher]
+    let command = [liveTool(launcher)]
     for item in liveBuild(graph, state, output, flags) { command.add(item) }
     command.add("--publish")
     return host.spawn(command, liveEnvironment(true), false, "", "", 0)

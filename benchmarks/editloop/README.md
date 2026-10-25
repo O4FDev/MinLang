@@ -19,3 +19,9 @@ Measured 2026-10-25, 4-vCPU Boat box (Linux 6.8 VM), median (min–max) seconds:
 With changed-function images the hot loop is within 1.2–1.4x of Rust's and
 Go's rebuild-and-restart for this small service and keeps the process state;
 plain watch mode is 4.5–5.6x slower.
+
+After hot builds stopped re-running the launcher's toolchain checks per edit
+(two later rounds of seven edits, same box): Minyar `--watch --hot` 0.237 s and
+0.210 s, Rust 0.153 s and 0.159 s, Go 0.200 s and 0.182 s. About 0.12 s of the
+Minyar figure is the watcher's deliberate save debounce; the Rust and Go loops
+here have none.
