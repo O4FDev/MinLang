@@ -1717,9 +1717,15 @@ pairs of outputs. Views starting at the same byte may share direct-index
 access; shifted overlapping views need separate storage or a copy. Disjoint
 views of one owner can still run together.
 Buffers keep their existing length, bounds checks and shared reference semantics.
-Managed values cannot be created, passed to functions, resized or returned by an
-iteration. Calls must be to pure `parallel function`s, including their callees;
-raw machine operations and native effects are rejected. `continue` skips one
+Managed values cannot be created, resized or returned by an iteration. Calls
+must be to pure `parallel function`s, including their callees; raw machine
+operations and native effects are rejected. An input buffer can be read with
+Bytes getters such as `getInt64` and passed whole to a parallel function, which
+borrows it read-only. Elements of a captured `List<Bytes>` are read-only views
+too: `segments[index].getInt64(0)` or `count(segments[index])`. A loop that
+reads such elements writes its results to Lists of scalars, not Bytes, so no
+element can be one of its outputs. Passing a buffer the loop writes is rejected:
+other iterations could be changing it. `continue` skips one
 iteration; `break` is allowed only inside a nested ordinary loop.
 
 On macOS and Linux, a persistent thread pool distributes fixed chunks of 128
@@ -1765,10 +1771,25 @@ The address-based pixel routines remain available for device memory.
 
 A `parallel function` may run on several processors at once. The runtime's
 ownership tracking is single-threaded, so a parallel function stays outside it:
-its parameters, locals and results are `Integer`, `Float`, `Boolean` or
-`Character`, and it calls only other parallel functions, `machine` intrinsics
-and scalar functions declared `parallel`, including those in `math`. The compiler checks this and
-compiles the function with no call-depth or ownership frame.
+its locals and results are `Integer`, `Float`, `Boolean` or `Character`, and it
+calls only other parallel functions, `machine` intrinsics and scalar functions
+declared `parallel`, including those in `math`. Parameters may also be `Bytes`
+or Lists of those scalars. The function borrows them read-only from a caller
+that keeps them alive: it may index them, read `.length`, call Bytes getters
+such as `getInt64` and `getUInt16`, or pass them whole to another parallel
+function. Writing, resizing, keeping a buffer in a local and returning it are
+rejected, and so are buffer parameters of native parallel functions. A
+function with buffer parameters cannot be started through `parallelEntry`,
+whose callers pass raw Integers. The compiler checks this and compiles the
+function with no call-depth or ownership frame.
+
+```minyar
+parallel function ones(postings: Bytes, first: Integer, words: Integer): Integer {
+    let total = 0
+    for word in first..first + words { total += postings.getInt64(word * 8) & 1 }
+    return total
+}
+```
 
 ```minyar
 use "machine" as machine

@@ -4,7 +4,10 @@
 scalar buffers keep their owners on the calling thread. Each iteration writes
 only its own index, while scalar captures are snapshots. The compiler rejects
 reference escape, resizing, changed indices, shared scalar mutation and callees
-that can reach raw machine or native effects. Same-index aliases remain safe
+that can reach raw machine or native effects. Input buffers, and Bytes elements
+of a captured `List<Bytes>`, may also be read through Bytes getters or passed
+whole to parallel functions, which borrow them read-only; such reads count as
+reads at any index for the alias checks below. Same-index aliases remain safe
 when their storage begins at the same byte. Bytes guards compare backing
 ranges, so C-layout views with distinct headers cannot hide shifted overlaps.
 Read/write pairs and pairs of outputs are checked before dispatch; adjacent

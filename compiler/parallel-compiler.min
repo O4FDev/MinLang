@@ -72,17 +72,32 @@ function checkParallelBody(context: CompilerContext, firstNode: Integer, body: I
                 let name = texts[start]
                 let capture = findText(captures, name)
                 let allowed = kind == 200 && capture >= 0
-                if allowed { allowed = parallelBuffer(types[capture]) }
                 let parent = nodes[node].parent
-                if allowed && parent >= 0 {
-                    if nodes[parent].kind == 213 {
-                        if !parallelDirectIndex(context, nodes[parent].start, nodes[parent].end, name, index) && findText(written, name) >= 0 {
-                            parallelRace(context, start, "cannot read shared '" + name + "' at another index while writing it; use " + name + "[" + index + "] or a separate input buffer")
-                        }
-                    } else {
-                        allowed = nodes[parent].kind == 212 && nodes[parent].end == start + 3 && texts[start + 1] == "." && texts[start + 2] == "length"
+                if allowed && parallelViewList(types[capture]) {
+                    // A Bytes element of a captured List<Bytes> is a read-only view.
+                    allowed = parent >= 0 && nodes[parent].kind == 213 && nodes[parent].start == start && parallelViewUse(context, parent)
+                    if allowed && parallelWritesBytes(written, captures, types) {
+                        parallelRace(context, start, "a loop reading Bytes from '" + name + "' cannot also write Bytes; write the results to a List of Integers or Floats")
                     }
-                } else { allowed = false }
+                } else if kind == 213 && capture >= 0 && parallelViewList(types[capture]) {
+                    allowed = true
+                } else {
+                    if allowed { allowed = parallelBuffer(types[capture]) }
+                    if allowed && parent >= 0 {
+                        if nodes[parent].kind == 213 {
+                            if !parallelDirectIndex(context, nodes[parent].start, nodes[parent].end, name, index) && findText(written, name) >= 0 {
+                                parallelRace(context, start, "cannot read shared '" + name + "' at another index while writing it; use " + name + "[" + index + "] or a separate input buffer")
+                            }
+                        } else if nodes[parent].kind == 212 && nodes[parent].end == start + 3 && texts[start + 1] == "." && texts[start + 2] == "length" {
+                            allowed = true
+                        } else {
+                            allowed = parallelViewUse(context, node)
+                            if allowed && findText(written, name) >= 0 {
+                                parallelRace(context, start, "cannot read shared '" + name + "' as a whole while writing it; pass a separate input buffer")
+                            }
+                        }
+                    } else { allowed = false }
+                }
                 if !allowed {
                     parallelRace(context, start, "shared values may only be scalar buffers read by index or through .length; managed values cannot escape or be changed")
                 }
@@ -180,11 +195,13 @@ function parallelReadGuards(context: CompilerContext, firstNode: Integer, body: 
     let node = firstNode
     while node < context.syntax.nodes.length {
         let access = context.syntax.nodes[node]
-        if access.start >= body && (access.kind == 213 || access.kind == 214) {
+        let whole = access.kind == 200 && access.start >= body && parallelViewUse(context, node)
+        if access.start >= body && (access.kind == 213 || access.kind == 214 || whole) {
             let name = context.tokenTexts[access.start]
             let read = findText(captures, name)
+            if read >= 0 && !parallelBuffer(types[read]) { read = -1 }
             if read >= 0 && types[read] == 8 && findText(byteNames, name) < 0 { byteNames.add(name) }
-            if read >= 0 && access.kind == 213 && !parallelDirectIndex(context, access.start, access.end, name, index) {
+            if read >= 0 && (whole || (access.kind == 213 && !parallelDirectIndex(context, access.start, access.end, name, index))) {
                 if findText(offIndex, name) < 0 { offIndex.add(name) }
                 let output = 0
                 while output < written.length {
@@ -275,7 +292,7 @@ function recordSafeParallelEffects(output: List<Text>, globals: List<Text>, body
             if user {
                 globals.add("; minyar-safe-edge: " + name + "|" + callee.slice(11, callee.length) + "\n")
             } else {
-                if text[symbol] != '@' || !(parallelRuntimeAllowed(callee) || parallelScalarIntrinsic(callee) || contractFailureIntrinsic(globals, callee)) {
+                if text[symbol] != '@' || !(parallelRuntimeAllowed(callee) || parallelScalarIntrinsic(callee) || parallelViewHelper(callee) || contractFailureIntrinsic(globals, callee)) {
                     globals.add("; minyar-unsafe-parallel: " + name + "\n")
                 }
             }
@@ -333,4 +350,83 @@ function checkSafeParallelCalls(context: CompilerContext, globals: List<Text>) {
             }
         }
     }
+}
+
+// Readers of a scalar buffer that touch only its header and storage. A view
+// borrowed by a parallel function or a safe loop may use these and no others.
+function parallelViewRuntime(callee: Text): Boolean {
+    return callee == "minyar_bytes_get" || callee == "minyar_bytes_length" || callee == "minyar_bytes_get_int64" || callee == "minyar_bytes_get_int32" || callee == "minyar_bytes_get_uint32" || callee == "minyar_bytes_get_int16" || callee == "minyar_bytes_get_uint16" || callee == "minyar_bytes_get_float64" || callee == "minyar_bytes_get_float32" || callee == "minyar_list_get" || callee == "minyar_list_length"
+}
+
+function parallelViewReader(member: Text): Boolean {
+    return member == "length" || member == "getInt64" || member == "getInt32" || member == "getUInt32" || member == "getInt16" || member == "getUInt16" || member == "getFloat64" || member == "getFloat32"
+}
+
+// A parallel function borrows its Bytes and List parameters from a caller that
+// keeps them alive and unchanged. Each use must read through an index, .length
+// or a typed getter, or pass the whole view on to another parallel function.
+function checkParallelViews(context: CompilerContext, first: Integer, after: Integer, names: List<Text>, types: List<Integer>, owner: Text) {
+    let texts = context.tokenTexts
+    let kinds = context.tokenKinds
+    let token = first
+    while token < after {
+        let parameter = findText(names, texts[token])
+        if kinds[token] == 1 && parameter >= 0 && parameter < types.length && texts[token - 1] != "." {
+            if parallelBuffer(types[parameter]) {
+                let name = texts[token]
+                let help = "parallel function '" + readableDeclarationName(owner) + "' borrows '" + name + "' read-only; "
+                let next = texts[token + 1]
+                if next == "[" {
+                    let depth = 1
+                    let close = token + 1
+                    while close + 1 < after && depth > 0 {
+                        close = close + 1
+                        if texts[close] == "[" || texts[close] == "(" { depth = depth + 1 }
+                        if texts[close] == "]" || texts[close] == ")" { depth = depth - 1 }
+                    }
+                    let operator = texts[close + 1]
+                    if operator.length >= 1 && operator[operator.length - 1] == '=' && operator != "==" && operator != "!=" && operator != "<=" && operator != ">=" {
+                        failAtToken(context.tokenLines, token, help + "write results through the loop's own slots instead")
+                    }
+                } else if next == "." {
+                    if !parallelViewReader(texts[token + 2]) {
+                        failAtToken(context.tokenLines, token, help + "only indexing, .length and get methods are allowed, not ." + texts[token + 2])
+                    }
+                } else if !((texts[token - 1] == "(" || texts[token - 1] == ",") && (next == "," || next == ")")) {
+                    failAtToken(context.tokenLines, token, help + "read it by index or pass it whole to another parallel function")
+                }
+            }
+        }
+        token = token + 1
+    }
+}
+
+function parallelViewList(type: Integer): Boolean {
+    return isListType(type) && listElementType(type) == 8
+}
+
+function parallelWritesBytes(written: List<Text>, captures: List<Text>, types: List<Integer>): Boolean {
+    let position = 0
+    while position < written.length {
+        if types[findText(captures, written[position])] == 8 { return true }
+        position = position + 1
+    }
+    return false
+}
+
+// A buffer expression used read-only: a typed getter's receiver or a whole
+// argument of a call. Calls in a safe loop reach only parallel functions,
+// which borrow such arguments as read-only views.
+function parallelViewUse(context: CompilerContext, node: Integer): Boolean {
+    let texts = context.tokenTexts
+    let nodes = context.syntax.nodes
+    let start = nodes[node].start
+    let end = nodes[node].end
+    if texts[end] == "." && parallelViewReader(texts[end + 1]) && texts[end + 2] == "(" { return true }
+    if texts[end] == "[" && nodes[node].kind == 213 { return true }
+    return (texts[start - 1] == "(" || texts[start - 1] == ",") && (texts[end] == "," || texts[end] == ")")
+}
+
+function parallelViewHelper(callee: Text): Boolean {
+    return callee.startsWith(".minyar.bytes.get.") || callee == ".minyar.bytes.length" || callee == ".minyar.list.get.checked" || callee == ".minyar.list.length"
 }
