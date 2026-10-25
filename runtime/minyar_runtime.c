@@ -1367,9 +1367,9 @@ MinyarText *minyar_interpolate(long long count, ...) {
 
 #include "minyar_library.h"
 #include "minyar_diagnostics.h"
-#ifdef MINYAR_RUNTIME_CALLBACKS
+/* Callback domain checks are ordinary entry points in every profile. Cycle
+ * tracing is selected separately, by the compiler's cycle-runtime marker. */
 #include "minyar_callbacks.h"
-#endif
 #if MINYAR_THREADED
 #include "minyar_thread_os.h"
 #endif

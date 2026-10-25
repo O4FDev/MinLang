@@ -3,6 +3,8 @@
  * IDs are unique for the process lifetime, so recycled OS thread IDs cannot
  * authorize stale values. The freestanding profile instead binds its one
  * execution domain to a physical CPU. This does not make managed heaps shared. */
+#ifndef MINYAR_CALLBACKS_H
+#define MINYAR_CALLBACKS_H
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -59,9 +61,11 @@ bool minyar_callbackruntime_service(void) {
 #elif defined(MINYAR_BOUNDED_RC)
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
     return rc_pending_count != 0;
-#else
+#elif defined(MINYAR_CYCLE_RC)
     rc_cycle_eager_service(32);
     return rc_cycle_pending != 0;
+#else
+    return false; /* Eager release leaves no queued work. */
 #endif
 }
 
@@ -84,6 +88,9 @@ long long minyar_callbackruntime_serviceWait(long long timeout_ms) {
     bool pending = minyar_callbackruntime_service();
     if (!pending)
         return timeout_ms;
+#ifndef MINYAR_CYCLE_RC
+    return 0; /* Only cycle batches are paced; other debt runs immediately. */
+#else
     if (!rc_cycle_pending)
         return 0;
 #ifdef MINYAR_BOUNDED_RC
@@ -92,4 +99,6 @@ long long minyar_callbackruntime_serviceWait(long long timeout_ms) {
 #endif
     return timeout_ms < 0 || timeout_ms > 10 ? 10 : timeout_ms;
 #endif
+#endif
 }
+#endif

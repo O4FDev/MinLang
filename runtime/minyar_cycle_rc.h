@@ -1,6 +1,7 @@
 /* Adapted from port/astra-cycles-v2 at 976a75a8c51518006cb654d6e6304f425e2eab91.
  * Selected only by the separate cycle runtime; ordinary runtime files retain
  * their original implementation. See docs/managed-graphs.md. */
+#define MINYAR_CYCLE_RC 1
 #if defined(MINYAR_SYSTEM_HEAP) && defined(MINYAR_LAZY_HEAP) && !defined(MINYAR_COMPILER_ARENA)
 #error Lazy pool backing cannot be combined with the system heap.
 #endif
