@@ -79,17 +79,20 @@ test.check(live.transform("define i64 @\".minyar.fn.bad\\GG\"() {\n  ret i64 0\n
 test.check(live.transform("define i64 @.minyar.fn.bad(i64 noundef %x) {\n  ret i64 %x\n}\n", 0, true).error != "", "unsupported parameter attributes fail closed")
 test.check(live.transform(ir + "; minyar-thread-runtime: 1\n", 0, true).error == "", "managed-thread programs are accepted")
 test.check(live.transform(ir + "; minyar-data-parallel-runtime: 1\n", 0, true).error == "", "parallel loop programs are accepted")
-test.check(host.hasText(initial.llvm, "load atomic ptr, ptr @minyar.live.0.slot.") && host.hasText(initial.llvm, "load atomic i64, ptr @minyar_live_epoch_seen monotonic"), "wrappers read shared dispatch state atomically")
+test.check(host.hasText(initial.llvm, "load atomic ptr, ptr @minyar.live.0.slot.") && host.hasText(initial.llvm, "load atomic i64, ptr @minyar_live_epoch_seen acquire"), "wrappers read shared dispatch state atomically; a seen epoch carries its slots")
+test.check(host.hasText(initial.llvm, "load atomic ptr, ptr @minyar_live_epoch unordered"), "the epoch page pointer may be set while parallel workers call wrappers")
 test.check(live.transform(ir, -1, true).error != "", "invalid generation identity is rejected")
 test.check(live.transform("define i64 @.minyar.fn.bad() {\n  ret i64 1\n", 0, true).error != "", "incomplete generated functions fail closed")
 
 // Update images hold only changed bodies and call through the original wrappers.
 let published = live.decodePairs(initial.digests)
 let exports = live.decodePairs(initial.exports)
+let cells = live.decodePairs(initial.cells)
+test.check(cells["minyar.constant|session|value"] == "ptr" && cells["minyar.constant|session|state"] == "i8", "the original image records its module state cells")
 test.check(exports.has(".minyar.fn.add") && published.has(".minyar.fn.add") && !exports.has("main"), "the original image records language wrappers and body fingerprints")
-let same = live.transformUpdate(ir, 3, published, exports)
+let same = live.transformUpdate(ir, 3, published, exports, cells)
 test.check(same.error == "" && same.names.length == 0 && same.signature == initial.signature, "unchanged bodies compile nothing: " + same.error)
-let partial = live.transformUpdate(host.replaceText(ir, "%sum = add i64", "%sum = sub i64"), 3, published, exports)
+let partial = live.transformUpdate(host.replaceText(ir, "%sum = add i64", "%sum = sub i64"), 3, published, exports, cells)
 test.check(partial.error == "" && partial.names.length == 1 && partial.names[0] == ".minyar.fn.add", "an update compiles only the changed body: " + partial.error)
 test.check(partial.signature == initial.signature, "a partial update keeps the whole ABI signature")
 test.check(!host.hasText(partial.llvm, "define i1 @") && !host.hasText(partial.llvm, "define double @"), "unchanged bodies are not recompiled")
@@ -97,12 +100,13 @@ test.check(host.hasText(partial.llvm, "declare i64 @" + exports[".minyar.fn.add"
 test.check(!host.hasText(partial.llvm, "minyar_live_bind"), "update images need no wrappers of their own")
 let literalIr = "@.message = private unnamed_addr constant [3 x i8] c\"ab\\00\"\ndefine ptr @.minyar.fn.message() uwtable {\nentry:\n  ret ptr @.message\n}\ndefine i64 @.minyar.fn.other() uwtable {\nentry:\n  ret i64 1\n}\ndefine i32 @main() {\nentry:\n  ret i32 0\n}\n"
 let literalInitial = live.transform(literalIr, 0, true)
-let literalUpdate = live.transformUpdate(host.replaceText(literalIr, "c\"ab\\00\"", "c\"cd\\00\""), 4, live.decodePairs(literalInitial.digests), live.decodePairs(literalInitial.exports))
+let literalUpdate = live.transformUpdate(host.replaceText(literalIr, "c\"ab\\00\"", "c\"cd\\00\""), 4, live.decodePairs(literalInitial.digests), live.decodePairs(literalInitial.exports), Map<Text, Text>())
 test.check(literalUpdate.error == "" && literalUpdate.names.length == 1 && literalUpdate.names[0] == ".minyar.fn.message", "editing a literal recompiles the functions that read it")
-test.check(live.transformUpdate(ir, 3, published, Map<Text, Text>()).error != "", "a function without an original wrapper needs a restart")
+let everything = live.transformUpdate(ir, 3, published, Map<Text, Text>(), cells)
+test.check(everything.error == "" && everything.added.length == 6, "functions the executable lacks are added: " + everything.error)
 let closureIr = "define internal i64 @.minyar.closure.7(i64 %value) {\nentry:\n  %next = add i64 %value, 1\n  ret i64 %next\n}\ndefine ptr @.minyar.fn.outer() uwtable {\nentry:\n  ret ptr @.minyar.closure.7\n}\ndefine i64 @.minyar.fn.other() uwtable {\nentry:\n  ret i64 1\n}\n"
 let closureInitial = live.transform(closureIr, 0, true)
-let closureUpdate = live.transformUpdate(host.replaceText(closureIr, "add i64 %value, 1", "add i64 %value, 2"), 5, live.decodePairs(closureInitial.digests), live.decodePairs(closureInitial.exports))
+let closureUpdate = live.transformUpdate(host.replaceText(closureIr, "add i64 %value, 1", "add i64 %value, 2"), 5, live.decodePairs(closureInitial.digests), live.decodePairs(closureInitial.exports), Map<Text, Text>())
 test.check(closureUpdate.error == "" && closureUpdate.names.length == 1 && closureUpdate.names[0] == ".minyar.fn.outer", "editing a closure recompiles the functions that create it")
 
 let unusedIr = "define internal i64 @.minyar.fn.unused() uwtable {\nentry:\n  %value = load i64, ptr @os_only_table\n  ret i64 %value\n}\ndefine internal i64 @.minyar.fn.used() uwtable {\nentry:\n  ret i64 1\n}\ndefine i32 @main() {\nentry:\n  %value = call i64 @.minyar.fn.used()\n  ret i32 0\n}\n"
@@ -110,15 +114,57 @@ let pruned = live.transformProgram(unusedIr, 0, true)
 test.check(pruned.error == "" && pruned.names.length == 1 && pruned.names[0] == ".minyar.fn.used", "live programs drop functions nothing reaches: " + pruned.error)
 test.check(!host.hasText(pruned.llvm, "os_only_table"), "an unreachable function's references leave with it")
 test.check(live.transform(unusedIr, 0, true).names.length == 2, "the REPL transform keeps every declaration")
-test.check(live.transformUpdate(unusedIr, 1, live.decodePairs(pruned.digests), live.decodePairs(pruned.exports)).error == "", "updates prune the same functions")
-let stopsCalling = live.transformUpdate(host.replaceText(unusedIr, "%value = call i64 @.minyar.fn.used()\n", ""), 1, live.decodePairs(pruned.digests), live.decodePairs(pruned.exports))
+test.check(live.transformUpdate(unusedIr, 1, live.decodePairs(pruned.digests), live.decodePairs(pruned.exports), Map<Text, Text>()).error == "", "updates prune the same functions")
+let stopsCalling = live.transformUpdate(host.replaceText(unusedIr, "%value = call i64 @.minyar.fn.used()\n", ""), 1, live.decodePairs(pruned.digests), live.decodePairs(pruned.exports), Map<Text, Text>())
 test.check(stopsCalling.error == "" && stopsCalling.signature == pruned.signature, "a body edit that stops calling a function keeps the signature: " + stopsCalling.error)
-let startsCalling = live.transformUpdate(host.replaceText(unusedIr, "@.minyar.fn.used()\n  ret i32", "@.minyar.fn.unused()\n  ret i32"), 1, live.decodePairs(pruned.digests), live.decodePairs(pruned.exports))
-test.check(host.hasText(startsCalling.error, "cannot add a call to .minyar.fn.unused"), "a call to a function the program left out names it: " + startsCalling.error)
+let startsCalling = live.transformUpdate(host.replaceText(unusedIr, "@.minyar.fn.used()\n  ret i32", "@.minyar.fn.unused()\n  ret i32"), 1, live.decodePairs(pruned.digests), live.decodePairs(pruned.exports), Map<Text, Text>())
+test.check(startsCalling.error == "" && host.hasText(startsCalling.llvm, "define internal i64 @minyar.live.1.body.0(") && startsCalling.added.length == 0, "a first call to an intrinsic the program left out carries its body: " + startsCalling.error)
+test.check(live.compatibility(pruned.signature, startsCalling.signature) == "", "a first call to a left-out intrinsic is a body edit")
 let tableIr = "@.dispatch.4 = private unnamed_addr constant [2 x { i64, i64 }] [\n  { i64, i64 } { i64 1, i64 10 },\n  { i64, i64 } { i64 2, i64 20 }\n]\ndefine i64 @.minyar.fn.lookup(i64 %key) uwtable {\nentry:\n  %row = getelementptr { i64, i64 }, ptr @.dispatch.4, i64 %key\n  %value = load i64, ptr %row\n  ret i64 %value\n}\ndefine i64 @.minyar.fn.other() uwtable {\nentry:\n  ret i64 1\n}\n"
 let tableInitial = live.transformProgram(tableIr, 0, true)
-let tableUpdate = live.transformUpdate(host.replaceText(tableIr, "i64 2, i64 20", "i64 2, i64 21"), 6, live.decodePairs(tableInitial.digests), live.decodePairs(tableInitial.exports))
+let tableUpdate = live.transformUpdate(host.replaceText(tableIr, "i64 2, i64 20", "i64 2, i64 21"), 6, live.decodePairs(tableInitial.digests), live.decodePairs(tableInitial.exports), Map<Text, Text>())
 test.check(tableUpdate.error == "" && tableUpdate.names.length == 1 && tableUpdate.names[0] == ".minyar.fn.lookup", "editing a multi-line table recompiles its readers: " + tableUpdate.error)
+
+// Edits may add functions, records and imports; nothing else.
+let base = "use \"./other.min\" as other\nrecord Point { x: Integer }\nglobal count: Integer = 1\nfunction value(): Integer { return 1 }\nprint(value())\n"
+function added(before: Text, after: Text): Text { return live.additions(live.surfaceItems(before).items, live.surfaceItems(after).items) }
+test.check(added(base, base) == "", "an unchanged surface adds nothing")
+test.check(added(base, base + "function extra(x: Integer): Integer { return x }\n") == "", "a new function may be added")
+test.check(added(base, "deterministic function first(): Integer { return 0 }\n" + base) == "", "a new function with modifiers may be added anywhere")
+test.check(added(base, "use \"./third.min\" as third\n" + base) == "", "a new import may be added")
+test.check(added(base, base + "public record Pair { a: Integer; b: Integer }\n") == "", "a new record may be added")
+test.check(added(base, host.replaceText(base, "function value(): Integer { return 1 }", "function value(): Integer { return 2 }")) == "", "a body edit adds nothing")
+test.check(added(base, base + "global other: Integer = 2\n") != "", "a new global needs its initializer run")
+test.check(added(base, base + "print(2)\n") != "", "new top-level statements need a restart")
+test.check(added(base, host.replaceText(base, "x: Integer", "x: Float")) != "", "a changed record needs a restart")
+test.check(added(base, host.replaceText(base, "function value(): Integer {", "function value(): Float {")) != "", "a changed function header needs a restart")
+test.check(added(base, host.replaceText(base, "function value(): Integer { return 1 }\n", "")) != "", "a removed function needs a restart")
+test.check(added(base, host.replaceText(base, "./other.min", "./another.min")) != "", "a changed import needs a restart")
+test.check(live.surface(base) == "live-surface-v1\n" + joinText(fieldsWithoutKinds(live.surfaceItems(base).items)), "the surface is its items' tokens")
+function fieldsWithoutKinds(items: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for item in items { result.add(host.textSlice(item, 1, item.byteLength)) }
+    return result
+}
+
+// An update may add functions (with wrappers of its own) but not module state;
+// the signature check keeps every original function and type.
+let addIr = "@\"minyar.constant|session|value\" = internal global ptr zeroinitializer\ndefine i64 @.minyar.fn.keep() uwtable {\nentry:\n  ret i64 1\n}\ndefine i32 @main() {\nentry:\n  %value = call i64 @.minyar.fn.keep()\n  ret i32 0\n}\n"
+let addInitial = live.transformProgram(addIr, 0, true)
+let grownIr = host.replaceText(addIr, "  ret i64 1\n}\n", "  %more = call i64 @.minyar.fn.fresh(i64 1)\n  ret i64 %more\n}\ndefine i64 @.minyar.fn.fresh(i64 %x) uwtable {\nentry:\n  ret i64 %x\n}\n")
+let grown = live.transformUpdate(grownIr, 7, live.decodePairs(addInitial.digests), live.decodePairs(addInitial.exports), live.decodePairs(addInitial.cells))
+test.check(grown.error == "" && grown.added.length == 1 && grown.added[0] == ".minyar.fn.fresh", "an update adds a new function: " + grown.error)
+test.check(grown.names.length == 2 && host.listed(grown.names, ".minyar.fn.fresh") && host.listed(grown.names, ".minyar.fn.keep"), "the table lists the added function and its changed caller")
+test.check(host.hasText(grown.llvm, "call ptr @minyar_live_bind(ptr @minyar.live.7.key."), "an added function gets a wrapper of its own")
+test.check(host.hasText(grown.llvm, "call i64 @minyar.live.7.function."), "the changed caller calls the added function through its wrapper")
+test.check(live.compatibility(addInitial.signature, grown.signature) == "", "an added function keeps the program compatible")
+test.check(host.hasText(live.compatibility(grown.signature, addInitial.signature), "cannot remove or rename fresh"), "a removed function is named")
+test.check(host.hasText(live.compatibility(addInitial.signature, live.transformProgram(host.replaceText(addIr, "define i64 @.minyar.fn.keep()", "define i1 @.minyar.fn.keep()"), 1, false).signature), "changed a compiled function signature (keep)"), "a changed signature is named")
+test.check(host.hasText(live.compatibility(addInitial.signature, live.transformProgram(addIr + "; minyar-native-library: json\n", 1, false).signature), "cannot add native code"), "a new native library needs a restart")
+test.check(live.compatibility(addInitial.signature, live.transformProgram("%record.Point = type { i64 }\n" + addIr, 1, false).signature) == "", "a new type may be added")
+let stateIr = "@\"minyar.constant|fresh|value\" = internal global i64 0\n" + addIr
+test.check(host.hasText(live.transformUpdate(stateIr, 8, live.decodePairs(addInitial.digests), live.decodePairs(addInitial.exports), live.decodePairs(addInitial.cells)).error, "cannot add module state (fresh)"), "new module state needs a restart")
+test.check(live.wellFormed(addInitial.exports) && !live.wellFormed("live-pairs-v1\n3:ab\n") && !live.wellFormed(""), "malformed session files are recognised")
 
 // Compile generated forwarding code, so the contract checks cover real LLVM
 // syntax and every supported scalar/pointer ABI at both useful optimizations.
@@ -134,5 +180,7 @@ for optimization in ["-O0", "-O2"] {
     test.check(execution.status == 0 && execution.output == "" && execution.errorOutput == "", "live forwarding ABI execution " + optimization + ": " + execution.errorOutput)
     test.require(test.run([clang, optimization, "-Wno-override-module", "-fPIC", "-c", work + "/next.ll", "-o", work + "/next.o"], system.environment(), "", work + "/object", 30), "replacement image LLVM " + optimization)
     test.require(test.run([clang, optimization, "-Wno-override-module", "-fPIC", "-c", work + "/partial.ll", "-o", work + "/partial.o"], system.environment(), "", work + "/partial", 30), "partial update LLVM " + optimization)
+    io.writeTextFile(work + "/grown.ll", grown.llvm)
+    test.require(test.run([clang, optimization, "-Wno-override-module", "-fPIC", "-c", work + "/grown.ll", "-o", work + "/grown.o"], system.environment(), "", work + "/grown", 30), "additive update LLVM " + optimization)
 }
 print("live transform tests passed")

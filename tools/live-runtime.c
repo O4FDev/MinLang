@@ -6,7 +6,17 @@
 // loads and no system call, and the first call after a publication loads it.
 // Managed threads and parallel loop workers may call wrappers concurrently:
 // slots and the seen epoch are read atomically and every update happens under
-// live_lock.
+// live_lock. The seen epoch is stored after the slots it covers (release) and
+// read with acquire, so a wrapper that sees a publication's epoch also sees its
+// retargeted slots. Slots are retargeted one at a time: a call already running
+// across the update can still reach an old body of another function.
+//
+// A published table (`current`) is NUL-separated text:
+//   minyar-live-table-v2, the executable's build id, the image path (or "-"
+//   for the executable's own functions), then key/symbol pairs.
+// A table for another executable (another build, or a session that was
+// replaced) is refused, so a copy only ever runs code built against its own
+// wrappers.
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif
@@ -24,11 +34,12 @@
 #include <unistd.h>
 
 extern const char minyar_live_manifest[];
+extern const char minyar_live_build[];
 // MINYAR_LIVE_STATE relocates the live state directory recorded at build time,
 // for a copy of the binary and its state deployed elsewhere. Image paths in a
 // published table that lie under the recorded directory are read from it.
 static const char *live_manifest = minyar_live_manifest;
-static const char *live_relocated;
+static char *live_relocated;
 static size_t live_recorded_length;
 struct live_entry { const char *key; void *address; };
 struct live_image { void *handle; struct live_image *previous; };
@@ -79,12 +90,17 @@ static void *live_lookup(const char *key, void *initial) {
         bsearch(&needle, live_entries, live_count, sizeof *live_entries, live_compare) : NULL;
     return found ? found->address : initial;
 }
+// Retries of the same failing publication stay quiet after the first report.
+static void live_report(int repeated, const char *problem, const char *detail) {
+    if (repeated) return;
+    if (detail) fprintf(stderr, "minyar live: %s: %s\n", problem, detail);
+    else fprintf(stderr, "minyar live: %s; keeping current code\n", problem);
+}
 // Called with live_lock held.
 static void live_refresh(void) {
     struct stat info;
     if (stat(live_manifest, &info) ||
         (live_have_seen && live_same(&info, &live_seen))) return;
-    // Retries of the same failing publication stay quiet after the first report.
     int repeated = live_have_failed && live_same(&info, &live_failed);
     live_failed = info; live_have_failed = 1;
     int fd = open(live_manifest, O_RDONLY | O_CLOEXEC);
@@ -105,12 +121,24 @@ static void live_refresh(void) {
     // Atomic publication is required; the descriptor pins exactly one version.
     if (offset != length || storage[length - 1] != 0) { free(storage); return; }
     char *cursor = storage, *end = storage + length;
+    char *format = live_part(&cursor, end);
+    if (!format || strcmp(format, "minyar-live-table-v2")) {
+        live_report(repeated, "update has an unknown table format", NULL);
+        free(storage); return;
+    }
+    char *build = live_part(&cursor, end);
+    if (!build || strcmp(build, minyar_live_build)) {
+        live_report(repeated, "update was built for another executable", NULL);
+        free(storage); return;
+    }
     char *path = live_part(&cursor, end);
     size_t count = 0;
     for (char *p = cursor; p < end; ++p) if (!*p) ++count;
+    // Messages describe a change to code this process has already run.
+    int running = live_slot_count != 0;
     if (path && !strcmp(path, "-") && !count) {
-        // `minyar patch --undo` back to the original program: every slot returns
-        // to the executable's own body.
+        // Every edit reverted, or `minyar patch --undo` back to the original
+        // program: every slot returns to the body it was created with.
         free(storage);
         int replaced = live_count != 0;
         free(live_entries);
@@ -118,10 +146,13 @@ static void live_refresh(void) {
         for (size_t i = 0; i < live_slot_count; ++i)
             __atomic_store_n(live_slots[i].slot, live_slots[i].initial, __ATOMIC_RELEASE);
         live_seen = info; live_have_seen = 1; live_have_failed = 0;
-        if (replaced) fprintf(stderr, "Restored original functions; program state preserved\n");
+        if (replaced && running) fprintf(stderr, "Restored original functions; program state preserved\n");
         return;
     }
-    if (!path || count % 2 || !count) { free(storage); return; }
+    if (!path || count % 2 || !count) {
+        live_report(repeated, "update has an invalid function table", NULL);
+        free(storage); return;
+    }
     count /= 2;
     struct live_entry *entries = calloc(count, sizeof *entries);
     struct live_image *image = malloc(sizeof *image);
@@ -138,8 +169,7 @@ static void live_refresh(void) {
     void *handle = dlopen(located ? located : path, RTLD_NOW | RTLD_LOCAL);
     free(located);
     if (!handle) {
-        const char *problem = dlerror();
-        if (!repeated) fprintf(stderr, "minyar live: cannot load update: %s\n", problem);
+        live_report(repeated, "cannot load update", dlerror());
         free(entries); free(image); free(storage); return;
     }
     int valid = 1;
@@ -157,7 +187,7 @@ static void live_refresh(void) {
             if (!strcmp(entries[i - 1].key, entries[i].key)) valid = 0;
     }
     if (!valid) {
-        fprintf(stderr, "minyar live: update has an invalid function table; keeping current code\n");
+        live_report(repeated, "update has an invalid function table", NULL);
         dlclose(handle); free(entries); free(image); free(storage); return;
     }
     image->handle = handle; image->previous = live_images; live_images = image;
@@ -169,30 +199,41 @@ static void live_refresh(void) {
         __atomic_store_n(live_slots[i].slot, live_lookup(live_slots[i].key, live_slots[i].initial),
                          __ATOMIC_RELEASE);
     live_seen = info; live_have_seen = 1; live_have_failed = 0;
-    fprintf(stderr, "Reloaded %zu functions; program state preserved\n", count);
+    if (running) fprintf(stderr, "Reloaded %zu functions; program state preserved\n", count);
 }
 static void live_map(void) {
     live_mapped = 1;
     const char *relocated = getenv("MINYAR_LIVE_STATE");
     const char *slash = strrchr(minyar_live_manifest, '/');
     if (relocated && *relocated && slash) {
-        size_t length = strlen(relocated);
-        char *manifest = malloc(length + strlen(slash) + 1);
-        if (manifest) {
-            memcpy(manifest, relocated, length);
-            strcpy(manifest + length, slash);
-            live_manifest = manifest;
-            live_relocated = relocated;
-            live_recorded_length = (size_t)(slash - minyar_live_manifest);
+        // Resolved once, into memory of our own: a later chdir or setenv in the
+        // program cannot move the directory this copy watches.
+        char *resolved = realpath(relocated, NULL);
+        char *manifest = resolved ? malloc(strlen(resolved) + strlen(slash) + 1) : NULL;
+        if (!manifest) {
+            fprintf(stderr, "minyar live: cannot use MINYAR_LIVE_STATE=%s: %s; keeping current code\n",
+                    relocated, strerror(resolved ? ENOMEM : errno));
+            free(resolved);
+            return;
         }
+        strcpy(manifest, resolved);
+        strcat(manifest, slash);
+        live_manifest = manifest;
+        live_relocated = resolved;
+        live_recorded_length = (size_t)(slash - minyar_live_manifest);
     }
     size_t length = strlen(live_manifest);
     char *path = malloc(length + sizeof ".epoch");
-    int descriptor = -1;
+    int descriptor = -1, missing = 0;
     if (path) {
         memcpy(path, live_manifest, length);
         memcpy(path + length, ".epoch", sizeof ".epoch");
         descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        // A read-only deployment (or another service user) can still follow
+        // publications through an existing counter.
+        if (descriptor < 0 && (errno == EACCES || errno == EROFS || errno == EPERM))
+            descriptor = open(path, O_RDONLY | O_CLOEXEC);
+        missing = descriptor < 0 && errno == ENOENT;
         free(path);
     }
     struct stat info;
@@ -202,11 +243,14 @@ static void live_map(void) {
         page = mmap(NULL, sizeof(uint64_t), PROT_READ, MAP_SHARED, descriptor, 0);
     if (descriptor >= 0) close(descriptor);
     if (page == MAP_FAILED) {
-        fprintf(stderr, "minyar live: cannot watch for updates; keeping current code\n");
+        // A later build --hot or plain build of the same output removes this
+        // build's session; nothing can publish to it any more.
+        if (!missing || live_relocated)
+            fprintf(stderr, "minyar live: cannot watch for updates; keeping current code\n");
         return;
     }
     __atomic_store_n(&minyar_live_epoch_seen, __atomic_load_n((const uint64_t *)page, __ATOMIC_ACQUIRE),
-                     __ATOMIC_RELAXED);
+                     __ATOMIC_RELEASE);
     __atomic_store_n(&minyar_live_epoch, (const uint64_t *)page, __ATOMIC_RELEASE);
     // A copy started after a publication runs it from its first call.
     live_refresh();
@@ -222,7 +266,7 @@ void *minyar_live_bind(const char *key, void *initial, void **slot) {
         // publication cannot load yet (say, its files are still arriving); the
         // failure is reported and the next epoch bump retries it.
         live_refresh();
-        __atomic_store_n(&minyar_live_epoch_seen, epoch, __ATOMIC_RELAXED);
+        __atomic_store_n(&minyar_live_epoch_seen, epoch, __ATOMIC_RELEASE);
     }
     void *address = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (!address) {

@@ -51,15 +51,79 @@ function sources(entry: Text, libraries: List<Text>): Sources {
     }
     return result
 }
-function surface(inputs: Sources, compiler: Text): Text {
-    let pieces = ["live-abi-v1\n", host.hashFile(compiler), "\n"]
+// The session's declaration surface: each source file's top-level items and
+// each package manifest. An edit may add functions, records, imports, modules
+// and dependencies; everything else must stay as the running program has it.
+function surface(inputs: Sources, manifests: List<Text>, compiler: Text, incremental: Boolean): Text {
+    let keys = ["toolchain", "incremental"]
+    let values = [host.hashFile(compiler), Text(incremental)]
     for index in 0..inputs.paths.length {
-        let signature = live.surface(inputs.texts[index])
-        if !signature.startsWith("live-surface-v1\n") { host.stop(signature) }
-        pieces.add(host.jsonText(inputs.paths[index])); pieces.add("\n")
-        pieces.add(signature); pieces.add("\n")
+        let found = live.surfaceItems(inputs.texts[index])
+        if found.error != "" { host.stop("live-surface-error: " + found.error) }
+        keys.add("source:" + inputs.paths[index]); values.add(live.encodeList(found.items))
     }
-    return host.joined(pieces, "")
+    for manifest in manifests { keys.add("manifest:" + manifest); values.add(host.readText(manifest)) }
+    return "live-abi-v2\n" + live.encodePairs(keys, values)
+}
+constant RESTART = " Stop and run again to accept this change"
+constant DECLARATIONS = "hot reload accepts function-body edits and additions of functions, records, imports and packages only; existing declarations, state layouts and initialization must stay unchanged."
+record Manifest { settings: Text; dependencies: List<Text> }
+// Settings outside [dependencies] must stay; dependencies may only be added.
+function manifestParts(text: Text): Manifest {
+    let result = Manifest { settings: ""; dependencies: [] }
+    let settings: List<Text> = []
+    let section = ""
+    for raw in host.lines(text) {
+        let line = host.strip(raw)
+        if line == "" || line.startsWith("#") { continue }
+        if line.startsWith("[") { section = line }
+        if line == "[dependencies]" { continue }
+        if section == "[dependencies]" && !line.startsWith("[") { result.dependencies.add(line) }
+        else { settings.add(line) }
+    }
+    result.settings = host.joined(settings, "\n")
+    return result
+}
+// "" when the edited program's surface (`after`) can replace functions in the
+// program built with `before`.
+function surfaceChange(before: Text, after: Text): Text {
+    if !before.startsWith("live-abi-v2\n") { return "the live session was made by another toolchain." + RESTART }
+    let old = live.decodeFields(host.textAfter(before, "live-abi-v2\n"))
+    let new = live.decodePairs(host.textAfter(after, "live-abi-v2\n"))
+    if old.length == 0 { return "the live session's surface record is malformed." + RESTART }
+    let known = Map<Text, Boolean>()
+    let index = 0
+    while index < old.length {
+        let key = old[index]
+        let value = old[index + 1]
+        known[key] = true
+        index += 2
+        if !new.has(key) {
+            if key.startsWith("source:") { return DECLARATIONS + " " + host.textAfter(key, "source:") + " is no longer imported." + RESTART }
+            if key.startsWith("manifest:") { return DECLARATIONS + " " + host.textAfter(key, "manifest:") + " is no longer a dependency." + RESTART }
+            return "the live session's surface record is malformed." + RESTART
+        }
+        if key.startsWith("source:") {
+            if live.additions(live.decodeList(value), live.decodeList(new[key])) != "" { return DECLARATIONS + RESTART }
+        } else if key.startsWith("manifest:") {
+            let first = manifestParts(value)
+            let second = manifestParts(new[key])
+            if first.settings != second.settings { return DECLARATIONS + " Package settings in " + host.textAfter(key, "manifest:") + " changed." + RESTART }
+            for dependency in first.dependencies { if !host.listed(second.dependencies, dependency) { return DECLARATIONS + " A dependency in " + host.textAfter(key, "manifest:") + " changed." + RESTART } }
+        } else if key == "toolchain" && new[key] != value { return "the compiler changed since this program started." + RESTART }
+        else if new[key] != value { return DECLARATIONS + RESTART }
+    }
+    // Without incremental builds, module symbols are numbered by import order,
+    // so a new module could rename existing functions.
+    if new["incremental"] != "true" {
+        let added = live.decodeFields(host.textAfter(after, "live-abi-v2\n"))
+        let position = 0
+        while position < added.length {
+            if added[position].startsWith("source:") && !known.has(added[position]) { return "hot reload adds modules only with incremental builds (the default)." + RESTART }
+            position += 2
+        }
+    }
+    return ""
 }
 function unchanged(inputs: Sources): Boolean {
     for index in 0..inputs.paths.length {
@@ -92,18 +156,63 @@ function snapshot(inputs: Sources, abi: Text, compiler: Text, root: Text, state:
     snapshotField(parts, host.hashBytes(Bytes(joinText(environment))))
     return host.hashBytes(Bytes(joinText(parts)))
 }
+// A published table (tools/live-runtime.c): format, the executable's build id,
+// the image path or "-" (the executable's own functions), then key/symbol pairs.
+constant TABLE_FORMAT = "minyar-live-table-v2"
+record Table { build: Text; image: Text; ok: Boolean }
+function parseTable(data: Bytes): Table {
+    let result = Table { build: ""; image: ""; ok: false }
+    if data.length == 0 || data[data.length - 1] != 0 || !textCodec.validUTF8(data) { return result }
+    let parts: List<Text> = []
+    let start = 0
+    for index in 0..data.length {
+        if data[index] == 0 {
+            if index == start { return result }
+            parts.add(Text(data.slice(start, index)))
+            start = index + 1
+        }
+    }
+    if parts.length < 3 || parts.length % 2 == 0 || parts[0] != TABLE_FORMAT { return result }
+    result.build = parts[1]
+    result.image = parts[2]
+    result.ok = result.image == "-" || parts.length > 3
+    if result.image == "-" && parts.length != 3 { result.ok = false }
+    return result
+}
+function tableBytes(state: Text, image: Text, names: List<Text>, symbols: List<Text>): Bytes {
+    let table = Bytes(TABLE_FORMAT)
+    table.add(0)
+    table.addBytes(Bytes(host.readText(state + "/build-id"))); table.add(0)
+    table.addBytes(Bytes(image)); table.add(0)
+    for position in 0..names.length {
+        table.addBytes(Bytes(names[position])); table.add(0)
+        table.addBytes(Bytes(symbols[position])); table.add(0)
+    }
+    return table
+}
+// The table that runs every function's original body.
+function originalTable(state: Text): Bytes { return tableBytes(state, "-", [], []) }
+// A table this session can publish: its own build, and an image that is still there.
+function usable(state: Text, table: Table): Boolean {
+    if !table.ok || table.build != host.readText(state + "/build-id") { return false }
+    if table.image == "-" { return true }
+    return table.image.startsWith(state + "/generation-") && table.image.endsWith("/update.so") && host.resolveName(table.image) == table.image && host.isFile(table.image)
+}
+function currentTable(state: Text): Table {
+    let path = state + "/current"
+    if !host.isFile(path) || host.resolveName(path) != path || host.fileStatus(path).size > 16 * 1024 * 1024 { return Table { build: ""; image: ""; ok: false } }
+    let loaded = host.load(path)
+    if loaded.error != 0 { return Table { build: ""; image: ""; ok: false } }
+    return parseTable(loaded.data)
+}
 function publishedUnchanged(state: Text, identity: Text): Boolean {
     let path = state + "/current"
     if !host.isFile(path) || host.resolveName(path) != path || host.fileStatus(path).size > 16 * 1024 * 1024 { return false }
     let current = host.load(state + "/current")
-    if current.error != 0 || current.data.length == 0 { return false }
-    let end = 0
-    while end < current.data.length && current.data[end] != 0 { end += 1 }
-    if end == 0 || end >= current.data.length - 1 { return false }
-    let imageBytes = current.data.slice(0, end)
-    if !textCodec.validUTF8(imageBytes) { return false }
-    let image = Text(imageBytes)
-    if !image.startsWith(state + "/generation-") || !image.endsWith("/update.so") || host.resolveName(image) != image || !host.isFile(image) { return false }
+    if current.error != 0 { return false }
+    let table = parseTable(current.data)
+    if table.image == "-" || !usable(state, table) { return false }
+    let image = table.image
     let sidecar = host.parentPath(image) + "/source-identity"
     if host.resolveName(sidecar) != sidecar || !host.isFile(sidecar) || host.fileStatus(sidecar).size > 1024 { return false }
     let stored = host.load(sidecar)
@@ -148,19 +257,33 @@ function announce(file: Integer, path: Text) {
 }
 // Updates compare against the original executable's fingerprints, so every
 // table names all functions changed so far and replaces the previous one.
-// Reverting every edit publishes a whole-program image of the original code.
-function liveImage(generated: Text, state: Text, initial: Boolean): live.Image {
-    if initial || !host.isFile(state + "/exports") || !host.isFile(state + "/digests") { return live.transformProgram(generated, system.monotonicNanoseconds(), initial) }
-    let image = live.transformUpdate(generated, system.monotonicNanoseconds(), live.decodePairs(host.readText(state + "/digests")), live.decodePairs(host.readText(state + "/exports")))
-    if image.error == "" && image.names.length == 0 && host.exists(state + "/current") { return live.transformProgram(generated, system.monotonicNanoseconds(), false) }
-    return image
+function sessionText(state: Text, name: Text): Text {
+    let path = state + "/" + name
+    if !host.isFile(path) { host.stop("the live session in " + state + " is incomplete (no " + name + "); rebuild with minyar build --hot, or stop and run again") }
+    let text = host.readText(path)
+    if name != "build-id" && name != "signature" && name != "abi" && !live.wellFormed(text) { host.stop("the live session's " + name + " file in " + state + " is malformed; rebuild with minyar build --hot, or stop and run again") }
+    if text == "" { host.stop("the live session's " + name + " file in " + state + " is empty; rebuild with minyar build --hot, or stop and run again") }
+    return text
 }
-// `minyar patch` keeps every table it replaces, newest last, so `--undo` can
-// restore one without compiling. "-" is the original program's table.
+function liveImage(generated: Text, state: Text, initial: Boolean): live.Image {
+    if initial { return live.transformProgram(generated, system.monotonicNanoseconds(), true) }
+    let digests = sessionText(state, "digests")
+    let exports = sessionText(state, "exports")
+    let cells = sessionText(state, "cells")
+    return live.transformUpdate(generated, system.monotonicNanoseconds(), live.decodePairs(digests), live.decodePairs(exports), live.decodePairs(cells))
+}
+// `minyar patch` keeps the tables it replaces, newest last, so `--undo` can
+// restore one without compiling; the oldest beyond HISTORY_LIMIT are dropped.
+constant HISTORY_LIMIT = 16
+function digits(text: Text): Boolean {
+    if text == "" { return false }
+    for byte in Bytes(text) { if byte < 48 || byte > 57 { return false } }
+    return true
+}
 function historyNumbers(state: Text): List<Integer> {
     let numbers: List<Integer> = []
     for name in files.list(state) {
-        if name.startsWith("history-") {
+        if name.startsWith("history-") && digits(host.textAfter(name, "history-")) {
             let number = textCodec.integer(host.textAfter(name, "history-")).unwrapOr(0)
             if number > 0 { numbers.add(number) }
         }
@@ -168,55 +291,78 @@ function historyNumbers(state: Text): List<Integer> {
     numbers.sort()
     return numbers
 }
-function remember(state: Text) {
+// Old history, temporaries a crash left behind and generations no table names
+// any more. Runs with publish.lock held (or as a watch session's only builder)
+// once `current` is final. Generations go only while no other build is running:
+// each build holds build.lock shared from before it makes its generation.
+function collect(state: Text, building: Integer, keep: Text) {
     let numbers = historyNumbers(state)
-    let next = 1
-    if numbers.length > 0 { next = numbers[numbers.length - 1] + 1 }
-    let previous = Bytes("-")
-    previous.add(0)
-    if host.isFile(state + "/current") { previous = host.readBytes(state + "/current") }
-    atomic(state + "/history-" + Text(next), previous)
+    for index in 0..max(0, numbers.length - HISTORY_LIMIT) { files.remove(state + "/history-" + Text(numbers[index])) }
+    for name in files.list(state) {
+        let crashed = name.startsWith("history-") && !digits(host.textAfter(name, "history-"))
+        if crashed || (name.startsWith("current.") && digits(host.textAfter(name, "current."))) { files.remove(state + "/" + name) }
+    }
+    files.close(building)
+    let exclusive = host.tryLockExclusive(state + "/build.lock")
+    if exclusive < 0 { return }
+    let referenced: List<Text> = []
+    if keep != "" { referenced.add(keep) }
+    let tables: List<Text> = [state + "/current"]
+    for number in historyNumbers(state) { tables.add(state + "/history-" + Text(number)) }
+    for path in tables {
+        if host.isFile(path) {
+            let table = parseTable(host.readBytes(path))
+            if table.ok && table.image != "-" { referenced.add(host.parentPath(table.image)) }
+        }
+    }
+    for name in files.list(state) {
+        if name.startsWith("generation-") && !host.listed(referenced, state + "/" + name) { host.release(state + "/" + name) }
+    }
+    files.close(exclusive)
 }
-function restorePrevious(state: Text) {
+function restorePrevious(state: Text, building: Integer) {
     let lock = host.lockExclusive(state + "/publish.lock")
     if lock < 0 { host.stop(host.osError(lock, state + "/publish.lock")) }
     let numbers = historyNumbers(state)
     if numbers.length == 0 { host.stop("nothing to undo: no earlier minyar patch publication") }
     let entry = state + "/history-" + Text(numbers[numbers.length - 1])
     let table = host.readBytes(entry)
-    // Only restore a table whose image is still there.
-    let end = 0
-    while end < table.length && table[end] != 0 { end += 1 }
-    let original = table.length == 2 && table[0] == 45
-    if !original && (end == 0 || end >= table.length || !host.isFile(Text(table.slice(0, end)))) {
-        host.stop("cannot undo: the earlier update's image is missing (" + entry + ")")
-    }
+    // Only restore a table this build can still load.
+    let parsed = parseTable(table)
+    if !usable(state, parsed) { host.stop("cannot undo: the earlier update is incomplete or its image is missing (" + entry + ")") }
     let epoch = files.open(state + "/current.epoch", files.WRITE + files.CREATE)
     if epoch < 0 { host.stop(host.osError(epoch, state + "/current.epoch")) }
-    atomic(state + "/current", table)
+    // Set the entry aside first: once restored it is gone from the history even
+    // if removing it fails, so a later undo goes further back.
+    let aside = entry + ".restoring"
+    if files.rename(entry, aside) != 0 { host.stop("cannot undo: " + host.osError(files.lastError(), entry)) }
+    let temporary = state + "/current." + Text(system.processId())
+    host.writeBytes(temporary, table)
+    if files.rename(temporary, state + "/current") != 0 {
+        files.remove(temporary)
+        files.rename(aside, entry)
+        host.stop("cannot undo: cannot replace " + state + "/current")
+    }
     announce(epoch, state + "/current.epoch")
-    if files.remove(entry) != 0 { system.writeStandardError("minyar: cannot remove " + entry + "\n") }
+    files.remove(aside)
+    collect(state, building, "")
     files.close(lock)
-    if original { system.writeStandardError("Restored the original code; running copies switch on their next call\n") }
+    if parsed.image == "-" { system.writeStandardError("Restored the original code; running copies switch on their next call\n") }
     else { system.writeStandardError("Restored the previous update; running copies switch on their next call\n") }
 }
 // What an operator sees after `minyar patch`: the functions the image carries,
 // by source-level name (module prefix dropped).
-function changedSummary(names: List<Text>): Text {
+function changedSummary(names: List<Text>, added: List<Text>): Text {
+    if names.length == 0 { return "Every edit reverted: the original functions run again\n" }
     let shown: List<Text> = []
     for name in names {
-        let readable = name
-        if readable.startsWith(".minyar.fn.") { readable = host.textAfter(readable, ".minyar.fn.") }
-        if readable.startsWith("minyar_module_") {
-            let rest = host.textAfter(readable, "minyar_module_")
-            let separator = host.findText(rest, "_", 0)
-            if separator >= 0 { readable = host.textSlice(rest, separator + 1, rest.byteLength) }
-        }
-        if shown.length < 12 { shown.add(readable) }
+        if shown.length < 12 { shown.add(live.readable(name)) }
     }
     let more = ""
     if names.length > shown.length { more = ", +" + Text(names.length - shown.length) + " more" }
-    return "Image carries " + Text(names.length) + " function(s): " + host.joined(shown, ", ") + more + "\n"
+    let fresh = ""
+    if added.length > 0 { fresh = " (" + Text(added.length) + " new)" }
+    return "Image carries " + Text(names.length) + " function(s)" + fresh + ": " + host.joined(shown, ", ") + more + "\n"
 }
 function llvmString(value: Text): Text {
     let hex = "0123456789ABCDEF"
@@ -224,6 +370,14 @@ function llvmString(value: Text): Text {
     for byte in Bytes(value) { pieces.add("\\" + Text(hex[byte / 16]) + Text(hex[byte % 16])) }
     pieces.add("\\00")
     return host.joined(pieces, "")
+}
+// The toolchain this tool belongs to: the launcher says so, or the tool's own
+// place in it (build/tooling/tools/live-build-cli).
+function toolchainRoot(): Text {
+    let root = system.getenv("MINYAR_PROJECT_DIR")
+    if root == "" { root = host.parentPath(host.parentPath(host.parentPath(host.parentPath(host.selfPath())))) }
+    if !host.isFile(root + "/minyar") { host.stop("cannot locate live toolchain; set MINYAR_PROJECT_DIR") }
+    return root
 }
 function buildLive() {
     let state = ""
@@ -239,9 +393,9 @@ function buildLive() {
     let dryRun = false
     let memory = "system"
     let index = 0
-    // `minyar live-build --ready` only lets the launcher build this tool and its
-    // inputs; callers then run it directly for every edit.
-    if process.argumentCount() == 1 && process.argument(0) == "--ready" { return }
+    // `minyar live-build --ready [eager|system]` only lets the launcher build
+    // this tool and its inputs; callers then run it directly for every edit.
+    if process.argumentCount() >= 1 && process.argument(0) == "--ready" { return }
     while index < process.argumentCount() {
         let item = process.argument(index)
         if item == "--release" { release = true }
@@ -265,31 +419,32 @@ function buildLive() {
         index += 1
     }
     if state == "" || entry == "" || output == "" { host.stop("live-build is an internal command; use minyar run --watch --hot") }
-    if undo { restorePrevious(host.resolveName(state)); return }
-    let root = system.getenv("MINYAR_PROJECT_DIR")
-    if root == "" { host.stop("cannot locate live toolchain") }
+    host.makeDirectories(state)
+    // Held until this build exits, so collect() leaves its generation alone.
+    let building = host.lockShared(state + "/build.lock")
+    if building < 0 { host.stop(host.osError(building, state + "/build.lock")) }
+    if undo { restorePrevious(state, building); return }
+    let root = toolchainRoot()
     if host.hostName() != "Darwin" && host.hostName() != "Linux" { host.stop("hot reload requires macOS or Linux") }
     if host.hostName() == "Darwin" { libraries.add(root + "/library/platform/macos") }
     libraries.add(root + "/library")
-    host.makeDirectories(state)
     let compiler = root + "/build/minyarc"
     if incremental { compiler = root + "/build/minyarc-modules" }
     let inputs = sources(entry, libraries)
     if inputs.error != "" { host.stop(inputs.error) }
-    let abi = surface(inputs, compiler)
+    let abi = surface(inputs, manifests, compiler, incremental)
     let graphRoots = Bytes()
     for manifest in manifests {
-        let manifestText = host.readText(manifest)
-        abi += host.jsonText(manifest) + "\n" + host.jsonText(manifestText) + "\n"
-        inputs.paths.add(manifest); inputs.texts.add(manifestText)
+        inputs.paths.add(manifest); inputs.texts.add(host.readText(manifest))
         graphRoots.addBytes(Bytes(host.parentPath(manifest))); graphRoots.add(0)
     }
     let initial = system.getenv("MINYAR_WATCH_RUNNING") != "1" || !host.isFile(state + "/abi")
     if initial && host.exists(state + "/current") {
         if files.remove(state + "/current") != 0 { host.stop("cannot clear the previous live session") }
     }
-    if !initial && host.readText(state + "/abi") != abi {
-        host.stop("hot reload accepts function-body edits only; declarations, state layouts, imports and initialization must stay unchanged. Stop and run again to accept this change")
+    if !initial {
+        let change = surfaceChange(host.readText(state + "/abi"), abi)
+        if change != "" { host.stop(change) }
     }
     let clang = host.pinnedLlvm(host.selectedClang())
     let runtime = root + "/build/minyar-default-runtime.o"
@@ -320,81 +475,113 @@ function buildLive() {
     if !unchanged(inputs) { host.stop("source changed during this build; save again to retry") }
     let image = liveImage(host.readText(staging + "/source.ll"), state, initial)
     if image.error != "" { host.stop(image.error) }
-    if !initial && host.readText(state + "/signature") != image.signature { host.stop("hot reload changed a compiled function signature; stop and run again") }
-    if !initial && image.names.length == 0 {
-        system.writeStandardError("No function bodies changed; keeping published update\n")
-        host.cleanup()
-        return
+    if !initial {
+        let problem = live.compatibility(sessionText(state, "signature"), image.signature)
+        if problem != "" { host.stop(problem) }
     }
-    let llvm = image.llvm
-    let native = root + "/tools/live-runtime.c"
-    if initial {
-        let path = state + "/current"
-        llvm += "\n@minyar_live_manifest = constant [" + Text(path.byteLength + 1) + " x i8] c\"" + llvmString(path) + "\"\n; minyar-native-library: liveruntime\n"
+    // Every edit reverted: the original program's table, no image to build.
+    let reverted = !initial && image.names.length == 0
+    if reverted {
+        let current = currentTable(state)
+        if !current.ok || current.image == "-" {
+            let rootsFile = system.getenv("MINYAR_WATCH_ROOTS")
+            if rootsFile != "" { host.writeBytes(rootsFile, graphRoots) }
+            system.writeStandardError("No function bodies changed; keeping published update\n")
+            host.cleanup()
+            return
+        }
     }
-    host.writeBytes(staging + "/program.ll", Bytes(llvm))
     let library = staging + "/update.so"
     if initial {
+        let build = host.hashBytes(Bytes(state + "\n" + Text(system.monotonicNanoseconds()) + "\n" + Text(system.processId()) + "\n" + host.hostName()))
+        let path = state + "/current"
+        let llvm = image.llvm + "\n@minyar_live_manifest = constant [" + Text(path.byteLength + 1) + " x i8] c\"" + llvmString(path) + "\"\n"
+        llvm += "@minyar_live_build = constant [" + Text(build.byteLength + 1) + " x i8] c\"" + llvmString(build) + "\"\n; minyar-native-library: liveruntime\n"
+        host.writeBytes(staging + "/program.ll", Bytes(llvm))
+        // Linker-only flags reach just the link (tools/clang-driver.min compileFlags).
         let flags = "-O0 -g -Wno-override-module"
         if release { flags = "-O2 -Wno-override-module" }
         flags = host.setting("MINYAR_CLANG_FLAGS", flags) + " -pthread"
         if host.hostName() == "Linux" { flags += " -Wl,--export-dynamic -ldl" }
         else { flags += " -Wl,-export_dynamic" }
         environment = ["MINYAR_CLANG_FLAGS=" + flags]
-        command = [root + "/build/tooling/tools/clang-driver", "link", root, staging + "/program.ll", runtime, output, "0", "0", entry, "--native-source", "liveruntime=" + native]
-    } else {
-        command = [clang, "-shared", "-fPIC", "-Wno-override-module"]
-        if release { command.add("-O2") } else { command.add("-O0") }
-        if host.hostName() == "Darwin" { command.add("-Wl,-undefined,dynamic_lookup") }
-        for item in [staging + "/program.ll", "-o", library] { command.add(item) }
-    }
-    status = run(command, environment)
-    if status != 0 { host.cleanup(); exit(status) }
-    if !unchanged(inputs) { host.stop("source changed during this build; save again to retry") }
-    let rootsFile = system.getenv("MINYAR_WATCH_ROOTS")
-    if rootsFile != "" { host.writeBytes(rootsFile, graphRoots) }
-    if initial {
+        command = [root + "/build/tooling/tools/clang-driver", "link", root, staging + "/program.ll", runtime, output, "0", "0", entry, "--native-source", "liveruntime=" + root + "/tools/live-runtime.c"]
+        status = run(command, environment)
+        if status != 0 { host.cleanup(); exit(status) }
+        if !unchanged(inputs) { host.stop("source changed during this build; save again to retry") }
+        let rootsFile = system.getenv("MINYAR_WATCH_ROOTS")
+        if rootsFile != "" { host.writeBytes(rootsFile, graphRoots) }
+        atomic(state + "/build-id", Bytes(build))
         atomic(state + "/signature", Bytes(image.signature))
         atomic(state + "/abi", Bytes(abi))
         atomic(state + "/digests", Bytes(image.digests))
         atomic(state + "/exports", Bytes(image.exports))
+        atomic(state + "/cells", Bytes(image.cells))
         host.release(staging)
-    } else {
-        let table = Bytes(library)
-        table.add(0)
-        for position in 0..image.names.length {
-            table.addBytes(Bytes(image.names[position])); table.add(0)
-            table.addBytes(Bytes(image.symbols[position])); table.add(0)
-        }
-        atomic(staging + "/source-identity", Bytes("live-snapshot-v1\n" + identity + "\n" + host.hashFile(library) + "\n" + host.hashBytes(table) + "\n"))
-        let candidate = staging + "/candidate"
-        atomic(candidate, table)
-        if publish && dryRun {
-            system.writeStandardError("Dry run: nothing published. " + changedSummary(image.names))
-            host.cleanup()
-            return
-        }
-        if publish {
-            // minyar patch: no watcher supervises running copies, so promote here,
-            // one publisher at a time; every step that can fail runs before the rename.
-            let lock = host.lockExclusive(state + "/publish.lock")
-            if lock < 0 { host.stop(host.osError(lock, state + "/publish.lock")) }
-            let epoch = files.open(state + "/current.epoch", files.WRITE + files.CREATE)
-            if epoch < 0 { host.stop(host.osError(epoch, state + "/current.epoch")) }
-            remember(state)
-            if files.rename(candidate, state + "/current") != 0 { host.stop("cannot publish live build: " + state + "/current") }
-            announce(epoch, state + "/current.epoch")
-            files.close(lock)
-            system.writeStandardError("Published update; running copies load it on their next call\n" + changedSummary(image.names))
-            return
-        }
-        let publication = system.getenv("MINYAR_WATCH_PUBLICATION")
-        if publication == "" { host.stop("hot builds must be supervised by run --watch --hot") }
-        let ready = Bytes(candidate); ready.add(0)
-        ready.addBytes(Bytes(state + "/current")); ready.add(0)
-        host.writeBytes(publication, ready)
-        // Intentionally retained: published images stay resident in the runner.
+        collect(state, building, "")
+        system.writeStandardError("Finished live build\n")
+        return
     }
-    system.writeStandardError("Finished live build\n")
+    let table = originalTable(state)
+    let code = ""
+    if !reverted {
+        host.writeBytes(staging + "/program.ll", Bytes(image.llvm))
+        command = [clang, "-shared", "-fPIC", "-Wno-override-module"]
+        if release { command.add("-O2") } else { command.add("-O0") }
+        if host.hostName() == "Darwin" { command.add("-Wl,-undefined,dynamic_lookup") }
+        for item in [staging + "/program.ll", "-o", library] { command.add(item) }
+        status = run(command, environment)
+        if status != 0 { host.cleanup(); exit(status) }
+        if !unchanged(inputs) { host.stop("source changed during this build; save again to retry") }
+        table = tableBytes(state, library, image.names, image.symbols)
+        code = host.hashFile(library)
+    }
+    let rootsFile = system.getenv("MINYAR_WATCH_ROOTS")
+    if rootsFile != "" { host.writeBytes(rootsFile, graphRoots) }
+    atomic(staging + "/source-identity", Bytes("live-snapshot-v1\n" + identity + "\n" + code + "\n" + host.hashBytes(table) + "\n"))
+    let candidate = staging + "/candidate"
+    atomic(candidate, table)
+    let summary = changedSummary(image.names, image.added)
+    if publish && dryRun {
+        system.writeStandardError("Dry run: nothing published. " + summary)
+        host.cleanup()
+        return
+    }
+    if publish {
+        // minyar patch: no watcher supervises running copies, so promote here,
+        // one publisher at a time; every step that can fail runs before the rename.
+        let lock = host.lockExclusive(state + "/publish.lock")
+        if lock < 0 { host.stop(host.osError(lock, state + "/publish.lock")) }
+        let epoch = files.open(state + "/current.epoch", files.WRITE + files.CREATE)
+        if epoch < 0 { host.stop(host.osError(epoch, state + "/current.epoch")) }
+        let numbers = historyNumbers(state)
+        let next = 1
+        if numbers.length > 0 { next = numbers[numbers.length - 1] + 1 }
+        let previous = originalTable(state)
+        if host.isFile(state + "/current") { previous = host.readBytes(state + "/current") }
+        // The replaced table enters the history only once `current` is replaced.
+        let pending = state + "/history-" + Text(next) + ".pending"
+        atomic(pending, previous)
+        if files.rename(candidate, state + "/current") != 0 {
+            files.remove(pending)
+            host.stop("cannot publish live build: " + state + "/current")
+        }
+        // From here on the staging generation is published: nothing may stop
+        // through host.stop, which would remove it.
+        if files.rename(pending, state + "/history-" + Text(next)) != 0 { system.writeStandardError("minyar: cannot record the replaced update for --undo\n") }
+        announce(epoch, state + "/current.epoch")
+        collect(state, building, staging)
+        files.close(lock)
+        system.writeStandardError("Published update; running copies load it on their next call\n" + summary)
+        return
+    }
+    let publication = system.getenv("MINYAR_WATCH_PUBLICATION")
+    if publication == "" { host.stop("hot builds must be supervised by run --watch --hot") }
+    collect(state, building, staging)
+    let ready = Bytes(candidate); ready.add(0)
+    ready.addBytes(Bytes(state + "/current")); ready.add(0)
+    host.writeBytes(publication, ready)
+    // Intentionally retained: published images stay resident in the runner.
+    system.writeStandardError("Finished live build\n" + summary)
 }
 buildLive()

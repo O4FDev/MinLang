@@ -349,11 +349,19 @@ running in their original version. A blocked program observes updates when it
 next calls a function. The lanterns gallery shows state passed through ordinary
 functions; no special declaration syntax is needed.
 
-Hot reload accepts function-body edits only. Function signatures, records,
-constants, globals, imports, native bodies, manifests and initialization must stay
-unchanged. Incompatible edits are rejected; stop and run again to accept them.
-Managed threads and parallel loops work: each call runs whichever version is
-current, so a thread or loop running across an update can mix both versions.
+Hot reload accepts function-body edits and additions: new functions, new
+records, new `use` imports and modules, and new dependencies in `Minyar.toml`.
+A new function gets a slot of its own in the update; existing slots are
+untouched. Existing function signatures, records, constants and globals, other
+manifest settings, native bodies and initialization must stay unchanged, and
+nothing may be removed. A new `global` (its initializer would have to run), a
+new native library or C layout, a new runtime requirement (cycle collection,
+callbacks, threads) and top-level statements also need a restart. Adding
+modules needs incremental builds (the default). Incompatible edits are rejected
+with the reason; stop and run again to accept them. Managed threads and parallel
+loops work: each call runs whichever version is current, so a thread or loop
+running across an update can mix both versions (slots are retargeted one at a
+time; a call that saw an update's epoch sees all of its slots).
 
 After a successful function update, saving identical source bytes keeps the
 published image and skips frontend compilation and native compilation/linking.
@@ -368,7 +376,9 @@ retargets every slot. Debug uses O0 and release uses O2 without
 whole-program LTO. An update compiles only the functions whose generated code
 differs from the original program's, including functions that read an edited
 literal or create an edited closure; its calls go through the original
-program's slots, and a function it omits runs its original body. Successful code generations remain resident because old
+program's slots, and a function it omits runs its original body. Reverting
+every edit publishes the original program's table: every slot returns to its
+original body. Successful code generations remain resident because old
 frames, closures and literal values may still refer to them; memory therefore
 grows with edits until the session ends. This development mode does not add a
 runtime cost to ordinary builds. Native debugger/trace metadata for replacement
@@ -390,23 +400,36 @@ minyar build --hot --release
 minyar patch --release
 ```
 
-`minyar patch` names the functions its update carries; `--dry-run` compiles
-and lists them without publishing. `minyar patch --undo` restores the table that
-the last `minyar patch` replaced, without compiling; repeating it walks back to
-the original program.
+`minyar patch` names the functions its update carries (and how many are new);
+`--dry-run` compiles and lists them without publishing. `minyar patch --undo`
+restores the table that the last `minyar patch` replaced, without compiling or
+preparing the toolchain; repeating it walks back to the original program. The
+last 16 replaced tables are kept for undo; older ones, and code generations no
+kept table names, are removed by the next publication (never while another
+`minyar patch` is still building).
 A package's `memory` setting applies to these builds and their patches. The
-same rules apply: function-body edits only,
+same rules apply: function-body edits and additions,
 and each accepted generation stays resident. An incompatible edit is refused
 and running copies keep their current code. Another `build --hot` starts a new
-session: copies of earlier builds keep running their code but receive no later
-patches. `minyar patch` refuses a binary that a later ordinary build or
-`run --watch` replaced. The binary records the absolute path of its live state directory
+session and removes the previous one: copies of earlier builds keep running
+their code but receive no later patches. A later ordinary build or
+`run --watch` of the same binary ends the session too (`<name>.live` and its
+state directory are removed), so `minyar patch` refuses that binary. Every
+published table names the executable it was built for, and a copy ignores a
+table for another executable.
+
+The binary records the absolute path of its live state directory
 (named in `<name>.live`). To run a copy elsewhere, copy that directory too and
-point `MINYAR_LIVE_STATE` at the copy. Patch on the build machine, then ship
-the new `generation-*` directories, then `current`, then write `current.epoch`
-in place (for example `rsync --inplace`); running copies load the update on
-their next call. A publication that cannot load yet (say, its files were still
-arriving) is reported once; writing `current.epoch` again retries it.
+point `MINYAR_LIVE_STATE` at the copy (resolved once, when the program first
+calls a function; a path that does not exist is reported and the copy runs its
+own code). The program needs only read access there when `current.epoch`
+already exists, so a read-only deployment or another service user works. Patch
+on the build machine, then ship the new `generation-*` directories, then
+`current`, then write `current.epoch` in place (for example `rsync --inplace`);
+running copies load the update on their next call. A publication that cannot
+load yet (say, its files were still arriving) is reported once; writing
+`current.epoch` again retries it. `run --watch --hot` ignores
+`MINYAR_LIVE_STATE`: the watched program always follows its own session.
 
 `minyar repl` opens a persistent native session. Enter an expression to see its
 value, a `let` binding to keep a value, or a function declaration to define or

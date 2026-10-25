@@ -14,10 +14,16 @@ public function publishRoots(graph: project.Graph) {
     host.writeBytes(path, bytes)
 }
 // The launcher prepares the live build tool once per command; each build then
-// runs it directly instead of repeating the launcher's toolchain checks.
-function liveTool(launcher: Text): Text {
-    let status = host.spawn([launcher, "live-build", "--ready"], [], true, "", "", 0)
+// runs it directly instead of repeating the launcher's toolchain checks. Only
+// the runtime the package's memory profile links is prepared.
+function liveTool(launcher: Text, graph: project.Graph): Text {
+    let memory = "system"
+    if graph.packages[0].memory == "eager" { memory = "eager" }
+    let status = host.spawn([launcher, "live-build", "--ready", memory], [], true, "", "", 0)
     if status != 0 { host.leave(status) }
+    return toolPath(launcher)
+}
+function toolPath(launcher: Text): Text {
     let root = system.getenv("MINYAR_PROJECT_DIR")
     if root == "" { root = host.parentPath(launcher) }
     return root + "/build/tooling/tools/live-build-cli"
@@ -47,9 +53,12 @@ public function run(graph: project.Graph, launcher: Text, output: Text, argument
     // would repeat its toolchain checks on every edit.
     let builder = host.selfPath()
     if hot {
+        // The watched program replaces the output, so a build --hot session
+        // for it can no longer be patched.
+        forgetSession(output)
         state = host.temporaryDirectory(host.parentPath(output), ".live-")
         command = liveBuild(graph, state, output, flags)
-        builder = liveTool(launcher)
+        builder = liveTool(launcher, graph)
     }
     let status = watch.run(builder, root, roots, arguments, command, output, hot)
     if state != "" { host.release(state) }
@@ -59,8 +68,17 @@ public function run(graph: project.Graph, launcher: Text, output: Text, argument
 // Each build --hot gets its own live state directory, recorded beside the
 // binary, so `minyar patch` publishes function-body updates that every running
 // copy of that build loads on its next call. Copies of earlier builds keep
-// their own state and never receive a later build's updates.
+// running the code they have, and never receive a later build's updates.
 function sessionFile(output: Text): Text { return output + ".live" }
+// Anything else that writes the output ends its session: the record and its
+// state directory go. Running copies are unaffected; nothing can patch them.
+public function forgetSession(output: Text) {
+    let session = sessionFile(output)
+    if !host.isFile(session) { return }
+    let state = host.readText(session)
+    files.remove(session)
+    if host.parentPath(state) == host.parentPath(output) && host.baseName(state).startsWith(".live-") && host.isDirectory(state) { host.release(state) }
+}
 function liveEnvironment(running: Boolean): List<Text> {
     let environment: List<Text> = []
     for entry in system.environment() {
@@ -71,10 +89,11 @@ function liveEnvironment(running: Boolean): List<Text> {
 }
 public function buildPatchable(graph: project.Graph, launcher: Text, output: Text, flags: List<Text>): Integer {
     let state = host.temporaryDirectory(host.parentPath(output), ".live-")
-    let command = [liveTool(launcher)]
+    let command = [liveTool(launcher, graph)]
     for item in liveBuild(graph, state, output, flags) { command.add(item) }
     let status = host.spawn(command, liveEnvironment(false), false, "", "", 0)
     if status != 0 { host.release(state); return status }
+    forgetSession(output)
     let temporary = sessionFile(output) + "." + Text(system.processId())
     host.writeBytes(temporary, Bytes(state))
     if files.rename(temporary, sessionFile(output)) != 0 { host.stop("cannot record the live session: " + sessionFile(output)) }
@@ -105,7 +124,10 @@ public function patch(graph: project.Graph, launcher: Text, output: Text, flags:
     if !containsBytes(host.readBytes(output), Bytes(state + "/current")) {
         host.stop(output + " was not built by its recorded live session; run minyar build --hot again")
     }
-    let command = [liveTool(launcher)]
+    // Undo compiles nothing, so it needs no toolchain preparation.
+    let tool = toolPath(launcher)
+    if !host.listed(flags, "--undo") || !host.isFile(tool) { tool = liveTool(launcher, graph) }
+    let command = [tool]
     for item in liveBuild(graph, state, output, flags) { command.add(item) }
     command.add("--publish")
     return host.spawn(command, liveEnvironment(true), false, "", "", 0)

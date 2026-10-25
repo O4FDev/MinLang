@@ -310,30 +310,41 @@ static pid_t lw_spawn(char **arguments, const char *root, const char *roots_file
     char *publication_setting = NULL;
     char running_setting[] = "MINYAR_WATCH_RUNNING=0";
     running_setting[sizeof(running_setting) - 2] = application_running ? '1' : '0';
-    if (!error && roots_file) {
+    if (!error) {
         const char prefix[] = "MINYAR_WATCH_ROOTS=";
         const char publication_prefix[] = "MINYAR_WATCH_PUBLICATION=";
         const char running_prefix[] = "MINYAR_WATCH_RUNNING=";
+        // The watched program follows this session's own live state; a
+        // deployment's relocation setting in the developer's shell must not
+        // redirect it.
+        const char state_prefix[] = "MINYAR_LIVE_STATE=";
         size_t count = 0;
         while (environment[count]) count++;
         override = calloc(count + 4, sizeof(*override));
-        setting = malloc(sizeof(prefix) + strlen(roots_file));
-        publication_setting = malloc(sizeof(publication_prefix) + strlen(publication_file));
-        if (!override || !setting || !publication_setting) error = ENOMEM;
+        if (roots_file) {
+            setting = malloc(sizeof(prefix) + strlen(roots_file));
+            publication_setting = malloc(sizeof(publication_prefix) + strlen(publication_file));
+        }
+        if (!override || (roots_file && (!setting || !publication_setting))) error = ENOMEM;
         else {
-            snprintf(setting, sizeof(prefix) + strlen(roots_file), "%s%s", prefix, roots_file);
-            snprintf(publication_setting, sizeof(publication_prefix) + strlen(publication_file),
-                     "%s%s", publication_prefix, publication_file);
             size_t next = 0;
             for (size_t index = 0; index < count; index++) {
-                if (strncmp(environment[index], prefix, sizeof(prefix) - 1) &&
-                    strncmp(environment[index], publication_prefix, sizeof(publication_prefix) - 1) &&
-                    strncmp(environment[index], running_prefix, sizeof(running_prefix) - 1))
-                    override[next++] = environment[index];
+                if (!strncmp(environment[index], state_prefix, sizeof(state_prefix) - 1)) continue;
+                if (roots_file &&
+                    (!strncmp(environment[index], prefix, sizeof(prefix) - 1) ||
+                     !strncmp(environment[index], publication_prefix, sizeof(publication_prefix) - 1) ||
+                     !strncmp(environment[index], running_prefix, sizeof(running_prefix) - 1))) continue;
+                override[next++] = environment[index];
             }
-            override[next++] = setting;
-            override[next++] = publication_setting;
-            override[next] = running_setting;
+            if (roots_file) {
+                snprintf(setting, sizeof(prefix) + strlen(roots_file), "%s%s", prefix, roots_file);
+                snprintf(publication_setting, sizeof(publication_prefix) + strlen(publication_file),
+                         "%s%s", publication_prefix, publication_file);
+                override[next++] = setting;
+                override[next++] = publication_setting;
+                override[next++] = running_setting;
+            }
+            override[next] = NULL;
             environment = override;
         }
     }

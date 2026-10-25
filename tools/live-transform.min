@@ -3,8 +3,9 @@ use "./editor-source.min" as editor
 use "./driver-support.min" as host
 
 // digests: each function's body fingerprint; exports: each function's wrapper in
-// this image (only meaningful for the original executable).
-public record Image { llvm: Text; names: List<Text>; symbols: List<Text>; signature: Text; digests: Text; exports: Text; error: Text }
+// this image; cells: each module state cell's LLVM type (both only meaningful
+// for the original executable). added: functions an update introduces.
+public record Image { llvm: Text; names: List<Text>; symbols: List<Text>; signature: Text; digests: Text; exports: Text; cells: Text; added: List<Text>; error: Text }
 record Symbol { token: Text; raw: Text; end: Integer; error: Text }
 record Function { name: Text; raw: Text; wrapper: Text; body: Text; language: Boolean; result: Text; returned: Text; parameters: Text; arguments: Text; signature: Text; error: Text }
 record Rewritten { text: Text; error: Text }
@@ -14,8 +15,22 @@ function surfaceError(message: Text): Text { return "live-surface-error: " + mes
 
 // Success is recognisable so malformed edits can leave the running image alone.
 public function surface(text: Text): Text {
+    let found = surfaceItems(text)
+    if found.error != "" { return surfaceError(found.error) }
+    let parts: List<Text> = ["live-surface-v1\n"]
+    for item in found.items { parts.add(host.textSlice(item, 1, item.byteLength)) }
+    return joinText(parts)
+}
+// The surface as top-level items, each a kind letter and its tokens' fields:
+// F a named function (modifiers and header; the body is hidden), U an import,
+// R a record, N a line break, T any other single token. Additive updates may
+// insert F, U and R items and insert or drop N items; everything else must
+// stay exactly as it was.
+public record Items { items: List<Text>; error: Text }
+public function surfaceItems(text: Text): Items {
+    let result = Items { items: []; error: "" }
     let source = editor.scan(text)
-    if source.error != "" { return surfaceError(source.error) }
+    if source.error != "" { result.error = source.error; return result }
     let tokens: List<editor.Token> = []
     for token in source.tokens { if token.kind != 5 { tokens.add(token) } }
     let delimiters: List<Text> = []
@@ -24,14 +39,14 @@ public function surface(text: Text): Text {
         let value = token.text
         if value == "(" || value == "[" || value == "{" { delimiters.add(value) }
         if value == ")" || value == "]" || value == "}" {
-            if delimiters.length == 0 { return surfaceError("unexpected closing delimiter") }
+            if delimiters.length == 0 { result.error = "unexpected closing delimiter"; return result }
             let opening = delimiters[delimiters.length - 1]
-            if (value == ")" && opening != "(") || (value == "]" && opening != "[") || (value == "}" && opening != "{") { return surfaceError("mismatched closing delimiter") }
+            if (value == ")" && opening != "(") || (value == "]" && opening != "[") || (value == "}" && opening != "{") { result.error = "mismatched closing delimiter"; return result }
             delimiters.pop()
         }
     }
-    if delimiters.length != 0 { return surfaceError("declaration or expression is missing its closing delimiter") }
-    let parts: List<Text> = ["live-surface-v1\n"]
+    if delimiters.length != 0 { result.error = "declaration or expression is missing its closing delimiter"; return result }
+    let items = result.items
     let index = 0
     let depth = 0
     while index < tokens.length {
@@ -50,11 +65,11 @@ public function surface(text: Text): Text {
                     if value == "[" { square += 1 }
                     if value == "]" { square -= 1 }
                     if value == "{" && round == 0 && square == 0 { break }
-                    if value == ";" || value == "}" { return surfaceError("a named function needs a body") }
+                    if value == ";" || value == "}" { result.error = "a named function needs a body"; return result }
                 }
                 body += 1
             }
-            if body == tokens.length { return surfaceError("a named function needs a body") }
+            if body == tokens.length { result.error = "a named function needs a body"; return result }
             let end = body + 1
             let nesting = 1
             while end < tokens.length && nesting > 0 {
@@ -64,7 +79,7 @@ public function surface(text: Text): Text {
                 }
                 end += 1
             }
-            if nesting != 0 { return surfaceError("a named function needs its closing brace") }
+            if nesting != 0 { result.error = "a named function needs its closing brace"; return result }
             let native = false
             for statement in (body + 1)..end {
                 if tokens[statement].kind == 1 && tokens[statement].text == "native" {
@@ -75,22 +90,87 @@ public function surface(text: Text): Text {
             }
             let main = name == "main" && index + 2 < tokens.length && tokens[index + 2].text != "."
             if !main && !native {
+                let parts: List<Text> = ["F", modifiers(items)]
                 for header in index..(body + 1) { field(parts, tokens[header].text) }
                 field(parts, "<live function body>")
                 field(parts, "}")
+                items.add(joinText(parts))
                 index = end
                 continue
             }
         }
+        if depth == 0 && token.kind == 1 && token.text == "use" && index + 3 < tokens.length && tokens[index + 1].kind == 3 && tokens[index + 2].text == "as" {
+            let parts: List<Text> = ["U"]
+            for position in index..(index + 4) { field(parts, tokens[position].text) }
+            items.add(joinText(parts))
+            index += 4
+            continue
+        }
+        if depth == 0 && token.kind == 1 && token.text == "record" && index + 1 < tokens.length && tokens[index + 1].kind == 1 {
+            let open = index + 2
+            while open < tokens.length && (tokens[open].kind == 3 || tokens[open].text != "{") { open += 1 }
+            let end = open + 1
+            let nesting = 1
+            while end < tokens.length && nesting > 0 {
+                if tokens[end].kind != 3 {
+                    if tokens[end].text == "{" { nesting += 1 }
+                    if tokens[end].text == "}" { nesting -= 1 }
+                }
+                end += 1
+            }
+            if open < tokens.length && nesting == 0 {
+                let parts: List<Text> = ["R", modifiers(items)]
+                for position in index..end { field(parts, tokens[position].text) }
+                items.add(joinText(parts))
+                index = end
+                continue
+            }
+        }
+        let parts: List<Text> = ["T"]
+        if token.kind == 6 { parts[0] = "N" }
         field(parts, token.text)
+        items.add(joinText(parts))
         if token.kind != 3 {
             if token.text == "{" { depth += 1 }
             if token.text == "}" { depth -= 1 }
         }
         index += 1
     }
+    return result
+}
+// Declaration modifiers just before a function or record belong to it.
+function modifiers(items: List<Text>): Text {
+    let taken = ""
+    while items.length > 0 {
+        let last = items[items.length - 1]
+        if last != "T6:public\n" && last != "T13:deterministic\n" && last != "T8:parallel\n" { break }
+        taken = host.textSlice(last, 1, last.byteLength) + taken
+        items.pop()
+    }
+    return taken
+}
+// "" when `after` keeps every item of `before` in order and only inserts
+// functions, records and imports.
+public function additions(before: List<Text>, after: List<Text>): Text {
+    let old = 0
+    let new = 0
+    while new < after.length {
+        if old < before.length && before[old] == after[new] { old += 1; new += 1; continue }
+        // Line breaks between declarations carry no meaning of their own.
+        if old < before.length && before[old].startsWith("N") { old += 1; continue }
+        if !after[new].startsWith("F") && !after[new].startsWith("U") && !after[new].startsWith("R") && !after[new].startsWith("N") { return "changed" }
+        new += 1
+    }
+    while old < before.length && before[old].startsWith("N") { old += 1 }
+    if old < before.length { return "changed" }
+    return ""
+}
+public function encodeList(items: List<Text>): Text {
+    let parts: List<Text> = ["live-list-v1\n"]
+    for item in items { field(parts, item) }
     return joinText(parts)
 }
+public function decodeList(text: Text): List<Text> { return fields(text, "live-list-v1\n").values }
 
 function hex(byte: Integer): Integer {
     if byte >= 48 && byte <= 57 { return byte - 48 }
@@ -143,7 +223,7 @@ function escaped(value: Text): Text {
     }
     return joinText(parts)
 }
-function failed(message: Text): Image { return Image { llvm: ""; names: []; symbols: []; signature: ""; digests: ""; exports: ""; error: message } }
+function failed(message: Text): Image { return Image { llvm: ""; names: []; symbols: []; signature: ""; digests: ""; exports: ""; cells: ""; added: []; error: message } }
 function scalar(value: Text): Boolean { return host.listed(["void", "i64", "i32", "i1", "double", "ptr"], value) }
 function definition(line: Text, generation: Integer, index: Integer, initial: Boolean): Function {
     let found = Function { name: ""; raw: ""; wrapper: ""; body: ""; language: false; result: ""; returned: ""; parameters: ""; arguments: ""; signature: ""; error: "" }
@@ -253,7 +333,8 @@ function references(text: Text): List<Text> {
 // A body's fingerprint covers its LLVM text and every global value it reaches,
 // so editing a literal changes the functions that use it. Calls are by name.
 function digest(body: Text, globals: Map<Text, Text>): Text {
-    let parts: List<Text> = [body]
+    let parts: List<Text> = []
+    field(parts, body)
     let seen = Map<Text, Boolean>()
     let pending = references(body)
     let index = 0
@@ -263,7 +344,8 @@ function digest(body: Text, globals: Map<Text, Text>): Text {
         if seen.has(name) || !globals.has(name) { continue }
         seen[name] = true
         let definition = globals[name]
-        parts.add(definition)
+        field(parts, name)
+        field(parts, definition)
         for next in references(definition) { pending.add(next) }
     }
     return host.hashBytes(Bytes(joinText(parts)))
@@ -273,38 +355,89 @@ public function encodePairs(keys: List<Text>, values: List<Text>): Text {
     for index in 0..keys.length { field(parts, keys[index]); field(parts, values[index]) }
     return joinText(parts)
 }
-public function decodePairs(text: Text): Map<Text, Text> {
-    let result = Map<Text, Text>()
+record Fields { values: List<Text>; ok: Boolean }
+// Length-prefixed fields after `header`; not ok unless the whole text is well formed.
+function fields(text: Text, header: Text): Fields {
+    let result = Fields { values: []; ok: false }
     let data = Bytes(text)
-    let header = Bytes("live-pairs-v1\n")
-    if data.length < header.length || Text(data.slice(0, header.length)) != "live-pairs-v1\n" { return result }
-    let index = header.length
-    let values: List<Text> = []
+    let start = Bytes(header)
+    if data.length < start.length || Text(data.slice(0, start.length)) != header { return result }
+    let index = start.length
     while index < data.length {
         let colon = index
         let length = 0
-        while colon < data.length && data[colon] >= 48 && data[colon] <= 57 { length = length * 10 + data[colon] - 48; colon += 1 }
-        if colon >= data.length || data[colon] != 58 || colon + 1 + length >= data.length || data[colon + 1 + length] != 10 { return Map<Text, Text>() }
-        values.add(Text(data.slice(colon + 1, colon + 1 + length)))
+        while colon < data.length && data[colon] >= 48 && data[colon] <= 57 && length < data.length { length = length * 10 + data[colon] - 48; colon += 1 }
+        if colon >= data.length || data[colon] != 58 || colon + 1 + length >= data.length || data[colon + 1 + length] != 10 { result.values = []; return result }
+        result.values.add(Text(data.slice(colon + 1, colon + 1 + length)))
         index = colon + 2 + length
     }
-    if values.length % 2 != 0 { return Map<Text, Text>() }
+    result.ok = true
+    return result
+}
+// Keys and values in order; empty unless the whole text is well formed.
+public function decodeFields(text: Text): List<Text> {
+    let found = fields(text, "live-pairs-v1\n")
+    if !found.ok || found.values.length % 2 != 0 { return [] }
+    return found.values
+}
+public function decodePairs(text: Text): Map<Text, Text> {
+    let result = Map<Text, Text>()
+    let values = decodeFields(text)
     let pair = 0
     while pair < values.length { result[values[pair]] = values[pair + 1]; pair += 2 }
     return result
 }
+// Whether a session file is complete; an empty map is valid.
+public function wellFormed(text: Text): Boolean {
+    let found = fields(text, "live-pairs-v1\n")
+    return found.ok && found.values.length % 2 == 0
+}
 
-function rootCell(line: Text, initial: Boolean): Rewritten {
-    if !line.startsWith("@") { return Rewritten { text: line; error: "" } }
+record Cell { raw: Text; token: Text; type: Text; value: Text; error: Text }
+// Module state (global values and their initialization flags) lives in the
+// original executable; every image refers to it there.
+function cellOf(line: Text): Cell {
+    let result = Cell { raw: ""; token: ""; type: ""; value: ""; error: "" }
+    if !line.startsWith("@") { return result }
     let parsed = symbol(Bytes(line), 1)
-    if parsed.error != "" { return Rewritten { text: ""; error: parsed.error } }
-    if !parsed.raw.startsWith("minyar.constant|") || !(parsed.raw.endsWith("|value") || parsed.raw.endsWith("|state")) { return Rewritten { text: line; error: "" } }
+    if parsed.error != "" { result.error = parsed.error; return result }
+    if !parsed.raw.startsWith("minyar.constant|") || !(parsed.raw.endsWith("|value") || parsed.raw.endsWith("|state")) { return result }
     let tail = host.strip(host.textSlice(line, parsed.end, line.byteLength))
-    if !tail.startsWith("= internal global ") { return Rewritten { text: ""; error: "unsupported module state cell linkage" } }
+    if !tail.startsWith("= internal global ") { result.error = "unsupported module state cell linkage"; return result }
     let words = host.words(host.textAfter(tail, "= internal global "))
-    if words.length != 2 || !(scalar(words[0]) || words[0] == "i8") { return Rewritten { text: ""; error: "unsupported module state cell layout" } }
-    if initial { return Rewritten { text: "@" + parsed.token + " = global " + words[0] + " " + words[1]; error: "" } }
-    return Rewritten { text: "@" + parsed.token + " = external global " + words[0]; error: "" }
+    if words.length != 2 || !(scalar(words[0]) || words[0] == "i8") { result.error = "unsupported module state cell layout"; return result }
+    result.raw = parsed.raw; result.token = parsed.token; result.type = words[0]; result.value = words[1]
+    return result
+}
+function rootCell(line: Text, initial: Boolean, cells: Map<Text, Text>): Rewritten {
+    let cell = cellOf(line)
+    if cell.error != "" { return Rewritten { text: ""; error: cell.error } }
+    if cell.raw == "" { return Rewritten { text: line; error: "" } }
+    if initial { return Rewritten { text: "@" + cell.token + " = global " + cell.type + " " + cell.value; error: "" } }
+    // A new global needs its initializer to run, which only a fresh start does.
+    if !cells.has(cell.raw) { return Rewritten { text: ""; error: "hot reload cannot add module state (" + readableCell(cell.raw) + "); stop and run again" } }
+    if cells[cell.raw] != cell.type { return Rewritten { text: ""; error: "hot reload changed the type of module state (" + readableCell(cell.raw) + "); stop and run again" } }
+    return Rewritten { text: "@" + cell.token + " = external global " + cell.type; error: "" }
+}
+function readableCell(raw: Text): Text {
+    let parts = raw.split("|")
+    if parts.length >= 2 { return parts[1] }
+    return raw
+}
+// A source-level name for messages: module prefixes dropped.
+public function readable(name: Text): Text {
+    let result = name
+    if result.startsWith(".minyar.fn.") { result = host.textAfter(result, ".minyar.fn.") }
+    if result.startsWith("minyar.module|") {
+        let parts = result.split("|")
+        if parts.length >= 2 { result = parts[1] }
+    }
+    if result.startsWith("minyar_module_") {
+        let rest = host.textAfter(result, "minyar_module_")
+        let separator = host.findText(rest, "_", 0)
+        if separator >= 0 { result = host.textSlice(rest, separator + 1, rest.byteLength) }
+    }
+    return result
 }
 function wrapper(function: Function, index: Integer, generation: Integer): Text {
     let key = "minyar.live." + Text(generation) + ".key." + Text(index)
@@ -315,9 +448,11 @@ function wrapper(function: Function, index: Integer, generation: Integer): Text 
     let slot = "minyar.live." + Text(generation) + ".slot." + Text(index)
     output.add("@" + slot + " = internal global ptr null, align 8\n")
     output.add("define " + function.result + " @" + function.wrapper + "(" + function.parameters + ") noinline uwtable {\nentry:\n")
-    output.add("  %live.page = load ptr, ptr @minyar_live_epoch, align 8\n")
+    // The page pointer is set once, possibly while a parallel loop's workers
+    // already call wrappers; the seen epoch is stored after the slots it covers.
+    output.add("  %live.page = load atomic ptr, ptr @minyar_live_epoch unordered, align 8\n")
     output.add("  %live.epoch = load atomic i64, ptr %live.page acquire, align 8\n")
-    output.add("  %live.seen = load atomic i64, ptr @minyar_live_epoch_seen monotonic, align 8\n")
+    output.add("  %live.seen = load atomic i64, ptr @minyar_live_epoch_seen acquire, align 8\n")
     output.add("  %live.cached = load atomic ptr, ptr @" + slot + " acquire, align 8\n")
     output.add("  %live.current = icmp eq i64 %live.epoch, %live.seen\n  %live.bound = icmp ne ptr %live.cached, null\n")
     output.add("  %live.ready = and i1 %live.current, %live.bound\n  br i1 %live.ready, label %live.call, label %live.bind\nlive.bind:\n")
@@ -378,24 +513,66 @@ function bodyText(parsed: Parsed, index: Integer): Text {
     for position in parsed.starts[index]..(parsed.ends[index] + 1) { parts.add(parsed.lines[position]); parts.add("\n") }
     return joinText(parts)
 }
-function signatureLine(signatures: List<Text>, line: Text) {
-    if line.startsWith("%") && host.hasText(line, " = type ") { field(signatures, line) }
-    if line.startsWith("; minyar-c-layout: ") || line.startsWith("; minyar-c-value: ") { field(signatures, line) }
-    if line.startsWith("; minyar-native-library: ") || line == "; minyar-cycle-runtime: 1" || line == "; minyar-callback-runtime: 1" || line == "; minyar-sort-callback-runtime: 1" { field(signatures, line) }
+// What every image must agree on, one entry per language function and per
+// type definition, native layout, native library or runtime requirement.
+function signatureLine(keys: List<Text>, line: Text) {
+    if (line.startsWith("%") && host.hasText(line, " = type ")) ||
+            line.startsWith("; minyar-c-layout: ") || line.startsWith("; minyar-c-value: ") ||
+            line.startsWith("; minyar-native-library: ") || line == "; minyar-cycle-runtime: 1" ||
+            line == "; minyar-callback-runtime: 1" || line == "; minyar-sort-callback-runtime: 1" {
+        keys.add("line:" + line)
+    }
 }
-// The ABI signature and fingerprints cover every language function, reachable
-// or not, so a body edit that starts or stops calling one is still a body edit.
+// The ABI signature covers every language function, reachable or not, so a
+// body edit that starts or stops calling one is still a body edit.
 function imageSignature(parsed: Parsed): Text {
-    let signatures: List<Text> = ["live-image-v1\n"]
+    let keys: List<Text> = []
+    let values: List<Text> = []
     let current = 0
     for line in parsed.lines {
         if line.startsWith("define ") {
-            if parsed.functions[current].language { field(signatures, parsed.functions[current].signature) }
+            if parsed.functions[current].language { keys.add("function:" + parsed.functions[current].raw); values.add(parsed.functions[current].signature) }
             current += 1
         }
-        signatureLine(signatures, line)
+        let before = keys.length
+        signatureLine(keys, line)
+        if keys.length != before { values.add("") }
     }
-    return joinText(signatures)
+    return "live-image-v2\n" + encodePairs(keys, values)
+}
+// "" when an update with signature `after` can run in the executable built with
+// `before`: every original function keeps its signature, every original type
+// and runtime requirement stays, and anything new is a function or a type.
+public function compatibility(before: Text, after: Text): Text {
+    if !before.startsWith("live-image-v2\n") || !after.startsWith("live-image-v2\n") { return "the live session's signature is from another toolchain; stop and run again" }
+    let old = decodeFields(host.textAfter(before, "live-image-v2\n"))
+    let new = decodePairs(host.textAfter(after, "live-image-v2\n"))
+    if old.length == 0 || new.length == 0 { return "the live session's signature is malformed; stop and run again" }
+    let known = Map<Text, Boolean>()
+    let index = 0
+    while index < old.length {
+        let key = old[index]
+        known[key] = true
+        if key.startsWith("function:") {
+            let name = readable(host.textAfter(key, "function:"))
+            if !new.has(key) { return "hot reload cannot remove or rename " + name + ", which the running program contains; stop and run again" }
+            if new[key] != old[index + 1] { return "hot reload changed a compiled function signature (" + name + "); stop and run again" }
+        } else if !new.has(key) {
+            if key.startsWith("line:%") { return "hot reload changed a record or type layout; stop and run again" }
+            return "hot reload changed a native library or runtime requirement; stop and run again"
+        }
+        index += 2
+    }
+    let added = decodeFields(host.textAfter(after, "live-image-v2\n"))
+    index = 0
+    while index < added.length {
+        let key = added[index]
+        if !known.has(key) && !key.startsWith("function:") && !key.startsWith("line:%") {
+            return "hot reload cannot add native code or a runtime requirement (" + host.textAfter(key, "line:") + "); stop and run again"
+        }
+        index += 2
+    }
+    return ""
 }
 function imageDigests(parsed: Parsed): Text {
     let keys: List<Text> = []
@@ -448,6 +625,9 @@ public function transformProgram(llvm: Text, generation: Integer, initial: Boole
 public function transform(llvm: Text, generation: Integer, initial: Boolean): Image {
     return transformWith(llvm, generation, initial, false)
 }
+function runtimeDeclarations(): Text {
+    return "declare ptr @minyar_live_bind(ptr, ptr, ptr)\n@minyar_live_epoch = external global ptr\n@minyar_live_epoch_seen = external global i64\n"
+}
 function transformWith(llvm: Text, generation: Integer, initial: Boolean, prune: Boolean): Image {
     let parsed = parse(llvm, generation, initial)
     if parsed.error != "" { return failed(parsed.error) }
@@ -461,6 +641,8 @@ function transformWith(llvm: Text, generation: Integer, initial: Boolean, prune:
     let symbols: List<Text> = []
     let digestKeys: List<Text> = []
     let exportValues: List<Text> = []
+    let cellNames: List<Text> = []
+    let cellTypes: List<Text> = []
     let current = 0
     let skipping = false
     for position in 0..parsed.lines.length {
@@ -473,8 +655,11 @@ function transformWith(llvm: Text, generation: Integer, initial: Boolean, prune:
             if position == parsed.ends[current - 1] { skipping = false }
             continue
         }
-        let state = rootCell(line, initial)
+        let cell = cellOf(line)
+        if cell.raw != "" { cellNames.add(cell.raw); cellTypes.add(cell.type) }
+        let state = rootCell(line, true, Map<Text, Text>())
         if state.error != "" { return failed(state.error) }
+        if !initial && cell.raw != "" { state.text = "@" + cell.token + " = external global " + cell.type }
         let replaced = renamed(state.text, namesBySymbol)
         if replaced.error != "" { return failed(replaced.error) }
         let result = replaced.text
@@ -491,29 +676,45 @@ function transformWith(llvm: Text, generation: Integer, initial: Boolean, prune:
         }
         output.add(result + "\n")
     }
-    output.add("declare ptr @minyar_live_bind(ptr, ptr, ptr)\n@minyar_live_epoch = external global ptr\n@minyar_live_epoch_seen = external global i64\n")
+    output.add(runtimeDeclarations())
     for index in 0..functions.length { if functions[index].language && kept[index] { output.add(wrapper(functions[index], index, generation)) } }
     return Image { llvm: joinText(output); names: names; symbols: symbols; signature: imageSignature(parsed);
-        digests: imageDigests(parsed); exports: encodePairs(digestKeys, exportValues); error: "" }
+        digests: imageDigests(parsed); exports: encodePairs(digestKeys, exportValues); cells: encodePairs(cellNames, cellTypes); added: []; error: "" }
 }
 
 // An update image holds the functions whose fingerprint differs from the
 // original executable's (`published`), so each table is complete on its own:
-// a function it omits runs its original body. Every call goes through the
-// original executable's wrappers (`exports`).
-public function transformUpdate(llvm: Text, generation: Integer, published: Map<Text, Text>, exports: Map<Text, Text>): Image {
+// a function it omits runs its original body. Calls to original functions go
+// through the original executable's wrappers (`exports`).
+//
+// Functions the executable does not contain are added: an ordinary function
+// gets a wrapper and slot of its own in this image, listed in the table like
+// any replaced function, so a later update (which carries it again) retargets
+// every copy, including function values already handed out. A machine
+// intrinsic is inlined, so its body is simply emitted for this image.
+public function transformUpdate(llvm: Text, generation: Integer, published: Map<Text, Text>, exports: Map<Text, Text>, cells: Map<Text, Text>): Image {
     let parsed = parse(llvm, generation, false)
     if parsed.error != "" { return failed(parsed.error) }
     let functions = parsed.functions
     let kept = reachable(parsed)
     let namesBySymbol = Map<Text, Text>()
     let changed: List<Boolean> = []
+    let fresh: List<Boolean> = []
+    let wrapped = false
+    let added: List<Text> = []
     for index in 0..functions.length {
         let function = functions[index]
+        fresh.add(false)
         if !kept[index] { changed.add(false); continue }
         if !function.language { namesBySymbol[function.raw] = function.wrapper; changed.add(true); continue }
-        // Functions the original program never reached were left out of it.
-        if !exports.has(function.raw) { return failed("hot reload cannot add a call to " + function.raw + ", which the running program does not contain; stop and run again") }
+        if !exports.has(function.raw) {
+            fresh[index] = true
+            changed.add(true)
+            let header = parsed.lines[parsed.starts[index]]
+            if header.startsWith("define internal ") || header.startsWith("define private ") { namesBySymbol[function.raw] = function.body }
+            else { namesBySymbol[function.raw] = function.wrapper; wrapped = true; added.add(function.raw) }
+            continue
+        }
         namesBySymbol[function.raw] = exports[function.raw]
         let fingerprint = digest(bodyText(parsed, index), parsed.globals)
         changed.add(!published.has(function.raw) || published[function.raw] != fingerprint)
@@ -533,26 +734,36 @@ public function transformUpdate(llvm: Text, generation: Integer, published: Map<
             if position == parsed.ends[current] { skipping = false }
             continue
         }
-        let state = rootCell(line, false)
+        let state = rootCell(line, false, cells)
         if state.error != "" { return failed(state.error) }
         let replaced = renamed(state.text, namesBySymbol)
         if replaced.error != "" { return failed(replaced.error) }
         let result = replaced.text
         if line.startsWith("define ") && functions[current].language {
             let function = functions[current]
-            result = publicDefinition(result, exports[function.raw], function.body)
-            names.add(function.raw)
-            symbols.add(function.body)
+            if !fresh[current] {
+                result = publicDefinition(result, exports[function.raw], function.body)
+                names.add(function.raw)
+                symbols.add(function.body)
+            } else if namesBySymbol[function.raw] == function.wrapper {
+                result = publicDefinition(result, function.wrapper, function.body)
+                names.add(function.raw)
+                symbols.add(function.body)
+            }
         }
         output.add(result + "\n")
     }
     for index in 0..functions.length {
         let function = functions[index]
-        if !function.language || !kept[index] { continue }
+        if !function.language || !kept[index] || fresh[index] { continue }
         let types: List<Text> = []
         if function.parameters != "" { for parameter in function.parameters.split(", ") { types.add(host.words(parameter)[0]) } }
         output.add("declare " + function.result + " @" + exports[function.raw] + "(" + host.joined(types, ", ") + ")\n")
     }
+    if wrapped {
+        output.add(runtimeDeclarations())
+        for index in 0..functions.length { if fresh[index] && namesBySymbol[functions[index].raw] == functions[index].wrapper { output.add(wrapper(functions[index], index, generation)) } }
+    }
     return Image { llvm: joinText(output); names: names; symbols: symbols; signature: imageSignature(parsed);
-        digests: imageDigests(parsed); exports: ""; error: "" }
+        digests: imageDigests(parsed); exports: ""; cells: ""; added: added; error: "" }
 }

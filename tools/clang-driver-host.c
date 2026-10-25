@@ -233,7 +233,7 @@ long long minyar_driverhost_copyExclusive(const MinyarText *source, const Minyar
     return -error;
 }
 
-long long minyar_driverhost_lockExclusive(const MinyarText *path) {
+static long long host_lock(const MinyarText *path, int operation) {
     char *name = host_cstring(path);
     if (!name) return -(host_error ? host_error : EINVAL);
     int descriptor = open(name, O_RDONLY | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0666);
@@ -241,13 +241,17 @@ long long minyar_driverhost_lockExclusive(const MinyarText *path) {
     struct stat info;
     if (!error && fstat(descriptor, &info)) error = errno;
     if (!error && !S_ISREG(info.st_mode)) error = EINVAL;
-    while (!error && flock(descriptor, LOCK_EX) < 0) {
-        if (errno != EINTR) error = errno;
+    while (!error && flock(descriptor, operation) < 0) {
+        if (errno != EINTR) error = errno == EWOULDBLOCK ? EAGAIN : errno;
     }
     if (error && descriptor >= 0) close(descriptor);
     free(name);
     return error ? -error : descriptor;
 }
+long long minyar_driverhost_lockExclusive(const MinyarText *path) { return host_lock(path, LOCK_EX); }
+long long minyar_driverhost_lockShared(const MinyarText *path) { return host_lock(path, LOCK_SH); }
+// -EAGAIN while anyone else holds the lock.
+long long minyar_driverhost_tryLockExclusive(const MinyarText *path) { return host_lock(path, LOCK_EX | LOCK_NB); }
 
 static int host_remove_entry(const char *path, const struct stat *info, int flag, struct FTW *walk);
 

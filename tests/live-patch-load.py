@@ -13,6 +13,7 @@ plain files.
 import argparse
 import os
 from pathlib import Path
+import re
 import selectors
 import shutil
 import signal
@@ -95,14 +96,19 @@ def ship(state, host):
     writing the epoch again retries it."""
     shutil.copyfile(state / "current", host / "current.incoming")
     (host / "current.incoming").replace(host / "current")
-    with open(host / "current.epoch", "r+b") as epoch:
-        epoch.write((state / "current.epoch").read_bytes())
+
+    def announce(value):
+        # The deployed counter is read-only to the program (F8); only the shipper writes it.
+        (host / "current.epoch").chmod(0o644)
+        with open(host / "current.epoch", "r+b") as epoch:
+            epoch.write(value)
+        (host / "current.epoch").chmod(0o444)
+    announce((state / "current.epoch").read_bytes())
     time.sleep(0.5)
     for generation in state.glob("generation-*"):
         if not (host / generation.name).exists():
             shutil.copytree(generation, host / generation.name)
-    with open(host / "current.epoch", "r+b") as epoch:
-        epoch.write(struct.pack("<Q", struct.unpack("<Q", (state / "current.epoch").read_bytes())[0] + 1000))
+    announce(struct.pack("<Q", struct.unpack("<Q", (state / "current.epoch").read_bytes())[0] + 1000))
 
 
 def check(launcher, release, deploy, relocate=False):
@@ -121,6 +127,9 @@ def check(launcher, release, deploy, relocate=False):
             assert built.returncode == 0, built
             command = [str(project / "target" / ("release" if release else "debug") / "livepatch-server")]
         environment = dict(os.environ, LIVEPATCH_PORT="0")
+        if not deploy:
+            # A relocation setting left in the shell does not redirect the watched program (F7).
+            environment["MINYAR_LIVE_STATE"] = str(Path(temporary) / "elsewhere")
         if relocate:
             # A deployed copy: the binary and its live state elsewhere, patched by shipping files.
             built_state = Path((project / "target" / ("release" if release else "debug") / "livepatch-server.live").read_text())
@@ -128,8 +137,11 @@ def check(launcher, release, deploy, relocate=False):
             shutil.copytree(built_state, host / "state")
             shutil.copy2(command[0], host / "server")
             command = [str(host / "server")]
-            environment["MINYAR_LIVE_STATE"] = str(host / "state")
-        process = subprocess.Popen(command, cwd=project, env=environment,
+            # Relative, and resolved once: the program may change directory later (F8).
+            environment["MINYAR_LIVE_STATE"] = "host/state"
+            (host / "state/current.epoch").write_bytes(bytes(8))
+            (host / "state/current.epoch").chmod(0o444)
+        process = subprocess.Popen(command, cwd=Path(temporary) if relocate else project, env=environment,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
         selector = selectors.DefaultSelector()
@@ -160,7 +172,7 @@ def check(launcher, release, deploy, relocate=False):
             if deploy and not relocate:
                 # A copy started after the publication runs it from its first request.
                 late = subprocess.Popen(command, cwd=project, env=environment, stdout=subprocess.PIPE,
-                                        stderr=subprocess.DEVNULL)
+                                        stderr=subprocess.PIPE)
                 try:
                     late_port = int(late.stdout.readline().split()[1])
                     probe = Client(late_port, threading.Event())
@@ -170,6 +182,9 @@ def check(launcher, release, deploy, relocate=False):
                 finally:
                     late.kill()
                     late.wait()
+                # It started on the update; nothing was reloaded (G6).
+                late_errors = late.stderr.read()
+                assert b"Reloaded" not in late_errors and b"minyar live:" not in late_errors, late_errors
             deadline = time.monotonic() + 300 * SCALE
             while not all(c.responses and c.responses[-1][0] == 2 for c in clients):
                 assert time.monotonic() < deadline, ("update never reached every client", output)
@@ -184,7 +199,7 @@ def check(launcher, release, deploy, relocate=False):
                                 .replace("served: 0; keys", "served: 0; extra: 0; keys"))
                 refused = subprocess.run([str(launcher), "patch", "--manifest-path", str(project), *profile],
                                          capture_output=True, timeout=600 * SCALE)
-                assert refused.returncode != 0 and b"function-body edits only" in refused.stderr, refused
+                assert refused.returncode != 0 and b"function-body edits and additions" in refused.stderr, refused
                 time.sleep(0.3)
                 assert all(c.responses[-1][0] == 2 for c in clients) and process.poll() is None
         finally:
@@ -230,7 +245,8 @@ def check_idle_patches(launcher, memory=""):
                                capture_output=True, timeout=600 * SCALE)
         assert built.returncode == 0, built
         server = subprocess.Popen([str(project / "target/debug/livepatch-server")], stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, env=dict(os.environ, LIVEPATCH_PORT="0"))
+                                  stderr=subprocess.PIPE, env=dict(os.environ, LIVEPATCH_PORT="0"))
+        state = Path((project / "target/debug/livepatch-server.live").read_text())
         try:
             port = int(server.stdout.readline().split()[1])
             client = Client(port, threading.Event())
@@ -264,16 +280,61 @@ def check_idle_patches(launcher, memory=""):
             refused = undo()
             assert refused.returncode != 0 and b"nothing to undo" in refused.stderr, refused
             assert ask() == (1, 15), client.responses
-            # A binary replaced by an ordinary build is not patched through the old session.
+            # Undo sets each entry aside before restoring it; nothing is left behind (G6).
+            assert not list(state.glob("history-*")), list(state.iterdir())
+
+            def patch():
+                return subprocess.run([str(launcher), "patch", "--manifest-path", str(project)],
+                                      capture_output=True, timeout=600 * SCALE)
+            # History is bounded and crash leftovers are collected (G6): twenty old
+            # entries and an orphaned generation before the next publication.
+            # The source still has both edits (version 2, served += 10).
+            main.write_text(main.read_text().replace('"version=2 served="', '"version=3 served="'))
+            assert patch().returncode == 0 and ask() == (3, 25), client.responses
+            table = (state / "current").read_bytes()
+            for number in range(1, 21):
+                (state / ("history-" + str(number))).write_bytes(table)
+            for leftover in ("history-21.pending", "history-4.restoring", "history-2.4242", "current.4242"):
+                (state / leftover).write_bytes(b"crash")
+            (state / "generation-orphan").mkdir()
+            main.write_text(main.read_text().replace('"version=3 served="', '"version=4 served="'))
+            published = patch()
+            assert published.returncode == 0 and ask() == (4, 35), published
+            names = sorted(path.name for path in state.iterdir())
+            history = sorted(int(name[len("history-"):]) for name in names if name.startswith("history-"))
+            assert history == list(range(6, 22)), names
+            assert not any(name.endswith((".pending", ".restoring", ".4242")) for name in names), names
+            generations = [name for name in names if name.startswith("generation-")]
+            assert "generation-orphan" not in generations and len(generations) == 2, names
+            # A malformed session file is named as such (F9).
+            main.write_text(main.read_text().replace('"version=4 served="', '"version=5 served="'))
+            exports = (state / "exports").read_bytes()
+            (state / "exports").write_bytes(b"live-pairs-v1\n9:short\n")
+            broken = patch()
+            assert broken.returncode != 0 and b"exports file" in broken.stderr and b"malformed" in broken.stderr, broken
+            (state / "exports").write_bytes(exports)
+            # A table that loads but names a missing function is reported once, however
+            # often it is announced (G6).
+            (state / "current.next").write_bytes(b"\0".join(table.split(b"\0")[:3] + [b"reply", b"no.such.symbol", b""]))
+            (state / "current.next").replace(state / "current")
+            for _ in range(2):
+                with open(state / "current.epoch", "r+b") as epoch:
+                    value = struct.unpack("<Q", epoch.read(8))[0]
+                    epoch.seek(0)
+                    epoch.write(struct.pack("<Q", value + 1))
+                assert ask()[0] == 4, client.responses
+            # A binary replaced by an ordinary build ends its session (F9).
             plain = subprocess.run([str(launcher), "build", "--manifest-path", str(project)], capture_output=True,
                                    timeout=600 * SCALE)
             assert plain.returncode == 0, plain
-            stale = subprocess.run([str(launcher), "patch", "--manifest-path", str(project)], capture_output=True,
-                                   timeout=600 * SCALE)
-            assert stale.returncode != 0 and b"not built by its recorded live session" in stale.stderr, stale
+            assert not (project / "target/debug/livepatch-server.live").exists() and not state.exists(), plain
+            stale = patch()
+            assert stale.returncode != 0 and b"no patchable build" in stale.stderr, stale
         finally:
             server.kill()
             server.wait()
+        errors = server.stderr.read()
+        assert errors.count(b"invalid function table") == 1, errors
     print("idle patches" + (" (" + memory + ")" if memory else "") + ": two publications without calls between them both apply; undo restores each")
 
 
@@ -312,10 +373,64 @@ def check_foreign_patch(launcher):
             server.kill()
             server.wait()
         refused = server.stderr.read()
-        # Generation-specific symbol names make another build's image fail to load.
-        assert b"cannot load update" in refused, refused
+        # Tables name the executable they were built for (F7).
+        assert b"update was built for another executable" in refused, refused
         assert refused.count(b"minyar live:") == 1, ("a refused update is reported once", refused)
-    print("foreign patch: a copy pointed at another build's state keeps its own code")
+        # A relocation that does not exist is reported, and the copy runs its own code (F8).
+        server = subprocess.Popen([str(Path(temporary) / "first-build")], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  env=dict(os.environ, LIVEPATCH_PORT="0", MINYAR_LIVE_STATE=str(Path(temporary) / "missing")))
+        try:
+            port = int(server.stdout.readline().split()[1])
+            client = Client(port, threading.Event())
+            with socket.create_connection(("127.0.0.1", port), timeout=30 * SCALE) as connection:
+                client.exchange(connection)
+            assert client.responses == [(1, 1)], client.responses
+        finally:
+            server.kill()
+            server.wait()
+        missing = server.stderr.read()
+        assert b"cannot use MINYAR_LIVE_STATE=" in missing and missing.count(b"minyar live:") == 1, missing
+    print("foreign patch: a copy pointed at another build's state, or at none, keeps its own code")
+
+
+def check_build_noise(launcher):
+    """Hot builds and patches print no linker-flag warnings, tool diagnostics keep their line
+    breaks (A12), and a watch session that replaces a build --hot binary ends its session (G6)."""
+    source = launcher.parent / "benchmarks/livepatch/server"
+    with tempfile.TemporaryDirectory(prefix="minyar-live-noise-") as temporary:
+        project = Path(temporary) / "server"
+        (project / "src").mkdir(parents=True)
+        (project / "Minyar.toml").write_text((source / "Minyar.toml").read_text())
+        main = project / "src/main.min"
+        main.write_text((source / "src/main.min").read_text())
+        # A private native cache, so every native object really compiles here.
+        fresh = dict(os.environ, MINYAR_CACHE_DIR=str(Path(temporary) / "cache"))
+        built = subprocess.run([str(launcher), "build", "--hot", "--manifest-path", str(project)],
+                               capture_output=True, timeout=600 * SCALE, env=fresh)
+        assert built.returncode == 0 and b"input unused" not in built.stderr and b"\\u{" not in built.stderr, built
+        main.write_text(main.read_text().replace('"version=1 served="', '"version=2 served="'))
+        patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project)],
+                                 capture_output=True, timeout=600 * SCALE, env=fresh)
+        assert patched.returncode == 0 and b"input unused" not in patched.stderr and b"\\u{" not in patched.stderr, patched
+        session = project / "target/debug/livepatch-server.live"
+        state = Path(session.read_text())
+        watch = subprocess.Popen([str(launcher), "run", "--watch", "--hot", "--manifest-path", str(project)],
+                                 env=dict(os.environ, LIVEPATCH_PORT="0"), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            assert watch.stdout.readline().startswith(b"LISTENING "), "the watched program did not start"
+        finally:
+            os.killpg(watch.pid, signal.SIGTERM)
+            watch.wait(30 * SCALE)
+        assert not session.exists() and not state.exists(), "a watch session replaced the build --hot binary"
+        # Explicit native flags with linker-only items: each clang warning on its own line.
+        noisy = dict(os.environ, MINYAR_CACHE_DIR=str(Path(temporary) / "noisy"),
+                     MINYAR_NATIVE_FLAGS="-O0 -Wl,--as-needed -Wl,-z,now")
+        plain = subprocess.run([str(launcher), "build", "--manifest-path", str(project)],
+                               capture_output=True, timeout=600 * SCALE, env=noisy)
+        assert plain.returncode == 0 and b"\\u{000a}" not in plain.stderr, plain
+        assert re.search(rb"-Wl,--as-needed: 'linker' input unused[^\n]*\n[^\n]*-Wl,-z,now: 'linker' input unused", plain.stderr), plain.stderr
+    print("build noise: hot builds and patches print no linker warnings; diagnostics keep their lines; watch ends a hot session")
 
 
 PARALLEL_SERVER = """use "httpserver" as http
@@ -502,6 +617,7 @@ def main():
     if args.mode != "patch":
         check(args.launcher.resolve(), args.profile == "release", False)
     if args.mode != "watch":
+        check_build_noise(args.launcher.resolve())
         check_idle_patches(args.launcher.resolve())
         check_idle_patches(args.launcher.resolve(), "eager")
         check_foreign_patch(args.launcher.resolve())

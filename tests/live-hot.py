@@ -74,8 +74,9 @@ def accepted_publication(project, release):
     current = current_files[0]
     data = current.read_bytes()
     fields = data.split(b"\0")
-    assert len(fields) > 2 and fields[0], ("invalid accepted function table", data)
-    image = Path(os.fsdecode(fields[0]))
+    assert len(fields) > 4 and fields[0] == b"minyar-live-table-v2" and fields[1], ("invalid accepted function table", data)
+    assert fields[1] == (current.parent / "build-id").read_bytes(), "a table names the executable it was built for"
+    image = Path(os.fsdecode(fields[2]))
     assert image.name == "update.so" and image.parent.parent == current.parent, image
     sidecar = image.with_name("source-identity")
     identity = sidecar.read_bytes()
@@ -158,7 +159,9 @@ def check(launcher, release):
         publish(source, program("first"))
         fifo = project / "tick"
         os.mkfifo(fifo)
-        watch = begin(launcher, project, fifo, release, {"MINYAR_CLANG": str(counter.wrapper)})
+        # A relocation setting in the shell does not redirect the watched program (F7).
+        watch = begin(launcher, project, fifo, release, {"MINYAR_CLANG": str(counter.wrapper),
+                                                          "MINYAR_LIVE_STATE": str(directory / "elsewhere")})
         try:
             pid = int(watch.wait(re.compile(rb"PID ([0-9]+)\n")).group(1))
             watch.pids.add(pid)
@@ -258,14 +261,28 @@ def check(launcher, release):
             rebuild_untrusted("third 10 10 first", "table")
             rebuild_untrusted("third 11 11 first", "binary-sidecar")
             rebuild_untrusted("third 12 12 first", "binary-path")
+            # Every edit reverted: the original functions run again, state kept.
+            errors = len(watch.output["stderr"])
+            publish(source, program("first"))
+            watch.wait(b"Every edit reverted", "stderr", errors)
+            watch.wait(b"Reload ready", "stderr", errors)
+            step("first 13 13 first")
+            watch.wait(b"Restored original functions; program state preserved", "stderr", errors)
+            # A new function and a call to it (A10).
+            errors = len(watch.output["stderr"])
+            publish(source, program("fourth").replace("function step() {", "function mark(): Text { return \"+\" }\nfunction step() {")
+                    .replace("+ STATE.history[0])", "+ STATE.history[0] + mark())"))
+            watch.wait(b"Reload ready", "stderr", errors)
+            step("fourth 14 14 first+")
+            assert b"(1 new)" in watch.output["stderr"][errors:], watch.diagnostics()
             errors = len(watch.output["stderr"])
             publish(source, program("third").replace('count: Integer;', 'count: Float;'))
             watch.wait(re.compile(rb"(?i)build failed"), "stderr", errors)
-            watch.wait(b"function-body edits only", "stderr", errors)
-            step("third 13 13 first")
+            watch.wait(b"function-body edits and additions", "stderr", errors)
+            step("fourth 15 15 first+")
             assert len(re.findall(rb"(?m)^PID ", watch.output["stdout"])) == 1, watch.diagnostics()
             watch.stop()
-            print(f"hot reload {'O2' if release else 'O0'}: same PID, heap roots, thirteen state transitions, "
+            print(f"hot reload {'O2' if release else 'O0'}: same PID, heap roots, fifteen state transitions (a full revert, an added function), "
                   f"three identical saves with zero native calls, trusted-sidecar recovery; "
                   f"edit-to-observation {latency:.3f}s, identical-save acceptance "
                   f"{min(noop_latencies):.3f}–{max(noop_latencies):.3f}s")
@@ -301,6 +318,43 @@ def check_exited_program(launcher, release):
             watch.close()
 
 
+def check_patch_toolchain(launcher):
+    """The project tool runs the live build tool directly, even without MINYAR_PROJECT_DIR; a
+    system-profile package never prepares the eager runtime; undo compiles nothing, so it skips the
+    launcher's toolchain preparation (G7)."""
+    root = launcher.parent
+    tool = root / "build/tooling/tools/project-cli"
+    with tempfile.TemporaryDirectory(prefix="minyar-hot-direct-") as temporary:
+        project = Path(temporary)
+        (project / "src").mkdir()
+        (project / "Minyar.toml").write_text('[package]\nname = "direct"\nversion = "0.1.0"\nkind = "bin"\n', encoding="utf-8")
+        source = project / "src/main.min"
+        source.write_text('function value(): Integer { return 1 }\nprint(value())\n', encoding="utf-8")
+        bare = {key: value for key, value in os.environ.items() if key != "MINYAR_PROJECT_DIR"}
+        built = subprocess.run([str(tool), "build", "--hot", "--manifest-path", str(project)], env=bare,
+                               capture_output=True, timeout=600 * SCALE)
+        assert built.returncode == 0, built
+        source.write_text('function value(): Integer { return 2 }\nprint(value())\n', encoding="utf-8")
+        patched = subprocess.run([str(tool), "patch", "--manifest-path", str(project)], env=bare,
+                                 capture_output=True, timeout=600 * SCALE)
+        assert patched.returncode == 0 and b"Published update" in patched.stderr, patched
+        assert not (root / "build/minyar-runtime-eager.o").exists(), "a system-profile hot build prepared the eager runtime"
+        toolchain = root / "tools/toolchain.sh"
+        original = toolchain.read_bytes()
+        toolchain.with_name("toolchain-real.sh").write_bytes(original)
+        toolchain.write_text('case "$*" in *live-build-cli*) echo "live toolchain prepared" >&2; exit 7 ;; esac\n'
+                             'exec sh "$(dirname "$0")/toolchain-real.sh" "$@"\n', encoding="utf-8")
+        try:
+            undone = subprocess.run([str(launcher), "patch", "--undo", "--manifest-path", str(project)],
+                                    capture_output=True, timeout=600 * SCALE)
+        finally:
+            toolchain.write_bytes(original)
+            toolchain.with_name("toolchain-real.sh").unlink()
+        assert undone.returncode == 0 and b"Restored the original code" in undone.stderr, undone
+        assert b"live toolchain prepared" not in undone.stderr, undone
+    print("direct live builds: no MINYAR_PROJECT_DIR needed, no eager runtime for system packages, undo without preparation")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("launcher", type=Path)
@@ -324,6 +378,7 @@ def main():
         if args.profile != "release":
             check(hot, False)
             check_exited_program(hot, False)
+            check_patch_toolchain(hot)
         if args.profile != "debug":
             check(hot, True)
             check_exited_program(hot, True)
