@@ -242,10 +242,20 @@ def check_idle_patches(launcher, memory=""):
                                          capture_output=True, timeout=600 * SCALE)
                 assert patched.returncode == 0, patched
             assert ask() == (2, 11), client.responses
+
+            def undo():
+                return subprocess.run([str(launcher), "patch", "--undo", "--manifest-path", str(project)],
+                                      capture_output=True, timeout=600 * SCALE)
+            # Undo restores the previous table without compiling, back to the original program.
+            assert undo().returncode == 0 and ask() == (2, 12), client.responses
+            assert undo().returncode == 0 and ask() == (1, 13), client.responses
+            refused = undo()
+            assert refused.returncode != 0 and b"nothing to undo" in refused.stderr, refused
+            assert ask() == (1, 14), client.responses
         finally:
             server.kill()
             server.wait()
-    print("idle patches" + (" (" + memory + ")" if memory else "") + ": two publications without calls between them both apply")
+    print("idle patches" + (" (" + memory + ")" if memory else "") + ": two publications without calls between them both apply; undo restores each")
 
 
 def check_foreign_patch(launcher):

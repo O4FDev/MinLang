@@ -155,6 +155,44 @@ function liveImage(generated: Text, state: Text, initial: Boolean): live.Image {
     if image.error == "" && image.names.length == 0 && host.exists(state + "/current") { return live.transform(generated, system.monotonicNanoseconds(), false) }
     return image
 }
+// `minyar patch` keeps every table it replaces, newest last, so `--undo` can
+// restore one without compiling. "-" is the original program's table.
+function historyNumbers(state: Text): List<Integer> {
+    let numbers: List<Integer> = []
+    for name in files.list(state) {
+        if name.startsWith("history-") {
+            let number = textCodec.integer(host.textAfter(name, "history-")).unwrapOr(0)
+            if number > 0 { numbers.add(number) }
+        }
+    }
+    numbers.sort()
+    return numbers
+}
+function remember(state: Text) {
+    let numbers = historyNumbers(state)
+    let next = 1
+    if numbers.length > 0 { next = numbers[numbers.length - 1] + 1 }
+    let previous = Bytes("-")
+    previous.add(0)
+    if host.isFile(state + "/current") { previous = host.readBytes(state + "/current") }
+    atomic(state + "/history-" + Text(next), previous)
+}
+function restorePrevious(state: Text) {
+    let lock = host.lockExclusive(state + "/publish.lock")
+    if lock < 0 { host.stop(host.osError(lock, state + "/publish.lock")) }
+    let numbers = historyNumbers(state)
+    if numbers.length == 0 { host.stop("nothing to undo: no earlier minyar patch publication") }
+    let entry = state + "/history-" + Text(numbers[numbers.length - 1])
+    let table = host.readBytes(entry)
+    let epoch = files.open(state + "/current.epoch", files.WRITE + files.CREATE)
+    if epoch < 0 { host.stop(host.osError(epoch, state + "/current.epoch")) }
+    atomic(state + "/current", table)
+    announce(epoch, state + "/current.epoch")
+    if files.remove(entry) != 0 { system.writeStandardError("minyar: cannot remove " + entry + "\n") }
+    files.close(lock)
+    if table.length == 2 && table[0] == 45 { system.writeStandardError("Restored the original code; running copies switch on their next call\n") }
+    else { system.writeStandardError("Restored the previous update; running copies switch on their next call\n") }
+}
 function llvmString(value: Text): Text {
     let hex = "0123456789ABCDEF"
     let pieces: List<Text> = []
@@ -172,6 +210,7 @@ function buildLive() {
     let manifests: List<Text> = []
     let format = ""
     let publish = false
+    let undo = false
     let memory = "system"
     let index = 0
     // `minyar live-build --ready` only lets the launcher build this tool and its
@@ -182,6 +221,7 @@ function buildLive() {
         if item == "--release" { release = true }
         else if item == "--no-incremental" { incremental = false }
         else if item == "--publish" { publish = true }
+        else if item == "--undo" { undo = true }
         else {
             if index + 1 >= process.argumentCount() { host.stop("missing live build option value: " + item) }
             index += 1
@@ -198,6 +238,7 @@ function buildLive() {
         index += 1
     }
     if state == "" || entry == "" || output == "" { host.stop("live-build is an internal command; use minyar run --watch --hot") }
+    if undo { restorePrevious(host.resolveName(state)); return }
     let root = system.getenv("MINYAR_PROJECT_DIR")
     if root == "" { host.stop("cannot locate live toolchain") }
     if host.hostName() != "Darwin" && host.hostName() != "Linux" { host.stop("hot reload requires macOS or Linux") }
@@ -308,6 +349,7 @@ function buildLive() {
             if lock < 0 { host.stop(host.osError(lock, state + "/publish.lock")) }
             let epoch = files.open(state + "/current.epoch", files.WRITE + files.CREATE)
             if epoch < 0 { host.stop(host.osError(epoch, state + "/current.epoch")) }
+            remember(state)
             if files.rename(candidate, state + "/current") != 0 { host.stop("cannot publish live build: " + state + "/current") }
             announce(epoch, state + "/current.epoch")
             files.close(lock)

@@ -117,6 +117,18 @@ static void live_refresh(void) {
     char *path = live_part(&cursor, end);
     size_t count = 0;
     for (char *p = cursor; p < end; ++p) if (!*p) ++count;
+    if (path && !strcmp(path, "-") && !count) {
+        // `minyar patch --undo` back to the original program: every slot returns
+        // to the executable's own body.
+        free(storage);
+        free(live_entries);
+        live_entries = NULL; live_count = 0;
+        for (size_t i = 0; i < live_slot_count; ++i)
+            __atomic_store_n(live_slots[i].slot, live_slots[i].initial, __ATOMIC_RELEASE);
+        live_seen = info; live_have_seen = 1; live_have_failed = 0;
+        fprintf(stderr, "Restored original functions; program state preserved\n");
+        return;
+    }
     if (!path || count % 2 || !count) { free(storage); return; }
     count /= 2;
     struct live_entry *entries = calloc(count, sizeof *entries);

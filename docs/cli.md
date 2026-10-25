@@ -363,6 +363,8 @@ minyar build --hot --release
 minyar patch --release
 ```
 
+`minyar patch --undo` restores the table that the last `minyar patch` replaced,
+without compiling; repeating it walks back to the original program.
 A package's `memory` setting applies to these builds and their patches. The
 same rules apply: function-body edits only, no managed threads,
 and each accepted generation stays resident. An incompatible edit is refused
