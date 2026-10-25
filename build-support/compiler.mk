@@ -96,7 +96,7 @@ build/compiler-stage3.ll: build/compiler.min build/minyarc $(COMPILER_LIBRARY_SO
 	$(LIMITED) ./build/minyarc $< $@ --library library
 
 build/compiler-bootstrap.ll: build/compiler-stage1.ll
-	cp $< $@
+	cp $< $@.tmp && mv -f $@.tmp $@
 
 build/compiler-bootstrap: build/compiler-bootstrap.ll build/minyar-compiler-runtime.ll
 	"$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
@@ -105,28 +105,28 @@ COMPILER_COMPAT_NAMES = modules callbacks errors errors-request calldepth thread
 COMPILER_COMPAT_FAMILIES = module closure errors calldepth thread
 
 $(addprefix build/minyarc-,$(COMPILER_COMPAT_NAMES)): build/minyarc
-	cp $< $@
+	cp $< $@.tmp && mv -f $@.tmp $@
 
 $(addsuffix -sanitize,$(addprefix build/minyarc-,$(COMPILER_COMPAT_NAMES))): build/minyarc-sanitize
-	cp $< $@
+	cp $< $@.tmp && mv -f $@.tmp $@
 
 $(addsuffix -compiler.min,$(addprefix build/,$(COMPILER_COMPAT_FAMILIES))): build/compiler.min
-	cp $< $@
+	cp $< $@.tmp && mv -f $@.tmp $@
 
 build/errors-request.min: build/compiler.min
-	cp $< $@
+	cp $< $@.tmp && mv -f $@.tmp $@
 
 $(addsuffix -compiler-stage1.ll,$(addprefix build/,$(COMPILER_COMPAT_FAMILIES))): build/compiler-stage1.ll
-	cp $< $@
+	cp $< $@.tmp && mv -f $@.tmp $@
 
 $(addsuffix -compiler-stage1,$(addprefix build/,$(COMPILER_COMPAT_FAMILIES))): build/compiler-stage1
-	cp $< $@
+	cp $< $@.tmp && mv -f $@.tmp $@
 
 $(addsuffix -compiler-stage2.ll,$(addprefix build/,$(COMPILER_COMPAT_FAMILIES))): build/compiler-stage2.ll
-	cp $< $@
+	cp $< $@.tmp && mv -f $@.tmp $@
 
 $(addsuffix -compiler-stage3.ll,$(addprefix build/,$(COMPILER_COMPAT_FAMILIES))): build/compiler-stage3.ll
-	cp $< $@
+	cp $< $@.tmp && mv -f $@.tmp $@
 
 build/minyar-module-build: tools/module-build.c build/.toolchain.json | build
 	$(LIMITED) "$(CC)" $(CFLAGS) $< -o $@
