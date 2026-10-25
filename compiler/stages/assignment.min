@@ -88,29 +88,55 @@ function loopAssignmentHasPath(tokenKinds: List<Integer>, tokenTexts: List<Text>
     return tokenKinds[start] == 1 && assignmentOperatorPosition(tokenKinds, tokenTexts, start) == position
 }
 
-// Path stores that can release a reference held by a List, record or Map.
-function replacedReference(output: List<Text>, start: Integer): Boolean {
-    let index = start
-    while index < output.length {
-        let text = output[index]
-        if text.find("@minyar_list_set") >= 0 || text.find("@minyar_record_replace") >= 0 || text.find("@minyar_record_append_text") >= 0 || text.find("@minyar_map_") >= 0 { return true }
-        index = index + 1
-    }
-    return false
+// Runtime operations that run no user code and never release a List slot, so
+// a walked List keeps every element. Leaving the frame ends every use of a
+// borrowed value; a returned one is retained before the frame is left. With `containers`, also exclude stores
+// that can release a record field or Map value, which may hold a borrowed
+// source such as a parameter.
+function loopBodyCallee(callee: Text, containers: Boolean): Boolean {
+    if pureLoopCallee(callee) || callee.startsWith("@.minyar.list.set.scalar.checked(") || callee.startsWith("@.minyar.record.") { return true }
+    if callee.startsWith("@minyar_rc_keep(") || callee.startsWith("@minyar_rc_borrow(") || callee.startsWith("@minyar_rc_borrow_traced(") || callee.startsWith("@minyar_rc_step(") || callee.startsWith("@minyar_rc_idle(") || callee.startsWith("@minyar_rc_leave(") || callee.startsWith("@minyar_rc_leave_stack_v1(") || callee.startsWith("@minyar_stack_leave(") || callee.startsWith("@minyar_rc_retain(") || callee.startsWith("@minyar_rc_retain_traced(") { return true }
+    if callee.startsWith("@minyar_rc_local(") || callee.startsWith("@minyar_rc_local_traced(") || callee.startsWith("@minyar_rc_local_take(") || callee.startsWith("@minyar_rc_local_move(") || callee.startsWith("@minyar_rc_local_move_owner(") { return true }
+    if callee.startsWith("@minyar_text_") || callee.startsWith("@minyar_texts_are_equal(") || callee.startsWith("@minyar_join_text") || callee.startsWith("@minyar_interpolate(") || callee.startsWith("@minyar_print_") || callee.startsWith("@minyar_bytes_") { return true }
+    if callee.startsWith("@minyar_integer_text(") || callee.startsWith("@minyar_float_text(") || callee.startsWith("@minyar_character_text(") || callee.startsWith("@minyar_boolean_text(") || callee.startsWith("@minyar_integer_character(") || callee.startsWith("@minyar_float_integer(") { return true }
+    if callee.startsWith("@minyar_compare_slots(") || callee.startsWith("@minyar_equal_slots(") || callee.startsWith("@minyar_hash_slot(") || callee.startsWith("@minyar_check_") || callee.startsWith("@minyar_fail") { return true }
+    if callee.startsWith("@minyar_list_new(") || callee.startsWith("@minyar_list_add(") || callee.startsWith("@minyar_list_add_take(") || callee.startsWith("@minyar_list_references(") || callee.startsWith("@minyar_list_length(") || callee.startsWith("@minyar_list_slice(") { return true }
+    if callee.startsWith("@minyar_record_new(") || callee.startsWith("@minyar_record_new_scalar(") || callee.startsWith("@minyar_record_set_scalar(") || callee.startsWith("@minyar_map_new(") || callee.startsWith("@minyar_map_has(") || callee.startsWith("@minyar_map_get(") || callee.startsWith("@minyar_map_length(") { return true }
+    if containers { return false }
+    return callee.startsWith("@minyar_record_set(") || callee.startsWith("@minyar_record_set_take(") || callee.startsWith("@minyar_record_set_reference(") || callee.startsWith("@minyar_record_replace(") || callee.startsWith("@minyar_record_append_text(") || callee.startsWith("@minyar_map_set(") || callee.startsWith("@minyar_map_remove(")
 }
 
-// When a loop body makes no call tokens and assigns only plain local names,
-// other than the loop name and the source name, or field and element paths,
-// it can change the collection it walks only through user code without a call
-// token (capability operators, Map key callbacks, record iteration) or a path
-// store that replaces a reference. The loop lowering reserves both owners and
-// fills them if compiling the body emitted either; scalar stores release nothing.
+// Whether every call in the compiled body is a loopBodyCallee.
+function loopBodyCallsAllowed(output: List<Text>, start: Integer, containers: Boolean): Boolean {
+    let pieces: List<Text> = []
+    let index = start
+    while index < output.length {
+        pieces.add(output[index])
+        index = index + 1
+    }
+    let rest = joinText(pieces)
+    if rest.find("invoke ") >= 0 { return false }
+    let call = rest.find("call ")
+    while call >= 0 {
+        rest = rest.slice(call + 5, rest.length)
+        let at = rest.find("@")
+        let indirect = rest.find("%")
+        if at < 0 || (indirect >= 0 && indirect < at) || !loopBodyCallee(rest.slice(at, rest.length), containers) { return false }
+        call = rest.find("call ")
+    }
+    return true
+}
+
+// When a loop body assigns only plain local names, other than the loop name
+// and the source name, or field and element paths, it can release the
+// collection it walks or its elements only through code its compiled form
+// shows: user calls, or runtime operations outside loopBodyCallsAllowed. The
+// loop lowering reserves both owners and fills them when that code appears.
 function loopBodyKeepsElements(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer, source: Text, loopName: Text): Boolean {
     if tokenKinds[position] != 4 || tokenTexts[position] != "{" { return false }
     let cursor = position + 1
     let depth = 0
     while tokenKinds[cursor] != 0 {
-        if callAt(tokenKinds, tokenTexts, cursor) { return false }
         let text = tokenTexts[cursor]
         if tokenKinds[cursor] == 4 {
             if text == "{" || text == "(" || text == "[" { depth = depth + 1 }
@@ -823,9 +849,11 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     let callsBefore = context.callTargets.length
     let bodyStart = output.length
     let bodyReturns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
-    if (collectionPiece >= 0 || elementPiece >= 0) && (ranUserCode(context, output, bodyStart, callsBefore) || replacedReference(output, bodyStart)) {
-        if collectionPiece >= 0 { rootLocalAt(context, output, state, collectionPiece, collection, source, sourceType[0]) }
-        if elementPiece >= 0 { rootLocalAt(context, output, state, elementPiece, variable, element, elementType) }
+    if collectionPiece >= 0 || elementPiece >= 0 {
+        let userCode = context.callTargets.length != callsBefore
+        let slots = userCode || !loopBodyCallsAllowed(output, bodyStart, false)
+        if collectionPiece >= 0 && (slots || !loopBodyCallsAllowed(output, bodyStart, true)) { rootLocalAt(context, output, state, collectionPiece, collection, source, sourceType[0]) }
+        if elementPiece >= 0 && slots { rootLocalAt(context, output, state, elementPiece, variable, element, elementType) }
     }
     output.add("; minyar-debug-scope: end\n")
     if !bodyReturns {
