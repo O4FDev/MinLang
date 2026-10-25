@@ -331,9 +331,9 @@ function wrapper(function: Function, index: Integer, generation: Integer): Text 
     return joinText(output)
 }
 
-record Parsed { functions: List<Function>; starts: List<Integer>; ends: List<Integer>; lines: List<Text>; globals: Map<Text, Text>; error: Text }
+record Parsed { functions: List<Function>; starts: List<Integer>; ends: List<Integer>; lines: List<Text>; globals: Map<Text, Text>; variables: List<Text>; error: Text }
 function parse(llvm: Text, generation: Integer, initial: Boolean): Parsed {
-    let result = Parsed { functions: []; starts: []; ends: []; lines: host.lines(llvm); globals: Map<Text, Text>(); error: "" }
+    let result = Parsed { functions: []; starts: []; ends: []; lines: host.lines(llvm); globals: Map<Text, Text>(); variables: []; error: "" }
     if generation < 0 { result.error = "live generation must be nonnegative"; return result }
     // Parallel loop workers may call wrappers concurrently; managed threads are not supported yet.
     if host.hasText(llvm, "; minyar-thread-runtime: 1") { result.error = "live reload does not support managed threads yet"; return result }
@@ -360,7 +360,7 @@ function parse(llvm: Text, generation: Integer, initial: Boolean): Parsed {
             inFunction = false
         } else if !inFunction && line.startsWith("@") {
             let global = symbol(Bytes(line), 1)
-            if global.error == "" { result.globals[global.raw] = line }
+            if global.error == "" { result.globals[global.raw] = line; result.variables.add(global.raw) }
         }
     }
     if inFunction { result.error = "generated LLVM is missing a function closing brace"; return result }
@@ -384,10 +384,45 @@ function publicDefinition(line: Text, from: Text, to: Text): Text {
     return host.replaceText(result, "define hidden ", "define ")
 }
 
+// Internal functions no root reaches, the same ones an ordinary LTO build drops.
+// Roots are functions with external linkage and everything a global refers to.
+function reachable(parsed: Parsed): List<Boolean> {
+    let index = Map<Text, Integer>()
+    let kept: List<Boolean> = []
+    let pending: List<Text> = []
+    for position in 0..parsed.functions.length {
+        index[parsed.functions[position].raw] = position
+        kept.add(false)
+        let header = parsed.lines[parsed.starts[position]]
+        if !header.startsWith("define internal ") && !header.startsWith("define private ") { pending.add(parsed.functions[position].raw) }
+    }
+    for name in parsed.variables { for target in references(parsed.globals[name]) { pending.add(target) } }
+    let next = 0
+    while next < pending.length {
+        let name = pending[next]
+        next += 1
+        if !index.has(name) || kept[index[name]] { continue }
+        let position = index[name]
+        kept[position] = true
+        for target in references(bodyText(parsed, position)) { pending.add(target) }
+    }
+    return kept
+}
+
+// Live builds drop unreachable functions, so code an ordinary build would not
+// link (say, OS-only machine helpers in a hosted program) is not wrapped either.
+public function transformProgram(llvm: Text, generation: Integer, initial: Boolean): Image {
+    return transformWith(llvm, generation, initial, true)
+}
 public function transform(llvm: Text, generation: Integer, initial: Boolean): Image {
+    return transformWith(llvm, generation, initial, false)
+}
+function transformWith(llvm: Text, generation: Integer, initial: Boolean, prune: Boolean): Image {
     let parsed = parse(llvm, generation, initial)
     if parsed.error != "" { return failed(parsed.error) }
     let functions = parsed.functions
+    let kept: List<Boolean> = []
+    if prune { kept = reachable(parsed) } else { for function in functions { kept.add(true) } }
     let namesBySymbol = Map<Text, Text>()
     for function in functions { namesBySymbol[function.raw] = function.wrapper }
     let output: List<Text> = []
@@ -398,7 +433,17 @@ public function transform(llvm: Text, generation: Integer, initial: Boolean): Im
     let digestValues: List<Text> = []
     let exportValues: List<Text> = []
     let current = 0
-    for line in parsed.lines {
+    let skipping = false
+    for position in 0..parsed.lines.length {
+        let line = parsed.lines[position]
+        if line.startsWith("define ") && !kept[current] {
+            skipping = true
+            current += 1
+        }
+        if skipping {
+            if position == parsed.ends[current - 1] { skipping = false }
+            continue
+        }
         let state = rootCell(line, initial)
         if state.error != "" { return failed(state.error) }
         let replaced = renamed(state.text, namesBySymbol)
@@ -421,7 +466,7 @@ public function transform(llvm: Text, generation: Integer, initial: Boolean): Im
         output.add(result + "\n")
     }
     output.add("declare ptr @minyar_live_bind(ptr, ptr, ptr)\n@minyar_live_epoch = external global ptr\n@minyar_live_epoch_seen = external global i64\n")
-    for index in 0..functions.length { if functions[index].language { output.add(wrapper(functions[index], index, generation)) } }
+    for index in 0..functions.length { if functions[index].language && kept[index] { output.add(wrapper(functions[index], index, generation)) } }
     return Image { llvm: joinText(output); names: names; symbols: symbols; signature: joinText(signatures);
         digests: encodePairs(digestKeys, digestValues); exports: encodePairs(digestKeys, exportValues); error: "" }
 }
@@ -434,12 +479,14 @@ public function transformUpdate(llvm: Text, generation: Integer, published: Map<
     let parsed = parse(llvm, generation, false)
     if parsed.error != "" { return failed(parsed.error) }
     let functions = parsed.functions
+    let kept = reachable(parsed)
     let namesBySymbol = Map<Text, Text>()
     let changed: List<Boolean> = []
     let digestKeys: List<Text> = []
     let digestValues: List<Text> = []
     for index in 0..functions.length {
         let function = functions[index]
+        if !kept[index] { changed.add(false); continue }
         if !function.language { namesBySymbol[function.raw] = function.wrapper; changed.add(true); continue }
         if !exports.has(function.raw) { return failed("hot reload changed a compiled function signature; stop and run again") }
         namesBySymbol[function.raw] = exports[function.raw]
@@ -458,8 +505,8 @@ public function transformUpdate(llvm: Text, generation: Integer, published: Map<
         let line = parsed.lines[position]
         if line.startsWith("define ") {
             current += 1
-            skipping = functions[current].language && !changed[current]
-            if functions[current].language { field(signatures, functions[current].signature) }
+            skipping = !kept[current] || (functions[current].language && !changed[current])
+            if functions[current].language && kept[current] { field(signatures, functions[current].signature) }
         }
         signatureLine(signatures, line)
         if skipping {
@@ -479,8 +526,9 @@ public function transformUpdate(llvm: Text, generation: Integer, published: Map<
         }
         output.add(result + "\n")
     }
-    for function in functions {
-        if !function.language { continue }
+    for index in 0..functions.length {
+        let function = functions[index]
+        if !function.language || !kept[index] { continue }
         let types: List<Text> = []
         if function.parameters != "" { for parameter in function.parameters.split(", ") { types.add(host.words(parameter)[0]) } }
         output.add("declare " + function.result + " @" + exports[function.raw] + "(" + host.joined(types, ", ") + ")\n")
