@@ -130,6 +130,19 @@ def begin(launcher, project, fifo, release, environment=None):
     return watch
 
 
+def private_launcher(launcher, directory):
+    """The Clang counter is a new Clang identity, so the launcher rebuilds its toolchain with it.
+    A private copy of the tree keeps the shared compiler and its toolchain stamp untouched."""
+    root = launcher.parent
+    for name in ("compiler", "bootstrap", "runtime", "vendor", "tools", "scripts", "build-support", "library"):
+        shutil.copytree(root / name, directory / name)
+    for name in ("Makefile", "minyar"):
+        shutil.copy2(root / name, directory / name)
+    if (root / "build/thinlto-cache").is_dir():
+        shutil.copytree(root / "build/thinlto-cache", directory / "build/thinlto-cache")
+    return directory / "minyar"
+
+
 def check(launcher, release):
     with tempfile.TemporaryDirectory(prefix="minyar-hot-λ ") as temporary, \
             tempfile.TemporaryDirectory(prefix="minyar-clang-counter-") as counter_temporary:
@@ -306,12 +319,14 @@ def main():
                             "-o", str(output)], check=True, capture_output=True, timeout=180 * SCALE)
             result = subprocess.run([str(output)], check=True, capture_output=True, text=True, timeout=10 * SCALE)
             assert result.stdout == "2\n41\n42\n7\n9\n3\n", result
-    if args.profile != "release":
-        check(launcher, False)
-        check_exited_program(launcher, False)
-    if args.profile != "debug":
-        check(launcher, True)
-        check_exited_program(launcher, True)
+    with tempfile.TemporaryDirectory(prefix="minyar-hot-toolchain-") as private:
+        hot = private_launcher(launcher, Path(private))
+        if args.profile != "release":
+            check(hot, False)
+            check_exited_program(hot, False)
+        if args.profile != "debug":
+            check(hot, True)
+            check_exited_program(hot, True)
 
 
 if __name__ == "__main__":
