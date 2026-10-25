@@ -89,7 +89,6 @@ static long long *list_sort_allocate(size_t slots) {
 #ifndef MINYAR_SORT_GRAPH
 #define SORT_RETAIN minyar_rc_retain
 #define SORT_ADD minyar_list_add
-#define SORT_SET minyar_list_set
 #else
 #define SORT_RETAIN minyar_rc_retain_traced
 #define SORT_ADD minyar_list_add_traced
@@ -163,7 +162,13 @@ static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortCompa
         list_reserve(result, (long long)count);
         for (size_t i = 0; i < count; i++) SORT_ADD(result, snapshot[indices[i]]);
     } else {
+#ifndef MINYAR_SORT_GRAPH
+        /* The slots still equal the snapshot, so the permutation moves each
+         * existing owner once, like the natural sort: no count changes. */
+        for (size_t i = 0; i < count; i++) list->values[i] = snapshot[indices[i]];
+#else
         for (size_t i = 0; i < count; i++) SORT_SET(list, (long long)i, snapshot[indices[i]]);
+#endif
     }
 done:
     for (size_t i = 0; references && i < count; i++) minyar_rc_release((void *)(uintptr_t)snapshot[i]);
