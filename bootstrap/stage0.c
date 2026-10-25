@@ -2516,7 +2516,7 @@ static void emit_program(FILE *output, Program *program) {
         Function *function = &program->functions[index];
         if (function->native_library && !strcmp(function->native_library, "diagnostics")) {
             fputs("declare zeroext i1 @minyar_compiler_try(ptr, ptr)\n"
-                  "define i1 @.minyar.fn.diagnosticRun(ptr %argument.0) {\nentry:\n"
+                  "define zeroext i1 @.minyar.fn.diagnosticRun(ptr %argument.0) {\nentry:\n"
                   "  %native.result = call zeroext i1 @minyar_compiler_try(ptr @.minyar.fn.diagnosticCompileJob, ptr %argument.0)\n"
                   "  ret i1 %native.result\n}\n\n", output);
             continue;
@@ -2529,7 +2529,7 @@ static void emit_program(FILE *output, Program *program) {
                 Type type = function->parameters[parameter_index].type;
                 fputs(type == TYPE_BOOLEAN ? "i1 zeroext" : llvm_type(type), output);
             }
-            fprintf(output, ")\ndefine %s @.minyar.fn.%s(", llvm_type(function->return_type), function->name);
+            fprintf(output, ")\ndefine %s @.minyar.fn.%s(", result, function->name);
             for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters); parameter_index++) {
                 if (parameter_index) fputs(", ", output);
                 fprintf(output, "%s %%argument.%zu", llvm_type(function->parameters[parameter_index].type), parameter_index);
@@ -2553,7 +2553,8 @@ static void emit_program(FILE *output, Program *program) {
         emitter.next_temporary = 0;
         emitter.next_label = 0;
         snprintf(emitter.current_block, sizeof(emitter.current_block), "entry");
-        fprintf(output, "define %s @%s%s(",
+        /* Boolean definitions promise zeroext, matching the Minyar compiler's ABI for Boolean returns. */
+        fprintf(output, "define %s%s @%s%s(", emitted_return == TYPE_BOOLEAN ? "zeroext " : "",
                 emitted_return == TYPE_UNKNOWN ? "i32" : llvm_type(emitted_return),
                 strcmp(function->name, "main") == 0 ? "" : ".minyar.fn.", function->name);
         if (strcmp(function->name, "main") == 0) {

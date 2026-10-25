@@ -1,0 +1,101 @@
+use "io" as io
+use "files" as files
+use "system" as system
+use "../tools/testing.min" as test
+
+// Each tests/miscompiles/<name>.min once compiled to a wrong result at some optimization level. Every fixture
+// is compiled once, linked at -O0, -O1 and -O2, and must print <name>.stdout at all three levels.
+// The Boolean return ABI scan below is the structural half: a `call zeroext i1 @f` site must reach a definition
+// of `f` that also promises `zeroext`, otherwise optimized callees may return garbage in bits 1-7.
+
+function find(raw: Bytes, pattern: Text, from: Integer): Integer {
+    let needle = Bytes(pattern)
+    let start = from
+    while start + needle.length <= raw.length {
+        let equal = true
+        for index in 0..needle.length {
+            if raw[start + index] != needle[index] { equal = false; break }
+        }
+        if equal { return start }
+        start += 1
+    }
+    return -1
+}
+
+// The symbol after `@` at `at`, up to its parameter list.
+function symbolAt(raw: Bytes, at: Integer): Text {
+    let end = find(raw, "(", at)
+    if end < 0 { return "" }
+    return Text(raw.slice(at + 1, end))
+}
+
+function booleanAbiMismatches(llvm: Text): List<Text> {
+    let plain = Map<Text, Boolean>()
+    let lines = test.lines(llvm)
+    for line in lines {
+        if line.startsWith("define ") {
+            let raw = Bytes(line)
+            let at = find(raw, "@", 0)
+            if at > 7 {
+                let header = test.words(Text(raw.slice(7, at)))
+                if header.length > 0 && header[header.length - 1] == "i1" {
+                    let promised = false
+                    for word in header { if word == "zeroext" { promised = true } }
+                    if !promised { plain[symbolAt(raw, at)] = true }
+                }
+            }
+        }
+    }
+    let found: List<Text> = []
+    let reported = Map<Text, Boolean>()
+    for line in lines {
+        let raw = Bytes(line)
+        let at = find(raw, "call zeroext i1 @", 0)
+        if at >= 0 {
+            let name = symbolAt(raw, at + 16)
+            if plain.has(name) && !reported.has(name) { reported[name] = true; found.add(name + " ") }
+        }
+    }
+    return found
+}
+
+let compiler = test.compiler()
+let names: List<Text> = []
+for name in files.list("tests/miscompiles") { if name.endsWith(".min") { names.add(name) } }
+names.sort()
+test.check(names.length >= 6, "tests/miscompiles lost fixtures")
+let probe = ""
+for name in names {
+    let stem = Text(Bytes(name).slice(0, Bytes(name).length - 4))
+    let expected = io.readTextFile("tests/miscompiles/" + stem + ".stdout")
+    let path = compiler.directory + "/" + stem
+    let compiled = test.run([compiler.executable, "tests/miscompiles/" + name, path + ".ll", "--library", "library"], system.environment(), "", path + ".compile", compiler.compileTimeout)
+    test.require(compiled, "compile " + name)
+    let llvm = io.readTextFile(path + ".ll")
+    if stem == "variable-shift-probe" { probe = llvm }
+    let mismatches = booleanAbiMismatches(llvm)
+    test.check(mismatches.length == 0, name + ": Boolean results called as zeroext but defined without it: " + joinText(mismatches))
+    for optimization in ["-O0", "-O1", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [path + ".ll", compiler.runtime, "-pthread", "-lm", "-o", path + optimization] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + optimization + ".link", compiler.linkTimeout), "link " + name + " " + optimization)
+        let result = test.run([path + optimization], system.environment(), "", path + optimization + ".run", compiler.runTimeout)
+        test.require(result, "run " + name + " " + optimization)
+        test.check(result.output == expected && result.errorOutput == "", name + " at " + optimization + " printed\n" + result.output + result.errorOutput + "expected\n" + expected)
+    }
+}
+
+// Negative control: the pre-fix definition of the probe must be reported.
+let mutant = test.replace(probe, "define zeroext i1 @.minyar.fn.has(", "define i1 @.minyar.fn.has(")
+test.check(mutant != probe, "probe no longer defines .minyar.fn.has as zeroext i1")
+let caught = booleanAbiMismatches(mutant)
+test.check(caught.length == 1 && caught[0] == ".minyar.fn.has ", "Boolean return ABI scan missed the pre-fix probe definition")
+
+// The compiler is the largest Minyar program; its own IR must keep the same contract.
+let compilerIR = system.getenv("MINYAR_MISCOMPILE_SELF_IR")
+if compilerIR != "" {
+    let mismatches = booleanAbiMismatches(io.readTextFile(compilerIR))
+    test.check(mismatches.length == 0, compilerIR + ": Boolean results called as zeroext but defined without it: " + joinText(mismatches))
+}
+print("miscompiles: " + Text(names.length) + " fixtures agree at -O0/-O1/-O2; Boolean return ABI consistent")

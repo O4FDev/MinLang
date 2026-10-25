@@ -928,6 +928,15 @@ deliberately removed guards and invalid dominance are rejected. It requires
 tools fail this explicitly requested target. The separate CI job uses LLVM 18;
 ordinary portable checks do not acquire this dependency.
 
+`make check-miscompiles` (part of `check-portable`) runs every
+`tests/miscompiles/<name>.min` once compiled, linked at -O0, -O1 and -O2, and
+requires `<name>.stdout` at all three levels. Add a fixture there for any
+program whose output depends on the optimization level. The harness also scans
+each fixture's LLVM, and the compiler's own `build/compiler-stage2.ll`, for a
+`call zeroext i1 @f` whose definition of `f` does not promise `zeroext`: that
+mismatch let optimized Boolean functions return garbage in bits 1-7, which
+callers read as `true`. A mutated pre-fix probe must be reported.
+
 Test runners require Python assertions to be enabled; optimized Python (`-O`)
 is rejected by the evidence harness. The shared regression helper and deterministic fuzz runner retain failing
 workspaces in `build/test-evidence/` (override with `MINYAR_TEST_EVIDENCE`).
