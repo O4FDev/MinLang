@@ -4,7 +4,9 @@
 // counter in `<manifest>.epoch` after it publishes an update; wrappers compare
 // that mapped counter with the last one seen, so an ordinary call costs a few
 // loads and no system call, and the first call after a publication loads it.
-// Hot mode only accepts single-threaded programs.
+// Hot mode rejects managed threads. Parallel loop workers may call wrappers
+// concurrently: slots and the seen epoch are read atomically and every
+// update happens under live_lock.
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif
@@ -199,7 +201,8 @@ static void live_map(void) {
         fprintf(stderr, "minyar live: cannot watch for updates; keeping current code\n");
         return;
     }
-    minyar_live_epoch_seen = __atomic_load_n((const uint64_t *)page, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&minyar_live_epoch_seen, __atomic_load_n((const uint64_t *)page, __ATOMIC_ACQUIRE),
+                     __ATOMIC_RELAXED);
     __atomic_store_n(&minyar_live_epoch, (const uint64_t *)page, __ATOMIC_RELEASE);
     // A copy started after a publication runs it from its first call.
     live_refresh();
@@ -219,7 +222,7 @@ void *minyar_live_bind(const char *key, void *initial, void **slot) {
             waited = live_elapsed(&now, &live_retry_checked);
         if (!live_have_failed || waited < 0 || waited >= 1000000000LL) {
             live_refresh();
-            if (!live_have_failed) minyar_live_epoch_seen = epoch;
+            if (!live_have_failed) __atomic_store_n(&minyar_live_epoch_seen, epoch, __ATOMIC_RELAXED);
         }
     }
     void *address = __atomic_load_n(slot, __ATOMIC_ACQUIRE);

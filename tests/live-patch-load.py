@@ -289,6 +289,112 @@ def check_foreign_patch(launcher):
     print("foreign patch: a copy pointed at another build's state keeps its own code")
 
 
+PARALLEL_SERVER = """use "httpserver" as http
+use "errors" as errors
+use "system" as system
+use "text" as text
+
+record Store { served: Integer }
+global STORE: Store = Store { served: 0 }
+
+parallel function weight(index: Integer): Integer {
+    return index * 1
+}
+
+function total(): Integer {
+    let values: List<Integer> = []
+    let index = 0
+    while index < 65536 { values.add(0); index += 1 }
+    parallel for slot in 0..values.length {
+        values[slot] = weight(slot)
+    }
+    let sum = 0
+    for value in values { sum += value }
+    return sum
+}
+
+function reply(target: Text): Bytes {
+    STORE.served += 1
+    return Bytes("version=" + Text(total() / 2147450880) + " served=" + Text(STORE.served) + "\\n")
+}
+
+function port(): Integer {
+    let raw = system.getenv("LIVEPATCH_PORT")
+    if raw == "" { return 0 }
+    return text.integer(raw).unwrapOr(0)
+}
+
+let server = http.listen("127.0.0.1", port(), http.defaults())
+if !http.ok(server) { fail(errors.message(http.serverError(server))) }
+print("LISTENING " + Text(http.port(server)))
+let running = true
+while running {
+    let batch = http.poll(server, 20)
+    if errors.isError(http.batchError(batch)) { running = false }
+    for request in http.requests(batch) {
+        http.respond(server, request, http.response(200, "text/plain", reply(request.target)))
+    }
+}
+http.close(server)
+"""
+
+
+def check_parallel_patch(launcher):
+    """A program whose requests run a parallel loop takes a patch to the loop's function."""
+    with tempfile.TemporaryDirectory(prefix="minyar-live-parallel-") as temporary:
+        project = Path(temporary) / "server"
+        (project / "src").mkdir(parents=True)
+        (project / "Minyar.toml").write_text('[package]\nname = "livepatch-server"\nversion = "0.1.0"\nkind = "bin"\n')
+        main = project / "src/main.min"
+        main.write_text(PARALLEL_SERVER)
+        built = subprocess.run([str(launcher), "build", "--hot", "--manifest-path", str(project)],
+                               capture_output=True, timeout=600 * SCALE)
+        assert built.returncode == 0, built
+        server = subprocess.Popen([str(project / "target/debug/livepatch-server")], stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=dict(os.environ, LIVEPATCH_PORT="0",
+                                                                      MINYAR_PARALLEL_THREADS="4"))
+        try:
+            port = int(server.stdout.readline().split()[1])
+            client = Client(port, threading.Event())
+
+            def ask():
+                with socket.create_connection(("127.0.0.1", port), timeout=30 * SCALE) as connection:
+                    client.exchange(connection)
+                return client.responses[-1]
+            assert ask() == (1, 1), client.responses
+            main.write_text(main.read_text().replace("return index * 1", "return index * 2"))
+            patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project)],
+                                     capture_output=True, timeout=600 * SCALE)
+            assert patched.returncode == 0, patched
+            assert ask() == (2, 2), client.responses
+            # Patch repeatedly while clients keep the parallel loop busy.
+            stop = threading.Event()
+            clients = [Client(port, stop) for _ in range(CLIENTS)]
+            for each in clients:
+                each.start()
+            for factor in (3, 4, 5):
+                time.sleep(0.3)
+                main.write_text(main.read_text().replace("return index * " + str(factor - 1), "return index * " + str(factor)))
+                patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project)],
+                                         capture_output=True, timeout=600 * SCALE)
+                assert patched.returncode == 0, patched
+            deadline = time.monotonic() + 60 * SCALE
+            while not all(each.responses and each.responses[-1][0] == 5 for each in clients):
+                assert time.monotonic() < deadline and all(not each.errors for each in clients), [c.errors for c in clients]
+                time.sleep(0.05)
+            stop.set()
+            for each in clients:
+                each.join(30 * SCALE)
+            assert all(not each.errors for each in clients), [each.errors for each in clients]
+            for each in clients:
+                versions = [version for version, _ in each.responses]
+                assert versions == sorted(versions) and set(versions) <= {2, 3, 4, 5}, versions[:5]
+        finally:
+            server.kill()
+            server.wait()
+    print("parallel patch: a parallel loop's function is replaced while its workers run, four times")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("launcher", type=Path)
@@ -301,6 +407,7 @@ def main():
         check_idle_patches(args.launcher.resolve())
         check_idle_patches(args.launcher.resolve(), "eager")
         check_foreign_patch(args.launcher.resolve())
+        check_parallel_patch(args.launcher.resolve())
         check(args.launcher.resolve(), args.profile == "release", True)
         check(args.launcher.resolve(), args.profile == "release", True, True)
 

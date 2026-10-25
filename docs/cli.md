@@ -324,7 +324,9 @@ functions; no special declaration syntax is needed.
 Hot reload accepts function-body edits only. Function signatures, records,
 constants, globals, imports, native bodies, manifests and initialization must stay
 unchanged. Incompatible edits are rejected; stop and run again to accept them.
-Managed threads and parallel loops currently require ordinary watch mode.
+Managed threads currently require ordinary watch mode. Parallel loops work; each
+iteration calls whichever version is current, so a loop running across an
+update can mix both versions.
 
 After a successful function update, saving identical source bytes keeps the
 published image and skips frontend compilation and native compilation/linking.
@@ -362,7 +364,7 @@ minyar patch --release
 ```
 
 A package's `memory` setting applies to these builds and their patches. The
-same rules apply: function-body edits only, single-threaded programs only,
+same rules apply: function-body edits only, no managed threads,
 and each accepted generation stays resident. An incompatible edit is refused
 and running copies keep their current code. Another `build --hot` starts a new
 session: copies of earlier builds keep running their code but receive no later
