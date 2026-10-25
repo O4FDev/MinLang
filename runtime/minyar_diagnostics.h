@@ -700,6 +700,53 @@ static int minyar_diagnostic_range(unsigned code, const unsigned (*ranges)[2], s
     }
     return 0;
 }
+/* declarationHashRange in compiler/stages/symbols.min: from 5381 + kind, each
+ * character of text[start..end) steps (hash * 65599 + character) % 2147483647
+ * with checked arithmetic and Text positions. The compiler hashes every symbol
+ * it looks up, so known-ASCII Text with a non-negative start is hashed four
+ * bytes per step: the modulus is the Mersenne prime 2^31 - 1, so combining
+ * steps with powers of 65599 and folding gives exactly the same value. */
+#define MINYAR_HASH_PRIME 2147483647ULL
+#define MINYAR_HASH_BASE 65599ULL
+#define MINYAR_HASH_BASE2 ((MINYAR_HASH_BASE * MINYAR_HASH_BASE) % MINYAR_HASH_PRIME)
+#define MINYAR_HASH_BASE3 ((MINYAR_HASH_BASE2 * MINYAR_HASH_BASE) % MINYAR_HASH_PRIME)
+#define MINYAR_HASH_BASE4 ((MINYAR_HASH_BASE2 * MINYAR_HASH_BASE2) % MINYAR_HASH_PRIME)
+
+static inline uint64_t declaration_hash_reduce(uint64_t value) {
+    value = (value & MINYAR_HASH_PRIME) + (value >> 31);
+    value = (value & MINYAR_HASH_PRIME) + (value >> 31);
+    return value >= MINYAR_HASH_PRIME ? value - MINYAR_HASH_PRIME : value;
+}
+
+long long minyar_runtime_compilerDeclarationHash(MinyarText *text, long long start, long long end,
+                                                 long long kind) {
+    long long hash;
+    if (__builtin_add_overflow(kind, 5381LL, &hash))
+        minyar_fail_integer_overflow();
+    if (start >= end)
+        return hash;
+    ensure_text_index(text);
+    if (!text->character_offsets && start >= 0 && end <= text->character_length && hash >= 0) {
+        const unsigned char *bytes = text->bytes;
+        uint64_t value = (uint64_t)hash % MINYAR_HASH_PRIME;
+        long long position = start;
+        for (; end - position >= 4; position += 4)
+            value = declaration_hash_reduce(value * MINYAR_HASH_BASE4 + bytes[position] * MINYAR_HASH_BASE3 +
+                                            bytes[position + 1] * MINYAR_HASH_BASE2 +
+                                            bytes[position + 2] * MINYAR_HASH_BASE + bytes[position + 3]);
+        for (; position < end; position++)
+            value = declaration_hash_reduce(value * MINYAR_HASH_BASE + bytes[position]);
+        return (long long)value;
+    }
+    for (long long position = start; position < end; position++) {
+        if (__builtin_mul_overflow(hash, 65599LL, &hash) ||
+            __builtin_add_overflow(hash, (long long)minyar_text_character_at(text, position), &hash))
+            minyar_fail_integer_overflow();
+        hash %= 2147483647;
+    }
+    return hash;
+}
+
 long long minyar_runtime_diagnosticColumns(const MinyarText *text) {
     long long position = 0, columns = 0, previous_width = 0;
     unsigned previous = 0;
