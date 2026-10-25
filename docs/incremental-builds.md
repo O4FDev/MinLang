@@ -38,8 +38,8 @@ function signatures, public visibility, record field names/order/types, and
 private or recursive record types reachable through those signatures. Relevant
 interface changes invalidate consumers; unrelated modules remain reusable.
 
-Cached function bodies require the compiler's common LLVM prelude when assembled
-as independent objects. That prelude includes runtime declarations and internal
+Cached function bodies keep external linkage and require the compiler's common
+LLVM prelude when assembled as independent objects. That prelude includes runtime declarations and internal
 helper definitions. The artifact test verifies ordinary object linking and LTO
 for cold, warm, and edited caches; declarations alone are not a complete prelude.
 

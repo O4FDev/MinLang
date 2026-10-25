@@ -1524,7 +1524,9 @@ specification to primary positive evidence and to negative/boundary suites.
 `make check-linkage` checks collisions with libc functions, global data names,
 and runtime helpers through the C bootstrap, ordinary compiler, and cold, warm,
 and edited module caches. It checks symbol isolation before linking or executing
-an artifact, then requires independent output values at O0/O2. Valid previous
+an artifact, then requires independent output values at O0/O2. Whole-program
+builds and module fallbacks must define imported functions internal, and
+`--export-modules` must keep them external. Valid previous
 schema payloads must rebuild rather than reuse the former linkage ABI.
 `check-linkage-sanitize` repeats those paths with generated LLVM instrumentation.
 The ordinary compiler case also runs against mutation and coverage candidates.

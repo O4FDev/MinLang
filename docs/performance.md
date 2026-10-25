@@ -272,6 +272,30 @@ Memory measurements report maximum child-process RSS, rather than the sum of
 simultaneous parent and child memory. See [incremental builds](incremental-builds.md)
 for cache behavior and platform limits.
 
+## Function linkage
+
+A whole-program build defines every function of an imported module (a package
+under `--library` or a relative `use`) with internal linkage. Only the entry
+module's functions and `main` stay external. Clang then drops imported
+functions the program never calls, and it can inline or specialize the rest
+without keeping an exported copy. Incremental builds that fall back to the full
+frontend (graphs with standard-library imports, natives or constants) do the
+same. Cached module bodies keep external linkage, because each body must link as
+an independent object (see [incremental builds](incremental-builds.md)).
+
+Code that binds to an imported function by symbol passes `--export-modules` to
+`minyarc` or `minyar-module-build`: live images (`minyar build --hot`,
+`run --watch --hot`, `minyar patch`), the REPL, and C test adapters such as
+`tests/calldepth-native-adapter.c`. The option is part of the module cache key.
+
+Measured on a Linux x86_64 Boat box with LLVM 23.1.3 (`clang -O2 -c` on the IR
+of one compile, `perf stat -e instructions:u`, before and after):
+`tests/regressions.min` 4.43 → 2.41 G instructions (0.61 → 0.30 s),
+`tests/scope-ownership.min` 4.61 → 2.73 G, `tests/diagnostics.min`
+2.77 → 2.13 G, `tests/text-literals.min` 1.57 → 1.18 G, `tools/project-cli.min`
+7.42 → 7.02 G, and a ten-line program using `io`, `json` and `files`
+1.11 → 0.48 G.
+
 ## Comparing generated code with C++
 
 `experiments/memory/critical-path-study.min` checks arithmetic, indexed List work,

@@ -27,9 +27,11 @@ function count(source: Text, needle: Text): Integer {
     }
     return found
 }
-function namespace(ir: Text, expected: List<Text>) {
+// expected: external language functions; imported: internal ones (imported modules of a whole-program build).
+function namespace(ir: Text, expected: List<Text>, imported: List<Text>) {
     let definitions: List<Text> = []
     let userNames: List<Text> = []
+    let internalNames: List<Text> = []
     let entries = 0
     for line in test.lines(ir) {
         if starts(line, "define ") {
@@ -54,7 +56,10 @@ function namespace(ir: Text, expected: List<Text>) {
             if quoted { spelling = "\"" + name + "\"" }
             for existing in definitions { test.check(existing != spelling, "LLVM definition collision " + spelling) }
             definitions.add(spelling)
-            if starts(attributes, "internal ") { test.check(starts(name, ".minyar."), "internal function escaped language namespace " + name) }
+            if starts(attributes, "internal ") {
+                test.check(starts(name, ".minyar."), "internal function escaped language namespace " + name)
+                if starts(name, ".minyar.fn.") { internalNames.add(name) }
+            }
             else {
                 test.check(name == "main" || starts(name, ".minyar.fn."), "user function interposes C namespace " + name)
                 if name == "main" { entries += 1 }
@@ -70,6 +75,11 @@ function namespace(ir: Text, expected: List<Text>) {
         for actual in userNames { if actual == name { occurrences += 1 } }
         test.check(occurrences == 1, "expected distinct language symbol " + name)
     }
+    for name in imported {
+        let occurrences = 0
+        for actual in internalNames { if actual == name { occurrences += 1 } }
+        test.check(occurrences == 1, "expected internal imported language function " + name)
+    }
 }
 function nativeCallee(ir: Text) {
     let declarations = 0
@@ -83,8 +93,11 @@ function nativeCallee(ir: Text) {
     test.check(count(ir, "call i64 @minyar_probe_sample(i64 %argument.0)") == 1, "native callee actual C call")
 }
 function execute(compiler: test.Compiler, llvm: Text, expected: Text, symbols: List<Text>, native: List<Text>) {
+    executeWith(compiler, llvm, expected, symbols, [], native)
+}
+function executeWith(compiler: test.Compiler, llvm: Text, expected: Text, symbols: List<Text>, imported: List<Text>, native: List<Text>) {
     let ir = io.readTextFile(llvm)
-    namespace(ir, symbols)
+    namespace(ir, symbols, imported)
     if test.addressEnabled(compiler.flags) { io.writeTextFile(llvm, test.instrument(ir)) }
     for optimization in ["-O0", "-O2"] {
         let command = [compiler.clang, optimization]
@@ -182,6 +195,8 @@ if selected("test_local_modules_and_cached_fragments_keep_names_separate") {
     test.require(test.run([compiler.executable, entry, llvm, "--library", "library"], system.environment(), "", llvm + ".compile", 30), "compile direct local linkage graph")
     let directSymbols: List<Text> = []
     for name in names { directSymbols.add(".minyar.fn.minyar_module_1_" + name) }
+    executeWith(compiler, llvm, expected, [], directSymbols, [])
+    test.require(test.run([compiler.executable, entry, llvm, "--library", "library", "--export-modules"], system.environment(), "", llvm + ".compile", 30), "compile exported local linkage graph")
     execute(compiler, llvm, expected, directSymbols, [])
     let prior = compiler.directory + "/prior.state"
     let following = compiler.directory + "/following.state"
@@ -225,7 +240,7 @@ if selected("test_native_module_fallback_keeps_c_and_language_symbols_separate")
     io.writeTextFile(native, "long long minyar_probe_sample(long long value) { return value + 100; }\n")
     test.require(test.run([compiler.executable, entry, llvm, "--library", "library"], system.environment(), "", llvm + ".compile", 30), "compile direct native module linkage")
     nativeCallee(io.readTextFile(llvm))
-    execute(compiler, llvm, "107\n207\n", moduleNames, [native])
+    executeWith(compiler, llvm, "107\n207\n", [moduleNames[0]], [moduleNames[1]], [native])
     let prior = compiler.directory + "/prior.state"
     let following = compiler.directory + "/following.state"
     let stats = compiler.directory + "/stats"
@@ -239,9 +254,12 @@ if selected("test_native_module_fallback_keeps_c_and_language_symbols_separate")
         for index in 0..counts.length { test.check(values[index] == counts[index], "native fallback statistic value") }
         test.check(io.readTextFile(following) == "", "native fallback published incremental state")
         nativeCallee(io.readTextFile(llvm))
-        execute(compiler, llvm, "107\n207\n", moduleNames, [native])
+        executeWith(compiler, llvm, "107\n207\n", [moduleNames[0]], [moduleNames[1]], [native])
         publish(prior, following)
     }
+    // Whole-program fallbacks keep imported functions external on request too.
+    test.require(test.run([modules, entry, llvm, "--module-state", prior, following, stats, "--export-modules"], system.environment(), "", llvm + ".exported", 30), "exported native module whole graph fallback")
+    execute(compiler, llvm, "107\n207\n", moduleNames, [native])
 }
 if selected("test_same_name_in_two_modules_and_entry_stays_distinct") {
     let left = compiler.directory + "/left.min"
@@ -255,7 +273,7 @@ if selected("test_same_name_in_two_modules_and_entry_stays_distinct") {
     test.require(test.run([compiler.executable, entry, llvm, "--library", "library"], system.environment(), "", llvm + ".compile", 30), "compile repeated nominal language name")
     let directSymbols: List<Text> = []
     for module in 0..3 { directSymbols.add(".minyar.fn.minyar_module_" + Text(module) + "_malloc") }
-    execute(compiler, llvm, "11\n12\n13\n", directSymbols, [])
+    executeWith(compiler, llvm, "11\n12\n13\n", [directSymbols[0]], [directSymbols[1], directSymbols[2]], [])
     let moduleNames: List<Text> = []
     for filename in ["main.min", "left.min", "right.min"] { for name in moduleSymbols(filename, ["malloc"]) { moduleNames.add(name) } }
     let prior = compiler.directory + "/prior.state"

@@ -306,7 +306,7 @@ enum { MAX_LIBRARIES = 8 };
 static int compiler_run(const char *compiler, const char *entry, const char *output, int input_fd,
                         const char *state, const char *stats, const char *error, const char *budget,
                         int scope_owners, char *const *libraries, size_t library_count,
-                        const char *error_format, int release) {
+                        const char *error_format, int release, int export_modules) {
     if (lseek(input_fd, 0, SEEK_SET) < 0)
         stop("cache seek");
     pid_t child = fork();
@@ -323,7 +323,7 @@ static int compiler_run(const char *compiler, const char *entry, const char *out
             _exit(126);
         char path[64];
         snprintf(path, sizeof path, "/dev/fd/%d", input_fd);
-        char *args[13 + 2 * MAX_LIBRARIES] = {(char *)compiler, (char *)entry, (char *)output,
+        char *args[14 + 2 * MAX_LIBRARIES] = {(char *)compiler, (char *)entry, (char *)output,
                                               "--module-state", path,          (char *)state,
                                               (char *)stats};
         size_t argc = 7;
@@ -335,6 +335,8 @@ static int compiler_run(const char *compiler, const char *entry, const char *out
         }
         if (scope_owners)
             args[argc++] = "--scope-owners";
+        if (export_modules)
+            args[argc++] = "--export-modules";
         for (size_t i = 0; i < library_count; i++) {
             args[argc++] = "--library";
             args[argc++] = libraries[i];
@@ -507,7 +509,7 @@ int main(int argc, char **argv) {
     const char *budget = NULL, *error_format = NULL, *library_options[MAX_LIBRARIES];
     size_t library_count = 0;
     unsigned owner_limit = 0;
-    int scope_owners = 0, release = 0;
+    int scope_owners = 0, release = 0, export_modules = 0;
     int next = positional;
     while (next < argc) {
         const char *option = argv[next];
@@ -518,6 +520,12 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(option, "--scope-owners") && !scope_owners) {
             scope_owners = 1;
+            next++;
+            continue;
+        }
+        /* Live images bind to imported modules' functions by symbol. */
+        if (!strcmp(option, "--export-modules") && !export_modules) {
+            export_modules = 1;
             next++;
             continue;
         }
@@ -542,7 +550,8 @@ int main(int argc, char **argv) {
     }
     if (argc < 5 || next != argc) {
         fputs("usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS] [--bounded-owners "
-              "BUDGET | --scope-owners] [--library DIRECTORY]... [--error-format text|json] [--release]\n",
+              "BUDGET | --scope-owners] [--library DIRECTORY]... [--error-format text|json] [--release] "
+              "[--export-modules]\n",
               stderr);
         return 2;
     }
@@ -574,6 +583,13 @@ int main(int argc, char **argv) {
         free(compiler_hex);
         compiler_hex = identity;
     }
+    if (export_modules) {
+        size_t length = strlen(compiler_hex) + sizeof ":export-modules-v1";
+        char *identity = allocate(length);
+        snprintf(identity, length, "%s:export-modules-v1", compiler_hex);
+        free(compiler_hex);
+        compiler_hex = identity;
+    }
     if (release) {
         size_t length = strlen(compiler_hex) + sizeof ":release-v1";
         char *identity = allocate(length);
@@ -593,17 +609,17 @@ int main(int argc, char **argv) {
     }
     char *entry = absolute_source(argv[2]);
     ensure_directory(argv[4]);
-    char key[80];
+    char key[96];
     uint64_t entry_hash = artifact_hash((const unsigned char *)entry, strlen(entry));
     if (owner_limit)
-        snprintf(key, sizeof key, "%016" PRIx64 "-stack-owners-v1-%u%s.cache", entry_hash,
-                 owner_limit, release ? "-release-v1" : "");
+        snprintf(key, sizeof key, "%016" PRIx64 "-stack-owners-v1-%u%s%s.cache", entry_hash,
+                 owner_limit, release ? "-release-v1" : "", export_modules ? "-export-modules-v1" : "");
     else if (scope_owners)
-        snprintf(key, sizeof key, "%016" PRIx64 "-scope-owners-v1%s.cache", entry_hash,
-                 release ? "-release-v1" : "");
+        snprintf(key, sizeof key, "%016" PRIx64 "-scope-owners-v1%s%s.cache", entry_hash,
+                 release ? "-release-v1" : "", export_modules ? "-export-modules-v1" : "");
     else
-        snprintf(key, sizeof key, "%016" PRIx64 "%s.cache", entry_hash,
-                 release ? "-release-v1" : "");
+        snprintf(key, sizeof key, "%016" PRIx64 "%s%s.cache", entry_hash,
+                 release ? "-release-v1" : "", export_modules ? "-export-modules-v1" : "");
     char *cache = join(argv[4], key);
     size_t cache_length = strlen(cache);
     char *delta = allocate(cache_length + 7);
@@ -673,10 +689,10 @@ int main(int argc, char **argv) {
         input_fd = plan_fd;
     }
     int result = compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget,
-                              scope_owners, libraries, library_count, error_format, release);
+                              scope_owners, libraries, library_count, error_format, release, export_modules);
     if (result && cache_valid)
         result = compiler_run(snapshot, entry, output, empty_fd, state, stats, error, budget,
-                              scope_owners, libraries, library_count, error_format, release);
+                              scope_owners, libraries, library_count, error_format, release, export_modules);
     if (!result) {
         Bytes diagnostic = read_path(stats, 4096);
         struct stat state_stat;
