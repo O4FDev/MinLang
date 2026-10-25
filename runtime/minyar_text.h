@@ -1,8 +1,15 @@
 /* Text operations use validated UTF-8 and scalar positions. Every public
  * entry validates all Text operands before taking empty/length shortcuts. */
 static long long text_scalar_count(const unsigned char *bytes, long long length) {
-    long long count = 0;
-    for (long long i = 0; i < length; i++) count += (bytes[i] & 0xc0) != 0x80;
+    long long count = 0, i = 0;
+    /* Eight bytes at a time: a continuation byte has its top bits 10, so it
+       has bit 7 set and bit 6 (shifted into bit 7) clear. */
+    for (; length - i >= 8; i += 8) {
+        uint64_t word;
+        memcpy(&word, bytes + i, sizeof(word));
+        count += 8 - __builtin_popcountll(word & ~(word << 1) & 0x8080808080808080ULL);
+    }
+    for (; i < length; i++) count += (bytes[i] & 0xc0) != 0x80;
     return count;
 }
 

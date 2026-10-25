@@ -1035,7 +1035,8 @@ static MinyarText *text_slice_bytes(MinyarText *text, long long first_byte, long
         static MinyarText *slice_cache[SLICE_CACHE_SIZE];
         long long length = last_byte - first_byte;
         const unsigned char *bytes = text->bytes + first_byte;
-        long long known = text->character_offsets ? -1 : characters;
+        /* A slice of ASCII bytes is ASCII even when its source is not. */
+        long long known = text->character_offsets && characters != length ? -1 : characters;
         if (length > 0 && length <= SLICE_CACHE_BYTES) {
             unsigned hash = (unsigned)length * 37u + (unsigned)bytes[0] * 101u +
                             (unsigned)bytes[length / 2] * 257u +
