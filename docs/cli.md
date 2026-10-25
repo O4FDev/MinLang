@@ -146,6 +146,15 @@ enables whole-program optimization. Outputs go to `target/debug` or
 directory; use `--no-incremental` to disable it. Library builds validate source;
 consumers compile reachable library modules into their own executables.
 
+A binary package can choose how its programs reclaim memory with
+`memory = "eager"` or `memory = "system"` under `[package]`. `system`, the
+default, spreads reclamation across bounded service points; `eager` frees each
+value as soon as its last owner ends, which removes that per-operation
+bookkeeping. Builds and tests of the package pass the choice to the compiler as
+`--memory-profile`. Measure before choosing: on a database server's TPC-B mix,
+eager used 25-30% less CPU per transaction, while freeing a large structure
+happens all at once instead of in bounded steps.
+
 `--error-format json` selects compiler diagnostics as JSON lines on standard
 error for `build`, `run`, `check`, `test`, `bench` and `install`. This includes discovery
 and compilation of embedded module tests and documentation examples. Each
