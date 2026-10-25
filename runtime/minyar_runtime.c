@@ -588,17 +588,23 @@ static MINYAR_COLD MINYAR_NORETURN void join_too_large(void) {
     minyar_stop("the joined Text would be too large.");
 }
 
+/* A join of two known-ASCII Texts is ASCII; otherwise its length is counted
+ * when first needed. */
+static long long join_character_length(const MinyarText *left, const MinyarText *right,
+                                       long long length) {
+    return left->character_length == left->byte_length &&
+                   right->character_length == right->byte_length
+               ? length
+               : -1;
+}
+
 static MinyarText *join_by_copying(const MinyarText *left, const MinyarText *right) {
     long long length = left->byte_length + right->byte_length;
     unsigned char *bytes = new_bytes(length);
     copy_bytes(bytes, left->bytes, (size_t)left->byte_length);
     copy_bytes(bytes + left->byte_length, right->bytes, (size_t)right->byte_length);
     bytes[length] = 0;
-    long long characters =
-        left->character_length == left->byte_length && right->character_length == right->byte_length
-            ? length
-            : -1;
-    return new_text(bytes, length, characters);
+    return new_text(bytes, length, join_character_length(left, right, length));
 }
 
 MinyarText *minyar_join_text(const MinyarText *left, const MinyarText *right) {
@@ -613,7 +619,7 @@ MinyarText *minyar_join_text(const MinyarText *left, const MinyarText *right) {
         long long length = left->byte_length + right->byte_length;
         copy_bytes(bytes + left->byte_length, right->bytes, (size_t)right->byte_length);
         bytes[length] = 0;
-        return new_text(bytes, length, -1);
+        return new_text(bytes, length, join_character_length(left, right, length));
     }
 #endif
     return join_by_copying(left, right);
