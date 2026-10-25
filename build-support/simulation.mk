@@ -1,4 +1,4 @@
-.PHONY: check-simulation check-simulation-neodb check-simulation-sanitize check-simulation-cli
+.PHONY: check-simulation check-simulation-neodb check-simulation-sanitize check-simulation-cli check-determinism-runtime
 
 check-simulation: build/minyarc build/minyar-runtime.o build/tooling/tests/simulation
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/simulation
@@ -16,5 +16,8 @@ build/tooling/tests/simulation-cli: tools/clang-driver-host.c runtime/minyar_nat
 check-simulation-cli: build/tooling/tests/simulation-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
 	+MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/simulation-cli
 
-check check-portable: check-simulation check-simulation-neodb check-simulation-cli
+check-determinism-runtime:
+	python3 tests/determinism-runtime.py
+
+check check-portable: check-simulation check-simulation-neodb check-simulation-cli check-determinism-runtime
 check-sanitize: check-simulation-sanitize
