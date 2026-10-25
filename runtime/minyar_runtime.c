@@ -576,9 +576,12 @@ MINYAR_HOT int bytes_are_equal(const unsigned char *left, const unsigned char *r
  * unequal comparisons cost a compare and a branch. There is no identity
  * shortcut: a Text is rarely compared with itself, and the pointer test
  * would keep every comparison from sharing those loads. */
+/* Copies of one Text share their bytes, so equal lengths at the same address
+ * need no byte comparison. */
 MINYAR_INLINE_ENTRY _Bool minyar_texts_are_equal(const MinyarText *left, const MinyarText *right) {
     return left->byte_length == right->byte_length &&
-           bytes_are_equal(left->bytes, right->bytes, (size_t)left->byte_length);
+           (left->bytes == right->bytes ||
+            bytes_are_equal(left->bytes, right->bytes, (size_t)left->byte_length));
 }
 
 static MINYAR_COLD MINYAR_NORETURN void join_too_large(void) {
