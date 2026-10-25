@@ -225,7 +225,8 @@ generated `deterministic function`, so a universe that can reach the host
 clock, files, randomness or other host effects does not compile. `--jobs`
 shares the seeds between processes. On a failure, `sim` prints the count, the
 lowest failing seed and its message, replays its saved decisions twice to
-confirm the same result, and exits with status 1. `--explore` forks half of the
+confirm the same result, saves a shrunk decision list that still fails, and
+exits with status 1. `--explore` forks half of the
 runs from recorded moments and stops at the first failure. Builds always use
 the release profile. See
 [deterministic simulation](simulation.md#running-many-universes).

@@ -90,8 +90,80 @@ function driverSource(name: Text): Text {
             return result
         }
 
+        // Simpler means fewer decisions, then smaller selections.
+        function simpler(left: List<simulation.Decision>, right: List<simulation.Decision>): Boolean {
+            if left.length != right.length { return left.length < right.length }
+            let leftSum = 0
+            let rightSum = 0
+            for decision in left { leftSum += decision.selected }
+            for decision in right { rightSum += decision.selected }
+            return leftSum < rightSum
+        }
+
+        // Follow `candidate` where it fits; keep the run's actual decisions when it
+        // still fails and is simpler than the best so far.
+        function tryCandidate(candidate: List<simulation.Decision>, best: List<List<simulation.Decision>>): Boolean {
+            let world = simulation.guide(0, candidate)
+            if attempt(world) == "" { return false }
+            let actual = simulation.choices(world)
+            if !simpler(actual, best[0]) { return false }
+            best[0] = actual
+            return true
+        }
+
+        function without(source: List<simulation.Decision>, start: Integer, count: Integer): List<simulation.Decision> {
+            let result: List<simulation.Decision> = []
+            for index in 0..source.length { if index < start || index >= start + count { result.add(source[index]) } }
+            return result
+        }
+
+        // Shorten, delete and lower decisions of a failing run within `budget` replays.
+        function shrink(start: List<simulation.Decision>, budget: Integer): List<Integer> {
+            let best: List<List<simulation.Decision>> = [start]
+            let tries = 0
+            let improved = true
+            while improved && tries < budget {
+                improved = false
+                let keep = best[0].length / 2
+                while keep > 0 && tries < budget {
+                    tries += 1
+                    if tryCandidate(without(best[0], keep, best[0].length - keep), best) { improved = true; keep = best[0].length / 2 } else { keep = keep / 2 }
+                }
+                for size in [16, 4, 1] {
+                    let position = 0
+                    while position + size <= best[0].length && tries < budget {
+                        tries += 1
+                        if tryCandidate(without(best[0], position, size), best) { improved = true } else { position += size }
+                    }
+                }
+                let index = 0
+                while index < best[0].length && tries < budget {
+                    if best[0][index].selected > 0 {
+                        let lowered: List<simulation.Decision> = []
+                        for decision in best[0] { lowered.add(simulation.Decision { options: decision.options; selected: decision.selected }) }
+                        lowered[index].selected = 0
+                        tries += 1
+                        if tryCandidate(lowered, best) { improved = true } else if best[0][index].selected > 1 {
+                            lowered[index].selected = best[0][index].selected / 2
+                            tries += 1
+                            if tryCandidate(lowered, best) { improved = true }
+                        }
+                    }
+                    index += 1
+                }
+            }
+            let shrunk = best[0]
+            let world = simulation.replay(0, shrunk)
+            let outcome = attempt(world)
+            io.writeTextFile(process.argument(2), script(world))
+            io.writeTextFile(process.argument(3), Text(start.length) + " " + Text(shrunk.length) + " " + Text(tries) + "|" + outcome)
+            return [shrunk.length, tries]
+        }
+
         let mode = process.argument(0)
-        if mode == "replay" {
+        if mode == "shrink" {
+            shrink(decisions(io.readTextFile(process.argument(1))), 2000)
+        } else if mode == "replay" {
             let world = simulation.replay(0, decisions(io.readTextFile(process.argument(1))))
             let outcome = attempt(world)
             io.writeTextFile(process.argument(2), outcome)
@@ -178,6 +250,22 @@ function replayOutcome(executable: Text, root: Text, script: Text, result: Text)
     if handle < 0 { host.stop(host.osError(handle, executable)) }
     waitFor(handle, "replay " + script + " to see it")
     return io.readTextFile(result)
+}
+
+// Shrink a failing run's decisions; "" or the report lines.
+function shrinkReport(executable: Text, root: Text, stem: Text, script: Text, directory: Text): Text {
+    let shrunk = directory + "/" + stem + "-shrunk.decisions"
+    let result = directory + "/" + stem + "-shrunk.result"
+    let handle = system.spawn(executable, [executable, "shrink", script, shrunk, result], system.environment(), root)
+    if handle < 0 { host.stop(host.osError(handle, executable)) }
+    waitFor(handle, "replay " + script + " to see it")
+    let text = io.readTextFile(result)
+    let bar = text.find("|")
+    if bar < 0 { host.stop("unreadable shrink result: " + result) }
+    let fields = host.words(text.slice(0, bar))
+    let message = text.slice(bar + 1, text.length)
+    if message == "" { return "  shrinking lost the failure; keep the original decisions\n" }
+    return "  shrunk from " + fields[0] + " to " + fields[1] + " decisions in " + fields[2] + " replays: " + message + "\n  shrunk decisions: " + shrunk + "\n"
 }
 
 function compileScenario(graph: project.Graph, compiler: Text, root: Text, directory: Text, name: Text, errorFormat: Text): Text {
@@ -280,6 +368,7 @@ public function run(graph: project.Graph, filters: List<Text>, first: Integer, s
             if !explore { print("  reproduce: minyar sim " + stem + " --seed " + Text(total.firstSeed)) }
             print("  decisions: " + total.script)
             print("  replay: minyar sim " + stem + " --replay " + total.script)
+            files.writeStandardOutput(shrinkReport(executable, root, stem, total.script, directory))
         }
         if total.moments.length > 0 { print("  moments reached: " + host.joined(total.moments, ", ")) }
     }

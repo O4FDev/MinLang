@@ -126,7 +126,13 @@ seeds between processes. The generated driver calls `universe` through a
 `deterministic function`, so the command refuses a scenario that can reach the
 host, and every reported run reproduces. A failure prints the lowest failing
 seed with its message, replays its recorded decisions twice, saves them, and
-exits with status 1. `minyar sim NAME --seed SEED` reruns a seed and
+exits with status 1. It also shrinks the failure within 2,000 replays: it
+shortens the decision list, deletes runs of decisions and lowers selections,
+following each candidate with `guide(seed, decisions)` (which reuses a recorded
+selection even when the number of options has changed, modulo the new count),
+and keeps any simpler list that still fails. kvlog's planted failure shrank
+from 9 to 3 decisions; a neo-db early acknowledgement from 23 to 10; a Raft
+double-leader run from 2,540 to 1,117. `minyar sim NAME --seed SEED` reruns a seed and
 `minyar sim NAME --replay FILE` reruns saved decisions.
 
 `reached(world, label)` marks a moment worth exploring from, such as a rare
