@@ -26,6 +26,9 @@ BOUNDED_FLAGS ?= -DMINYAR_BOUNDED_HEAP=1
 RUNTIME_HEADERS = $(wildcard runtime/minyar_*.h) build/.toolchain.json
 LIMITED ?= zsh scripts/with-limits.sh
 SANITIZER_LIMITED ?= zsh scripts/with-sanitizer-limits.sh
+# Labs that run a real redis-server print a SKIP line instead of failing on hosts without one
+# (scripts/needs-command.sh; MINYAR_REQUIRE_LAB_TOOLS=1 makes a missing server a failure).
+NEEDS_REDIS = sh scripts/needs-command.sh redis-server $@ "these labs run a real Redis (Debian/Ubuntu: apt-get install redis-server)"
 # Native LSan is available on Linux; Windows/macOS retain ASan and UBSan.
 NATIVE_SANITIZER_LEAKS = $(if $(filter Windows_NT,$(OS)),0,$(if $(filter Linux,$(shell uname -s)),1,0))
 NATIVE_SANITIZER_ENV = ASAN_OPTIONS=detect_leaks=$(NATIVE_SANITIZER_LEAKS) UBSAN_OPTIONS=halt_on_error=1
