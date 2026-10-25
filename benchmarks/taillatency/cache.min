@@ -1,0 +1,98 @@
+// Tail-latency workload: a request loop that builds the next cache generation a
+// little per request and swaps generations every TAIL_SWAP requests. The swap
+// drops the previous generation (TAIL_BUILD*TAIL_SWAP sessions, three objects
+// each). Prints per-request latency percentiles in nanoseconds.
+use "system" as system
+use "text" as text
+use "process" as process
+
+record Session { name: Text; items: List<Integer>; score: Integer }
+
+function setting(name: Text, fallback: Integer): Integer {
+    let raw = system.getenv(name)
+    if raw == "" { return fallback }
+    return text.integer(raw).unwrapOr(fallback)
+}
+
+function makeSession(id: Integer): Session {
+    let items: List<Integer> = []
+    items.add(id)
+    items.add(id * 3)
+    items.add(id * 7)
+    items.add(id % 97)
+    return Session { name: "session-" + Text(id); items: items; score: id % 1000 }
+}
+
+function serve(current: List<Session>, request: Integer, reads: Integer): Integer {
+    let size = current.length
+    if size == 0 { return 0 }
+    let total = 0
+    let k = 0
+    while k < reads {
+        let session = current[(request * 7919 + k * 104729) % size]
+        total = total + session.score + session.items[k % 4]
+        k = k + 1
+    }
+    return total
+}
+
+// Runs queued cleanup until none is pending or the deadline passes (idle.c).
+function releaseIdle(deadline: Integer): Integer { native "tailidle" }
+
+function percentile(sorted: List<Integer>, perMillion: Integer): Integer {
+    let index = (sorted.length * perMillion) / 1000000
+    if index >= sorted.length { index = sorted.length - 1 }
+    return sorted[index]
+}
+
+let requests = setting("TAIL_REQUESTS", 20000)
+let perRequest = setting("TAIL_BUILD", 200)
+let swapEvery = setting("TAIL_SWAP", 1000)
+let reads = setting("TAIL_READS", 64)
+// TAIL_INTERVAL_NS > 0: requests are scheduled that far apart and the loop
+// sleeps between them; TAIL_IDLE=1 first spends the idle gap on cleanup.
+let interval = setting("TAIL_INTERVAL_NS", 0)
+let idleDrain = setting("TAIL_IDLE", 0) == 1
+let drained = 0
+let current: List<Session> = []
+let next: List<Session> = []
+let latencies: List<Integer> = []
+let checksum = 0
+let id = 0
+let r = 0
+let begin = system.monotonicNanoseconds()
+while r < requests {
+    if interval > 0 {
+        let arrival = begin + r * interval
+        if idleDrain { drained = drained + releaseIdle(arrival) }
+        let remaining = arrival - system.monotonicNanoseconds()
+        if remaining > 0 { process.sleepNanoseconds(remaining) }
+    }
+    let start = system.monotonicNanoseconds()
+    let b = 0
+    while b < perRequest {
+        next.add(makeSession(id))
+        id = id + 1
+        b = b + 1
+    }
+    checksum = (checksum + serve(current, r, reads)) % 1000000007
+    if (r + 1) % swapEvery == 0 {
+        current = next
+        next = []
+    }
+    latencies.add(system.monotonicNanoseconds() - start)
+    r = r + 1
+}
+let elapsed = system.monotonicNanoseconds() - begin
+let slow = setting("TAIL_SLOW_NS", 0)
+if slow > 0 {
+    let line = "slow:"
+    let index = 0
+    while index < latencies.length {
+        if latencies[index] >= slow { line = line + " " + Text(index % swapEvery) + "@" + Text(latencies[index] / 1000) + "us" }
+        index = index + 1
+    }
+    print(line)
+}
+latencies.sort()
+print("lang=minyar requests=" + Text(requests) + " checksum=" + Text(checksum) + " total_ns=" + Text(elapsed) + " p50=" + Text(percentile(latencies, 500000)) + " p99=" + Text(percentile(latencies, 990000)) + " p999=" + Text(percentile(latencies, 999000)) + " max=" + Text(latencies[latencies.length - 1]) + " rss=" + Text(system.residentBytes()) + " idle_work=" + Text(drained))
