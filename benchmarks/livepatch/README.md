@@ -42,3 +42,8 @@ plain release 38.7–38.9k, watch without `--hot` 38.6–38.8k; hot 58.3–58.4k
 the original locked resolver, 49.4–49.6k with a lock-free cached one, and
 42.0–42.1k with per-function slots and the published epoch (+8.5%). A
 `build --hot` binary patched mid-run: 42.2–42.4k.
+
+Twenty successive `minyar patch --release` runs on the idle server (4-vCPU
+box): with whole-program update images each took 0.66–1.11 s and resident
+memory grew 2,800 → 8,088 KiB (~265 KiB per patch); with images holding only
+changed functions, 0.29–0.37 s and 2,780 → 4,336 KiB (~78 KiB per patch).

@@ -2,7 +2,9 @@
 use "./editor-source.min" as editor
 use "./driver-support.min" as host
 
-public record Image { llvm: Text; names: List<Text>; symbols: List<Text>; signature: Text; error: Text }
+// digests: each function's body fingerprint; exports: each function's wrapper in
+// this image (only meaningful for the original executable).
+public record Image { llvm: Text; names: List<Text>; symbols: List<Text>; signature: Text; digests: Text; exports: Text; error: Text }
 record Symbol { token: Text; raw: Text; end: Integer; error: Text }
 record Function { name: Text; raw: Text; wrapper: Text; body: Text; language: Boolean; result: Text; returned: Text; parameters: Text; arguments: Text; signature: Text; error: Text }
 record Rewritten { text: Text; error: Text }
@@ -141,7 +143,7 @@ function escaped(value: Text): Text {
     }
     return joinText(parts)
 }
-function failed(message: Text): Image { return Image { llvm: ""; names: []; symbols: []; signature: ""; error: message } }
+function failed(message: Text): Image { return Image { llvm: ""; names: []; symbols: []; signature: ""; digests: ""; exports: ""; error: message } }
 function scalar(value: Text): Boolean { return host.listed(["void", "i64", "i32", "i1", "double", "ptr"], value) }
 function definition(line: Text, generation: Integer, index: Integer, initial: Boolean): Function {
     let found = Function { name: ""; raw: ""; wrapper: ""; body: ""; language: false; result: ""; returned: ""; parameters: ""; arguments: ""; signature: ""; error: "" }
@@ -226,6 +228,72 @@ function renamed(text: Text, names: Map<Text, Text>): Rewritten {
     parts.add(Text(data.slice(start, data.length)))
     return Rewritten { text: joinText(parts); error: "" }
 }
+// Symbols referenced outside strings and comments, in order of appearance.
+function references(text: Text): List<Text> {
+    let data = Bytes(text)
+    let found: List<Text> = []
+    let index = 0
+    while index < data.length {
+        if data[index] == 59 { while index < data.length && data[index] != 10 { index += 1 }; continue }
+        if data[index] == 34 {
+            index += 1
+            while index < data.length && data[index] != 34 { if data[index] == 92 { index += 1 }; index += 1 }
+            index += 1
+            continue
+        }
+        if data[index] == 64 {
+            let parsed = symbol(data, index + 1)
+            if parsed.error != "" { return found }
+            found.add(parsed.raw)
+            index = parsed.end
+        } else { index += 1 }
+    }
+    return found
+}
+// A body's fingerprint covers its LLVM text and every global value it reaches,
+// so editing a literal changes the functions that use it. Calls are by name.
+function digest(body: Text, globals: Map<Text, Text>): Text {
+    let parts: List<Text> = [body]
+    let seen = Map<Text, Boolean>()
+    let pending = references(body)
+    let index = 0
+    while index < pending.length {
+        let name = pending[index]
+        index += 1
+        if seen.has(name) || !globals.has(name) { continue }
+        seen[name] = true
+        let definition = globals[name]
+        parts.add(definition)
+        for next in references(definition) { pending.add(next) }
+    }
+    return host.hashBytes(Bytes(joinText(parts)))
+}
+public function encodePairs(keys: List<Text>, values: List<Text>): Text {
+    let parts: List<Text> = ["live-pairs-v1\n"]
+    for index in 0..keys.length { field(parts, keys[index]); field(parts, values[index]) }
+    return joinText(parts)
+}
+public function decodePairs(text: Text): Map<Text, Text> {
+    let result = Map<Text, Text>()
+    let data = Bytes(text)
+    let header = Bytes("live-pairs-v1\n")
+    if data.length < header.length || Text(data.slice(0, header.length)) != "live-pairs-v1\n" { return result }
+    let index = header.length
+    let values: List<Text> = []
+    while index < data.length {
+        let colon = index
+        let length = 0
+        while colon < data.length && data[colon] >= 48 && data[colon] <= 57 { length = length * 10 + data[colon] - 48; colon += 1 }
+        if colon >= data.length || data[colon] != 58 || colon + 1 + length >= data.length || data[colon + 1 + length] != 10 { return Map<Text, Text>() }
+        values.add(Text(data.slice(colon + 1, colon + 1 + length)))
+        index = colon + 2 + length
+    }
+    if values.length % 2 != 0 { return Map<Text, Text>() }
+    let pair = 0
+    while pair < values.length { result[values[pair]] = values[pair + 1]; pair += 2 }
+    return result
+}
+
 function rootCell(line: Text, initial: Boolean): Rewritten {
     if !line.startsWith("@") { return Rewritten { text: line; error: "" } }
     let parsed = symbol(Bytes(line), 1)
@@ -263,35 +331,69 @@ function wrapper(function: Function, index: Integer, generation: Integer): Text 
     return joinText(output)
 }
 
-public function transform(llvm: Text, generation: Integer, initial: Boolean): Image {
-    if generation < 0 { return failed("live generation must be nonnegative") }
-    if host.hasText(llvm, "; minyar-thread-runtime: 1") || host.hasText(llvm, "; minyar-data-parallel-runtime: 1") { return failed("live reload currently requires a single-threaded program") }
-    let functions: List<Function> = []
-    let namesBySymbol = Map<Text, Text>()
-    let lines = host.lines(llvm)
+record Parsed { functions: List<Function>; starts: List<Integer>; ends: List<Integer>; lines: List<Text>; globals: Map<Text, Text>; error: Text }
+function parse(llvm: Text, generation: Integer, initial: Boolean): Parsed {
+    let result = Parsed { functions: []; starts: []; ends: []; lines: host.lines(llvm); globals: Map<Text, Text>(); error: "" }
+    if generation < 0 { result.error = "live generation must be nonnegative"; return result }
+    if host.hasText(llvm, "; minyar-thread-runtime: 1") || host.hasText(llvm, "; minyar-data-parallel-runtime: 1") { result.error = "live reload currently requires a single-threaded program"; return result }
+    let seen = Map<Text, Boolean>()
     let inFunction = false
-    for line in lines {
+    for position in 0..result.lines.length {
+        let line = result.lines[position]
         if line.startsWith("define ") {
-            if inFunction { return failed("generated LLVM contains a nested function definition") }
-            let function = definition(line, generation, functions.length, initial)
-            if function.error != "" { return failed(function.error) }
-            if namesBySymbol.has(function.raw) { return failed("generated LLVM repeats a function definition") }
-            namesBySymbol[function.raw] = function.wrapper
-            functions.add(function)
+            if inFunction { result.error = "generated LLVM contains a nested function definition"; return result }
+            let function = definition(line, generation, result.functions.length, initial)
+            if function.error != "" { result.error = function.error; return result }
+            if seen.has(function.raw) { result.error = "generated LLVM repeats a function definition"; return result }
+            seen[function.raw] = true
+            result.functions.add(function)
+            result.starts.add(position)
             inFunction = true
         } else if line == "}" {
-            if !inFunction { return failed("generated LLVM has an unexpected function closing brace") }
+            if !inFunction { result.error = "generated LLVM has an unexpected function closing brace"; return result }
+            result.ends.add(position)
             inFunction = false
+        } else if !inFunction && line.startsWith("@") {
+            let global = symbol(Bytes(line), 1)
+            if global.error == "" { result.globals[global.raw] = line }
         }
     }
-    if inFunction { return failed("generated LLVM is missing a function closing brace") }
-    if functions.length == 0 { return failed("generated LLVM contains no functions") }
+    if inFunction { result.error = "generated LLVM is missing a function closing brace"; return result }
+    if result.functions.length == 0 { result.error = "generated LLVM contains no functions"; return result }
+    return result
+}
+function bodyText(parsed: Parsed, index: Integer): Text {
+    let parts: List<Text> = []
+    for position in parsed.starts[index]..(parsed.ends[index] + 1) { parts.add(parsed.lines[position]); parts.add("\n") }
+    return joinText(parts)
+}
+function signatureLine(signatures: List<Text>, line: Text) {
+    if line.startsWith("%") && host.hasText(line, " = type ") { field(signatures, line) }
+    if line.startsWith("; minyar-c-layout: ") || line.startsWith("; minyar-c-value: ") { field(signatures, line) }
+    if line.startsWith("; minyar-native-library: ") || line == "; minyar-cycle-runtime: 1" || line == "; minyar-callback-runtime: 1" || line == "; minyar-sort-callback-runtime: 1" { field(signatures, line) }
+}
+function publicDefinition(line: Text, from: Text, to: Text): Text {
+    let result = host.replaceText(line, "@" + from + "(", "@" + to + "(")
+    result = host.replaceText(result, "define internal ", "define ")
+    result = host.replaceText(result, "define private ", "define ")
+    return host.replaceText(result, "define hidden ", "define ")
+}
+
+public function transform(llvm: Text, generation: Integer, initial: Boolean): Image {
+    let parsed = parse(llvm, generation, initial)
+    if parsed.error != "" { return failed(parsed.error) }
+    let functions = parsed.functions
+    let namesBySymbol = Map<Text, Text>()
+    for function in functions { namesBySymbol[function.raw] = function.wrapper }
     let output: List<Text> = []
     let names: List<Text> = []
     let symbols: List<Text> = []
     let signatures: List<Text> = ["live-image-v1\n"]
+    let digestKeys: List<Text> = []
+    let digestValues: List<Text> = []
+    let exportValues: List<Text> = []
     let current = 0
-    for line in lines {
+    for line in parsed.lines {
         let state = rootCell(line, initial)
         if state.error != "" { return failed(state.error) }
         let replaced = renamed(state.text, namesBySymbol)
@@ -300,22 +402,83 @@ public function transform(llvm: Text, generation: Integer, initial: Boolean): Im
         if line.startsWith("define ") {
             let function = functions[current]
             if function.language {
-                result = host.replaceText(result, "@" + function.wrapper + "(", "@" + function.body + "(")
-                result = host.replaceText(result, "define internal ", "define ")
-                result = host.replaceText(result, "define private ", "define ")
-                result = host.replaceText(result, "define hidden ", "define ")
+                result = publicDefinition(result, function.wrapper, function.body)
                 names.add(function.raw)
                 symbols.add(function.body)
                 field(signatures, function.signature)
+                digestKeys.add(function.raw)
+                digestValues.add(digest(bodyText(parsed, current), parsed.globals))
+                exportValues.add(function.wrapper)
             }
             current += 1
         }
-        if line.startsWith("%") && host.hasText(line, " = type ") { field(signatures, line) }
-        if line.startsWith("; minyar-c-layout: ") || line.startsWith("; minyar-c-value: ") { field(signatures, line) }
-        if line.startsWith("; minyar-native-library: ") || line == "; minyar-cycle-runtime: 1" || line == "; minyar-callback-runtime: 1" || line == "; minyar-sort-callback-runtime: 1" { field(signatures, line) }
+        signatureLine(signatures, line)
         output.add(result + "\n")
     }
     output.add("declare ptr @minyar_live_bind(ptr, ptr, ptr)\n@minyar_live_epoch = external global ptr\n@minyar_live_epoch_seen = external global i64\n")
     for index in 0..functions.length { if functions[index].language { output.add(wrapper(functions[index], index, generation)) } }
-    return Image { llvm: joinText(output); names: names; symbols: symbols; signature: joinText(signatures); error: "" }
+    return Image { llvm: joinText(output); names: names; symbols: symbols; signature: joinText(signatures);
+        digests: encodePairs(digestKeys, digestValues); exports: encodePairs(digestKeys, exportValues); error: "" }
+}
+
+// An update image holds only the functions whose fingerprint differs from the
+// published one. Every call it makes goes through the original executable's
+// wrappers (`exports`), whose slots already point at the newest bodies.
+public function transformUpdate(llvm: Text, generation: Integer, published: Map<Text, Text>, exports: Map<Text, Text>): Image {
+    let parsed = parse(llvm, generation, false)
+    if parsed.error != "" { return failed(parsed.error) }
+    let functions = parsed.functions
+    let namesBySymbol = Map<Text, Text>()
+    let changed: List<Boolean> = []
+    let digestKeys: List<Text> = []
+    let digestValues: List<Text> = []
+    for index in 0..functions.length {
+        let function = functions[index]
+        if !function.language { namesBySymbol[function.raw] = function.wrapper; changed.add(true); continue }
+        if !exports.has(function.raw) { return failed("hot reload changed a compiled function signature; stop and run again") }
+        namesBySymbol[function.raw] = exports[function.raw]
+        let fingerprint = digest(bodyText(parsed, index), parsed.globals)
+        digestKeys.add(function.raw)
+        digestValues.add(fingerprint)
+        changed.add(!published.has(function.raw) || published[function.raw] != fingerprint)
+    }
+    let output: List<Text> = []
+    let names: List<Text> = []
+    let symbols: List<Text> = []
+    let signatures: List<Text> = ["live-image-v1\n"]
+    let current = -1
+    let skipping = false
+    for position in 0..parsed.lines.length {
+        let line = parsed.lines[position]
+        if line.startsWith("define ") {
+            current += 1
+            skipping = functions[current].language && !changed[current]
+            if functions[current].language { field(signatures, functions[current].signature) }
+        }
+        signatureLine(signatures, line)
+        if skipping {
+            if position == parsed.ends[current] { skipping = false }
+            continue
+        }
+        let state = rootCell(line, false)
+        if state.error != "" { return failed(state.error) }
+        let replaced = renamed(state.text, namesBySymbol)
+        if replaced.error != "" { return failed(replaced.error) }
+        let result = replaced.text
+        if line.startsWith("define ") && functions[current].language {
+            let function = functions[current]
+            result = publicDefinition(result, exports[function.raw], function.body)
+            names.add(function.raw)
+            symbols.add(function.body)
+        }
+        output.add(result + "\n")
+    }
+    for function in functions {
+        if !function.language { continue }
+        let types: List<Text> = []
+        if function.parameters != "" { for parameter in function.parameters.split(", ") { types.add(host.words(parameter)[0]) } }
+        output.add("declare " + function.result + " @" + exports[function.raw] + "(" + host.joined(types, ", ") + ")\n")
+    }
+    return Image { llvm: joinText(output); names: names; symbols: symbols; signature: joinText(signatures);
+        digests: encodePairs(digestKeys, digestValues); exports: ""; error: "" }
 }

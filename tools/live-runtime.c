@@ -27,7 +27,6 @@ struct live_image { void *handle; struct live_image *previous; };
 static pthread_mutex_t live_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct live_entry *live_entries;
 static size_t live_count;
-static char *live_storage;
 static struct live_image *live_images;
 static struct stat live_seen;
 static int live_have_seen;
@@ -132,13 +131,23 @@ static void live_refresh(void) {
         for (size_t i = 1; i < count; ++i)
             if (!strcmp(entries[i - 1].key, entries[i].key)) valid = 0;
     }
-    if (!valid) {
+    // An update image may hold only the functions that changed; earlier entries
+    // stay for the rest. Their keys point into earlier tables, kept resident.
+    size_t merged_count = count;
+    for (size_t i = 0; valid && i < live_count; ++i)
+        if (!bsearch(&live_entries[i], entries, count, sizeof *entries, live_compare)) merged_count++;
+    struct live_entry *merged = valid ? malloc(merged_count * sizeof *merged) : NULL;
+    if (!valid || !merged) {
         fprintf(stderr, "minyar live: update has an invalid function table; keeping current code\n");
         dlclose(handle); free(entries); free(image); free(storage); return;
     }
+    memcpy(merged, entries, count * sizeof *entries);
+    for (size_t i = 0, used = count; i < live_count; ++i)
+        if (!bsearch(&live_entries[i], entries, count, sizeof *entries, live_compare)) merged[used++] = live_entries[i];
+    qsort(merged, merged_count, sizeof *merged, live_compare);
     image->handle = handle; image->previous = live_images; live_images = image;
-    free(live_entries); free(live_storage);
-    live_entries = entries; live_count = count; live_storage = storage;
+    free(entries); free(live_entries);
+    live_entries = merged; live_count = merged_count;
     for (size_t i = 0; i < live_slot_count; ++i)
         __atomic_store_n(live_slots[i].slot, live_lookup(live_slots[i].key, live_slots[i].initial),
                          __ATOMIC_RELEASE);

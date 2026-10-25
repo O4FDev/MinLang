@@ -304,7 +304,9 @@ Hot mode calls each function through its own slot: a few loads and an indirect
 call, with no system call. The watcher announces each accepted update through a
 shared counter, so the first call after `Reload ready` loads the update and
 retargets every slot. Debug uses O0 and release uses O2 without
-whole-program LTO. Successful code generations remain resident because old
+whole-program LTO. An update compiles only the functions whose generated code
+changed, including functions that read an edited literal; its calls go through
+the original program's slots. Successful code generations remain resident because old
 frames, closures and literal values may still refer to them; memory therefore
 grows with edits until the session ends. This development mode does not add a
 runtime cost to ordinary builds. Native debugger/trace metadata for replacement

@@ -82,17 +82,37 @@ test.check(live.transform(ir + "; minyar-data-parallel-runtime: 1\n", 0, true).e
 test.check(live.transform(ir, -1, true).error != "", "invalid generation identity is rejected")
 test.check(live.transform("define i64 @.minyar.fn.bad() {\n  ret i64 1\n", 0, true).error != "", "incomplete generated functions fail closed")
 
+// Update images hold only changed bodies and call through the original wrappers.
+let published = live.decodePairs(initial.digests)
+let exports = live.decodePairs(initial.exports)
+test.check(exports.has(".minyar.fn.add") && published.has(".minyar.fn.add") && !exports.has("main"), "the original image records language wrappers and body fingerprints")
+let same = live.transformUpdate(ir, 3, published, exports)
+test.check(same.error == "" && same.names.length == 0 && same.signature == initial.signature, "unchanged bodies compile nothing: " + same.error)
+let partial = live.transformUpdate(host.replaceText(ir, "%sum = add i64", "%sum = sub i64"), 3, published, exports)
+test.check(partial.error == "" && partial.names.length == 1 && partial.names[0] == ".minyar.fn.add", "an update compiles only the changed body: " + partial.error)
+test.check(partial.signature == initial.signature, "a partial update keeps the whole ABI signature")
+test.check(!host.hasText(partial.llvm, "define i1 @") && !host.hasText(partial.llvm, "define double @"), "unchanged bodies are not recompiled")
+test.check(host.hasText(partial.llvm, "declare i64 @" + exports[".minyar.fn.add"] + "(i64, i64)"), "update calls go through the original wrappers")
+test.check(!host.hasText(partial.llvm, "minyar_live_bind"), "update images need no wrappers of their own")
+let literalIr = "@.message = private unnamed_addr constant [3 x i8] c\"ab\\00\"\ndefine ptr @.minyar.fn.message() uwtable {\nentry:\n  ret ptr @.message\n}\ndefine i64 @.minyar.fn.other() uwtable {\nentry:\n  ret i64 1\n}\ndefine i32 @main() {\nentry:\n  ret i32 0\n}\n"
+let literalInitial = live.transform(literalIr, 0, true)
+let literalUpdate = live.transformUpdate(host.replaceText(literalIr, "c\"ab\\00\"", "c\"cd\\00\""), 4, live.decodePairs(literalInitial.digests), live.decodePairs(literalInitial.exports))
+test.check(literalUpdate.error == "" && literalUpdate.names.length == 1 && literalUpdate.names[0] == ".minyar.fn.message", "editing a literal recompiles the functions that read it")
+test.check(live.transformUpdate(ir, 3, published, Map<Text, Text>()).error != "", "a function without an original wrapper needs a restart")
+
 // Compile generated forwarding code, so the contract checks cover real LLVM
 // syntax and every supported scalar/pointer ABI at both useful optimizations.
 let work = test.scratch()
 let clang = test.setting("MINYAR_TEST_CLANG", "clang")
 io.writeTextFile(work + "/initial.ll", initial.llvm)
 io.writeTextFile(work + "/next.ll", next.llvm)
+io.writeTextFile(work + "/partial.ll", partial.llvm)
 io.writeTextFile(work + "/resolver.c", "static const long long epoch; const long long *minyar_live_epoch = &epoch; long long minyar_live_epoch_seen;\nvoid *minyar_live_bind(const char *name, void *initial, void **slot) { (void)name; *slot = initial; return initial; }\n")
 for optimization in ["-O0", "-O2"] {
     test.require(test.run([clang, optimization, "-Wno-override-module", work + "/initial.ll", work + "/resolver.c", "-o", work + "/program"], system.environment(), "", work + "/link", 30), "live forwarding " + optimization)
     let execution = test.run([work + "/program"], system.environment(), "", work + "/run", 10)
     test.check(execution.status == 0 && execution.output == "" && execution.errorOutput == "", "live forwarding ABI execution " + optimization + ": " + execution.errorOutput)
     test.require(test.run([clang, optimization, "-Wno-override-module", "-fPIC", "-c", work + "/next.ll", "-o", work + "/next.o"], system.environment(), "", work + "/object", 30), "replacement image LLVM " + optimization)
+    test.require(test.run([clang, optimization, "-Wno-override-module", "-fPIC", "-c", work + "/partial.ll", "-o", work + "/partial.o"], system.environment(), "", work + "/partial", 30), "partial update LLVM " + optimization)
 }
 print("live transform tests passed")
