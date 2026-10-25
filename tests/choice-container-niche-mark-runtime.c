@@ -94,7 +94,9 @@ void minyar_choice_mark_step(void) {
     minyar_rc_step();
 }
 long long minyar_choice_mark_assertSaved(void) {
-    assert(mark_pre_cleanup_checks == 1);
+    /* Zero when the assignment transferred its field borrow and left no
+     * temporary: no cleanup boundary precedes this observation. */
+    assert(mark_pre_cleanup_checks <= 1);
     mark_assert_root();
     ++mark_checks;
     return 1;
@@ -151,7 +153,7 @@ long long minyar_choice_mark_finishMark(void) {
     return 1;
 }
 __attribute__((destructor)) static void check_container_mark_contract(void) {
-    assert(!mark_carrier && !mark_target && !mark_parent && mark_mode == 0 && mark_checks == 4 && mark_pre_cleanup_checks == 1);
+    assert(!mark_carrier && !mark_target && !mark_parent && mark_mode == 0 && mark_checks == 4 && mark_pre_cleanup_checks <= 1);
     assert(rc_frames == NULL);
     mark_drain();
     assert(rc_object_count == 0 && rc_bytes == 0 && rc_immortal_object_count == 0);
