@@ -513,6 +513,17 @@ hoist loop-invariant List and record loads. Otherwise each iteration is serviced
 as before, and the loop re-asks after each service. A `while` loop counts its
 iterations in a local for this; its `continue` paths share the loop's one
 back-edge service point. The eager cycle collector is never idle.
+When such a `for` loop reads or writes a List at its position (`a[j]` with the
+loop variable unchanged, or the element of a List walk), and each such List is
+reached only through locals the loop never stores, reference List slots, record
+fields and lengths (none of which a call-free loop can change), the idle entry
+also runs one test: the first position is not negative and the bound is at most
+every such List's length. The test computes those Lists without failing; any
+check it cannot pass sends the loop to the checked copy. When it passes, the
+loop runs a copy whose accesses at the position are plain loads and stores from
+buffers read once, which LLVM can vectorize. A loop whose position goes out of
+range therefore always runs checked and fails at the same access with the same
+message (`make check-list-access`).
 
 Compiler-arena builds retain storage until process exit and compile away ownership
 hooks. Their short-slice cache can evict an entry without invalidating aliases

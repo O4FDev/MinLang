@@ -23,6 +23,7 @@ COMPILER_SOURCES = build/choice-builtins.min build/capability-builtins.min \
 	compiler/stages/literals.min \
 	compiler/stages/calls.min \
 	compiler/stages/assignment.min \
+	compiler/stages/loop-versioning.min \
 	compiler/stages/native.min \
 	compiler/stages/effects.min \
 	compiler/parallel-compiler.min \
