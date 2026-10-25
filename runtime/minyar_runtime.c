@@ -1252,58 +1252,85 @@ void minyar_initialize_arguments(int count, char **values) {
 #include "minyar_maps.h"
 #include "minyar_numbers.h"
 
-static long long interpolation_part(long long kind, long long slot, unsigned char *out, _Bool *ascii) {
-    char buffer[48];
-    const unsigned char *bytes = (const unsigned char *)buffer;
-    long long length;
+/* Formats one interpolation part into buffer when it is a scalar, and points
+ * bytes at the part's encoding. */
+static long long interpolation_bytes(long long kind, long long slot, char buffer[48],
+                                     const unsigned char **bytes, _Bool *ascii) {
+    *bytes = (const unsigned char *)buffer;
     if (kind == 1) {
-        char *start = write_integer_digits(slot, buffer + sizeof(buffer));
-        bytes = (const unsigned char *)start;
-        length = buffer + sizeof(buffer) - start;
-    } else if (kind == 2) {
-        const MinyarText *text = (const MinyarText *)(intptr_t)slot;
-        bytes = text->bytes;
-        length = text->byte_length;
-        if (text->character_length != length) *ascii = 0;
-    } else if (kind == 3) {
-        length = encode_character((int)slot, (unsigned char *)buffer);
-        if (length > 1) *ascii = 0;
-    } else if (kind == 4) {
-        bytes = (const unsigned char *)(slot ? "true" : "false");
-        length = slot ? 4 : 5;
-    } else {
-        double value;
-        memcpy(&value, &slot, sizeof(value));
-        length = (long long)format_float(value, buffer, sizeof(buffer));
+        char *start = write_integer_digits(slot, buffer + 48);
+        *bytes = (const unsigned char *)start;
+        return buffer + 48 - start;
     }
-    if (out) copy_bytes(out, bytes, (size_t)length);
-    return length;
+    if (kind == 2) {
+        const MinyarText *text = (const MinyarText *)(intptr_t)slot;
+        *bytes = text->bytes;
+        if (text->character_length != text->byte_length) *ascii = 0;
+        return text->byte_length;
+    }
+    if (kind == 3) {
+        long long length = encode_character((int)slot, (unsigned char *)buffer);
+        if (length > 1) *ascii = 0;
+        return length;
+    }
+    if (kind == 4) {
+        *bytes = (const unsigned char *)(slot ? "true" : "false");
+        return slot ? 4 : 5;
+    }
+    double value;
+    memcpy(&value, &slot, sizeof(value));
+    return (long long)format_float(value, buffer, 48);
 }
 
 /* One Text interpolation over `count` (kind, slot) pairs, using the compiler's
  * type codes: 1 Integer, 2 Text, 3 Character, 4 Boolean, 7 Float. Scalars are
  * formatted straight into one exactly sized buffer, so they need no temporary
- * Text or parts List. Text parts are borrowed for the call. */
+ * Text or parts List. Text parts are borrowed for the call. The first parts
+ * are formatted once and remembered; longer interpolations format the rest
+ * again while copying. */
 MinyarText *minyar_interpolate(long long count, ...) {
+    enum { REMEMBERED = 16 };
+    char buffers[REMEMBERED][48];
+    const unsigned char *parts[REMEMBERED];
+    long long lengths[REMEMBERED];
     va_list arguments;
     long long length = 0, offset = 0;
     _Bool ascii = 1;
     va_start(arguments, count);
     for (long long index = 0; index < count; index++) {
         long long kind = va_arg(arguments, long long);
-        long long part = interpolation_part(kind, va_arg(arguments, long long), NULL, &ascii);
+        long long slot = va_arg(arguments, long long);
+        char scratch[48];
+        const unsigned char *bytes;
+        long long part = index < REMEMBERED
+                             ? interpolation_bytes(kind, slot, buffers[index], &parts[index], &ascii)
+                             : interpolation_bytes(kind, slot, scratch, &bytes, &ascii);
+        if (index < REMEMBERED) lengths[index] = part;
         if (part > LLONG_MAX - length)
             join_too_large();
         length += part;
     }
     va_end(arguments);
     unsigned char *bytes = new_bytes(length);
-    va_start(arguments, count);
-    for (long long index = 0; index < count; index++) {
-        long long kind = va_arg(arguments, long long);
-        offset += interpolation_part(kind, va_arg(arguments, long long), bytes + offset, &ascii);
+    long long remembered = count < REMEMBERED ? count : REMEMBERED;
+    for (long long index = 0; index < remembered; index++) {
+        copy_bytes(bytes + offset, parts[index], (size_t)lengths[index]);
+        offset += lengths[index];
     }
-    va_end(arguments);
+    if (count > REMEMBERED) {
+        va_start(arguments, count);
+        for (long long index = 0; index < count; index++) {
+            long long kind = va_arg(arguments, long long);
+            long long slot = va_arg(arguments, long long);
+            if (index < REMEMBERED) continue;
+            char scratch[48];
+            const unsigned char *part;
+            long long size = interpolation_bytes(kind, slot, scratch, &part, &ascii);
+            copy_bytes(bytes + offset, part, (size_t)size);
+            offset += size;
+        }
+        va_end(arguments);
+    }
     bytes[length] = 0;
     return new_text(bytes, length, ascii ? length : -1);
 }
