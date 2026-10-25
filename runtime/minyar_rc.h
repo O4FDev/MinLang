@@ -22,6 +22,7 @@ void minyar_rc_local_take(long long index, void *value) { (void)index; (void)val
 void minyar_rc_local_move(long long index) { (void)index; }
 void minyar_rc_local_move_owner(long long index, void *value) { (void)index; (void)value; }
 void minyar_rc_step(void) {}
+_Bool minyar_rc_idle(void) { return 1; }
 void minyar_rc_retain(void *value) { (void)value; }
 void minyar_rc_release(void *value) { (void)value; }
 #else
@@ -477,6 +478,18 @@ void minyar_rc_step(void) {
 #else
     while (frame->temporary_count)
         minyar_rc_release(frame->temporaries[--frame->temporary_count]);
+#endif
+}
+
+/* Whether minyar_rc_step would do nothing now. Code that cannot release,
+ * allocate or run user code leaves this unchanged, so the compiler can skip
+ * the service points of such a loop while it holds. */
+_Bool minyar_rc_idle(void) {
+    RcFrame *frame = rc_frames;
+#ifdef MINYAR_BOUNDED_RC
+    return !rc_pending_count && (!frame || !frame->temporary_head);
+#else
+    return !frame || !frame->temporary_count;
 #endif
 }
 #endif

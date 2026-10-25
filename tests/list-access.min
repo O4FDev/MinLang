@@ -190,6 +190,20 @@ plain = plain.slice(0, plain.find("\n}\n"))
 let plainBorrows = 0
 for line in test.lines(plain) { if test.contains(line, "call void @minyar_rc_borrow(") { plainBorrows += 1 } }
 test.check(plainBorrows <= 2, "a call-free Text comparison borrowed its left operand twice")
+// A call-free loop in a function with owners takes a service-free inner
+// loop while the runtime is idle; a frame-free function needs no query, and a
+// loop that calls the runtime keeps a service point on every iteration.
+test.executes(compiler, "function pureSum(values: List<Integer>): Integer { let label = Text(values.length); let total = 0; for i in 0..values.length { if values[i] < 0 { continue }; if values[i] > 100 { break }; total += values[i] }; return total + label.length }\nfunction scalarSum(values: List<Integer>): Integer { let total = 0; for value in values { total += value }; return total }\nfunction busy(values: List<Integer>): Integer { let total = 0; for i in 0..values.length { total += Text(values[i]).length }; return total }\nlet values = [1, -2, 3, 200, 5]\nlet dropped = [Text(1), Text(2), Text(3)]\ndropped = []\nprint(pureSum(values))\nprint(scalarSum(values))\nprint(busy(values))\nlet spin = 0\nfor round in 0..1000 { spin += values[round % 5] }\nprint(spin + dropped.length)\n", "5\n207\n8\n41400\n")
+let versioned = generated(compiler)
+let pureBody = versioned.slice(versioned.find("pureSum(ptr %argument.0"), versioned.length)
+pureBody = pureBody.slice(0, pureBody.find("\n}\n"))
+test.check(test.contains(pureBody, "call i1 @minyar_rc_idle()") && test.contains(pureBody, "call void @minyar_rc_step()"), "a call-free loop with owners must test the runtime and keep its service point")
+let scalarBody = versioned.slice(versioned.find("scalarSum(ptr %argument.0"), versioned.length)
+scalarBody = scalarBody.slice(0, scalarBody.find("\n}\n"))
+test.check(!test.contains(scalarBody, "@minyar_rc_idle(") && !test.contains(scalarBody, "@minyar_rc_step("), "a frame-free loop must not query or service the runtime")
+let busyBody = versioned.slice(versioned.find("busy(ptr %argument.0"), versioned.length)
+busyBody = busyBody.slice(0, busyBody.find("\n}\n"))
+test.check(!test.contains(busyBody, "@minyar_rc_idle(") && test.contains(busyBody, "call void @minyar_rc_step()"), "a loop that calls the runtime must service every iteration")
 test.executes(compiler, "function sum(values: List<Integer>): Integer { let total = 0; let index = 0; while index < values.length { total += values[index]; index += 1 }; return total }\nprint(sum([1, 2, 3]))\n", "6\n")
 let path = compiler.directory + "/case" + Text(compiler.serial)
 // Keep this exact-count oracle on one scalar iteration; ordinary O0/O2

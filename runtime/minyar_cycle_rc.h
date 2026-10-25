@@ -27,6 +27,7 @@ void minyar_rc_local_take(long long index, void *value) { (void)index; (void)val
 void minyar_rc_local_move(long long index) { (void)index; }
 void minyar_rc_local_move_owner(long long index, void *value) { (void)index; (void)value; }
 void minyar_rc_step(void) {}
+_Bool minyar_rc_idle(void) { return 1; }
 void minyar_rc_retain(void *value) { (void)value; }
 void minyar_rc_retain_traced(void *value) { (void)value; }
 void minyar_rc_local_traced(long long index, void *value) { (void)index; (void)value; }
@@ -534,6 +535,17 @@ void minyar_rc_step(void) {
     while (frame->temporary_count)
         minyar_rc_release(frame->temporaries[--frame->temporary_count]);
     rc_cycle_eager_service(32);
+#endif
+}
+
+/* Whether minyar_rc_step would do nothing now; see minyar_rc.h. The eager
+ * collector advances at every service point, so it is never idle. */
+_Bool minyar_rc_idle(void) {
+#ifdef MINYAR_BOUNDED_RC
+    RcFrame *frame = rc_frames;
+    return !rc_pending_count && (!frame || !frame->temporary_head);
+#else
+    return 0;
 #endif
 }
 #endif

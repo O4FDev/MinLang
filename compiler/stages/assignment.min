@@ -18,6 +18,67 @@ function loopAssignmentDeclaresLocal(tokenKinds: List<Integer>, tokenTexts: List
     return tokenKinds[start] == 1 && tokenTexts[start] == "let"
 }
 
+// Checked accessors and arithmetic helpers whose only runtime call stops the
+// program; none allocates, releases or runs user code.
+function pureLoopCallee(callee: Text): Boolean {
+    if callee.startsWith("@llvm.") || callee.startsWith("@.minyar.bytes.get.") || callee.startsWith("@.minyar.bytes.set.") || callee.startsWith("@.minyar.integer.") || callee.startsWith("@.minyar.clamp.") { return true }
+    return callee.startsWith("@.minyar.list.get.checked(") || callee.startsWith("@.minyar.list.set.scalar.checked(") || callee.startsWith("@.minyar.list.length(") || callee.startsWith("@.minyar.record.get.checked(") || callee.startsWith("@.minyar.record.set.scalar.checked(") || callee.startsWith("@.minyar.bytes.length(") || callee.startsWith("@.minyar.character.checked(") || callee.startsWith("@.minyar.float.integer.checked(") || callee.startsWith("@.minyar.shift.checked(")
+}
+
+// Loop code that calls only those helpers cannot release, allocate or run
+// user code, so it creates no cleanup debt.
+function pureLoopCode(output: List<Text>, start: Integer, end: Integer): Boolean {
+    // One call can span several output pieces, so scan the joined code.
+    let pieces: List<Text> = []
+    let index = start
+    while index < end {
+        pieces.add(output[index])
+        index = index + 1
+    }
+    let rest = joinText(pieces)
+    if rest.find("invoke ") >= 0 { return false }
+    let call = rest.find("call ")
+    while call >= 0 {
+        rest = rest.slice(call + 5, rest.length)
+        // Return types contain no @ or %, so the first one names the callee;
+        // an indirect call through % may run any code.
+        let at = rest.find("@")
+        let indirect = rest.find("%")
+        if at < 0 || (indirect >= 0 && indirect < at) || !pureLoopCallee(rest.slice(at, rest.length)) { return false }
+        call = rest.find("call ")
+    }
+    return true
+}
+
+// A pure loop cannot add cleanup debt, so when the runtime is idle at entry
+// its service points have nothing to do: run every remaining iteration as one
+// call-free inner loop, which lets LLVM hoist invariant List and record loads.
+// Otherwise each iteration is its own strip, serviced exactly as before. The
+// service and idle pieces stay separate so a frame-free function can drop them.
+function versionPureLoop(output: List<Text>, entryPiece: Integer, testPiece: Integer, stepPiece: Integer, loopLabel: Integer, bodyLabel: Integer, endLabel: Integer, strip: Integer, continuing: Text, position: Text) {
+    let loop = Text(loopLabel)
+    let slot = "ptr %local." + Text(strip)
+    output[entryPiece] = "  %loop.idle." + loop + " = call i1 @minyar_rc_idle()\n"
+    output[entryPiece + 1] = "  %loop.strip." + loop + " = select i1 %loop.idle." + loop + ", i64 9223372036854775807, i64 -9223372036854775808\n  store i64 %loop.strip." + loop + ", " + slot + "\n  br label %for.outer." + loop + "\n\nfor.outer." + loop + ":\n"
+    output[testPiece] = "  br i1 " + continuing + ", label %for.strip." + loop + ", label %for.end." + Text(endLabel) + "\n\nfor.strip." + loop + ":\n  %loop.limit." + loop + " = load i64, " + slot + "\n  %loop.within." + loop + " = icmp slt i64 " + position + ", %loop.limit." + loop + "\n  br i1 %loop.within." + loop + ", label %for.body." + Text(bodyLabel) + ", label %for.service." + loop + "\n\nfor.service." + loop + ":\n"
+    output[testPiece + 1] = "  call void @minyar_rc_step()\n"
+    output[testPiece + 2] = "  %loop.again." + loop + " = call i1 @minyar_rc_idle()\n"
+    output[testPiece + 3] = "  %loop.following." + loop + " = add nsw i64 " + position + ", 1\n  %loop.renewed." + loop + " = select i1 %loop.again." + loop + ", i64 9223372036854775807, i64 %loop.following." + loop + "\n  store i64 %loop.renewed." + loop + ", " + slot + "\n  br label %for.outer." + loop + "\n\nfor.body." + Text(bodyLabel) + ":\n"
+    output[stepPiece] = ""
+}
+
+// A frame-free function has no cleanup to service: its pure loops always take
+// the call-free inner loop.
+function settleIdleQueries(output: List<Text>, start: Integer) {
+    let query = "call i1 @minyar_rc_idle()\n"
+    let index = start
+    while index < output.length {
+        let text = output[index]
+        if text.startsWith("  %loop.") && text.endsWith(query) { output[index] = text.slice(0, text.length - query.length) + "or i1 true, true\n" }
+        index = index + 1
+    }
+}
+
 // A field or element store such as `totals[key] += 1` or `row.count = 0`.
 function loopAssignmentHasPath(tokenKinds: List<Integer>, tokenTexts: List<Text>, position: Integer): Boolean {
     let start = position - 1
@@ -670,6 +731,14 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
         parts[3] = collection
         blocks.add(textState[0])
     }
+    // A loop whose compiled body makes no calls can create no cleanup debt.
+    // These pieces stay empty unless that holds; see versionPureLoop.
+    let pure = parts.length == 0 && sequenceStages.length == 0
+    let strip = -1
+    if pure { strip = nextLocal(state) }
+    let entryPiece = output.length
+    output.add("")
+    output.add("")
     output.add("  br label %for.condition." + Text(loopLabel) + "\n\nfor.condition." + Text(loopLabel) + ":\n")
     textState[0] = "for.condition." + Text(loopLabel)
     let position = loadLocal(output, textState, state, counter, 1)
@@ -694,7 +763,11 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
         bound = emitCall(output, textState, state, 1, lengthFunction, arguments, argumentTypes)
     }
     let continuing = emitInstruction(output, textState, state, "icmp slt i64 " + position + ", " + bound)
+    let testPiece = output.length
     output.add("  br i1 " + continuing + ", label %for.body." + Text(bodyLabel) + ", label %for.end." + Text(endLabel) + "\n\nfor.body." + Text(bodyLabel) + ":\n")
+    output.add("")
+    output.add("")
+    output.add("")
     textState[0] = "for.body." + Text(bodyLabel)
     let element = position
     if collection >= 0 {
@@ -743,8 +816,12 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     let current = loadLocal(output, textState, state, counter, 1)
     let next = emitInstruction(output, textState, state, "add nsw i64 " + current + ", 1")
     storeLocal(output, counter, 1, next)
+    let stepPiece = output.length
     output.add("  call void @minyar_rc_step()\n")
     output.add("  br label %for.condition." + Text(loopLabel) + "\n\nfor.end." + Text(endLabel) + ":\n")
+    if pure && pureLoopCode(output, entryPiece + 2, stepPiece) {
+        versionPureLoop(output, entryPiece, testPiece, stepPiece, loopLabel, bodyLabel, endLabel, strip, continuing, position)
+    }
     textState[0] = "for.end." + Text(endLabel)
     let scoped = firstLoopLocal
     while scoped < state[3] {

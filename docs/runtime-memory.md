@@ -486,6 +486,14 @@ so a long scalar phase after releasing a graph cannot starve pending retirement.
 The compiler removes these calls from functions that never acquire managed
 owners. This guarantees progress per completed loop iteration, not a wall-clock
 deadline for code that reaches no further runtime or loop service point.
+A `for` loop whose compiled body and bounds call only the inline checked
+accessors and arithmetic helpers cannot release, allocate or run user code, so
+it creates no cleanup work. It asks `minyar_rc_idle()` at entry: when nothing is
+pending and the frame holds no temporaries, its service points would do nothing,
+so the remaining iterations run as one inner loop without them, letting LLVM
+hoist loop-invariant List and record loads. Otherwise each iteration is serviced
+as before, and the loop re-asks after each service. The eager cycle collector
+is never idle.
 
 Compiler-arena builds retain storage until process exit and compile away ownership
 hooks. Their short-slice cache can evict an entry without invalidating aliases
