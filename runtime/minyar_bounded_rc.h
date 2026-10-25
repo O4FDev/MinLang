@@ -475,6 +475,12 @@ size_t minyar_rc_poll(size_t budget) {
     return rc_bounded_poll_work(budget);
 }
 
+/* Direct frame exit and statement cleanup perform what one poll would; test
+ * probes that count poll work observe them here with the same total. */
+#ifndef MINYAR_RC_DIRECT_SERVICE_OBSERVER
+#define MINYAR_RC_DIRECT_SERVICE_OBSERVER(work) ((void)(work))
+#endif
+
 /* Frame exit with nothing else pending, the commonest service point. The
  * scheduler would give this frame every unit: one per written owner slot, in
  * reverse order, then one to retire it. Do exactly that here without queueing
@@ -500,9 +506,8 @@ static int rc_bounded_leave_direct(RcFrame *frame) {
             size_t more = rc_bounded_poll_work(MINYAR_RC_POLL_BUDGET - work);
 #ifdef MINYAR_RC_TESTING
             rc_bounded_last_work = work + more;
-#else
-            (void)more;
 #endif
+            MINYAR_RC_DIRECT_SERVICE_OBSERVER(work + more);
             return 1;
         }
     }
@@ -510,6 +515,54 @@ static int rc_bounded_leave_direct(RcFrame *frame) {
 #ifdef MINYAR_RC_TESTING
     rc_bounded_last_work = work + 1;
 #endif
+    MINYAR_RC_DIRECT_SERVICE_OBSERVER(work + 1);
+    return 1;
+}
+
+/* Statement cleanup with nothing else pending. The scheduler would give the
+ * statement's temporary chunks every unit: one per owner, newest first, then
+ * one to retire each chunk, oldest chunk first. Do exactly that here; if a
+ * release queues an object, queue the remaining chunks and continue in the
+ * scheduler from the state it would have reached. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static int rc_bounded_step_chunks(RcFrame *frame) {
+    RcTemporaryChunk *chunk = frame->temporary_head;
+    size_t chunks = frame->temporary_count / RC_TEMPORARY_CHUNK_SLOTS
+                  + (frame->temporary_count % RC_TEMPORARY_CHUNK_SLOTS != 0);
+    if (frame->temporary_count + chunks > MINYAR_RC_POLL_BUDGET) return 0;
+    RcTemporaryChunk *tail = frame->temporary_tail;
+    frame->temporary_head = frame->temporary_tail = NULL;
+    frame->temporary_count = 0;
+    size_t work = 0;
+    rc_bounded_next_queue = 0;
+    while (chunk) {
+        while (chunk->count) {
+            rc_drop(chunk->values[--chunk->count]);
+            work++;
+            if (rc_pending_count) {
+                rc_bounded_chunk_head = chunk;
+                rc_bounded_chunk_tail = tail;
+                rc_pending_count += chunks;
+                size_t more = rc_bounded_poll_work(MINYAR_RC_POLL_BUDGET - work);
+#ifdef MINYAR_RC_TESTING
+                rc_bounded_last_work = work + more;
+#endif
+                MINYAR_RC_DIRECT_SERVICE_OBSERVER(work + more);
+                return 1;
+            }
+        }
+        RcTemporaryChunk *next = chunk->next;
+        rc_bounded_chunk_retire(chunk);
+        chunks--;
+        work++;
+        chunk = next;
+    }
+#ifdef MINYAR_RC_TESTING
+    rc_bounded_last_work = work;
+#endif
+    MINYAR_RC_DIRECT_SERVICE_OBSERVER(work);
     return 1;
 }
 

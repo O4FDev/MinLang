@@ -12,10 +12,12 @@
  * Match numeric-domain isolation even if this fixture gains real workers. */
 static _Thread_local size_t observed_heap_allocation_events;
 #endif
+static size_t observed_calls, observed_work;
+/* Direct frame exit and statement cleanup replace one poll call. */
+#define MINYAR_RC_DIRECT_SERVICE_OBSERVER(work) (observed_calls++, observed_work += (work))
 #include MINYAR_RUNTIME_SOURCE
 #include <assert.h>
 
-static size_t observed_calls, observed_work;
 static RcObject immortal = { RC_TEXT };
 size_t minyar_rc_poll(size_t budget) {
     size_t work = cache_probe_poll_impl(budget);

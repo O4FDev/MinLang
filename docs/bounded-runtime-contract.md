@@ -183,12 +183,13 @@ Batching reduces scheduler overhead under specific conditions:
   and parity state before returning. Shared children use the normal decrement
   path.
 
-- Frame exit usually finds nothing else pending. When the exiting frame's
-  written slots plus its retirement fit within K, they are released at that
-  service point without entering the queues, in the order and with the units
-  the scheduler would use. If a release queues an object, the frame is queued
-  with its remaining slots and the scheduler continues from the state it would
-  have reached.
+- Frame exit and statement cleanup usually find nothing else pending. When
+  the exiting frame's written slots plus its retirement, or the statement's
+  temporaries plus their chunk retirements, fit within K, they are released at
+  that service point without entering the queues, in the order and with the
+  units the scheduler would use. If a release queues an object, the remaining
+  slots or chunks are queued and the scheduler continues from the state it
+  would have reached.
 
 These paths require non-reentrant runtime and allocator hooks. Intermediate
 pending ownership remains local to the poll; batching neither raises K nor

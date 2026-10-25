@@ -474,7 +474,11 @@ void minyar_rc_borrow(void *value) {
 void minyar_rc_step(void) {
     RcFrame *frame = rc_frames;
 #ifdef MINYAR_BOUNDED_RC
-    rc_bounded_retire_temporaries(frame);
+    /* Most statements own no temporaries: only the pending test remains. */
+    if (frame->temporary_head) {
+        if (!rc_pending_count && rc_bounded_step_chunks(frame)) return;
+        rc_bounded_retire_temporaries(frame);
+    }
     minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
 #else
     while (frame->temporary_count)
