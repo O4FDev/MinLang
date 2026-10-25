@@ -14,21 +14,27 @@ static long long text_scalar_count(const unsigned char *bytes, long long length)
 }
 
 /* KMP avoids quadratic scans of repeated prefixes. One table is reused for
- * all split matches; one-byte separators take the allocation-free path. */
-static long long *text_search_table(const MinyarText *needle, long long available) {
+ * all split matches; one-byte separators take the allocation-free path, and
+ * needles of up to TEXT_SEARCH_SMALL bytes use the caller's stack table. */
+enum { TEXT_SEARCH_SMALL = 32 };
+static long long *text_search_table(const MinyarText *needle, long long available,
+                                    long long small[TEXT_SEARCH_SMALL]) {
     long long length = needle->byte_length;
     if (length <= 1 || length > available) return NULL;
     if ((unsigned long long)length > SIZE_MAX / sizeof(long long))
         minyar_stop("the Text search pattern is too large.");
+    long long *table = small;
+    if (length > TEXT_SEARCH_SMALL) {
 #ifdef MINYAR_COMPILER_ARENA
-    /* The arena never frees, and the compiler searches Text constantly; the
-     * table lives only for one search, so it comes from malloc instead. */
-    long long *table = malloc((size_t)length * sizeof(*table));
-    if (!table)
-        out_of_memory();
+        /* The arena never frees, and the compiler searches Text constantly;
+         * the table lives only for one search, so it comes from malloc. */
+        table = malloc((size_t)length * sizeof(*table));
+        if (!table)
+            out_of_memory();
 #else
-    long long *table = data_allocate((size_t)length * sizeof(*table), sizeof(*table));
+        table = data_allocate((size_t)length * sizeof(*table), sizeof(*table));
 #endif
+    }
     table[0] = 0;
     for (long long i = 1, matched = 0; i < length; i++) {
         while (matched && needle->bytes[i] != needle->bytes[matched]) matched = table[matched - 1];
@@ -37,7 +43,9 @@ static long long *text_search_table(const MinyarText *needle, long long availabl
     }
     return table;
 }
-static void text_search_free(long long *table) {
+static void text_search_free(long long *table, const long long *small) {
+    if (table == small)
+        return;
 #ifndef MINYAR_COMPILER_ARENA
     rc_free_data(table);
 #else
@@ -73,9 +81,10 @@ long long minyar_text_find(MinyarText *text, MinyarText *needle) {
     ensure_text_index(text);
     ensure_text_index(needle);
     if (!needle->byte_length) return 0;
-    long long *table = text_search_table(needle, text->byte_length);
+    long long small[TEXT_SEARCH_SMALL];
+    long long *table = text_search_table(needle, text->byte_length, small);
     long long byte = text_search_next(text, needle, 0, table);
-    text_search_free(table);
+    text_search_free(table, small);
     return byte < 0 ? -1 : text_scalar_count(text->bytes, byte);
 }
 _Bool minyar_text_starts_with(MinyarText *text, MinyarText *needle) {
@@ -103,7 +112,8 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
     }
     /* Pieces are byte ranges between matches. Every piece of ASCII Text is
      * ASCII; other pieces count their scalars once, as their slices record. */
-    long long *table = text_search_table(separator, text->byte_length);
+    long long small[TEXT_SEARCH_SMALL];
+    long long *table = text_search_table(separator, text->byte_length, small);
     _Bool ascii = !text->character_offsets;
     long long start_byte = 0, match;
     while ((match = text_search_next(text, separator, start_byte, table)) >= 0) {
@@ -114,7 +124,7 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
     long long rest = text->byte_length - start_byte;
     long long characters = ascii ? rest : text_scalar_count(text->bytes + start_byte, rest);
     minyar_list_add_take(parts, (long long)(uintptr_t)text_slice_bytes(text, start_byte, text->byte_length, characters));
-    text_search_free(table);
+    text_search_free(table, small);
     return parts;
 }
 static _Bool text_white_space(unsigned int scalar) {
