@@ -32,109 +32,148 @@ function collectDeterministicRoots(context: CompilerContext, roots: List<Integer
     }
 }
 
+// The final module as bytes. LLVM text is ASCII outside c"..." constants, so
+// byte offsets are positions; inlined Bytes reads keep the scan linear and cheap.
+// Byte values: '\n' 10, ' ' 32, '"' 34, '%' 37, '(' 40, ')' 41, ',' 44,
+// '<' 60, '>' 62, '@' 64, '[' 91, ']' 93, 'c' 99, '{' 123, '}' 125.
 record DeterminismModule {
+    code: Bytes
     text: Text
+    ascii: Boolean
     names: List<Text>
     kinds: List<Integer>
+    nameStarts: List<Integer>
+    nameEnds: List<Integer>
     starts: List<Integer>
     ends: List<Integer>
     signatures: List<Text>
     addressTaken: List<Boolean>
-    lookup: List<Integer>
-    zeros: List<Integer>
+    addressReady: Boolean
+    buckets: List<Integer>
     sourceSymbols: List<Integer>
 }
 
-function determinismNameCharacter(character: Character): Boolean {
-    return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '.' || character == '_' || character == '$' || character == '-'
+function determinismNameByte(byte: Integer): Boolean {
+    return (byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57) || byte == 46 || byte == 95 || byte == 36 || byte == 45
 }
 
-// The position after the symbol that starts at text[at] == '@'.
-function determinismNameEnd(text: Text, at: Integer): Integer {
+// The position after the symbol that starts at code[at] == '@'.
+function determinismNameEnd(code: Bytes, at: Integer): Integer {
     let position = at + 1
-    if position < text.length && text[position] == '"' {
+    if position < code.length && code[position] == 34 {
         position = position + 1
-        while position < text.length && text[position] != '"' && text[position] != '\n' { position = position + 1 }
+        while position < code.length && code[position] != 34 && code[position] != 10 { position = position + 1 }
         return position + 1
     }
-    while position < text.length && determinismNameCharacter(text[position]) { position = position + 1 }
+    while position < code.length && determinismNameByte(code[position]) { position = position + 1 }
     return position
 }
 
-function determinismName(text: Text, at: Integer, end: Integer): Text {
-    if at + 1 < end && text[at + 1] == '"' { return text.slice(at + 2, end - 1) }
-    return text.slice(at + 1, end)
+// The symbol's characters without '@' or quotes.
+function determinismNameFirst(code: Bytes, at: Integer, end: Integer): Integer {
+    if at + 1 < end && code[at + 1] == 34 { return at + 2 }
+    return at + 1
+}
+
+function determinismNameLast(code: Bytes, at: Integer, end: Integer): Integer {
+    if at + 1 < end && code[at + 1] == 34 { return end - 1 }
+    return end
+}
+
+// LLVM text is normally ASCII, where byte offsets are character offsets.
+function determinismText(module: DeterminismModule, first: Integer, last: Integer): Text {
+    if module.ascii { return module.text.slice(first, last) }
+    let parts: List<Text> = []
+    let position = first
+    while position < last {
+        parts.add(Text(Character(module.code[position])))
+        position = position + 1
+    }
+    return joinText(parts)
 }
 
 // Skip a c"..." constant so source text kept for traces is never read as code.
-function determinismSkipString(text: Text, position: Integer): Integer {
-    if text[position] == 'c' && position + 1 < text.length && text[position + 1] == '"' {
+function determinismSkipString(code: Bytes, position: Integer): Integer {
+    if code[position] == 99 && position + 1 < code.length && code[position + 1] == 34 {
         let end = position + 2
-        while end < text.length && text[end] != '"' && text[end] != '\n' { end = end + 1 }
+        while end < code.length && code[end] != 34 && code[end] != 10 { end = end + 1 }
         return end + 1
     }
     return position
 }
 
-function determinismLineEnd(text: Text, position: Integer): Integer {
+function determinismLineEnd(code: Bytes, position: Integer): Integer {
     let end = position
-    while end < text.length && text[end] != '\n' { end = end + 1 }
+    while end < code.length && code[end] != 10 { end = end + 1 }
     return end
 }
 
-function determinismStartsWith(text: Text, position: Integer, prefix: Text): Boolean {
-    if position + prefix.length > text.length { return false }
+function determinismStartsWith(code: Bytes, position: Integer, prefix: Text): Boolean {
+    if position + prefix.length > code.length { return false }
     let index = 0
     while index < prefix.length {
-        if text[position + index] != prefix[index] { return false }
+        if code[position + index] != Integer(prefix[index]) { return false }
         index = index + 1
     }
     return true
 }
 
-function determinismFind(text: Text, start: Integer, end: Integer, wanted: Text): Integer {
+function determinismFindByte(code: Bytes, start: Integer, end: Integer, wanted: Integer): Integer {
     let position = start
-    while position + wanted.length <= end {
-        if text[position] == wanted[0] && determinismStartsWith(text, position, wanted) { return position }
+    while position < end {
+        if code[position] == wanted { return position }
         position = position + 1
     }
     return -1
 }
 
-// The last word before `end`: the result type of `define T @f` or `call T @f`.
-function determinismWordBefore(text: Text, end: Integer): Text {
-    let last = end
-    while last > 0 && text[last - 1] == ' ' { last = last - 1 }
-    let first = last
-    while first > 0 && text[first - 1] != ' ' { first = first - 1 }
-    return text.slice(first, last)
+// The end of the definition whose header line ends at `lineEnd`: the first
+// following line that holds only '}'.
+function determinismDefinitionEnd(code: Bytes, lineEnd: Integer): Integer {
+    let position = lineEnd
+    while position + 2 < code.length {
+        if code[position] == 10 && code[position + 1] == 125 && code[position + 2] == 10 { return position + 2 }
+        position = position + 1
+    }
+    return code.length
 }
 
-// Argument or parameter types inside text[open] == '(' .. its ')': the first
+// The last word before `end`: the result type of `define T @f` or `call T @f`.
+function determinismWordBefore(module: DeterminismModule, end: Integer): Text {
+    let code = module.code
+    let last = end
+    while last > 0 && code[last - 1] == 32 { last = last - 1 }
+    let first = last
+    while first > 0 && code[first - 1] != 32 { first = first - 1 }
+    return determinismText(module, first, last)
+}
+
+// Argument or parameter types inside code[open] == '(' .. its ')': the first
 // word of each top-level comma-separated item.
-function determinismTypes(text: Text, open: Integer): Text {
+function determinismTypes(module: DeterminismModule, open: Integer): Text {
+    let code = module.code
     let parts: List<Text> = []
     let depth = 0
     let position = open + 1
     let itemStart = position
     let done = false
-    while position < text.length && !done {
-        let character = text[position]
-        if character == '(' || character == '{' || character == '[' || character == '<' { depth = depth + 1 }
-        if (character == ')' || character == '}' || character == ']' || character == '>') && depth > 0 {
+    while position < code.length && !done {
+        let byte = code[position]
+        if byte == 40 || byte == 123 || byte == 91 || byte == 60 { depth = depth + 1 }
+        if (byte == 41 || byte == 125 || byte == 93 || byte == 62) && depth > 0 {
             depth = depth - 1
         } else {
-            if (character == ',' && depth == 0) || character == ')' {
+            if (byte == 44 && depth == 0) || byte == 41 {
                 let first = itemStart
-                while first < position && text[first] == ' ' { first = first + 1 }
+                while first < position && code[first] == 32 { first = first + 1 }
                 let last = first
-                while last < position && text[last] != ' ' { last = last + 1 }
+                while last < position && code[last] != 32 { last = last + 1 }
                 if last > first {
                     if parts.length > 0 { parts.add(",") }
-                    parts.add(text.slice(first, last))
+                    parts.add(determinismText(module, first, last))
                 }
                 itemStart = position + 1
-                if character == ')' { done = true }
+                if byte == 41 { done = true }
             }
         }
         position = position + 1
@@ -142,66 +181,129 @@ function determinismTypes(text: Text, open: Integer): Text {
     return joinText(parts)
 }
 
+function determinismHash(code: Bytes, first: Integer, last: Integer): Integer {
+    let hash = 5381
+    let position = first
+    while position < last {
+        hash = (hash * 65599 + code[position]) % 2147483647
+        position = position + 1
+    }
+    return hash
+}
+
+// The symbol spelled by code[first..last), or -1.
+function determinismLookup(module: DeterminismModule, first: Integer, last: Integer): Integer {
+    let code = module.code
+    let capacity = module.buckets.length
+    let bucket = determinismHash(code, first, last) % capacity
+    let symbol = module.buckets[bucket]
+    while symbol >= 0 {
+        let start = module.nameStarts[symbol]
+        if module.nameEnds[symbol] - start == last - first {
+            let same = true
+            let offset = 0
+            while same && offset < last - first {
+                if code[start + offset] != code[first + offset] { same = false }
+                offset = offset + 1
+            }
+            if same { return symbol }
+        }
+        bucket = (bucket + 1) % capacity
+        symbol = module.buckets[bucket]
+    }
+    return -1
+}
+
+function determinismLookupName(module: DeterminismModule, name: Text): Integer {
+    let wanted = Bytes(name)
+    let capacity = module.buckets.length
+    let bucket = determinismHash(wanted, 0, wanted.length) % capacity
+    let symbol = module.buckets[bucket]
+    while symbol >= 0 {
+        if module.names[symbol] == name { return symbol }
+        bucket = (bucket + 1) % capacity
+        symbol = module.buckets[bucket]
+    }
+    return -1
+}
+
 function parseDeterminismModule(context: CompilerContext, output: List<Text>): DeterminismModule {
     let text = joinText(output)
-    let names: List<Text> = []
-    let kinds: List<Integer> = []
-    let starts: List<Integer> = []
-    let ends: List<Integer> = []
-    let signatures: List<Text> = []
+    let code = Bytes(text)
+    let module = DeterminismModule { code: code, text: text, ascii: code.length == text.length, names: [], kinds: [], nameStarts: [], nameEnds: [], starts: [], ends: [], signatures: [], addressTaken: [], addressReady: false, buckets: [], sourceSymbols: [] }
     let position = 0
-    while position < text.length {
-        let lineEnd = determinismLineEnd(text, position)
+    while position < code.length {
+        let lineEnd = determinismLineEnd(code, position)
         let kind = 0
-        if determinismStartsWith(text, position, "define ") { kind = 1 }
-        if determinismStartsWith(text, position, "@") { kind = 2 }
-        if determinismStartsWith(text, position, "declare ") { kind = 3 }
-        let at = position
-        if kind == 1 || kind == 3 {
-            at = determinismFind(text, position, lineEnd, "@")
-            if at < 0 { kind = 0 }
-        }
-        if kind > 0 {
-            let nameEnd = determinismNameEnd(text, at)
-            names.add(determinismName(text, at, nameEnd))
-            kinds.add(kind)
+        let at = -1
+        if code[position] == 64 { kind = 2; at = position }
+        if code[position] == 100 && determinismStartsWith(code, position, "define ") { kind = 1 }
+        if code[position] == 100 && determinismStartsWith(code, position, "declare ") { kind = 3 }
+        if kind == 1 || kind == 3 { at = determinismFindByte(code, position, lineEnd, 64) }
+        if at >= 0 {
+            let nameEnd = determinismNameEnd(code, at)
+            let first = determinismNameFirst(code, at, nameEnd)
+            let last = determinismNameLast(code, at, nameEnd)
+            module.names.add(determinismText(module, first, last))
+            module.nameStarts.add(first)
+            module.nameEnds.add(last)
+            module.kinds.add(kind)
             let signature = ""
-            if kind != 2 && nameEnd < lineEnd && text[nameEnd] == '(' { signature = determinismWordBefore(text, at) + "(" + determinismTypes(text, nameEnd) }
-            signatures.add(signature)
-            starts.add(position)
+            if kind != 2 && nameEnd < lineEnd && code[nameEnd] == 40 { signature = determinismWordBefore(module, at) + "(" + determinismTypes(module, nameEnd) }
+            module.signatures.add(signature)
+            module.addressTaken.add(false)
+            module.sourceSymbols.add(-1)
+            module.starts.add(position)
             let end = lineEnd
-            if kind == 1 {
-                // A definition ends at its first line holding only '}'.
-                let close = determinismFind(text, lineEnd, text.length, "\n}\n")
-                if close < 0 { close = text.length - 2 }
-                end = close + 2
-            }
-            ends.add(end)
+            if kind == 1 { end = determinismDefinitionEnd(code, lineEnd) }
+            module.ends.add(end)
             position = end
         }
-        position = determinismLineEnd(text, position) + 1
+        position = determinismLineEnd(code, position) + 1
     }
-    let zeros: List<Integer> = []
-    let addressTaken: List<Boolean> = []
+    let capacity = 8
+    while capacity < module.names.length * 2 { capacity = capacity * 2 }
+    let bucket = 0
+    while bucket < capacity { module.buckets.add(-1); bucket = bucket + 1 }
     let index = 0
-    while index < names.length { zeros.add(0); addressTaken.add(false); index = index + 1 }
-    let lookup = buildDeclarationIndex(names, zeros)
-    // A function whose address is taken anywhere may be the target of any
-    // indirect call with its signature.
-    index = 0
-    while index < names.length {
-        if kinds[index] != 3 {
-            let scan = starts[index]
-            if kinds[index] == 1 { scan = determinismLineEnd(text, scan) }
-            while scan < ends[index] {
-                let skipped = determinismSkipString(text, scan)
-                if skipped != scan { scan = skipped } else if text[scan] == '@' {
-                    let end = determinismNameEnd(text, scan)
-                    let first = scan + 1
-                    let last = end
-                    if first < end && text[first] == '"' { first = first + 1; last = end - 1 }
-                    let target = findIndexedSymbolRange(lookup, names, zeros, text, first, last, 0)
-                    if target >= 0 && kinds[target] == 1 && !(end < text.length && text[end] == '(') { addressTaken[target] = true }
+    while index < module.names.length {
+        if determinismLookup(module, module.nameStarts[index], module.nameEnds[index]) < 0 {
+            bucket = determinismHash(code, module.nameStarts[index], module.nameEnds[index]) % capacity
+            while module.buckets[bucket] >= 0 { bucket = (bucket + 1) % capacity }
+            module.buckets[bucket] = index
+        }
+        index = index + 1
+    }
+    // Map final symbols back to source declarations for readable names and
+    // native classification.
+    let symbol = 0
+    while symbol < context.functionIRNames.length {
+        if context.symbolKinds[symbol] == 1 {
+            let found = determinismLookupName(module, context.functionIRNames[symbol])
+            if found >= 0 { module.sourceSymbols[found] = symbol }
+        }
+        symbol = symbol + 1
+    }
+    return module
+}
+
+// A function whose address is taken anywhere may be the target of any
+// indirect call with its signature. Computed once, on the first indirect call.
+function determinismAddressTaken(module: DeterminismModule) {
+    if module.addressReady { return }
+    module.addressReady = true
+    let code = module.code
+    let index = 0
+    while index < module.names.length {
+        if module.kinds[index] != 3 {
+            let scan = module.starts[index]
+            if module.kinds[index] == 1 { scan = determinismLineEnd(code, scan) }
+            while scan < module.ends[index] {
+                let skipped = determinismSkipString(code, scan)
+                if skipped != scan { scan = skipped } else if code[scan] == 64 {
+                    let end = determinismNameEnd(code, scan)
+                    let target = determinismLookup(module, determinismNameFirst(code, scan, end), determinismNameLast(code, scan, end))
+                    if target >= 0 && module.kinds[target] == 1 && !(end < code.length && code[end] == 40) { module.addressTaken[target] = true }
                     scan = end
                 } else {
                     scan = scan + 1
@@ -210,21 +312,8 @@ function parseDeterminismModule(context: CompilerContext, output: List<Text>): D
         }
         index = index + 1
     }
-    // Map final symbols back to source declarations for readable names and
-    // native classification.
-    let sourceSymbols: List<Integer> = []
-    index = 0
-    while index < names.length { sourceSymbols.add(-1); index = index + 1 }
-    let symbol = 0
-    while symbol < context.functionIRNames.length {
-        if context.symbolKinds[symbol] == 1 {
-            let found = findIndexedSymbol(lookup, names, zeros, context.functionIRNames[symbol], 0)
-            if found >= 0 { sourceSymbols[found] = symbol }
-        }
-        symbol = symbol + 1
-    }
-    return DeterminismModule { text: text, names: names, kinds: kinds, starts: starts, ends: ends, signatures: signatures, addressTaken: addressTaken, lookup: lookup, zeros: zeros, sourceSymbols: sourceSymbols }
 }
+
 
 // The library of a function declared with a `native "library"` body, or "".
 function determinismNativeLibrary(context: CompilerContext, symbol: Integer): Text {
@@ -298,6 +387,7 @@ function determinismHelp(effect: Text): Text {
     return "keep this call in the caller, or move a pure Minyar version of it inside the deterministic boundary"
 }
 
+
 function determinismReadable(context: CompilerContext, module: DeterminismModule, index: Integer): Text {
     let symbol = module.sourceSymbols[index]
     if symbol >= 0 { return readableDeclarationName(context.functionNames[symbol]) }
@@ -336,9 +426,28 @@ function determinismViolation(search: DeterminismSearch, effect: Text, detail: T
     search.at = at
 }
 
+// An indirect call `call T %callee(types...)` may reach every address-taken
+// function with the same result and parameter types.
+function determinismIndirectCall(module: DeterminismModule, search: DeterminismSearch, index: Integer, position: Integer) {
+    let code = module.code
+    let open = determinismFindByte(code, position, determinismLineEnd(code, position), 40)
+    if open <= 0 { return }
+    let callee = determinismWordBefore(module, open)
+    if callee.length == 0 || callee[0] != '%' { return }
+    let signature = determinismWordBefore(module, open - callee.length) + "(" + determinismTypes(module, open)
+    if findText(search.indirect, signature) >= 0 { return }
+    search.indirect.add(signature)
+    determinismAddressTaken(module)
+    let candidate = 0
+    while candidate < module.names.length {
+        if module.addressTaken[candidate] && module.signatures[candidate] == signature { determinismReach(search, candidate, index, true) }
+        candidate = candidate + 1
+    }
+}
+
 // Scan one reachable definition or global initializer.
 function determinismScan(context: CompilerContext, module: DeterminismModule, search: DeterminismSearch, index: Integer) {
-    let text = module.text
+    let code = module.code
     let symbol = module.sourceSymbols[index]
     let library = determinismNativeLibrary(context, symbol)
     if library != "" {
@@ -350,17 +459,14 @@ function determinismScan(context: CompilerContext, module: DeterminismModule, se
     }
     let position = module.starts[index]
     let end = module.ends[index]
-    if module.kinds[index] == 1 { position = determinismLineEnd(text, position) }
-    let code = module.kinds[index] == 1
+    let definition = module.kinds[index] == 1
+    if definition { position = determinismLineEnd(code, position) }
     while position < end && search.effect == "" {
-        let character = text[position]
-        let skipped = determinismSkipString(text, position)
-        if skipped != position { position = skipped } else if character == '@' {
-            let nameEnd = determinismNameEnd(text, position)
-            let first = position + 1
-            let last = nameEnd
-            if first < nameEnd && text[first] == '"' { first = first + 1; last = nameEnd - 1 }
-            let target = findIndexedSymbolRange(module.lookup, module.names, module.zeros, text, first, last, 0)
+        let byte = code[position]
+        let skipped = determinismSkipString(code, position)
+        if skipped != position { position = skipped } else if byte == 64 {
+            let nameEnd = determinismNameEnd(code, position)
+            let target = determinismLookup(module, determinismNameFirst(code, position, nameEnd), determinismNameLast(code, position, nameEnd))
             if target >= 0 {
                 if module.kinds[target] == 3 {
                     let effect = determinismExternalEffect(module.names[target])
@@ -370,33 +476,13 @@ function determinismScan(context: CompilerContext, module: DeterminismModule, se
                 }
             }
             position = nameEnd
-        } else if code {
-            if character == 'a' && determinismStartsWith(text, position, "asm ") && position > 0 && text[position - 1] == ' ' {
-                determinismViolation(search, "machine hardware", "inline assembly", index)
-            }
-            if character == 'v' && determinismStartsWith(text, position, "volatile ") && position > 0 && text[position - 1] == ' ' {
-                determinismViolation(search, "machine hardware", "a volatile memory access", index)
-            }
-            if character == 'c' && determinismStartsWith(text, position, "call ") && position > 0 && text[position - 1] == ' ' {
-                let lineEnd = determinismLineEnd(text, position)
-                let open = determinismFind(text, position, lineEnd, "(")
-                if open > 0 {
-                    let callee = determinismWordBefore(text, open)
-                    if callee.length > 0 && callee[0] == '%' {
-                        let signature = determinismWordBefore(text, open - callee.length) + "(" + determinismTypes(text, open)
-                        if findText(search.indirect, signature) < 0 {
-                            search.indirect.add(signature)
-                            let candidate = 0
-                            while candidate < module.names.length {
-                                if module.addressTaken[candidate] && module.signatures[candidate] == signature { determinismReach(search, candidate, index, true) }
-                                candidate = candidate + 1
-                            }
-                        }
-                    }
-                }
-            }
-            position = position + 1
         } else {
+            // Instruction words follow a space: `asm `, `volatile `, `call `.
+            if definition && position > 0 && code[position - 1] == 32 {
+                if byte == 97 && determinismStartsWith(code, position, "asm ") { determinismViolation(search, "machine hardware", "inline assembly", index) }
+                if byte == 118 && determinismStartsWith(code, position, "volatile ") { determinismViolation(search, "machine hardware", "a volatile memory access", index) }
+                if byte == 99 && determinismStartsWith(code, position, "call ") { determinismIndirectCall(module, search, index, position) }
+            }
             position = position + 1
         }
     }
@@ -407,8 +493,12 @@ function auditDeterministicRoots(context: CompilerContext, output: List<Text>, r
     let module = parseDeterminismModule(context, output)
     let root = 0
     while root < roots.length {
-        let start = findIndexedSymbol(module.lookup, module.names, module.zeros, context.functionIRNames[roots[root]], 0)
-        if start >= 0 {
+        let name = readableDeclarationName(context.functionNames[roots[root]])
+        let span = sourceSpan(context.tokenLines, context.tokenLines.inputPath, origins[root], origins[root] + 1)
+        let start = determinismLookupName(module, context.functionIRNames[roots[root]])
+        // Fail closed: an unproved function must never pass silently.
+        if start < 0 || module.kinds[start] != 1 { failDiagnostic(span, "a deterministic function must compile to its own code; '" + name + "' was not found in the final module", "", "") }
+        if start >= 0 && module.kinds[start] == 1 {
             let parents: List<Integer> = []
             let indirectEdges: List<Boolean> = []
             let index = 0
@@ -437,8 +527,7 @@ function auditDeterministicRoots(context: CompilerContext, output: List<Text>, r
                     position = position - 1
                 }
                 if search.detail != "" && search.detail[0] == '(' { path.add(" " + search.detail) } else { path.add(" -> " + search.detail) }
-                let name = readableDeclarationName(context.functionNames[roots[root]])
-                failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, origins[root], origins[root] + 1), "deterministic function '" + name + "' can reach " + search.effect + ": " + joinText(path), "", determinismHelp(search.effect))
+                failDiagnostic(span, "deterministic function '" + name + "' can reach " + search.effect + ": " + joinText(path), "", determinismHelp(search.effect))
             }
         }
         root = root + 1
