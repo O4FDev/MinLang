@@ -101,6 +101,29 @@ not make out-of-memory or stack exhaustion reproducible. Floating-point
 `math` results are fixed for one build on one platform. `deterministic` is an
 ordinary identifier everywhere except directly before `function`.
 
+## Running many universes
+
+In a project, put each scenario in `sim/NAME.min`:
+
+```minyar
+use "simulation" as sim
+
+public function universe(seed: Integer): Text {
+    let world = sim.create(seed)
+    sim.advance(world, sim.choose(world, 10))
+    if sim.now(world) > 9 { return "the tide came in late at seed \(seed)" }
+    return ""
+}
+```
+
+`minyar sim` builds each scenario in the release profile and runs seeds
+`0..9999` (`--first`, `--seeds`); `--jobs` shares them between processes. The
+generated driver calls `universe` through a `deterministic function`, so the
+command refuses any scenario that can reach the host, and every reported seed
+reproduces. A failure prints the lowest failing seed with its message, replays
+it twice, and exits with status 1; `minyar sim NAME --seed SEED` runs that seed
+alone.
+
 ## A disk with explicit durability
 
 `openFile(world, path, create)` returns a positive file identity, or negative

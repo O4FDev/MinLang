@@ -209,6 +209,23 @@ the effective compiler, runtime and native flags. See
 [tests and benchmarks beside the code](language.md#tests-beside-the-code) for
 control bounds, copying/shrinking contracts and measurement costs.
 
+```sh
+minyar sim                        # every sim/*.min universe, seeds 0..9999
+minyar sim lanterns --seeds 100000 --jobs 8
+minyar sim lanterns --seed 4711    # run and explain one seed
+```
+
+`sim` runs the deterministic universes in a project's `sim/*.min` files; its
+optional filter matches a file name. Each file declares
+`public function universe(seed: Integer): Text` and returns `""` for a correct
+run or a description of what went wrong. Minyar calls it through a generated
+`deterministic function`, so a universe that can reach the host clock, files,
+randomness or other host effects does not compile. `--jobs` shares the seeds
+between processes. On a failure, `sim` prints the count, the lowest failing
+seed and its message, replays that seed twice to confirm the same result,
+and exits with status 1. Builds always use the release profile. See
+[deterministic simulation](simulation.md#running-many-universes).
+
 `clean` only removes a generated `target` directory bearing Minyar's ownership
 marker. Symlinked targets and existing unowned directories are rejected.
 
