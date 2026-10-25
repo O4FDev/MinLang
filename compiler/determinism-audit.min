@@ -367,14 +367,44 @@ function determinismNativeLibrary(context: CompilerContext, symbol: Integer): Te
     return ""
 }
 
-// Pure computations over their arguments. Everything else native is outside
-// the proof until it is classified here.
-function determinismNativeAllowed(library: Text, name: Text): Boolean {
-    if library == "unicode" || library == "aes" || library == "securecrypto" || library == "sha256" || library == "integer_overflow" { return true }
-    if library == "runtime" {
-        return name == "sqrt" || name == "sin" || name == "cos" || name == "tan" || name == "asin" || name == "acos" || name == "atan" || name == "exp" || name == "log" || name == "floor" || name == "ceil" || name == "round" || name == "atan2" || name == "pow" || name == "jsonNumber"
+// A native's Minyar declaration, such as "unicode.graphemeCount(Text): Integer".
+function determinismNativeSignature(context: CompilerContext, symbol: Integer, library: Text): Text {
+    let parts: List<Text> = [library, ".", readableDeclarationName(context.functionNames[symbol]), "("]
+    let first = functionParameterOffset(context.functionParameterCounts, symbol)
+    let index = 0
+    while index < context.functionParameterCounts[symbol] {
+        if index > 0 { parts.add(", ") }
+        parts.add(describeType(context.functionParameterTypes[first + index]))
+        index = index + 1
     }
-    return false
+    parts.add("): ")
+    parts.add(describeType(context.functionReturnTypes[symbol]))
+    return joinText(parts)
+}
+
+// Pure computations over their arguments, by exact library, name and
+// declaration: a native redeclared with another signature (for example one
+// returning a pointer as an Integer) stays outside the proof, as does
+// everything not listed here.
+function determinismNativeAllowed(signature: Text): Boolean {
+    let unary = ["sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "exp", "log", "floor", "ceil", "round"]
+    let index = 0
+    while index < unary.length {
+        if signature == "runtime." + unary[index] + "(Float): Float" { return true }
+        index = index + 1
+    }
+    let allowed = [
+        "runtime.atan2(Float, Float): Float", "runtime.pow(Float, Float): Float", "runtime.jsonNumber(Text): Float",
+        "unicode.unicodeVersion(): Text", "unicode.unicodeBoundaries(Text): Bytes", "unicode.graphemeCount(Text): Integer",
+        "unicode.normalized(Text): Text", "unicode.caseFold(Text): Text", "unicode.uppercased(Text): Text", "unicode.lowercased(Text): Text",
+        "aes.encrypt(Bytes, Bytes, Bytes, Bytes): Bytes", "aes.decrypt(Bytes, Bytes, Bytes, Bytes): Bytes", "aes.block(Bytes, Bytes): Bytes",
+        "securecrypto.x25519(Bytes, Bytes): Bytes", "securecrypto.chacha20(Bytes, Integer, Bytes, Bytes): Bytes",
+        "securecrypto.poly1305(Bytes, Bytes): Bytes", "securecrypto.seal(Bytes, Bytes, Bytes, Bytes): Bytes",
+        "securecrypto.open(Bytes, Bytes, Bytes, Bytes): Bytes", "securecrypto.equal(Bytes, Bytes): Boolean",
+        "integer_overflow.addOverflows(Integer, Integer): Boolean", "integer_overflow.subtractOverflows(Integer, Integer): Boolean",
+        "integer_overflow.multiplyOverflows(Integer, Integer): Boolean"
+    ]
+    return findText(allowed, signature) >= 0
 }
 
 function determinismNativeEffect(library: Text, name: Text): Text {
@@ -400,6 +430,7 @@ function determinismRuntimeEffect(name: Text): Text {
     if name == "minyar_initialize_arguments" { return "the program's arguments" }
     if resultPrefix(name, "minyar_calldepth_") { return "the host stack size" }
     if name == "minyar_compiler_try" { return "native code" }
+    if name == "minyar_c_record_at" { return "raw memory addresses" }
     return ""
 }
 
@@ -421,6 +452,7 @@ function determinismHelp(effect: Text): Text {
     if effect == "host files" { return "route storage through the simulation World (simulation.openFile, submitWrite, submitSync) or another facade passed in as a parameter" }
     if effect == "the network" { return "send messages through the simulation World (simulation.submitPacket) instead of host sockets" }
     if effect == "the program's arguments" || effect == "the process environment" || effect == "the process ID" { return "read it in the caller and pass the value in as a parameter" }
+    if effect == "raw memory addresses" { return "addresses change from run to run; keep cAddress, cAt and parallelEntry in the caller" }
     if effect == "threads" || effect == "parallel execution" || effect == "host threads and I/O completions" { return "keep scheduling inside the function, for example with simulation.choose; run independent universes in separate calls or processes" }
     return "keep this call in the caller, or move a pure Minyar version of it inside the deterministic boundary"
 }
@@ -504,7 +536,7 @@ function determinismScan(context: CompilerContext, module: DeterminismModule, se
     let library = determinismNativeLibrary(context, symbol)
     if library != "" {
         let name = readableDeclarationName(context.functionNames[symbol])
-        if !determinismNativeAllowed(library, name) {
+        if !determinismNativeAllowed(determinismNativeSignature(context, symbol, library)) {
             determinismViolation(search, determinismNativeEffect(library, name), "(native \"" + library + "\")", index)
         }
         return
@@ -522,7 +554,9 @@ function determinismScan(context: CompilerContext, module: DeterminismModule, se
             if target >= 0 {
                 if module.kinds[target] == 3 {
                     let effect = determinismExternalEffect(module.names[target])
-                    if effect != "" { determinismViolation(search, effect, module.names[target], index) }
+                    let detail = module.names[target]
+                    if detail == "minyar_c_record_at" { detail = "cAt" }
+                    if effect != "" { determinismViolation(search, effect, detail, index) }
                     if !search.collections && resultPrefix(module.names[target], "minyar_map") {
                         search.collections = true
                         let callbacks = determinismCollectionCallbacks(module)
@@ -539,6 +573,11 @@ function determinismScan(context: CompilerContext, module: DeterminismModule, se
             position = nameEnd
         } else {
             // Instruction words follow a space: `asm `, `volatile `, `call `.
+            // The compiler marks operations that turn an address into an Integer.
+            if definition && byte == 59 && determinismStartsWith(code, position, "; minyar-raw-address: ") {
+                let lineEnd = determinismLineEnd(code, position)
+                determinismViolation(search, "raw memory addresses", determinismText(module, position + 22, lineEnd), index)
+            }
             if definition && position > 0 && code[position - 1] == 32 {
                 if byte == 97 && determinismStartsWith(code, position, "asm ") { determinismViolation(search, "machine hardware", "inline assembly", index) }
                 if byte == 118 && determinismStartsWith(code, position, "volatile ") { determinismViolation(search, "machine hardware", "a volatile memory access", index) }

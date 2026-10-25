@@ -74,9 +74,10 @@ The compiler follows every call the function can make, including calls into
 other modules, generic instances, contract helpers, closures and the
 initializers of the globals it reads. Nothing reachable may use a host clock,
 randomness, files, sockets, process arguments, the environment, threads,
-parallel execution, inline assembly, volatile machine access or native code.
-Pure native libraries are allowed: `math`, `unicode`, `sha256`, `aes`,
-`securecrypto` and `json` number parsing. A call through a callback value counts
+parallel execution, inline assembly, volatile machine access, raw addresses
+(`cAddress`, `cAt`, `parallelEntry`) or native code. Pure natives are allowed
+when they match their standard library declaration exactly: `math`, `unicode`,
+`aes`, `securecrypto`, checked Integer overflow and `json` number parsing. A call through a callback value counts
 as a call to every function whose address the program takes with that
 signature, so a callback built by the caller is checked too. Any reachable Map
 operation also reaches the key hash, equality and copy functions of every Map
