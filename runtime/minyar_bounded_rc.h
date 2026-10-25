@@ -99,9 +99,13 @@ MINYAR_HOT unsigned rc_drop(void *value) {
     if (!value) return 0;
     RcObject *object = (RcObject *)value - 1;
     size_t ownership = object->ownership;
+    /* Most releases leave another owner: decrement before any kind test. */
+    if (ownership >= 16) {
+        object->ownership = ownership - 8;
+        return 0;
+    }
     /* Exactly one owner and no child fields: no zero-count store or broad
-     * kind dispatch is needed before returning this allocation. Shared scalar
-     * records continue through the ordinary checked decrement below. */
+     * kind dispatch is needed before returning this allocation. */
     if (ownership == (8 | RC_LIST)) {
         rc_bounded_finish_object(object, RC_LIST);
         return 1;
@@ -110,9 +114,8 @@ MINYAR_HOT unsigned rc_drop(void *value) {
         rc_bounded_finish_object(object, RC_SCALAR_RECORD);
         return 1;
     }
-    if (!(ownership >> 3)) return 0;
+    if (ownership < 8) return 0; /* Immortal literal or cache. */
     object->ownership = ownership - 8;
-    if (object->ownership >> 3) return 0;
     unsigned kind = object->ownership & 7;
 #if MINYAR_THREADED
     if (kind == 0) {
