@@ -420,21 +420,49 @@ long long minyar_runtime_writePartsStatus(const MinyarText *path, const MinyarRe
 /* Module-native entry points. */
 MinyarText *minyar_runtime_readTextFile(const MinyarText *path) { return minyar_read_text_file(path); }
 void minyar_runtime_writeTextFile(const MinyarText *path, const MinyarText *text) { minyar_write_text_file(path, text); }
-long long minyar_runtime_openTextWriter(const MinyarText *path) {
-    FILE *file = create_text_file(path);
-#if defined(__STDC_HOSTED__) && __STDC_HOSTED__
-    if (setvbuf(file, NULL, _IOFBF, MINYAR_WRITE_PARTS_BUFFER) != 0)
-        minyar_stop("a requested text file could not be buffered.");
-#endif
-    return (long long)(uintptr_t)file;
-}
-void minyar_runtime_writeTextPart(long long writer, const MinyarText *part) {
-    FILE *file = (FILE *)(uintptr_t)writer;
-    if (fwrite(part->bytes, 1, (size_t)part->byte_length, file) != (size_t)part->byte_length)
+/* io.writeTextParts copies its pieces into one buffer and writes it in large
+ * blocks. A stdio call per piece costs several times more than the copy, and
+ * the compiler writes its output as about 800,000 pieces. */
+typedef struct {
+    FILE *file;
+    size_t used;
+    unsigned char buffer[MINYAR_WRITE_PARTS_BUFFER];
+} MinyarTextWriter;
+
+static void text_writer_put(FILE *file, const unsigned char *bytes, size_t length) {
+    if (length && fwrite(bytes, 1, length, file) != length)
         minyar_stop("a requested text file could not be written.");
 }
-void minyar_runtime_closeTextWriter(long long writer) {
-    finish_text_file((FILE *)(uintptr_t)writer, 1);
+
+long long minyar_runtime_openTextWriter(const MinyarText *path) {
+    FILE *file = create_text_file(path);
+    MinyarTextWriter *writer = malloc(sizeof(*writer));
+    if (!writer)
+        out_of_memory();
+    writer->file = file;
+    writer->used = 0;
+    return (long long)(uintptr_t)writer;
+}
+void minyar_runtime_writeTextPart(long long handle, const MinyarText *part) {
+    MinyarTextWriter *writer = (MinyarTextWriter *)(uintptr_t)handle;
+    size_t length = (size_t)part->byte_length;
+    if (length > sizeof(writer->buffer) - writer->used) {
+        text_writer_put(writer->file, writer->buffer, writer->used);
+        writer->used = 0;
+        if (length > sizeof(writer->buffer)) {
+            text_writer_put(writer->file, part->bytes, length);
+            return;
+        }
+    }
+    copy_bytes(writer->buffer + writer->used, part->bytes, length);
+    writer->used += length;
+}
+void minyar_runtime_closeTextWriter(long long handle) {
+    MinyarTextWriter *writer = (MinyarTextWriter *)(uintptr_t)handle;
+    FILE *file = writer->file;
+    text_writer_put(file, writer->buffer, writer->used);
+    free(writer);
+    finish_text_file(file, 1);
 }
 MinyarBytes *minyar_runtime_readBytesFile(const MinyarText *path) { return minyar_read_bytes_file(path); }
 void minyar_runtime_writeBytesFile(const MinyarText *path, const MinyarBytes *bytes) { minyar_write_bytes_file(path, bytes); }
