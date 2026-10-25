@@ -525,8 +525,9 @@ libraries. Invalid input is rejected at the conversion boundary.
 `text.byteLength` counts encoded bytes, including embedded zero bytes.
 Keep arbitrary file contents in Bytes. Import `text` and call
 `text.decode(bytes): Result<Text, errors.Error>` for recoverable decoding;
-invalid UTF-8 produces `errors.invalidDataCode()`. Character-offset caches
-remain lazy.
+invalid UTF-8 produces `errors.invalidDataCode()`. Validation skips ASCII a
+word at a time; an all-ASCII file or native Text gets its character length at
+once and never needs an offset cache. Other character-offset caches remain lazy.
 
 Import `unicode` when a character should mean a whole visible cluster:
 

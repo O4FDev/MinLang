@@ -28,7 +28,9 @@ static MinyarText *load(const char *path) {
      * actual owning runtime Text after UTF-8 validation. */
     MinyarText path_text = {(const unsigned char *)path, (long long)strlen(path), -1, NULL, NULL};
     MinyarText *text = minyar_read_text_file(&path_text);
-    assert(text->character_length == -1 && text->character_offsets == NULL);
+    /* Validation records an all-ASCII file's length; other lengths stay lazy. */
+    assert((text->character_length == -1 || text->character_length == text->byte_length) &&
+           text->character_offsets == NULL);
     return text;
 }
 

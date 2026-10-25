@@ -117,8 +117,8 @@ MinyarText *minyar_read_text_file(const MinyarText *path_text) {
     free(path);
 #endif
     bytes[length] = 0;
-    validate_text_bytes(bytes, length);
-    return new_text(bytes, length, -1);
+    _Bool ascii = validate_text_bytes(bytes, length);
+    return new_text(bytes, length, ascii ? length : -1);
 }
 
 static FILE *create_text_file(const MinyarText *path_text) {

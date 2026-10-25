@@ -503,24 +503,24 @@ MINYAR_HOT unsigned char *new_bytes(long long length) {
 #endif
 #include "minyar_sort.h"
 
-static void validate_text_bytes(const unsigned char *bytes, long long length);
+static _Bool validate_text_bytes(const unsigned char *bytes, long long length);
 
 static MinyarText *copy_c_text(const char *source) {
     size_t length = strlen(source);
-    validate_text_bytes((const unsigned char *)source, (long long)length);
+    _Bool ascii = validate_text_bytes((const unsigned char *)source, (long long)length);
     unsigned char *bytes = new_bytes((long long)length);
     memcpy(bytes, source, length + 1);
-    return new_text(bytes, (long long)length, -1);
+    return new_text(bytes, (long long)length, ascii ? (long long)length : -1);
 }
 
 MinyarText *minyar_native_copy_text(const unsigned char *source, long long length) {
     if (length < 0 || (!source && length != 0))
         minyar_stop("a native Text buffer is invalid.");
-    validate_text_bytes(source, length);
+    _Bool ascii = validate_text_bytes(source, length);
     unsigned char *bytes = new_bytes(length);
     if (length) memcpy(bytes, source, (size_t)length);
     bytes[length] = 0;
-    return new_text(bytes, length, -1);
+    return new_text(bytes, length, ascii ? length : -1);
 }
 
 void minyar_print_text(const MinyarText *text) {
@@ -782,18 +782,30 @@ static unsigned int decode_character(const unsigned char *bytes, long long remai
     return 0;
 }
 
-/* Validate at foreign-byte boundaries. Character-offset caches remain lazy. */
-static void validate_text_bytes(const unsigned char *bytes, long long length) {
+/* Validate at foreign-byte boundaries, skipping ASCII a word at a time. ASCII
+ * Text needs no character-offset cache, so callers can record its character
+ * length at once; other caches remain lazy. Returns whether every byte was ASCII. */
+static _Bool validate_text_bytes(const unsigned char *bytes, long long length) {
     long long position = 0;
+    _Bool ascii = 1;
     while (position < length) {
+        while (length - position >= (long long)sizeof(uint64_t)) {
+            uint64_t word;
+            memcpy(&word, bytes + position, sizeof(word));
+            if (word & UINT64_C(0x8080808080808080)) break;
+            position += (long long)sizeof(word);
+        }
+        if (position >= length) break;
         if (bytes[position] < 0x80) {
             position++;
         } else {
             long long width;
             decode_character(bytes + position, length - position, &width);
             position += width;
+            ascii = 0;
         }
     }
+    return ascii;
 }
 
 enum { TEXT_INDEX_STRIDE = 64 };
