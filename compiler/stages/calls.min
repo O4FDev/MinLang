@@ -225,6 +225,71 @@ function emitMinimumOrMaximum(output: List<Text>, textState: List<Text>, state: 
     return emitInstruction(output, textState, state, "select i1 " + chooseLeft + ", i64 " + values[0] + ", i64 " + values[1])
 }
 
+// One interpolation is one runtime call over its parts. Integer, Boolean and
+// Character parts are formatted straight into the exactly sized result, so
+// they need no temporary Text or parts List. A Text part is borrowed; it gets
+// a count only if a later part runs user code that could replace its holder.
+function compileInterpolation(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let tokenKinds = context.tokenKinds
+    let tokenTexts = context.tokenTexts
+    let tokenLines = context.tokenLines
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "[")
+    let arguments: List<Text> = []
+    let pieces: List<Integer> = []
+    let values: List<Text> = []
+    let calls: List<Integer> = []
+    while !tokenIs(tokenKinds, tokenTexts, state, "]") {
+        let partType: List<Integer> = [2]
+        let callLocation = state[0]
+        let converted = tokenKinds[callLocation] == 1 && isInterpolationConversion(tokenTexts[callLocation])
+        if converted {
+            state[0] = state[0] + 1
+            expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
+            if tokenIs(tokenKinds, tokenTexts, state, ")") {
+                let span = sourceSpan(tokenLines, tokenLines.inputPath, callLocation + 2, callLocation + 3)
+                failDiagnostic(span, "text interpolation is missing a value", "", "put a value between \\( and ), such as \\(name)")
+            }
+            setType(partType, 0)
+        }
+        let value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, partType)
+        let type = partType[0]
+        if converted {
+            if !((type >= 1 && type <= 4) || type == 7) || !tokenIs(tokenKinds, tokenTexts, state, ")") {
+                failAtToken(tokenLines, callLocation + 2, "text interpolation needs Integer, Float, Boolean, Character, or Text; convert this value to Text explicitly")
+            }
+            state[0] = state[0] + 1
+        } else {
+            requireType(tokenLines, state, type, 2, "an interpolated Text part must be Text")
+        }
+        if type == 2 {
+            pieces.add(output.length)
+            output.add("")
+            values.add(value)
+            calls.add(context.callTargets.length)
+        }
+        arguments.add(Text(type))
+        arguments.add(valueAsListSlot(output, textState, state, value, type))
+        if tokenIs(tokenKinds, tokenTexts, state, ",") { state[0] = state[0] + 1 }
+    }
+    state[0] = state[0] + 1
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    let index = 0
+    while index < pieces.length {
+        settleBorrow(context, output, state, pieces[index], values[index], 2, calls[index])
+        index = index + 1
+    }
+    let value = valueName(textState, newTemporary(state))
+    output.add("  " + value + " = call ptr (i64, ...) @minyar_interpolate(i64 " + Text(arguments.length / 2))
+    index = 0
+    while index < arguments.length {
+        output.add(", i64 " + arguments[index])
+        index = index + 1
+    }
+    output.add(")\n")
+    setType(resultType, 2)
+    return value
+}
+
 function parseCall(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let syntaxCall = context.syntax.active
     let tokenKinds = context.tokenKinds
@@ -282,7 +347,7 @@ function parseCall(context: CompilerContext, localNames: List<Text>, localTypes:
     state[0] = state[0] + 1
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "(")
     if isContractCheck(name) { return parseContractCheck(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, name, callLocation) }
-    if isInterpolationJoin(name) { name = "joinText" }
+    if isInterpolationJoin(name) { return compileInterpolation(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType) }
     if (state[15] / 4 % 2) != 0 && isThreadType(simpleTypeCode(name)) { failCompiler("opaque thread types cannot be constructed") }
     let threadTarget = ""
     let threadChannelType = 10

@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #ifndef __wasi__
@@ -1231,6 +1232,62 @@ void minyar_initialize_arguments(int count, char **values) {
 
 #include "minyar_maps.h"
 #include "minyar_numbers.h"
+
+static long long interpolation_part(long long kind, long long slot, unsigned char *out, _Bool *ascii) {
+    char buffer[48];
+    const unsigned char *bytes = (const unsigned char *)buffer;
+    long long length;
+    if (kind == 1) {
+        char *start = write_integer_digits(slot, buffer + sizeof(buffer));
+        bytes = (const unsigned char *)start;
+        length = buffer + sizeof(buffer) - start;
+    } else if (kind == 2) {
+        const MinyarText *text = (const MinyarText *)(intptr_t)slot;
+        bytes = text->bytes;
+        length = text->byte_length;
+        if (text->character_length != length) *ascii = 0;
+    } else if (kind == 3) {
+        length = encode_character((int)slot, (unsigned char *)buffer);
+        if (length > 1) *ascii = 0;
+    } else if (kind == 4) {
+        bytes = (const unsigned char *)(slot ? "true" : "false");
+        length = slot ? 4 : 5;
+    } else {
+        double value;
+        memcpy(&value, &slot, sizeof(value));
+        length = (long long)format_float(value, buffer, sizeof(buffer));
+    }
+    if (out) copy_bytes(out, bytes, (size_t)length);
+    return length;
+}
+
+/* One Text interpolation over `count` (kind, slot) pairs, using the compiler's
+ * type codes: 1 Integer, 2 Text, 3 Character, 4 Boolean, 7 Float. Scalars are
+ * formatted straight into one exactly sized buffer, so they need no temporary
+ * Text or parts List. Text parts are borrowed for the call. */
+MinyarText *minyar_interpolate(long long count, ...) {
+    va_list arguments;
+    long long length = 0, offset = 0;
+    _Bool ascii = 1;
+    va_start(arguments, count);
+    for (long long index = 0; index < count; index++) {
+        long long kind = va_arg(arguments, long long);
+        long long part = interpolation_part(kind, va_arg(arguments, long long), NULL, &ascii);
+        if (part > LLONG_MAX - length)
+            join_too_large();
+        length += part;
+    }
+    va_end(arguments);
+    unsigned char *bytes = new_bytes(length);
+    va_start(arguments, count);
+    for (long long index = 0; index < count; index++) {
+        long long kind = va_arg(arguments, long long);
+        offset += interpolation_part(kind, va_arg(arguments, long long), bytes + offset, &ascii);
+    }
+    va_end(arguments);
+    bytes[length] = 0;
+    return new_text(bytes, length, ascii ? length : -1);
+}
 
 #include "minyar_bytes.h"
 #include "minyar_dma.h"

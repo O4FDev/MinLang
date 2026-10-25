@@ -598,10 +598,12 @@ run once, from left to right. For records, Lists and Bytes, choose a Text
 representation explicitly before inserting it. `\\(` writes a literal `\(`.
 Other text escapes keep their usual meaning.
 
-One interpolation uses one `joinText` over its literal and converted parts,
-with one exactly sized output byte buffer. The parts List, the Text header,
-and conversions of scalar values have their own allocations; this does not
-promise one allocation for the entire expression.
+One interpolation is one runtime call over its literal and value parts, with
+one exactly sized output byte buffer and one Text header. Integer, Boolean and
+Character values are written straight into that buffer; a Float is formatted
+twice on the stack, once to measure it. There is no parts List and no
+temporary Text per scalar. Text parts are borrowed; one read from a field or
+element is counted only when a later part calls code that could replace it.
 
 Multi-line Text uses three quotes. Its opening delimiter is followed by a
 newline, and its closing delimiter sits on its own line:
@@ -663,7 +665,7 @@ separates elements, and a trailing comma is allowed.
 
 In a Result-returning function, a temporary owner protects a List's partially
 built contents when `try` returns an error. Successful construction adds one
-retain/release pair, including for an interpolation's parts List.
+retain/release pair.
 
 A List is a reference value: aliases observe the same additions and indexed
 replacements, including those performed by functions. Mutations that could
