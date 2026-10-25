@@ -4,9 +4,9 @@
 // counter in `<manifest>.epoch` after it publishes an update; wrappers compare
 // that mapped counter with the last one seen, so an ordinary call costs a few
 // loads and no system call, and the first call after a publication loads it.
-// Hot mode rejects managed threads. Parallel loop workers may call wrappers
-// concurrently: slots and the seen epoch are read atomically and every
-// update happens under live_lock.
+// Managed threads and parallel loop workers may call wrappers concurrently:
+// slots and the seen epoch are read atomically and every update happens under
+// live_lock.
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
 #endif

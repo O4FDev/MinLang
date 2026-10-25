@@ -418,6 +418,75 @@ def check_parallel_patch(launcher):
     print("parallel patch: a parallel loop's function is replaced while its workers run, four times")
 
 
+THREAD_PROGRAM = """use "system" as system
+use "process" as process
+
+function weight(seed: Integer): Integer { return seed * 1 }
+thread function worker(seed: Integer, input: FrozenBytes, channel: BytesChannel): Integer { return weight(seed) }
+record Store { count: Integer }
+global STORE: Store = Store { count: 0 }
+function round(): Integer {
+    let channel = bytesChannel(0, 1)
+    let handle = startThread(worker, 21, freezeBytes(Bytes()), channel)
+    let result = joinThread(handle)
+    closeBytesChannel(channel)
+    STORE.count += 1
+    return result
+}
+function main() {
+    nativeThreadSetup()
+    let i = 0
+    while i < 400 {
+        print("ROUND " + Text(STORE.count) + " " + Text(round()))
+        process.sleepNanoseconds(50000000)
+        i += 1
+    }
+}
+"""
+
+
+def check_thread_patch(launcher, release):
+    """A function that managed threads call is replaced; the main thread's state continues."""
+    with tempfile.TemporaryDirectory(prefix="minyar-live-thread-") as temporary:
+        project = Path(temporary) / "probe"
+        (project / "src").mkdir(parents=True)
+        (project / "Minyar.toml").write_text('[package]\nname = "threadprobe"\nversion = "0.1.0"\nkind = "bin"\n')
+        main = project / "src/main.min"
+        main.write_text(THREAD_PROGRAM)
+        profile = ["--release"] if release else []
+        built = subprocess.run([str(launcher), "build", "--hot", "--manifest-path", str(project), *profile],
+                               capture_output=True, timeout=600 * SCALE)
+        assert built.returncode == 0, built
+        program = subprocess.Popen([str(project / "target" / ("release" if release else "debug") / "threadprobe")],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        try:
+            rounds = []
+
+            def until(value):
+                deadline = time.monotonic() + 60 * SCALE
+                while time.monotonic() < deadline:
+                    words = program.stdout.readline().split()
+                    rounds.append((int(words[1]), int(words[2])))
+                    if rounds[-1][1] == value:
+                        return
+                raise AssertionError(rounds[-5:])
+            until(21)
+            main.write_text(main.read_text().replace("return seed * 1", "return seed * 2"))
+            patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project), *profile],
+                                     capture_output=True, timeout=600 * SCALE)
+            assert patched.returncode == 0, patched
+            until(42)
+            until(42)
+        finally:
+            program.kill()
+            program.wait()
+        counts = [count for count, _ in rounds]
+        assert counts == list(range(counts[0], counts[0] + len(counts))), counts
+        results = [value for _, value in rounds]
+        assert results == sorted(results) and set(results) <= {21, 42}, results
+    print("thread patch (" + ("release" if release else "debug") + "): a function managed threads call is replaced")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("launcher", type=Path)
@@ -431,6 +500,7 @@ def main():
         check_idle_patches(args.launcher.resolve(), "eager")
         check_foreign_patch(args.launcher.resolve())
         check_parallel_patch(args.launcher.resolve())
+        check_thread_patch(args.launcher.resolve(), args.profile == "release")
         check(args.launcher.resolve(), args.profile == "release", True)
         check(args.launcher.resolve(), args.profile == "release", True, True)
 
