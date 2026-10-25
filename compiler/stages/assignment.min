@@ -252,10 +252,10 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
         return
     }
     let done = false
-    let deferredPiece = -1
-    let deferredValue = ""
-    let deferredType = 0
-    let deferredCalls = 0
+    let deferredPieces: List<Integer> = []
+    let deferredValues: List<Text> = []
+    let deferredTypes: List<Integer> = []
+    let deferredCalls: List<Integer> = []
     while !done {
         if tokenTexts[state[0]] == "." {
             let member = tokenTexts[state[0] + 1]
@@ -301,7 +301,7 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                     let rightType: List<Integer> = [2]
                     let right = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightType)
                     if rightType[0] == 2 {
-                        if deferredPiece >= 0 { settleBorrow(context, output, state, deferredPiece, deferredValue, deferredType, deferredCalls) }
+                        settleBorrows(context, output, state, deferredPieces, deferredValues, deferredTypes, deferredCalls)
                         output.add("  call void @minyar_record_append_text(ptr ")
                         output.add(receiver)
                         output.add(", i64 ")
@@ -363,11 +363,7 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                 if possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) || !(tokenTexts[state[0]] == "[" && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
                     borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                 } else {
-                    deferredPiece = output.length
-                    output.add("")
-                    deferredValue = receiver
-                    deferredType = receiverType
-                    deferredCalls = context.callTargets.length
+                    deferBorrow(context, output, receiver, receiverType, deferredPieces, deferredValues, deferredTypes, deferredCalls)
                 }
             }
         } else {
@@ -462,15 +458,40 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                 if receiverType == 8 {
                     failAtToken(tokenLines, bracketLocation, "a byte has no fields or positions to assign")
                 }
-                if isMapType(receiverType) { receiver = readMapElement(context, output, textState, state, receiver, position, elementType, mapKeyType(receiverType)) } else {
+                let fromMap = isMapType(receiverType)
+                if fromMap { receiver = readMapElement(context, output, textState, state, receiver, position, elementType, mapKeyType(receiverType)) } else {
                     receiver = readListElement(output, textState, state, receiver, position, elementType)
                 }
                 receiverType = elementType
-                borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                let next = tokenTexts[state[0]]
+                if fromMap || possibleCycleType(receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes) || !((next == "[" || next == ".") && statementWithoutCalls(tokenKinds, tokenTexts, state[0])) {
+                    borrowReference(output, state, receiver, receiverType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                } else {
+                    deferBorrow(context, output, receiver, receiverType, deferredPieces, deferredValues, deferredTypes, deferredCalls)
+                }
             }
         }
     }
-    if deferredPiece >= 0 { settleBorrow(context, output, state, deferredPiece, deferredValue, deferredType, deferredCalls) }
+    settleBorrows(context, output, state, deferredPieces, deferredValues, deferredTypes, deferredCalls)
+}
+
+// An element or field receiver that the rest of the statement cannot replace
+// without a call needs no count. Reserve a piece; settleBorrows fills it if
+// compiling the rest of the statement ran user code after all.
+function deferBorrow(context: CompilerContext, output: List<Text>, receiver: Text, type: Integer, pieces: List<Integer>, values: List<Text>, types: List<Integer>, calls: List<Integer>) {
+    pieces.add(output.length)
+    output.add("")
+    values.add(receiver)
+    types.add(type)
+    calls.add(context.callTargets.length)
+}
+
+function settleBorrows(context: CompilerContext, output: List<Text>, state: List<Integer>, pieces: List<Integer>, values: List<Text>, types: List<Integer>, calls: List<Integer>) {
+    let index = 0
+    while index < pieces.length {
+        settleBorrow(context, output, state, pieces[index], values[index], types[index], calls[index])
+        index = index + 1
+    }
 }
 
 function emitBytesRead(output: List<Text>, textState: List<Text>, state: List<Integer>, bytes: Text, position: Text): Text {

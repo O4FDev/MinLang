@@ -208,6 +208,10 @@ both endpoints of traced ownership operations use the physical payload type.
 - A chain of field reads borrows intermediate receivers without count changes.
   Indexed expressions and method arguments can run user code, so their
   receivers remain protected. This optimization does not assume pure functions.
+  A nested store such as `grid[i][j] = value` or `rows[i].total = value` leaves
+  its acyclic List-element and field receivers uncounted when the rest of the
+  statement has no call token; if compiling it still ran user code (a
+  capability operator or Map key callback), the receiver count is restored.
 - `minyar_rc_local` retains a new local value before releasing the previous
   value, making aliases and self-assignment safe. Synchronous calls borrow
   parameters protected by caller or ancestor owners; incoming parameter ownership
