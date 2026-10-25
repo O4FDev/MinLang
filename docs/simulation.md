@@ -146,9 +146,9 @@ prefix of the WAL, and checks the recovered rows against the acknowledged
 history. `minyar sim --manifest-path tests/neodb-sim durable --seeds 5000 --jobs 4`
 passed 5,000 universes in 243 ms on a 4-vCPU Linux box; the planted `early-ack`
 scenario, which acknowledges before durability, fails most seeds with an exact
-replay. `two-crashes` adds work and a second power loss after recovery. These
-universes keep prefixes of the WAL only, so they do not cover scattered sector
-tearing.
+replay. `two-crashes` adds random checkpoints and a second power loss after
+recovery, and tears every file in 512-byte sectors with `persistSectors`;
+100,000 such universes passed in 11 s on 4 processes.
 
 ## A disk with explicit durability
 
@@ -172,9 +172,12 @@ By default unsynced writes are lost. To model a torn write, call
 `persistPrefix(world, file, count)` before crashing: exactly that volatile prefix
 overlays the durable contents, extending their length when needed. The existing
 durable suffix remains. Sweep every prefix of a new WAL record, and include
-zero and full length. This is a deliberately bounded model of persistence; it
-does not enumerate arbitrary sector reorderings, filesystem journals or hardware
-that lies about completed syncs.
+zero and full length. `persistSectors(world, file, sectorBytes)` models a
+power loss that persists unsynced sectors independently: the durable length
+becomes its old value or the current one, and each sector whose volatile bytes
+differ is kept or lost by its own World decision, so a seed replays the same
+tearing. These are deliberately bounded models of persistence; they do not
+model filesystem journals or hardware that lies about completed syncs.
 
 `injectError(world, kind, negativeCode)` fails the next matching `READ`, `WRITE`,
 `SYNC` or `PACKET` operation without its ordinary side effect. Different kinds

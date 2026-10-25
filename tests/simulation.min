@@ -5,7 +5,7 @@ use "io" as io
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
 let levels = ["-O0", "-O2"]
-let cases = ["seed", "replay", "ordering", "causality", "durability", "namespace", "torn-write", "faults", "packets", "clock-cancel", "invalid", "gallery", "determinism"]
+let cases = ["seed", "replay", "ordering", "causality", "durability", "namespace", "torn-write", "faults", "packets", "clock-cancel", "invalid", "gallery", "determinism", "sectors"]
 fixtures.validate("simulation", cases)
 // Each source joins a shared header and must fail at compile time.
 function rejectNondeterministic(frontend: fixtures.Frontend, source: Text, diagnostic: Text) {
@@ -414,6 +414,42 @@ if fixtures.selected("simulation", "invalid") {
 
 if fixtures.selected("simulation", "gallery") {
     fixtures.executes(frontend, io.readTextFile("examples/gallery/the-harbour-remembers.min"), "There is a light on the shore.\nThe unfinished bell is quiet.\n", levels, 0, "", true)
+}
+
+if fixtures.selected("simulation", "sectors") {
+    fixtures.executes(frontend, prelude + #"""
+        // Each dirty sector survives or not on its own; the length is old or new.
+        function run(seed: Integer): Text {
+            let world = sim.create(seed)
+            let file = sim.openFile(world, "/log", true)
+            sim.syncDirectory(world, "/")
+            let old = Bytes(1024)
+            for index in 0..old.length { old[index] = 97 }
+            sim.write(world, file, 0, old)
+            sim.syncFile(world, file)
+            let fresh = Bytes(2048)
+            for index in 0..fresh.length { fresh[index] = 98 }
+            sim.write(world, file, 0, fresh)
+            sim.persistSectors(world, file, 512)
+            sim.crash(world)
+            let kept = sim.read(world, sim.openFile(world, "/log", false), 0, 4096)
+            check(kept.length == 1024 || kept.length == 2048, "length is old or new")
+            let shape = ""
+            for sector in 0..kept.length / 512 {
+                let first = kept[sector * 512]
+                for index in sector * 512..sector * 512 + 512 { check(kept[index] == first, "sectors are whole") }
+                if first == 98 { shape += "n" } else { check(first == 97 || sector >= 2, "unwritten bytes stay old"); shape += "o" }
+            }
+            return shape
+        }
+        let shapes: Set<Text> = Set()
+        for seed in 1..200 { shapes.add(run(seed)) }
+        check(shapes.contains("oo") && shapes.contains("nn") && shapes.contains("nnnn") && shapes.contains("onon"), "independent sectors and lengths")
+        check(run(7) == run(7), "a seed reproduces the same sectors")
+        check(sim.transcript(sim.create(1)).length == 0, "fresh transcript")
+        print("sectors: passed")
+
+        """#, "sectors: passed\n", levels, 0, "", true)
 }
 
 if fixtures.selected("simulation", "determinism") {

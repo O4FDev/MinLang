@@ -164,6 +164,7 @@ constant EVENT_PARTITION = 16
 constant EVENT_SUBMIT = 17
 constant EVENT_CANCEL = 18
 constant EVENT_COMPLETE = 19
+constant EVENT_SECTORS = 20
 function note(world: World, kind: Integer, a: Integer, b: Integer, c: Integer) {
     world.events.add(kind)
     world.events.add(a)
@@ -194,6 +195,7 @@ function eventLine(world: World, at: Integer): Text {
     if kind == EVENT_REMOVE { return "remove " + world.texts[a] }
     if kind == EVENT_DIRECTORY { return "directory " + world.texts[a] }
     if kind == EVENT_PERSIST { return "persist " + Text(a) + " " + Text(b) }
+    if kind == EVENT_SECTORS { return "sectors " + Text(a) + " " + Text(b) + " " + Text(c) }
     if kind == EVENT_CRASH { return "crash" }
     if kind == EVENT_PARTITION { return "partition " + Text(a) + " " + Text(b == 1) }
     if kind == EVENT_SUBMIT { return "submit " + Text(a) + " " + Text(b) + " " + Text(c) }
@@ -366,6 +368,32 @@ public function persistPrefix(world: World, file: Integer, length: Integer) {
     if length > contents.durable.length { contents.durable.resize(length) }
     for index in 0..length { contents.durable[index] = contents.data[index] }
     note(world, EVENT_PERSIST, file, length, 0)
+}
+// Model a power loss that persists unsynced sectors independently: the
+// durable length becomes either its old value or the current length, and each
+// sector whose volatile bytes differ from the durable ones is kept or lost by
+// its own decision. Bytes past the current length, inside a longer durable
+// length, keep their old durable contents. Call it before crash().
+public function persistSectors(world: World, file: Integer, sectorBytes: Integer) {
+    if !validFile(world, file) { fail("simulation: torn-write fault needs an open file") }
+    if sectorBytes < 1 { fail("simulation: a sector needs at least one byte") }
+    let contents = world.files[file - 1]
+    let length = contents.durable.length
+    if contents.data.length != length && choose(world, 2) == 1 { length = contents.data.length }
+    let durable = Bytes(length)
+    for index in 0..min(length, contents.durable.length) { durable[index] = contents.durable[index] }
+    let start = 0
+    while start < min(length, contents.data.length) {
+        let end = min(start + sectorBytes, min(length, contents.data.length))
+        let dirty = false
+        for index in start..end { if index >= contents.durable.length || contents.data[index] != contents.durable[index] { dirty = true } }
+        if dirty && choose(world, 2) == 1 {
+            for index in start..end { durable[index] = contents.data[index] }
+        }
+        start = end
+    }
+    contents.durable = durable
+    note(world, EVENT_SECTORS, file, sectorBytes, length)
 }
 public function crash(world: World) {
     for item in world.files { item.data = item.durable.slice(0, item.durable.length) }

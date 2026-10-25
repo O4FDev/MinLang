@@ -100,9 +100,26 @@ record Round { problem: Text; acknowledged: Rows; inFlight: Text }
 // Statements, one in flight, and a crash, on top of `rows`, the state the
 // engine holds now. Afterwards `rows` includes the in-flight statement and the
 // result's `acknowledged` does not.
-function round(world: simulation.World, e: engine.Engine, rows: Rows, earlyAck: Boolean): Round {
+// A checkpoint publishes a snapshot and lets the WAL restart in a new segment.
+function checkpoint(e: engine.Engine, session: engine.Session, world: simulation.World): Text {
+    let requested = engine.simpleQuery(e, session, "CHECKPOINT")
+    if requested.length != 1 || requested[0].status == engine.STATUS_ERROR { return "CHECKPOINT was refused" }
+    let attempts = 0
+    while engine.backgroundPending(e) {
+        attempts += 1
+        if attempts > 128 || !drive(e, world) { return "checkpoint never finished" }
+    }
+    simulation.reached(world, "checkpoint completed")
+    return ""
+}
+
+function round(world: simulation.World, e: engine.Engine, rows: Rows, earlyAck: Boolean, sectors: Boolean, checkpoints: Boolean): Round {
     let session = engine.newSession(e, "sim", "sim")
     for serial in 0..1 + simulation.choose(world, 12) {
+        if checkpoints && simulation.choose(world, 8) == 0 {
+            let problem = checkpoint(e, session, world)
+            if problem != "" { return Round { problem: problem; acknowledged: rows; inFlight: "" } }
+        }
         let text = statement(world, rows, serial)
         let problem = execute(e, session, world, text, !earlyAck)
         if problem != "" { return Round { problem: problem; acknowledged: rows; inFlight: "" } }
@@ -116,12 +133,17 @@ function round(world: simulation.World, e: engine.Engine, rows: Rows, earlyAck: 
     for step in 0..simulation.choose(world, simulation.pendingCount(world) + 1) {
         if simulation.pendingCount(world) > 0 { dbio.completeNext() }
     }
-    let file = simulation.openFile(world, wal.segmentPath("/db", 0), false)
-    if file > 0 {
-        let size = simulation.size(world, file)
-        let kept = simulation.choose(world, size + 1)
-        if kept < size { simulation.reached(world, "crash cut the WAL tail") }
-        simulation.persistPrefix(world, file, kept)
+    // The power loss reaches every file: WAL segments, snapshots and manifests.
+    for name in simulation.names(world, "/db") {
+        let file = simulation.openFile(world, "/db/" + name, false)
+        if file > 0 && sectors {
+            simulation.persistSectors(world, file, 512)
+        } else if file > 0 {
+            let size = simulation.size(world, file)
+            let kept = simulation.choose(world, size + 1)
+            if kept < size { simulation.reached(world, "crash cut a file's tail") }
+            simulation.persistPrefix(world, file, kept)
+        }
     }
     dbio.crash()
     return Round { problem: ""; acknowledged: acknowledged; inFlight: inFlight }
@@ -138,8 +160,11 @@ function compare(recovered: engine.Engine, before: Rows, after: Rows, inFlight: 
 }
 
 // `earlyAck` is the planted mistake: statements count as acknowledged before
-// their commit is durable. Each universe survives `crashes` power losses.
-public deterministic function run(world: simulation.World, earlyAck: Boolean, crashes: Integer): Text {
+// their commit is durable. Each universe survives `crashes` power losses,
+// which keep either a WAL prefix or, with `sectors`, any subset of its
+// unsynced 512-byte sectors and either file length.
+public deterministic function run(world: simulation.World, earlyAck: Boolean, crashes: Integer, sectors: Boolean): Text {
+    let checkpoints = crashes > 1
     dbio.bind(world)
     let e = open()
     let session = engine.newSession(e, "sim", "sim")
@@ -148,7 +173,7 @@ public deterministic function run(world: simulation.World, earlyAck: Boolean, cr
     if problem != "" { return problem }
     let rows = Rows { ids: [0]; values: [0] }
     for crash in 0..crashes {
-        let result = round(world, e, rows, earlyAck)
+        let result = round(world, e, rows, earlyAck, sectors, checkpoints)
         if result.problem != "" { return result.problem }
         e = open()
         let outcome = compare(e, result.acknowledged, rows, result.inFlight)
