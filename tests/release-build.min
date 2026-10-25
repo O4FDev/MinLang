@@ -51,6 +51,15 @@ if chosen("test_release_and_custom_flags") {
         "for argument in \"$@\"; do\n    case \"$argument\" in\n        */runtime.ll) cp \"$argument\" \"$MINYAR_RELEASE_RUNTIME_CAPTURE\" ;;\n    esac\ndone\n" +
         "exec " + support.shellQuote(clang) + " \"$@\"\n")
     test.require(test.run(["chmod", "755", shim], system.environment(), "", work + "/shim-mode", 10), "release argument shim mode")
+    // The capture shim is a new Clang identity, so the launcher rebuilds its toolchain with it. A private copy of
+    // the tree (with the shared ThinLTO cache) keeps the shared compiler and its toolchain stamp untouched.
+    let launcherRoot = work + "/launcher-project"
+    test.require(test.run(["mkdir", "-p", "--", launcherRoot + "/build"], system.environment(), "", work + "/launcher-mkdir", 10), "create release launcher project")
+    for name in ["compiler", "bootstrap", "runtime", "vendor", "tools", "scripts", "build-support", "library", "Makefile", "minyar"] {
+        test.require(test.run(["cp", "-RLp", root + "/" + name, launcherRoot + "/" + name], system.environment(), "", work + "/launcher-copy", 120), "copy release launcher tree " + name)
+    }
+    let cache = "if [ -d \"$1/build/thinlto-cache\" ]; then cp -Rp \"$1/build/thinlto-cache\" \"$2/build/\"; fi"
+    test.require(test.run(["/bin/sh", "-c", cache, "minyar", root, launcherRoot], system.environment(), "", work + "/launcher-cache", 120), "copy release launcher LTO cache")
     let base = ["LIMITED=", "SANITIZER_LIMITED=", "MINYAR_CLANG=" + shim, "MINYAR_RELEASE_ARGUMENT_LOG=" + log]
     let expectations = ["-O2", "-O2", "-O1"]
     for index in 0..3 {
@@ -62,10 +71,13 @@ if chosen("test_release_and_custom_flags") {
         if lto { flags.add("--release") }
         if index == 2 { overrides.add("MINYAR_CLANG_FLAGS=-O1 -Wno-override-module") }
         let environment = release(overrides)
-        let command = [root + "/minyar"]
+        let command = [launcherRoot + "/minyar"]
         for flag in flags { command.add(flag) }
         for item in [source, "-o", output] { command.add(item) }
-        let built = test.run(command, environment, work, work + "/build" + Text(index), 120)
+        // The first build bootstraps the private toolchain.
+        let limit = 120
+        if index == 0 { limit = 900 }
+        let built = test.run(command, environment, work, work + "/build" + Text(index), limit)
         test.check(built.status == 0, "release build failed\n" + built.errorOutput)
         let arguments = test.lines(io.readTextFile(log))
         test.check(support.has(arguments, expectations[index]), "release build optimization " + expectations[index])
@@ -78,7 +90,7 @@ if chosen("test_release_and_custom_flags") {
         for argument in arguments { if runtimePath == "" && basename(argument) == runtimeName { runtimePath = argument } }
         test.check(runtimePath != "", "release build runtime argument " + runtimeName)
         test.check(support.starts(basename(parent(runtimePath)), "invocation."), "release runtime is invocation-local")
-        test.check(parent(parent(runtimePath)) == root + "/build/programs", "release runtime lives in project programs")
+        test.check(parent(parent(runtimePath)) == launcherRoot + "/build/programs", "release runtime lives in project programs")
         if lto {
             test.check(support.exists(capturedRuntime), "release runtime LLVM was not captured before launcher cleanup")
             let runtime = io.readTextFile(capturedRuntime)
