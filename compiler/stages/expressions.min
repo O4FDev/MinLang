@@ -243,6 +243,18 @@ function readMapElement(context: CompilerContext, output: List<Text>, textState:
     return slotAsValue(output, textState, state, raw, type)
 }
 
+// A borrowed value that becomes a whole local binding, assignment, return
+// value or List append argument, or the receiver of a Text or List join, hands
+// its protecting count to that consumer, which needs a count anyway.
+function transfersBorrow(tokenKinds: List<Integer>, tokenTexts: List<Text>, atom: Integer, end: Integer, type: Integer): Boolean {
+    if tokenKinds[end] == 4 && tokenTexts[end] == "+" && (type == 2 || isListType(type)) { return true }
+    if tokenTexts[end] == "." && tokenTexts[end + 1] == "appended" && tokenTexts[end + 2] == "(" { return true }
+    if atom == 0 { return false }
+    if atom >= 3 && tokenTexts[atom - 1] == "(" && tokenTexts[atom - 2] == "add" && tokenTexts[atom - 3] == "." && tokenTexts[end] == ")" { return true }
+    let whole = tokenKinds[end] == 0 || tokenKinds[end] == 6 || (tokenKinds[end] == 4 && tokenTexts[end] == "}")
+    return whole && (tokenTexts[atom - 1] == "=" || tokenTexts[atom - 1] == "return")
+}
+
 function parsePrimary(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
@@ -657,10 +669,14 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                 deferredType = resultType[0]
                 deferredCalls = context.callTargets.length
             } else if !fieldRead && !syntaxIndexHasNoCalls(context.syntax, state[0]) {
-                let borrowOwner = output.length
-                borrowReference(output, state, value, resultType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)
-                if !recoveryEnabled(state) && borrowOwner < output.length && output[borrowOwner] == "  call void @minyar_rc_borrow(ptr " {
-                    markOwner(resultType, borrowOwner)
+                if context.valueBorrows.enabled && context.valueBorrows.depth > 0 && !recoveryEnabled(state) && state[15] / 4 % 2 == 0 && isReferenceType(resultType[0]) && !possibleCycleType(resultType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes) && !transfersBorrow(tokenKinds, tokenTexts, atom, state[0], resultType[0]) {
+                    reserveValueBorrow(context, output, value, resultType[0])
+                } else {
+                    let borrowOwner = output.length
+                    borrowReference(output, state, value, resultType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                    if !recoveryEnabled(state) && borrowOwner < output.length && output[borrowOwner] == "  call void @minyar_rc_borrow(ptr " {
+                        markOwner(resultType, borrowOwner)
+                    }
                 }
             }
         }

@@ -216,6 +216,14 @@ both endpoints of traced ownership operations use the physical payload type.
   count on their Map receiver or key: a Map operation runs user code only
   through key hash or equality methods, which are recorded as calls. A key or
   value expression with a call token, or such a method, restores the counts.
+  An element, field or Map value read inside a statement and used only within
+  it (such as `Integer(fields[2])` or `a.name < b.name`) reserves its count;
+  at the end of the statement the count is taken only if code after the read
+  made a user call or called a runtime operation that can release a holder
+  (List slot, record field or Map value stores). If and while conditions
+  settle on their own; pattern conditions, and statements containing nested
+  statements, always take the count. `--scope-owners` keeps the borrows: its lowering derives
+  scope cells from them.
 - `minyar_rc_local` retains a new local value before releasing the previous
   value, making aliases and self-assignment safe. Synchronous calls borrow
   parameters protected by caller or ancestor owners; incoming parameter ownership

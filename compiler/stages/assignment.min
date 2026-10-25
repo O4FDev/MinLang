@@ -106,6 +106,44 @@ function loopBodyCallee(callee: Text, containers: Boolean): Boolean {
     return callee.startsWith("@minyar_record_set(") || callee.startsWith("@minyar_record_set_take(") || callee.startsWith("@minyar_record_set_reference(") || callee.startsWith("@minyar_record_replace(") || callee.startsWith("@minyar_record_append_text(") || callee.startsWith("@minyar_map_set(") || callee.startsWith("@minyar_map_remove(")
 }
 
+// An element, field or Map value read inside a statement stays alive while
+// its holder keeps it. Its count is reserved here and taken at the end of the
+// statement only if code after the read could release a holder: a user call,
+// or a runtime operation outside the strict loopBodyCallee set.
+function reserveValueBorrow(context: CompilerContext, output: List<Text>, value: Text, type: Integer) {
+    let borrows = context.valueBorrows
+    if borrows.count == borrows.pieces.length {
+        borrows.pieces.add(0)
+        borrows.values.add("")
+        borrows.types.add(0)
+        borrows.calls.add(0)
+    }
+    borrows.pieces[borrows.count] = output.length
+    borrows.values[borrows.count] = value
+    borrows.types[borrows.count] = type
+    borrows.calls[borrows.count] = context.callTargets.length
+    borrows.count = borrows.count + 1
+    output.add("")
+}
+
+// A pattern condition may bind a value that the body keeps using, so its
+// reserved borrows are always taken.
+function settleValueBorrows(context: CompilerContext, output: List<Text>, state: List<Integer>, mark: Integer, always: Boolean) {
+    let borrows = context.valueBorrows
+    let index = borrows.count - 1
+    while index >= mark {
+        let piece = borrows.pieces[index]
+        if always || context.callTargets.length != borrows.calls[index] || !loopBodyCallsAllowed(output, piece, true) {
+            state[6] = 1
+            state[7] = state[7] + 1
+            noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, piece, borrows.types[index], 0)
+            output[piece] = "  call void @minyar_rc_borrow(ptr " + borrows.values[index] + ")\n"
+        }
+        index = index - 1
+    }
+    borrows.count = mark
+}
+
 // Whether every call in the compiled body is a loopBodyCallee.
 function loopBodyCallsAllowed(output: List<Text>, start: Integer, containers: Boolean): Boolean {
     let pieces: List<Text> = []
