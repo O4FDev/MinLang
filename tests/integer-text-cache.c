@@ -55,7 +55,8 @@ int main(void) {
         }
         assert(rc_bytes == expected_bytes);
 #ifdef MINYAR_BOUNDED_HEAP
-        assert(minyar_pool_used == (size_t)EXPECTED_CACHE_LIMIT * 96);
+        /* Header and short bytes share one 64-byte block. */
+        assert(minyar_pool_used == (size_t)EXPECTED_CACHE_LIMIT * 64);
 #endif
     }
     printf("cache limit %d: values, aliases and retained storage passed\n", EXPECTED_CACHE_LIMIT);

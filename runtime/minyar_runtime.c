@@ -496,6 +496,32 @@ MINYAR_HOT unsigned char *new_bytes(long long length) {
     return data_allocate((size_t)length + 1, 1);
 }
 
+#ifndef MINYAR_COMPILER_ARENA
+/* Most Text values are short: keep their bytes in the header's allocation,
+ * so creating and destroying one costs one allocator call instead of two. */
+#define MINYAR_INLINE_TEXT_BYTES 256
+#endif
+
+/* A new Text with room for length bytes plus a terminator. The caller fills
+ * text->bytes, including the terminator, before anything can read it. */
+MINYAR_HOT MinyarText *new_text_storage(long long length, long long character_length) {
+#ifndef MINYAR_COMPILER_ARENA
+    /* Inline bytes keep eight-byte alignment only on LP64 header layouts. */
+    if (sizeof(MinyarText) % 8 == 0 && (unsigned long long)length < MINYAR_INLINE_TEXT_BYTES) {
+        MinyarText *text = object_allocate(sizeof(*text) + sizeof(RcData) + (size_t)length + 1, 1);
+        RcData *data = (RcData *)(text + 1);
+        data->size = ((uint64_t)length + 1) | RC_INLINE_TEXT;
+        text->bytes = (unsigned char *)(data + 1);
+        text->byte_length = length;
+        text->character_length = character_length;
+        text->character_offsets = NULL;
+        text->backing = NULL;
+        return text;
+    }
+#endif
+    return new_text(new_bytes(length), length, character_length);
+}
+
 #ifdef MINYAR_MAP_CYCLE_RUNTIME
 #include "minyar_cycle_collections.h"
 #else
@@ -508,19 +534,20 @@ static _Bool validate_text_bytes(const unsigned char *bytes, long long length);
 static MinyarText *copy_c_text(const char *source) {
     size_t length = strlen(source);
     _Bool ascii = validate_text_bytes((const unsigned char *)source, (long long)length);
-    unsigned char *bytes = new_bytes((long long)length);
-    memcpy(bytes, source, length + 1);
-    return new_text(bytes, (long long)length, ascii ? (long long)length : -1);
+    MinyarText *text = new_text_storage((long long)length, ascii ? (long long)length : -1);
+    memcpy((unsigned char *)text->bytes, source, length + 1);
+    return text;
 }
 
 MinyarText *minyar_native_copy_text(const unsigned char *source, long long length) {
     if (length < 0 || (!source && length != 0))
         minyar_stop("a native Text buffer is invalid.");
     _Bool ascii = validate_text_bytes(source, length);
-    unsigned char *bytes = new_bytes(length);
+    MinyarText *text = new_text_storage(length, ascii ? length : -1);
+    unsigned char *bytes = (unsigned char *)text->bytes;
     if (length) memcpy(bytes, source, (size_t)length);
     bytes[length] = 0;
-    return new_text(bytes, length, ascii ? length : -1);
+    return text;
 }
 
 void minyar_print_text(const MinyarText *text) {
@@ -620,11 +647,12 @@ static long long join_character_length(const MinyarText *left, const MinyarText 
 
 static MinyarText *join_by_copying(const MinyarText *left, const MinyarText *right) {
     long long length = left->byte_length + right->byte_length;
-    unsigned char *bytes = new_bytes(length);
+    MinyarText *text = new_text_storage(length, join_character_length(left, right, length));
+    unsigned char *bytes = (unsigned char *)text->bytes;
     copy_bytes(bytes, left->bytes, (size_t)left->byte_length);
     copy_bytes(bytes + left->byte_length, right->bytes, (size_t)right->byte_length);
     bytes[length] = 0;
-    return new_text(bytes, length, join_character_length(left, right, length));
+    return text;
 }
 
 MinyarText *minyar_join_text(const MinyarText *left, const MinyarText *right) {
@@ -654,13 +682,20 @@ static void append_in_place(MinyarText *left, const MinyarText *right) {
     if ((unsigned long long)length >= SIZE_MAX) join_too_large();
     RcData *data = (RcData *)left->bytes - 1;
     size_t required = (size_t)length + 1;
-    size_t capacity = data->size;
+    size_t capacity = data->size & ~RC_INLINE_TEXT;
     unsigned char *bytes = (unsigned char *)left->bytes;
     if (required > capacity) {
         size_t grown = capacity > SIZE_MAX / 2 ? SIZE_MAX : capacity * 2;
         if (grown < required)
             grown = required;
-        bytes = rc_reallocate_data(bytes, grown);
+        if (rc_text_is_inline(left)) {
+            /* Inline bytes cannot grow; move them to their own buffer. The
+             * unused inline region is released with the header. */
+            RC_ACCOUNT(rc_bytes -= sizeof(RcData) + capacity);
+            bytes = rc_allocate_data(grown);
+            copy_bytes(bytes, left->bytes, (size_t)left_length);
+        } else
+            bytes = rc_reallocate_data(bytes, grown);
     }
     const unsigned char *right_bytes = right == left ? bytes : right->bytes;
     copy_bytes(bytes + left_length, right_bytes, (size_t)right_length);
@@ -733,14 +768,15 @@ MinyarText *minyar_join_texts(const MinyarList *parts) {
         if (part->character_length != part->byte_length)
             certified_ascii = 0;
     }
-    bytes = new_bytes(length);
+    MinyarText *text = new_text_storage(length, certified_ascii ? length : -1);
+    bytes = (unsigned char *)text->bytes;
     for (index = 0; index < parts->length; index++) {
         const MinyarText *part = (const MinyarText *)(intptr_t)parts->values[index];
         copy_bytes(bytes + offset, part->bytes, (size_t)part->byte_length);
         offset += part->byte_length;
     }
     bytes[length] = 0;
-    return new_text(bytes, length, certified_ascii ? length : -1);
+    return text;
 }
 
 static MINYAR_COLD MINYAR_NORETURN void invalid_utf8(void) {
@@ -1065,10 +1101,11 @@ static MinyarText *text_slice_bytes(MinyarText *text, long long first_byte, long
         }
         if (root->byte_length > 4096 &&
             (unsigned long long)length * 8 < (unsigned long long)root->byte_length) {
-            unsigned char *bytes = new_bytes(length);
+            MinyarText *copy = new_text_storage(length, length == characters ? characters : -1);
+            unsigned char *bytes = (unsigned char *)copy->bytes;
             memcpy(bytes, text->bytes + first_byte, (size_t)length);
             bytes[length] = 0;
-            return new_text(bytes, length, length == characters ? characters : -1);
+            return copy;
         }
         MinyarText *view =
             new_text(text->bytes + first_byte, length, length == characters ? characters : -1);
@@ -1116,10 +1153,11 @@ static MINYAR_COLD MinyarText *format_integer_text(long long integer) {
     char *cursor = write_integer_digits(integer, end);
     {
         long long length = end - cursor;
-        unsigned char *bytes = new_bytes(length);
+        MinyarText *text = new_text_storage(length, length);
+        unsigned char *bytes = (unsigned char *)text->bytes;
         memcpy(bytes, cursor, (size_t)length);
         bytes[length] = 0;
-        return new_text(bytes, length, length);
+        return text;
     }
 }
 
@@ -1207,11 +1245,12 @@ static long long encode_character(int character, unsigned char *bytes) {
 static MINYAR_COLD MinyarText *encode_character_text(int character) {
     unsigned char encoded[4];
     long long length = encode_character(character, encoded);
-    unsigned char *bytes = new_bytes(length);
+    /* A non-ASCII Text needs its offsets built before indexed access. */
+    MinyarText *text = new_text_storage(length, -1);
+    unsigned char *bytes = (unsigned char *)text->bytes;
     memcpy(bytes, encoded, (size_t)length);
     bytes[length] = 0;
-    /* A non-ASCII Text needs its offsets built before indexed access. */
-    return new_text(bytes, length, -1);
+    return text;
 }
 
 MinyarText *minyar_character_text(int character) {
@@ -1330,7 +1369,8 @@ MinyarText *minyar_interpolate(long long count, ...) {
         length += part;
     }
     va_end(arguments);
-    unsigned char *bytes = new_bytes(length);
+    MinyarText *text = new_text_storage(length, -1);
+    unsigned char *bytes = (unsigned char *)text->bytes;
     long long remembered = count < REMEMBERED ? count : REMEMBERED;
     for (long long index = 0; index < remembered; index++) {
         copy_bytes(bytes + offset, parts[index], (size_t)lengths[index]);
@@ -1351,7 +1391,8 @@ MinyarText *minyar_interpolate(long long count, ...) {
         va_end(arguments);
     }
     bytes[length] = 0;
-    return new_text(bytes, length, ascii ? length : -1);
+    text->character_length = ascii ? length : -1;
+    return text;
 }
 
 #include "minyar_bytes.h"

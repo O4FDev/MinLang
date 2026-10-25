@@ -80,7 +80,7 @@ static void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
     if (kind == RC_TEXT) {
         MinyarText *text = (MinyarText *)(object + 1);
         text_backing = text->backing;
-        if (!text_backing) rc_free_data((void *)text->bytes);
+        if (!text_backing) rc_free_text_bytes(text);
         rc_free_data(text->character_offsets);
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*text));
     } else if (kind == RC_LIST || kind == RC_REFERENCES || kind == RC_REFERENCES_IMMORTAL) {

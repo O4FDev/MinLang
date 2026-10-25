@@ -179,6 +179,26 @@ static void rc_free_data(void *pointer) {
     RC_DEALLOCATE(data);
 }
 
+/* Small Text payloads can share their header's allocation: RcObject,
+ * MinyarText, an RcData whose size carries RC_INLINE_TEXT, then the bytes.
+ * Comparing the address alone is not enough: an allocator without chunk
+ * headers can place a separate buffer exactly there. */
+#define RC_INLINE_TEXT ((uint64_t)1 << 63)
+static inline unsigned char *rc_text_inline_bytes(const MinyarText *text) {
+    return (unsigned char *)((RcData *)(text + 1) + 1);
+}
+static inline _Bool rc_text_is_inline(const MinyarText *text) {
+    return text->bytes == rc_text_inline_bytes(text) &&
+           (((const RcData *)text->bytes - 1)->size & RC_INLINE_TEXT);
+}
+static inline void rc_free_text_bytes(const MinyarText *text) {
+    if (rc_text_is_inline(text)) {
+        RC_ACCOUNT(rc_bytes -= sizeof(RcData) + (((const RcData *)text->bytes - 1)->size & ~RC_INLINE_TEXT));
+        return;
+    }
+    rc_free_data((void *)text->bytes);
+}
+
 static void *rc_reallocate_data(void *pointer, size_t size) {
     if (!pointer) return rc_allocate_data(size);
 #ifdef MINYAR_BOUNDED_RC
@@ -246,7 +266,7 @@ static void rc_drop(void *value) {
     if (kind == RC_TEXT) {
         MinyarText *text = (MinyarText *)(object + 1);
         text_backing = text->backing;
-        if (!text_backing) rc_free_data((void *)text->bytes);
+        if (!text_backing) rc_free_text_bytes(text);
         rc_free_data(text->character_offsets);
         RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*text));
     } else if (kind == RC_LIST) {

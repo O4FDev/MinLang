@@ -227,8 +227,8 @@ On the supported 64-bit layout, a full cache costs:
 
 | Entry limit | Fixed/lazy pool blocks | Static pointer table |
 | --- | ---: | ---: |
-| 32,768 (default) | 3 MiB | 256 KiB |
-| 256 | 24 KiB | 2 KiB |
+| 32,768 (default) | 2 MiB | 256 KiB |
+| 256 | 16 KiB | 2 KiB |
 
 With eager or system allocation, the default cache requests 1,758,362 heap
 bytes plus the table, excluding allocator overhead. These are capacity costs,
