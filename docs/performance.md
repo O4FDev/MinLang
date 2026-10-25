@@ -97,6 +97,32 @@ compiler roles receive the identical adapted source, library arguments, runtime,
 and optimization flags. The compatibility report records every renamed API;
 the measured result therefore compares the previous frontend after API adaptation.
 
+## Compiler memory
+
+The compiler links its runtime with `MINYAR_COMPILER_ARENA`: Text, record and
+small List storage come from bump arenas that are never freed. Anything the
+compiler builds and drops therefore stays in its peak, so its memory is the sum
+of what it ever allocated, not what is live. Two rules keep that bounded:
+
+- A List of 2,048 or more entries owns a malloc block that grows by `realloc`,
+  and `clear()` frees it. On glibc the mmap threshold is pinned so growth remaps
+  pages instead of copying them.
+- Token passes copy the whole token stream into a fresh stage. The owner of a
+  superseded stage releases it: `compileTokens` marks stages through
+  `SourceMap.stage` and calls `adoptTokenStage` after each pass, and a pass
+  that keeps a private full copy (a prelude or a declaration prefix) releases it
+  with `releaseTokens` before returning. A new pass must return a fresh
+  `newSourceMap()` stage and never share its input's Lists.
+
+Module builds create one compiler context per module, so per-module work must
+not grow with the whole program: share program-wide tables (IR names) and free
+module-sized ones once the module's code is joined.
+
+To measure, compare byte-identical output and record both peak RSS and the
+smallest `ulimit -v` that lets the self-compile finish (the test runner's cap is
+address space, not RSS). On 2026-10-25 a normal self-compile needed 144 MiB and
+a `--scope-owners` one 227 MiB, down from 700 and 810 MiB.
+
 ## Known release-build cost
 
 In the September 2026 release-build fixture, the larger incremental runtime IR
