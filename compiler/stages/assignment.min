@@ -28,7 +28,9 @@ function pureLoopCallee(callee: Text): Boolean {
 // Loop code that calls only those helpers cannot release, allocate or run
 // user code, so it creates no cleanup debt.
 function pureLoopCode(output: List<Text>, start: Integer, end: Integer): Boolean {
-    // One call can span several output pieces, so scan the joined code.
+    // One call can span several output pieces, so scan the joined code. Large
+    // bodies are not candidates, keeping deeply nested loops linear.
+    if end - start > 2000 { return false }
     let pieces: List<Text> = []
     let index = start
     while index < end {
@@ -67,14 +69,38 @@ function versionPureLoop(output: List<Text>, entryPiece: Integer, testPiece: Int
     output[stepPiece] = ""
 }
 
+// The same for a while loop, whose strips count iterations in a local at the
+// top of the body. After a service the condition is evaluated again (it is
+// pure), which counts one more pass, so the next strip ends two counts later.
+function versionPureWhile(output: List<Text>, entryPiece: Integer, branchPiece: Integer, stepPiece: Integer, conditionLabel: Integer, bodyLabel: Integer, endLabel: Integer, first: Integer, condition: Text) {
+    let loop = Text(conditionLabel)
+    let counter = "ptr %local." + Text(first)
+    let slot = "ptr %local." + Text(first + 1)
+    output[entryPiece] = "  %loop.idle." + loop + " = call i1 @minyar_rc_idle()\n"
+    output[entryPiece + 1] = "  %loop.strip." + loop + " = select i1 %loop.idle." + loop + ", i64 9223372036854775807, i64 -9223372036854775808\n  store i64 %loop.strip." + loop + ", " + slot + "\n  store i64 0, " + counter + "\n  br label %while.outer." + loop + "\n\nwhile.outer." + loop + ":\n"
+    output[branchPiece] = "  br i1 " + condition + ", label %while.strip." + loop + ", label %while.end." + Text(endLabel) + "\n\nwhile.strip." + loop + ":\n  %loop.count." + loop + " = load i64, " + counter + "\n  %loop.counted." + loop + " = add i64 %loop.count." + loop + ", 1\n  store i64 %loop.counted." + loop + ", " + counter + "\n  %loop.limit." + loop + " = load i64, " + slot + "\n  %loop.within." + loop + " = icmp slt i64 %loop.count." + loop + ", %loop.limit." + loop + "\n  br i1 %loop.within." + loop + ", label %while.body." + Text(bodyLabel) + ", label %while.service." + loop + "\n\nwhile.service." + loop + ":\n"
+    output[branchPiece + 1] = "  call void @minyar_rc_step()\n"
+    output[branchPiece + 2] = "  %loop.again." + loop + " = call i1 @minyar_rc_idle()\n"
+    output[branchPiece + 3] = "  %loop.following." + loop + " = add i64 %loop.count." + loop + ", 2\n  %loop.renewed." + loop + " = select i1 %loop.again." + loop + ", i64 9223372036854775807, i64 %loop.following." + loop + "\n  store i64 %loop.renewed." + loop + ", " + slot + "\n  br label %while.outer." + loop + "\n"
+    output[stepPiece] = ""
+}
+
 // A frame-free function has no cleanup to service: its pure loops always take
 // the call-free inner loop.
 function settleIdleQueries(output: List<Text>, start: Integer) {
     let query = "call i1 @minyar_rc_idle()\n"
+    let compare = " = icmp slt i64 %loop.count."
     let index = start
     while index < output.length {
         let text = output[index]
         if text.startsWith("  %loop.") && text.endsWith(query) { output[index] = text.slice(0, text.length - query.length) + "or i1 true, true\n" }
+        // A while strip compares a counter LLVM cannot bound; make it constant
+        // so the counter is dead.
+        let found = text.find(compare)
+        if found >= 0 {
+            let rest = text.slice(found, text.length)
+            output[index] = text.slice(0, found) + " = or i1 true, true" + rest.slice(rest.find("\n"), rest.length)
+        }
         index = index + 1
     }
 }
@@ -146,6 +172,7 @@ function settleValueBorrows(context: CompilerContext, output: List<Text>, state:
 
 // Whether every call in the compiled body is a loopBodyCallee.
 function loopBodyCallsAllowed(output: List<Text>, start: Integer, containers: Boolean): Boolean {
+    if output.length - start > 2000 { return false }
     let pieces: List<Text> = []
     let index = start
     while index < output.length {
