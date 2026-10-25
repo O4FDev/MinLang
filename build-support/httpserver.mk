@@ -17,6 +17,15 @@ ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s))
 check-sanitize: check-httpserver-sanitize
 endif
 
+.PHONY: check-httpserver-idle-memory
+# Server memory per idle keep-alive connection (Linux /proc; skips elsewhere).
+check-httpserver-idle-memory: build/minyarc build/minyar-default-runtime.o
+	MINYAR_CLANG="$(LLVM_CC)" python3 tests/httpserver-idle-memory.py "$(CURDIR)/minyar"
+
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+check check-portable: check-httpserver-idle-memory
+endif
+
 .PHONY: check-httpserver-front bench-httpserver
 build/tooling/tests/httpserver-front-test: TOOL_NATIVE = runtime/native/net.c tests/net-wire-native.c
 build/tooling/tests/httpserver-front-test: runtime/native/net.c tests/net-wire-native.c
