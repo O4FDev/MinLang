@@ -45,6 +45,14 @@ for example `make check-in-parallel CHECKS="check-portable check-suite-catalogue
 As in CI, harnesses do not add their own parallelism or pause for host load.
 Checks must not rebuild shared artefacts with a different toolchain: a launcher
 test that needs another Clang identity uses a private copy of the tree.
+`make check-in-parallel-tool` (in `check-portable`) runs the runner on a
+scratch Makefile: an aggregate of passing checks passes, its shared file
+prerequisite is built exactly once, and every check sees `MINYAR_TEST_JOBS=1`
+and `MINYAR_TEST_SHARED_HOST=1`. A failing check fails only the aggregates that
+contain it. A check that rewrites `build/.toolchain.json`, or whose log shows an
+in-tree `bootstrap/stage0.c -o build/stage0` rebuild with the stamp unchanged,
+fails the run with `Failed check: toolchain-stamp`. Only the latest run
+directory is kept.
 
 `make check-foundations-proofs` selects the Lean version pinned by
 `proofs/lean-toolchain`, builds the ownership and effect semantics, checks the
