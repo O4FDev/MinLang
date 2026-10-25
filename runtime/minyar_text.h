@@ -20,7 +20,15 @@ static long long *text_search_table(const MinyarText *needle, long long availabl
     if (length <= 1 || length > available) return NULL;
     if ((unsigned long long)length > SIZE_MAX / sizeof(long long))
         minyar_stop("the Text search pattern is too large.");
+#ifdef MINYAR_COMPILER_ARENA
+    /* The arena never frees, and the compiler searches Text constantly; the
+     * table lives only for one search, so it comes from malloc instead. */
+    long long *table = malloc((size_t)length * sizeof(*table));
+    if (!table)
+        out_of_memory();
+#else
     long long *table = data_allocate((size_t)length * sizeof(*table), sizeof(*table));
+#endif
     table[0] = 0;
     for (long long i = 1, matched = 0; i < length; i++) {
         while (matched && needle->bytes[i] != needle->bytes[matched]) matched = table[matched - 1];
@@ -33,7 +41,7 @@ static void text_search_free(long long *table) {
 #ifndef MINYAR_COMPILER_ARENA
     rc_free_data(table);
 #else
-    (void)table;
+    free(table);
 #endif
 }
 static long long text_search_next(const MinyarText *text, const MinyarText *needle,
