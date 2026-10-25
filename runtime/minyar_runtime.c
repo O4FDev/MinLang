@@ -1020,19 +1020,9 @@ static MINYAR_COLD MINYAR_NORETURN void slice_outside_text(void) {
     minyar_stop("a Text slice must stay within the Text and end after it starts.");
 }
 
-MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) {
-    long long first_byte;
-    long long last_byte;
-    ensure_text_index(text);
-    if (start < 0 || end < start || end > text->character_length)
-        slice_outside_text();
-    if (text->character_offsets) {
-        first_byte = indexed_byte_offset(text, start);
-        last_byte = indexed_byte_offset(text, end);
-    } else {
-        first_byte = start;
-        last_byte = end;
-    }
+/* A slice by byte range. `characters` is its scalar count, or -1 if unknown. */
+static MinyarText *text_slice_bytes(MinyarText *text, long long first_byte, long long last_byte,
+                                    long long characters) {
 #ifdef MINYAR_COMPILER_ARENA
     /* Text is immutable, so a slice can share its source's bytes. A slice of
        ASCII Text is ASCII, so its character count is already known. */
@@ -1045,6 +1035,7 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
         static MinyarText *slice_cache[SLICE_CACHE_SIZE];
         long long length = last_byte - first_byte;
         const unsigned char *bytes = text->bytes + first_byte;
+        long long known = text->character_offsets ? -1 : characters;
         if (length > 0 && length <= SLICE_CACHE_BYTES) {
             unsigned hash = (unsigned)length * 37u + (unsigned)bytes[0] * 101u +
                             (unsigned)bytes[length / 2] * 257u +
@@ -1054,16 +1045,15 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
             if (cached && cached->byte_length == length &&
                 !memcmp(cached->bytes, bytes, (size_t)length))
                 return cached;
-            cached = new_text(bytes, length, text->character_offsets ? -1 : end - start);
+            cached = new_text(bytes, length, known);
             slice_cache[slot] = cached;
             return cached;
         }
-        return new_text(bytes, length, text->character_offsets ? -1 : end - start);
+        return new_text(bytes, length, known);
     }
 #else
     {
         long long length = last_byte - first_byte;
-        long long characters = end - start;
         MinyarText *root = text->backing ? text->backing : text;
         /* A full slice is the same immutable value. For a tiny portion of a
          * large allocation, copy so a short-lived token cannot retain the
@@ -1086,6 +1076,22 @@ MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) 
         return view;
     }
 #endif
+}
+
+MinyarText *minyar_text_slice(MinyarText *text, long long start, long long end) {
+    long long first_byte;
+    long long last_byte;
+    ensure_text_index(text);
+    if (start < 0 || end < start || end > text->character_length)
+        slice_outside_text();
+    if (text->character_offsets) {
+        first_byte = indexed_byte_offset(text, start);
+        last_byte = indexed_byte_offset(text, end);
+    } else {
+        first_byte = start;
+        last_byte = end;
+    }
+    return text_slice_bytes(text, first_byte, last_byte, end - start);
 }
 
 #include "minyar_text.h"

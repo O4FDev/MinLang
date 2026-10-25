@@ -77,15 +77,19 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
             minyar_list_add_take(parts, (long long)(uintptr_t)minyar_text_slice(text, i, i + 1));
         return parts;
     }
+    /* Pieces are byte ranges between matches. Every piece of ASCII Text is
+     * ASCII; other pieces count their scalars once, as their slices record. */
     long long *table = text_search_table(separator, text->byte_length);
-    long long start_byte = 0, start_scalar = 0, match;
+    _Bool ascii = !text->character_offsets;
+    long long start_byte = 0, match;
     while ((match = text_search_next(text, separator, start_byte, table)) >= 0) {
-        long long end_scalar = start_scalar + text_scalar_count(text->bytes + start_byte, match - start_byte);
-        minyar_list_add_take(parts, (long long)(uintptr_t)minyar_text_slice(text, start_scalar, end_scalar));
+        long long characters = ascii ? match - start_byte : text_scalar_count(text->bytes + start_byte, match - start_byte);
+        minyar_list_add_take(parts, (long long)(uintptr_t)text_slice_bytes(text, start_byte, match, characters));
         start_byte = match + separator->byte_length;
-        start_scalar = end_scalar + separator->character_length;
     }
-    minyar_list_add_take(parts, (long long)(uintptr_t)minyar_text_slice(text, start_scalar, text->character_length));
+    long long rest = text->byte_length - start_byte;
+    long long characters = ascii ? rest : text_scalar_count(text->bytes + start_byte, rest);
+    minyar_list_add_take(parts, (long long)(uintptr_t)text_slice_bytes(text, start_byte, text->byte_length, characters));
     text_search_free(table);
     return parts;
 }
