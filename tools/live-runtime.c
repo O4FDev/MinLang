@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,9 @@ static struct stat live_failed;
 static int live_have_failed;
 static struct timespec live_retry_checked;
 static struct timespec live_checked;
+static unsigned live_generation;
+struct live_cached { const char *key; void *address; unsigned generation; };
+static struct live_cached live_cache[1024];
 
 static int live_compare(const void *left, const void *right) {
     return strcmp(((const struct live_entry *)left)->key,
@@ -52,18 +56,29 @@ static int live_same(const struct stat *a, const struct stat *b) {
         a->st_mtim.tv_nsec == b->st_mtim.tv_nsec;
 #endif
 }
-static void live_refresh(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now)) return;
-    long long elapsed = (long long)(now.tv_sec - live_checked.tv_sec) * 1000000000LL +
-        now.tv_nsec - live_checked.tv_nsec;
+// Every call reads this clock, so prefer the coarse variants: they read a
+// kernel-maintained value instead of the hardware clock source. Updates are
+// still noticed within 25 ms plus one clock tick.
+static int live_clock(struct timespec *now) {
+#if defined(CLOCK_MONOTONIC_COARSE)
+    return clock_gettime(CLOCK_MONOTONIC_COARSE, now);
+#elif defined(CLOCK_MONOTONIC_RAW_APPROX)
+    return clock_gettime(CLOCK_MONOTONIC_RAW_APPROX, now);
+#else
+    return clock_gettime(CLOCK_MONOTONIC, now);
+#endif
+}
+static long long live_elapsed(const struct timespec *now, const struct timespec *before) {
+    return (long long)(now->tv_sec - before->tv_sec) * 1000000000LL + now->tv_nsec - before->tv_nsec;
+}
+static void live_refresh(struct timespec now) {
+    long long elapsed = live_elapsed(&now, &live_checked);
     if (elapsed >= 0 && elapsed < 25000000) return;
     live_checked = now;
     struct stat info;
     if (stat(minyar_live_manifest, &info) ||
         (live_have_seen && live_same(&info, &live_seen))) return;
-    long long retry_elapsed = (long long)(now.tv_sec - live_retry_checked.tv_sec) * 1000000000LL +
-        now.tv_nsec - live_retry_checked.tv_nsec;
+    long long retry_elapsed = live_elapsed(&now, &live_retry_checked);
     if (live_have_failed && live_same(&info, &live_failed) &&
         retry_elapsed >= 0 && retry_elapsed < 1000000000LL) return;
     live_failed = info; live_have_failed = 1; live_retry_checked = now;
@@ -119,16 +134,27 @@ static void live_refresh(void) {
     image->handle = handle; image->previous = live_images; live_images = image;
     free(live_entries); free(live_storage);
     live_entries = entries; live_count = count; live_storage = storage;
+    ++live_generation;
     live_seen = info; live_have_seen = 1; live_have_failed = 0;
     fprintf(stderr, "Reloaded %zu functions; program state preserved\n", count);
 }
+// Every function call resolves its target here. Hot mode only accepts
+// single-threaded programs, so between update checks the published table
+// cannot change: lookups skip the lock and are cached by key address.
 void *minyar_live_resolve(const char *key, void *initial) {
-    pthread_mutex_lock(&live_lock);
-    live_refresh();
+    struct timespec now;
+    if (!live_clock(&now) && live_elapsed(&now, &live_checked) >= 25000000) {
+        pthread_mutex_lock(&live_lock);
+        live_refresh(now);
+        pthread_mutex_unlock(&live_lock);
+    }
+    if (!live_count) return initial;
+    struct live_cached *slot = &live_cache[((uint64_t)(uintptr_t)key * UINT64_C(0x9E3779B97F4A7C15)) >> 54];
+    if (slot->key == key && slot->generation == live_generation) return slot->address;
     struct live_entry needle = { key, NULL };
-    struct live_entry *found = live_count ?
-        bsearch(&needle, live_entries, live_count, sizeof *live_entries, live_compare) : NULL;
-    void *address = found ? found->address : initial;
-    pthread_mutex_unlock(&live_lock);
-    return address;
+    struct live_entry *found =
+        bsearch(&needle, live_entries, live_count, sizeof *live_entries, live_compare);
+    slot->key = key; slot->generation = live_generation;
+    slot->address = found ? found->address : initial;
+    return slot->address;
 }
