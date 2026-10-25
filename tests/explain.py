@@ -438,6 +438,16 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
             diagnostic(path, "E0202", expected_message=message, expected_help=repair,
                        expected_span=span, expected_source_lines=source.splitlines())
 
+    # Anonymous function headers point at the offending token, not the start of the program.
+    for name, source, message, span in (
+        ("callback-parameter", prefix + "let shine = function(3) { }\n", "expected a callback parameter name", (3, 22, 3, 23)),
+        ("callback-method-name", prefix + "record Sky { light: Integer }\nlet sky = Sky { light: 1 }\nsky.function(2)\n",
+         "expected a method name; 'function' always begins an anonymous function, so it cannot name a method or field", (5, 5, 5, 13)),
+    ):
+        path = root / f"{name}.min"
+        path.write_text(source, encoding="utf-8")
+        diagnostic(path, "E0202", expected_message=message, expected_span=span, expected_source_lines=source.splitlines())
+
     imported = root / "broken-module.min"
     importer = root / "delimiter-importer.min"
     importer.write_text('use "./broken-module.min" as broken\nprint(1)\n', encoding="utf-8")
