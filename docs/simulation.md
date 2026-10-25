@@ -86,6 +86,8 @@ whole path:
 
 ```text
 error: deterministic function 'simulate' can reach the host clock: simulate -> onCrash -> cover -> monotonicNanoseconds (native "system")
+  ...
+  = help: called from cover (raftkv.min:230, column 10); use the simulation World's virtual time (simulation.now or simulation.wallTime) and pass the World in
 ```
 
 The marked function must be a named, top-level, non-generic Minyar function. It

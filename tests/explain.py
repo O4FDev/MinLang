@@ -216,7 +216,8 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
     determinism_path = root / "deterministic-clock.min"
     determinism_path.write_text(determinism_source, encoding="utf-8")
     diagnostic(determinism_path, "E0901",
-               expected_help=("use the simulation World's virtual time (simulation.now or simulation.wallTime) "
+               expected_help=(f"called from universe ({determinism_path}:2, column 24); "
+                              "use the simulation World's virtual time (simulation.now or simulation.wallTime) "
                               "and pass the World in"),
                expected_message=("deterministic function 'universe' can reach the host clock: "
                                  "universe -> wallClockMicroseconds (native \"system\")"),
