@@ -36,24 +36,33 @@ function newGenericIndex(): GenericIndex {
 }
 
 function genericIndexGet(index: GenericIndex, key: Text): Integer {
-    let entry = findIndexedSymbol(index.slots, index.keys, index.kinds, key, 0)
+    return genericIndexGetKind(index, key, 0)
+}
+
+function genericIndexPut(index: GenericIndex, key: Text, value: Integer) {
+    genericIndexPutKind(index, key, 0, value)
+}
+
+// Kinds separate names in one index, so lookups need no "kind:name" key Text.
+function genericIndexGetKind(index: GenericIndex, key: Text, kind: Integer): Integer {
+    let entry = findIndexedSymbol(index.slots, index.keys, index.kinds, key, kind)
     if entry < 0 { return -1 }
     return index.values[entry]
 }
 
-function genericIndexPut(index: GenericIndex, key: Text, value: Integer) {
-    let entry = findIndexedSymbol(index.slots, index.keys, index.kinds, key, 0)
+function genericIndexPutKind(index: GenericIndex, key: Text, kind: Integer, value: Integer) {
+    let entry = findIndexedSymbol(index.slots, index.keys, index.kinds, key, kind)
     if entry >= 0 { index.values[entry] = value; return }
     entry = index.keys.length
     index.keys.add(key)
     index.values.add(value)
-    index.kinds.add(0)
+    index.kinds.add(kind)
     let capacity = index.slots.length - 1
     if index.keys.length * 2 > capacity {
         index.slots = buildDeclarationIndex(index.keys, index.kinds)
         return
     }
-    let bucket = declarationHash(key, 0) % capacity
+    let bucket = declarationHash(key, kind) % capacity
     while index.slots[1 + bucket] >= 0 { bucket = (bucket + 1) % capacity }
     index.slots[1 + bucket] = entry
     index.slots[0] = index.keys.length
@@ -100,7 +109,7 @@ function genericNamedType(program: GenericProgram, name: Text): Integer {
 }
 
 function genericDeclaration(program: GenericProgram, name: Text, kind: Integer): Integer {
-    return genericIndexGet(program.declarationIndex, Text(kind) + ":" + name)
+    return genericIndexGetKind(program.declarationIndex, name, kind)
 }
 
 function genericError(stream: GenericStream, position: Integer, message: Text) {
@@ -396,7 +405,7 @@ function genericResolveAliases(program: GenericProgram) {
                 let name = methodFunctionName(genericEmitType(program, source, signature.start, target, 0), member)
                 let previous = genericDeclaration(program, name, 1)
                 if previous >= 0 && previous != declaration { genericError(source, signature.start, "the same record method is declared more than once through type aliases") }
-                genericIndexPut(program.declarationIndex, "1:" + name, declaration)
+                genericIndexPutKind(program.declarationIndex, name, 1, declaration)
                 signature.name = name
                 source.texts[signature.start + 1] = name
             }
@@ -429,7 +438,7 @@ function genericResolveAliases(program: GenericProgram) {
             }
             let constraints: List<Text> = []
             let facade = GenericDeclaration { name: name; kind: 2; start: position; parametersStart: position; body: position; end: position; variables: variables; constraints: constraints; names: template.names; types: fields; result: genericNamedType(program, "Nothing") }
-            genericIndexPut(program.declarationIndex, "2:" + name, program.declarations.length)
+            genericIndexPutKind(program.declarationIndex, name, 2, program.declarations.length)
             program.declarations.add(facade)
         }
         alias = alias + 1
@@ -615,7 +624,7 @@ function genericScopeAdd(scope: GenericScope, name: Text, type: Integer) {
 function genericScopeType(program: GenericProgram, scope: GenericScope, name: Text): Integer {
     let index = scope.active
     while index > 0 { index = index - 1; if scope.names[index] == name { return scope.types[index] } }
-    let type = genericIndexGet(program.declarationIndex, "3:" + name) + 1
+    let type = genericIndexGetKind(program.declarationIndex, name, 3) + 1
     if type == 0 || program.aliases.keys.length == 0 { return type }
     let variables: List<Text> = []
     return genericCanonicalType(program, program.source, 0, type, variables, 0)
@@ -1375,9 +1384,8 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
             if resultPrefix(readableDeclarationName(declaration.name), "minyar_sequence_") { genericError(source, start + 1, "reserved sequence compiler name") }
             if declaration.kind == 1 && isBuiltinName(readableDeclarationName(declaration.name)) { genericError(source, start + 1, "function '" + readableDeclarationName(declaration.name) + "' uses a reserved built-in name; rename this function") }
             if declaration.name == "main" && declaration.variables.length > 0 { genericError(source, start + 1, "main cannot have type parameters") }
-            let key = Text(declaration.kind) + ":" + declaration.name
-            if genericIndexGet(program.declarationIndex, key) >= 0 || (declaration.kind == 2 && (genericIndexGet(program.aliases, declaration.name) >= 0 || (!builtinCapability(declaration.name) && genericIndexGet(program.capabilityIndex, declaration.name) >= 0))) { genericError(source, start + 1, "module declares '" + readableDeclarationName(declaration.name) + "' more than once") }
-            genericIndexPut(program.declarationIndex, key, declarations.length)
+            if genericDeclaration(program, declaration.name, declaration.kind) >= 0 || (declaration.kind == 2 && (genericIndexGet(program.aliases, declaration.name) >= 0 || (!builtinCapability(declaration.name) && genericIndexGet(program.capabilityIndex, declaration.name) >= 0))) { genericError(source, start + 1, "module declares '" + readableDeclarationName(declaration.name) + "' more than once") }
+            genericIndexPutKind(program.declarationIndex, declaration.name, declaration.kind, declarations.length)
             declarations.add(declaration)
         } else {
             if kinds[start] == 1 && (texts[start] == "constant" || texts[start] == "global") {
@@ -1394,7 +1402,7 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
                     // Private inference shape only; resolved reads still reject table aliases.
                     if texts[start] == "constant" && kinds[literal] == 4 && texts[literal] == "[" { type = genericType(program, "List", [genericNamedType(program, "Integer")]) }
                 }
-                genericIndexPut(program.declarationIndex, "3:" + texts[start + 1], type - 1)
+                genericIndexPutKind(program.declarationIndex, texts[start + 1], 3, type - 1)
             }
             skipTopLevelStatement(kinds, texts, cursor)
         }
