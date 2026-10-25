@@ -13,7 +13,7 @@ use "io" as io
 // saved decision list reproduces any reported run.
 
 record Batch { first: Integer; count: Integer; result: Text; script: Text; handle: Integer }
-record Summary { runs: Integer; failures: Integer; firstSeed: Integer; forks: Integer; moments: List<Text>; message: Text; script: Text }
+record Summary { runs: Integer; failures: Integer; firstSeed: Integer; forks: Integer; lastPrint: Integer; moments: List<Text>; message: Text; script: Text }
 
 function scenarios(root: Text, filter: Text): List<Text> {
     let result: List<Text> = []
@@ -163,6 +163,13 @@ function driverSource(name: Text): Text {
             return [shrunk.length, tries]
         }
 
+        // Decisions made and the outcome, as one number, to compare two runs of a seed.
+        function fingerprint(world: simulation.World, outcome: Text): Integer {
+            let hash = simulation.choices(world).length
+            for byte in Bytes(outcome) { hash = (hash * 31 + byte) % 2147483647 }
+            return hash
+        }
+
         let mode = process.argument(0)
         if mode == "shrink" {
             shrink(decisions(io.readTextFile(process.argument(1))), 2000)
@@ -182,6 +189,7 @@ function driverSource(name: Text): Text {
             let firstSeed = -1
             let forks = 0
             let message = ""
+            let lastPrint = 0
             for run in 0..count {
                 let seed = first + run
                 let world = simulation.create(seed)
@@ -190,6 +198,7 @@ function driverSource(name: Text): Text {
                     forks += 1
                 }
                 let outcome = attempt(world)
+                if run == count - 1 { lastPrint = fingerprint(world, outcome) }
                 runs += 1
                 remember(world, labels, corpus, explore)
                 if outcome != "" {
@@ -202,7 +211,7 @@ function driverSource(name: Text): Text {
                     if explore { break }
                 }
             }
-            let parts = [Text(runs) + " " + Text(failures) + " " + Text(firstSeed) + " " + Text(forks) + Text(Character(10))]
+            let parts = [Text(runs) + " " + Text(failures) + " " + Text(firstSeed) + " " + Text(forks) + " " + Text(lastPrint) + Text(Character(10))]
             for index in 0..labels.length {
                 if index > 0 { parts.add(Text(Character(9))) }
                 parts.add(labels[index])
@@ -235,7 +244,7 @@ function finish(batch: Batch): Summary {
     let second = rest.find("\n")
     if second < 0 { host.stop("unreadable simulation result: " + batch.result) }
     let fields = host.words(text.slice(0, first))
-    if fields.length != 4 { host.stop("unreadable simulation result: " + batch.result) }
+    if fields.length != 5 { host.stop("unreadable simulation result: " + batch.result) }
     let moments: List<Text> = []
     let labels = rest.slice(0, second)
     let start = 0
@@ -245,7 +254,7 @@ function finish(batch: Batch): Summary {
             start = index + 1
         }
     }
-    return Summary { runs: Integer(fields[0]); failures: Integer(fields[1]); firstSeed: Integer(fields[2]); forks: Integer(fields[3]); moments: moments; message: rest.slice(second + 1, rest.length); script: batch.script }
+    return Summary { runs: Integer(fields[0]); failures: Integer(fields[1]); firstSeed: Integer(fields[2]); forks: Integer(fields[3]); lastPrint: Integer(fields[4]); moments: moments; message: rest.slice(second + 1, rest.length); script: batch.script }
 }
 
 function replayOutcome(executable: Text, root: Text, script: Text, result: Text): Text {
@@ -342,9 +351,11 @@ public function run(graph: project.Graph, filters: List<Text>, first: Integer, s
                 next += count
             }
         }
-        let total = Summary { runs: 0; failures: 0; firstSeed: -1; forks: 0; moments: []; message: ""; script: "" }
+        let total = Summary { runs: 0; failures: 0; firstSeed: -1; forks: 0; lastPrint: 0; moments: []; message: ""; script: "" }
+        let firstPrint = 0
         for batch in batches {
             let summary = finish(batch)
+            if batch.first == first { firstPrint = summary.lastPrint }
             total.runs += summary.runs
             total.failures += summary.failures
             total.forks += summary.forks
@@ -357,6 +368,16 @@ public function run(graph: project.Graph, filters: List<Text>, first: Integer, s
         if explore { verb = "explored" }
         let detail = ""
         if explore { detail = ", " + Text(total.forks) + " forked from recorded moments" }
+        // The static proof does not cover state that universes share through
+        // module globals: the first batch's last seed must run the same alone.
+        if !explore && batches[0].count > 1 {
+            let lastSeed = first + batches[0].count - 1
+            let alone = finish(start(executable, root, "batch", lastSeed, 1, directory + "/" + stem + "-alone.result", directory + "/" + stem + "-alone.decisions"))
+            if alone.lastPrint != firstPrint {
+                passed = false
+                print("sim " + stem + ": seed " + Text(lastSeed) + " ran differently alone than after " + Text(batches[0].count - 1) + " earlier universes in one process; the universes share state through a module global, so reset it in universe or pass it in")
+            }
+        }
         if total.failures == 0 {
             print("sim " + stem + ": " + verb + " " + Text(total.runs) + " universes, no failures (" + range + detail + ")")
         } else {

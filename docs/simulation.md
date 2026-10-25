@@ -134,7 +134,10 @@ and keeps any simpler list that still fails. It saves the shrunk run's World
 `transcript`, one line per choice, operation, completion and crash. kvlog's planted failure shrank
 from 9 to 3 decisions; a neo-db early acknowledgement from 23 to 10; a Raft
 double-leader run from 2,540 to 1,117. `minyar sim NAME --seed SEED` reruns a seed and
-`minyar sim NAME --replay FILE` reruns saved decisions.
+`minyar sim NAME --replay FILE` reruns saved decisions. Because the proof does not cover
+List, record or Map globals that universes change, `minyar sim` also reruns
+the last seed of its first process alone and reports the scenario if that run
+differs from the same seed after the earlier universes.
 
 `reached(world, label)` marks a moment worth exploring from, such as a rare
 state; `moments(world)` lists the labels a run reached, with the number of
