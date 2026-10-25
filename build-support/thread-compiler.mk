@@ -68,6 +68,9 @@ check-thread-language-sanitize: build/minyarc-threads build/minyar-default-runti
 check-thread-language-tsan: build/minyarc-threads build/minyar-default-runtime.o build/tooling/tests/thread-language
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-language --sanitizer thread
 
+# Link evidence retains Clang itself (282 MB for an LLVM release build); permit files up to 512 MiB, as the other
+# evidence checks do, or the link dies with SIGXFSZ (status 153) under the default 128 MiB file limit.
+check-thread-tsan-control: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-thread-tsan-control: build/minyarc-threads build/minyar-default-runtime.o build/tooling/tests/thread-tsan-control build/tooling/tools/clang-driver
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-tsan-control
 
