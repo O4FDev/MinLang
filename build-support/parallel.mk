@@ -32,14 +32,14 @@ check-parallel-signatures: $(addprefix build/,$(PARALLEL_SIGNATURE_FRONTENDS)) b
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile callbacks --ir build/closure-compiler-stage3.ll
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile errors --ir build/errors-compiler-stage3.ll
-	@set -e; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-native-XXXXXX"); \
+	@set -e; rm -rf -- build/parallel-signatures-native-*; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-native-XXXXXX"); \
 	for frontend in $(PARALLEL_SIGNATURE_FRONTENDS); do \
 	    MINYAR_TEST_COMPILER="./build/$$frontend" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/$$frontend" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/parallel-signatures; \
 	done
 
 # The driver emits LLVM but never links its synthetic native-package controls.
 check-parallel-signatures-sanitize: $(addprefix build/,$(PARALLEL_SIGNATURE_SANITIZER_FRONTENDS)) build/minyar-runtime.o $(PARALLEL_SIGNATURE_INPUTS) | build
-	@set -e; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-sanitize-XXXXXX"); \
+	@set -e; rm -rf -- build/parallel-signatures-sanitize-*; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-sanitize-XXXXXX"); \
 	for frontend in $(PARALLEL_SIGNATURE_SANITIZER_FRONTENDS); do \
 	    $(NATIVE_SANITIZER_ENV) MINYAR_TEST_COMPILER="./build/$$frontend" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/$$frontend" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/parallel-signatures; \
 	done

@@ -742,10 +742,10 @@ build/tooling/tests/quic-wire-test.ll: tests/cpython-random.min
 # ACK scheduling gates retain both native and sanitizer optimizations.
 .PHONY: check-quic-ack check-quic-ack-sanitize
 check-quic-ack: build/minyarc tests/quic-ack.min build/tooling/tests/quic-ack-test | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-ack-native.*; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --artifacts "$$artifacts"
 
 check-quic-ack-sanitize: build/minyarc tests/quic-ack.min build/tooling/tests/quic-ack-test | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-sanitize.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --sanitize --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-ack-sanitize.*; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-sanitize.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --sanitize --artifacts "$$artifacts"
 
 check check-portable check-quic: check-quic-ack
 check-sanitize check-quic-sanitize: check-quic-ack-sanitize
@@ -753,11 +753,11 @@ check-sanitize check-quic-sanitize: check-quic-ack-sanitize
 # Handshake PTO virtual-clock modes use fresh absolute evidence directories.
 .PHONY: check-quic-pto check-quic-pto-sanitize
 check-quic-pto: build/minyarc tests/quic-pto.min build/tooling/tests/quic-pto-test | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O0.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 0 --artifacts "$$artifacts"
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O2.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 2 --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-pto-native-O0.*; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O0.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 0 --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-pto-native-O2.*; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O2.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 2 --artifacts "$$artifacts"
 
 check-quic-pto-sanitize: build/minyarc tests/quic-pto.min build/tooling/tests/quic-pto-test | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-sanitize-O1.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-pto-test --optimization 1 --sanitize --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-pto-sanitize-O1.*; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-sanitize-O1.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-pto-test --optimization 1 --sanitize --artifacts "$$artifacts"
 
 check check-portable check-quic: check-quic-pto
 check-sanitize check-quic-sanitize: check-quic-pto-sanitize
@@ -977,15 +977,15 @@ build/tooling/tests/generated-llvm-sanitizer-test: TOOL_LIBS = $(TOOL_CRYPTO)
 # Evidence retains Clang itself; permit files up to 512 MiB for this check.
 check-generated-llvm-sanitizer: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-generated-llvm-sanitizer: build/minyarc $(GENERATED_SANITIZER_INPUTS) | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); PATH="$(GENERATED_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/generated-llvm-sanitizer-test --artifacts "$$artifacts/run"
+	@set -e; rm -rf -- build/generated-llvm-sanitizer-*; artifacts=$$(mktemp -d "$(abspath build)/generated-llvm-sanitizer-XXXXXXXX"); PATH="$(GENERATED_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call GENERATED_SANITIZER_QUOTE,$(GENERATED_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/generated-llvm-sanitizer-test --artifacts "$$artifacts/run"
 check check-portable check-sanitize: check-generated-llvm-sanitizer
 
 # Actual UDP blackholes before/mid-session, then independent TCP mTLS/yamux.
 .PHONY: check-transport-udp-fallback check-transport-udp-fallback-sanitize
 check-transport-udp-fallback: build/minyarc build/yamux-peer build/tooling/tests/transport-udp-fallback-test | build
-	@set -e; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-native.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-udp-fallback-test --go-binary build/yamux-peer --evidence "$$evidence"
+	@set -e; rm -rf -- build/transport-udp-fallback-native.*; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-native.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-udp-fallback-test --go-binary build/yamux-peer --evidence "$$evidence"
 check-transport-udp-fallback-sanitize: build/minyarc build/yamux-peer build/tooling/tests/transport-udp-fallback-test | build
-	@set -e; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-udp-fallback-test --go-binary build/yamux-peer --sanitize --evidence "$$evidence"
+	@set -e; rm -rf -- build/transport-udp-fallback-sanitize.*; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-udp-fallback-test --go-binary build/yamux-peer --sanitize --evidence "$$evidence"
 check: check-transport-udp-fallback
 check-sanitize: check-transport-udp-fallback-sanitize
 

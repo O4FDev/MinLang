@@ -91,20 +91,20 @@ check-sanitize: check-peer-edge-cids-sanitize
 # Signed relay and independently malformed/abrupt gateway lifetime checks are Linux labs.
 .PHONY: check-peer-edge-relay check-peer-edge-relay-sanitize check-peer-edge-relay-lifetime check-peer-edge-relay-lifetime-sanitize
 check-peer-edge-relay: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-relay-test | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-native.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-relay-test --evidence "$$artifacts"
+	@set -e; rm -rf -- build/peer-edge-relay-native.*; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-native.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-relay-test --evidence "$$artifacts"
 
 check-peer-edge-relay-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-relay-test | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-relay-test --sanitize --evidence "$$artifacts"
+	@set -e; rm -rf -- build/peer-edge-relay-sanitize.*; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-relay-test --sanitize --evidence "$$artifacts"
 
 check-peer-edge-relay-lifetime: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-relay-lifetime-test | build
 	@set -e; cache=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
-	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-malformed.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode malformed --evidence "$$artifacts"; \
-	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-abrupt.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode abrupt --evidence "$$artifacts"
+	rm -rf -- build/peer-edge-relay-lifetime-native-malformed.*; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-malformed.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode malformed --evidence "$$artifacts"; \
+	rm -rf -- build/peer-edge-relay-lifetime-native-abrupt.*; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-native-abrupt.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode abrupt --evidence "$$artifacts"
 
 check-peer-edge-relay-lifetime-sanitize: build/minyarc build/peergrpc-peer build/tooling/tests/peer-edge-relay-lifetime-test | build
 	@set -e; cache=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
-	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-malformed.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode malformed --sanitize --evidence "$$artifacts"; \
-	artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-abrupt.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode abrupt --sanitize --evidence "$$artifacts"
+	rm -rf -- build/peer-edge-relay-lifetime-sanitize-malformed.*; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-malformed.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode malformed --sanitize --evidence "$$artifacts"; \
+	rm -rf -- build/peer-edge-relay-lifetime-sanitize-abrupt.*; artifacts=$$(mktemp -d "$(abspath build)/peer-edge-relay-lifetime-sanitize-abrupt.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/peer-edge-relay-lifetime-test --mode abrupt --sanitize --evidence "$$artifacts"
 
 check: check-peer-edge-relay check-peer-edge-relay-lifetime
 check-sanitize: check-peer-edge-relay-sanitize check-peer-edge-relay-lifetime-sanitize

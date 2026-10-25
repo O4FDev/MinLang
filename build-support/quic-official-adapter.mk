@@ -36,7 +36,7 @@ check-quic-qns-endpoint-lifecycle: build/tooling/tests/quic-qns-endpoint-lifecyc
 
 check-quic-official-adapter: check-quic-simulator-shutdown check-quic-qns-endpoint-lifecycle
 check-quic-official-adapter: $(QUIC_OFFICIAL_INPUTS) $(QUIC_OFFICIAL_TOOLS) $(QUIC_OFFICIAL_RUNNER_BOOTSTRAP) | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-official-adapter.XXXXXXXX"); \
+	@set -e; rm -rf -- build/quic-official-adapter.*; artifacts=$$(mktemp -d "$(abspath build)/quic-official-adapter.XXXXXXXX"); \
 	$(LIMITED) ./build/tooling/tests/quic-official-inputs; \
 	$(LIMITED) ./build/tooling/scripts/check-quic-official-inputs controls --repository "$(QUIC_OFFICIAL_RUNNER)" --controls "$(abspath build/tooling/tests/quic-official-adapter)" --adapter "$(abspath build/tooling/tests/interop/qns/owned-adapter)" --report "$$artifacts/inputs.json" --artifacts "$$artifacts/run"
 

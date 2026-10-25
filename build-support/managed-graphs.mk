@@ -152,10 +152,10 @@ build/tooling/tests/cycle-private-retirement: tests/evidence-support-native.c ru
 # Evidence retains Clang itself; permit files up to 512 MiB for these checks.
 check-cycle-private-retirement check-cycle-private-retirement-sanitize: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-cycle-private-retirement: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
-	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-XXXXXX"); \
+	@set -e; rm -rf -- build/cycle-private-retirement-native-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-XXXXXX"); \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-private-retirement --evidence "$$evidence/run"
 check-cycle-private-retirement-sanitize: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
-	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-sanitize-XXXXXX"); \
+	@set -e; rm -rf -- build/cycle-private-retirement-sanitize-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-sanitize-XXXXXX"); \
 	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-private-retirement --sanitize --evidence "$$evidence/run"
 check: check-cycle-private-retirement check-cycle-private-retirement-sanitize
 check-portable: check-cycle-private-retirement check-cycle-private-retirement-sanitize
@@ -174,7 +174,7 @@ $(IDLE_OBSERVABILITY_TOOLS): TOOL_LIBS = $(TOOL_CRYPTO)
 $(IDLE_OBSERVABILITY_TOOLS): build/testing/cycle-runtime.o tests/cycle-progress-observability-native.c tests/evidence-support-native.c runtime/native/sha256.c
 check-cycle-progress-observability: build/tooling/tests/cycle-progress-observability build/tooling/tests/cycle-progress-observability-harness tests/cycle-progress.c tests/fixtures/cycle-progress-before-observability.c.txt | build
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-progress-observability-harness
-	@set -e; evidence=$$(mktemp -d "$(abspath build)/cycle-progress-observability.XXXXXXXX"); \
+	@set -e; rm -rf -- build/cycle-progress-observability.*; evidence=$$(mktemp -d "$(abspath build)/cycle-progress-observability.XXXXXXXX"); \
 	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/cycle-progress-observability --evidence "$$evidence/run"
 check check-cycle-progress check-cycle-progress-sanitize check-managed-graphs-profiles check-portable check-sanitize: check-cycle-progress-observability
 

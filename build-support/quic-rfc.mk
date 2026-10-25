@@ -18,17 +18,17 @@ $(QUIC_PROTOCOL_DRIVERS): TOOL_LIBS = $(TOOL_CRYPTO)
 $(QUIC_PROTOCOL_DRIVERS): runtime/native/net.c runtime/native/sha256.c
 
 check-quic-protocol-artifacts: build/tooling/tests/quic-protocol-artifacts build/tooling/tests/quic-qns-local build/tooling/tests/quic-vn-probe tests/quic-protocol-artifacts.min tests/quic-protocol-support.min tests/quic-qns-local.min tests/quic-vn-probe.min tests/interop/qns/endpoint.min | build
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-protocol-artifacts.XXXXXXXX"); $(LIMITED) ./build/tooling/tests/quic-protocol-artifacts --artifacts "$$artifacts/run"
+	@set -e; rm -rf -- build/quic-protocol-artifacts.*; artifacts=$$(mktemp -d "$(abspath build)/quic-protocol-artifacts.XXXXXXXX"); $(LIMITED) ./build/tooling/tests/quic-protocol-artifacts --artifacts "$$artifacts/run"
 
 # Link provenance retains Clang itself; permit files up to 512 MiB here.
 check-quic-rfc check-quic-rfc-sanitize: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-quic-rfc: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
 	./build/tooling/tests/quic-rfc-harness
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization both --artifacts "$$artifacts/run"
+	@set -e; rm -rf -- build/quic-rfc-native.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization both --artifacts "$$artifacts/run"
 
 check-quic-rfc-sanitize: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
 	MINYAR_QUIC_RFC_PORT=44310 ./build/tooling/tests/quic-rfc-harness
-	@set -e; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44310 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization both --sanitize --artifacts "$$artifacts/run"
+	@set -e; rm -rf -- build/quic-rfc-sanitize.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44310 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization both --sanitize --artifacts "$$artifacts/run"
 
 check check-portable check-quic: check-quic-rfc
 check-sanitize check-quic-sanitize: check-quic-rfc-sanitize
