@@ -455,6 +455,9 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
         } else {
             let bracketLocation = state[0]
             state[0] = state[0] + 1
+            let keyPiece = -1
+            let keyValue = ""
+            let keyCalls = 0
             let positionType: List<Integer> = [0]
             if isMapType(receiverType) { positionType[0] = mapKeyType(receiverType) }
             let position = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
@@ -462,7 +465,10 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
             if isMapType(receiverType) {
                 declareMapRuntime(globals)
                 requireType(tokenLines, state, positionType[0], mapKeyType(receiverType), "Map key has the wrong type")
-                borrowReference(output, state, position, mapKeyType(receiverType), functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                keyPiece = output.length
+                output.add("")
+                keyValue = position
+                keyCalls = context.callTargets.length
                 position = valueAsListSlot(output, textState, state, position, positionType[0])
             } else { requireType(tokenLines, state, positionType[0], 1, "a position must be an Integer") }
             if (!isContainerType(receiverType) || isSetType(receiverType)) && receiverType != 8 {
@@ -490,6 +496,7 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                     let slot = valueAsListSlot(output, textState, state, value, elementType)
                     let custom = noteHashableCalls(context, mapKeyType(receiverType), state, textState, output)
                     output.add("  call void @minyar_map_set(ptr " + receiver + ", i64 " + position + ", i64 " + slot + ")\n")
+                    settleMapBorrow(context, output, state, keyPiece, keyValue, mapKeyType(receiverType), keyCalls, tokensMakeCall(tokenKinds, tokenTexts, operatorPosition + 1, state[0]))
                     if custom { recoveryCheckpoint(output, textState, state) }
                 } else {
                 if receiverType == 8 {
@@ -559,6 +566,19 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
         }
     }
     settleBorrows(context, output, state, deferredPieces, deferredValues, deferredTypes, deferredCalls)
+}
+
+// A Map operation runs user code only through key hash or equality methods,
+// and noteHashableCalls records those as call targets. A borrowed receiver or
+// key therefore needs a count only if a call target was recorded since its
+// reserved piece, or the code in between has a call token (a builtin method
+// may release what holds it).
+function settleMapBorrow(context: CompilerContext, output: List<Text>, state: List<Integer>, piece: Integer, value: Text, type: Integer, calls: Integer, callTokens: Boolean) {
+    if piece < 0 || !isReferenceType(type) || (context.callTargets.length == calls && !callTokens) { return }
+    state[6] = 1
+    state[7] = state[7] + 1
+    noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, piece, type, 0)
+    output[piece] = "  call void @minyar_rc_borrow(ptr " + value + ")\n"
 }
 
 // An element or field receiver that the rest of the statement cannot replace

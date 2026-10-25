@@ -212,6 +212,10 @@ both endpoints of traced ownership operations use the physical payload type.
   its acyclic List-element and field receivers uncounted when the rest of the
   statement has no call token; if compiling it still ran user code (a
   capability operator or Map key callback), the receiver count is restored.
+  Map `has`, `remove`, `m[key]` reads and `m[key] = value` likewise take no
+  count on their Map receiver or key: a Map operation runs user code only
+  through key hash or equality methods, which are recorded as calls. A key or
+  value expression with a call token, or such a method, restores the counts.
 - `minyar_rc_local` retains a new local value before releasing the previous
   value, making aliases and self-assignment safe. Synchronous calls borrow
   parameters protected by caller or ancestor owners; incoming parameter ownership
