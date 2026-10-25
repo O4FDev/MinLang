@@ -54,6 +54,22 @@ in-tree `bootstrap/stage0.c -o build/stage0` rebuild with the stamp unchanged,
 fails the run with `Failed check: toolchain-stamp`. Only the latest run
 directory is kept.
 
+Checks run under `scripts/with-limits.sh` (240 s of CPU, 128 MiB files and, on
+Linux, a 768 MiB soft address-space cap; macOS uses `taskpolicy`) or
+`scripts/with-sanitizer-limits.sh` (no address-space cap). Programs that are not
+Minyar code and reserve address space up front run through
+`test.fullAddressSpace` in `tools/testing.min`, which raises only the soft
+address-space limit to the inherited hard limit: the ASan children of
+`check-bounded` and the independent peers of the peer-edge, gRPC, transport and
+Quinn labs (`go` and `cargo` builds, the Go and Rust peer programs and
+`redis-server`). Checks whose link evidence keeps Clang itself (an LLVM release
+`clang` is 282 MB) raise the file limit to 512 MiB with
+`MINYAR_MAX_FILE_BLOCKS ?= 1048576`; without it the link dies with SIGXFSZ
+(status 153). The labs that run a real Redis (`check-peer-edge*`,
+`check-peer-live-redis`) print `SKIP <target>: redis-server is not on PATH` and
+pass on hosts without one; `MINYAR_REQUIRE_LAB_TOOLS=1` makes a missing server a
+failure.
+
 `make check-foundations-proofs` selects the Lean version pinned by
 `proofs/lean-toolchain`, builds the ownership and effect semantics, checks the
 required soundness theorem signatures, and audits every project declaration for
@@ -1098,8 +1114,10 @@ K1 overlap, active cycle phases and complete pool recovery. Numeric thread
 domains additionally require cache disposal and reject cached residual state.
 `make check-owner-queue-batching` compares every poll with the generic cycle
 scheduler, including partial/zero budgets, queue competition and cycle phases.
-Both run at O0/O2 with system, fixed and lazy heaps and budgets 1, 2, 7, 32 and
-1024. Their `-sanitize` variants add ASan/UBSan. Reuse/service and
+Both run at O0/O2 with system, fixed and lazy heaps. The native checks in
+`check-portable` use budgets 1, 32 and 1024; their `-budgets` targets in
+`check-ownership` (and so `make check`) add 2 and 7. Their `-sanitize` variants
+add ASan/UBSan over all five budgets. Reuse/service and
 scheduler-stop/work-charge mutants must fail after successful compilation.
 The cache oracle counts cumulative system allocation events in a copied header;
 a free-and-reallocate churn mutant must fail its specific allocation assertion.
@@ -1111,18 +1129,22 @@ exact, fail-closed source inversions. Independent per-slot/count models compare
 release order, K work, debt and queues, and require every fully retired capacity
 slot to be NULL. Cases cover sparse/dense/shrunken/moved owners, pool discard
 growth and an actual collected cycle activating the four-queue path. The old
-runtime must fail the stronger physical invariant. `-sanitize` adds ASan/UBSan
-and the full activated-cycle matrix. Recovery, stack and eager paths retain their
+runtime must fail the stronger physical invariant. The native check uses budgets
+1, 32 and 1024; `make check-frame-initialization-budgets` (in `check-ownership`)
+runs 2 and 7. `-sanitize` adds ASan/UBSan over all five budgets and the full
+activated-cycle matrix. Recovery, stack and eager paths retain their
 separate existing ownership gates.
 
 `make check-empty-map-traversal` compares the optimized Map with its scan-only
 reference across ordinary/cycle, incremental/eager/arena, O0/O2 profiles. It
 checks empty result kinds, exact guard retain/release service, callbacks,
 recovery, nested values and full allocator recovery. Mutants skipping result
-classification or the equality guard must fail specific assertions. Its
-`-sanitize` variant adds ASan/UBSan with leak detection.
-Native checks belong to `check-portable`; sanitizer checks belong to
-`check-ownership` and `check-sanitize`. All logs and failed artifacts are retained.
+classification or the equality guard must fail specific assertions. The native
+check uses budgets 1 and 32; `make check-empty-map-traversal-budgets` runs 2 and 7
+for the incremental profiles. Its `-sanitize` variant adds ASan/UBSan with leak
+detection over all budgets.
+Native checks belong to `check-portable` (their `-budgets` complements to
+`check-ownership`); sanitizer checks belong to `check-ownership` and `check-sanitize`. All logs and failed artifacts are retained.
 
 ## Running the suites
 
