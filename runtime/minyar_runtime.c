@@ -306,12 +306,11 @@ static MINYAR_COLD MINYAR_NORETURN void out_of_memory(void) {
  * The compiler never frees memory: the operating system reclaims everything
  * when it exits. Bump arenas serve it. The object arena holds fixed-size Text
  * and List headers, the data arena holds Text bytes, and List storage lives
- * in the list arena, or in the large-list arena once a List passes a few
- * thousand elements. The newest allocation in an arena can grow in place, so
- * a chain of Text joins extends one buffer instead of copying it each time,
- * and a large List such as the compiler's output keeps growing in place
- * instead of copying at every doubling while short-lived small Lists come
- * and go in their own arena.
+ * in the list arena until a List passes a few thousand elements; larger List
+ * storage is a malloc block that realloc grows. The newest allocation in an
+ * arena can grow in place, so a chain of Text joins extends one buffer
+ * instead of copying it each time, while short-lived small Lists come and go
+ * in their own arena.
  */
 typedef struct MinyarArenaBlock {
     struct MinyarArenaBlock *next;
@@ -328,7 +327,6 @@ typedef struct {
 static MinyarArena object_arena = {NULL, 1024 * 1024};
 static MinyarArena data_arena = {NULL, 1024 * 1024};
 static MinyarArena list_arena = {NULL, 1024 * 1024};
-static MinyarArena large_list_arena = {NULL, 4 * 1024 * 1024};
 
 static MINYAR_COLD void *arena_grow(MinyarArena *arena, size_t size, size_t alignment) {
     size_t capacity = size > arena->block_size ? size : arena->block_size;
@@ -381,12 +379,30 @@ MINYAR_HOT void *data_allocate(size_t size, size_t alignment) {
     return arena_allocate(&data_arena, size, alignment);
 }
 
-MINYAR_HOT MinyarArena *list_arena_for(long long capacity) {
-    return capacity >= LARGE_LIST_CAPACITY ? &large_list_arena : &list_arena;
-}
-
-MINYAR_HOT void *list_allocate(long long capacity, size_t size) {
-    return arena_allocate(list_arena_for(capacity), size, sizeof(long long));
+/* Moves a List's storage to room for capacity entries. Small Lists live in
+ * the list arena and grow in place while they are its newest allocation. A
+ * large List owns a malloc block instead: realloc grows it in place or remaps
+ * its pages, and returns the superseded storage, which no other List or Text
+ * refers to. An arena would keep every outgrown copy until the compiler
+ * exits; the large Lists that hold tokens and output dominated its peak. */
+MINYAR_HOT long long *list_arena_resize(long long *values, long long length,
+                                        long long current, long long capacity) {
+    size_t size = (size_t)capacity * sizeof(*values);
+    if (capacity >= LARGE_LIST_CAPACITY) {
+        long long *grown = realloc(current >= LARGE_LIST_CAPACITY ? values : NULL, size);
+        if (!grown)
+            out_of_memory();
+        if (values && current < LARGE_LIST_CAPACITY)
+            memcpy(grown, values, (size_t)length * sizeof(*values));
+        return grown;
+    }
+    if (values && arena_extend(&list_arena, values, (size_t)current * sizeof(*values),
+                               size - (size_t)current * sizeof(*values)))
+        return values;
+    long long *fresh = arena_allocate(&list_arena, size, sizeof(*values));
+    if (values)
+        memcpy(fresh, values, (size_t)length * sizeof(*values));
+    return fresh;
 }
 #else
 MINYAR_HOT void *object_allocate(size_t size, unsigned kind) {

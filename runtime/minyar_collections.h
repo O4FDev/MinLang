@@ -40,10 +40,15 @@ MINYAR_HOT long long list_next_capacity(long long current) {
         minyar_stop("this List became too large.");
     long long capacity = current == 0 ? 3 : current * 2 + 1;
 #else
-    /* Most Lists stay tiny, so they start small; large ones grow fast enough
-       that the copies made before they settle in the large-list arena stay
-       a fraction of their final size. */
+    /* Most Lists stay tiny, so they start small. Large reference-counted
+       Lists grow fourfold to make fewer copies; the compiler's large Lists
+       grow by realloc (see list_arena_resize), so doubling keeps their spare
+       address space to at most half. */
+#ifdef MINYAR_COMPILER_ARENA
+    long long factor = 2;
+#else
     long long factor = current >= LARGE_LIST_CAPACITY ? 4 : 2;
+#endif
     if (current > LLONG_MAX / factor)
         minyar_stop("this List became too large.");
     long long capacity = current == 0 ? 2 : current * factor;
@@ -56,16 +61,7 @@ MINYAR_HOT void list_resize(MinyarList *list, long long capacity) {
     if (capacity < list->capacity || (unsigned long long)capacity > SIZE_MAX / sizeof(*values))
         minyar_stop("this List became too large.");
 #ifdef MINYAR_COMPILER_ARENA
-    if (list->values && list_arena_for(list->capacity) == list_arena_for(capacity) &&
-        arena_extend(list_arena_for(capacity), list->values,
-                     (size_t)list->capacity * sizeof(*values),
-                     (size_t)(capacity - list->capacity) * sizeof(*values))) {
-        list->capacity = capacity;
-        return;
-    }
-    values = list_allocate(capacity, (size_t)capacity * sizeof(*values));
-    if (list->values)
-        memcpy(values, list->values, (size_t)list->length * sizeof(*values));
+    values = list_arena_resize(list->values, list->length, list->capacity, capacity);
 #else
     values = rc_reallocate_data(list->values, (size_t)capacity * sizeof(*values));
     if (!values)
