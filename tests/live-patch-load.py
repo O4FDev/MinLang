@@ -245,6 +245,8 @@ def check_idle_patches(launcher, memory=""):
                 patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project)],
                                          capture_output=True, timeout=600 * SCALE)
                 assert patched.returncode == 0, patched
+            # The table is complete: both edited functions, named for the operator.
+            assert b"Image carries 2 function(s): " in patched.stderr and b"reply" in patched.stderr and b"remember" in patched.stderr, patched.stderr
             assert ask() == (2, 11), client.responses
 
             def undo():
