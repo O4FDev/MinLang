@@ -1679,6 +1679,13 @@ recovery against acknowledged records and torn tails. The fixtures record their
 upstream revision and hashes. `check-simulation-sanitize` adds ASan/UBSan to the
 compiler and generated programs. See [simulation](simulation.md) for the model's
 limits; this is explicit cooperative testing, not native thread exploration.
+`check-simulation-cli` drives `minyar sim` on a scratch project: universe
+discovery, seed sharing across jobs, reporting and replaying the first failing
+seed, one-seed runs, filters, option rejection and the determinism proof.
+`check-determinism-runtime` statically requires every runtime function the
+compiler can emit to be classified as pure or host-effecting in
+`compiler/determinism-audit.min`, so a new runtime call fails at the change that
+adds it rather than inside a deterministic function later.
 
 `make check-simulation-manifests` extends the real neo-db proof to snapshot
 encoding, alternating manifest slots, 596 prefix crashes, 148 configured byte
