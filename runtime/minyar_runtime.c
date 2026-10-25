@@ -404,6 +404,16 @@ MINYAR_HOT long long *list_arena_resize(long long *values, long long length,
         memcpy(fresh, values, (size_t)length * sizeof(*values));
     return fresh;
 }
+
+/* Clearing a large List returns its malloc block. The compiler clears token
+ * streams it has finished with; small Lists keep their arena storage. */
+void list_arena_release(MinyarList *list) {
+    if (list->capacity < LARGE_LIST_CAPACITY)
+        return;
+    free(list->values);
+    list->values = NULL;
+    list->capacity = 0;
+}
 #else
 MINYAR_HOT void *object_allocate(size_t size, unsigned kind) {
     return rc_allocate_object(size, kind);

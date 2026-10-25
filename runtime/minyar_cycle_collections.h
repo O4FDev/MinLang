@@ -197,6 +197,8 @@ void minyar_list_clear(MinyarList *list) {
         }
         return;
     }
+#else
+    list_arena_release(list);
 #endif
     list->length = 0;
 }
