@@ -747,6 +747,29 @@ long long minyar_runtime_compilerDeclarationHash(MinyarText *text, long long sta
     return hash;
 }
 
+/* compareSymbolName in compiler/stages/symbols.min: byte length, then
+ * character length, then characters compared from the last one backwards. */
+long long minyar_runtime_compilerCompareSymbolNames(MinyarText *left, MinyarText *right) {
+    if (left->byte_length != right->byte_length)
+        return left->byte_length < right->byte_length ? -1 : 1;
+    ensure_text_index(left);
+    ensure_text_index(right);
+    if (left->character_length != right->character_length)
+        return left->character_length < right->character_length ? -1 : 1;
+    if (!left->character_offsets && !right->character_offsets) {
+        for (long long position = left->byte_length; position-- > 0;)
+            if (left->bytes[position] != right->bytes[position])
+                return left->bytes[position] < right->bytes[position] ? -1 : 1;
+        return 0;
+    }
+    for (long long position = left->character_length; position-- > 0;) {
+        int a = minyar_text_character_at(left, position), b = minyar_text_character_at(right, position);
+        if (a != b)
+            return a < b ? -1 : 1;
+    }
+    return 0;
+}
+
 long long minyar_runtime_diagnosticColumns(const MinyarText *text) {
     long long position = 0, columns = 0, previous_width = 0;
     unsigned previous = 0;
