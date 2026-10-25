@@ -362,8 +362,10 @@ minyar build --hot --release
 minyar patch --release
 ```
 
-`minyar patch --undo` restores the table that the last `minyar patch` replaced,
-without compiling; repeating it walks back to the original program.
+`minyar patch` names the functions its update carries; `--dry-run` compiles
+and lists them without publishing. `minyar patch --undo` restores the table that
+the last `minyar patch` replaced, without compiling; repeating it walks back to
+the original program.
 A package's `memory` setting applies to these builds and their patches. The
 same rules apply: function-body edits only,
 and each accepted generation stays resident. An incompatible edit is refused

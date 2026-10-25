@@ -240,6 +240,12 @@ def check_idle_patches(launcher, memory=""):
                     client.exchange(connection)
                 return client.responses[-1]
             assert ask() == (1, 1)
+            main.write_text(main.read_text().replace('"version=1 served="', '"version=9 served="'))
+            dry = subprocess.run([str(launcher), "patch", "--dry-run", "--manifest-path", str(project)],
+                                 capture_output=True, timeout=600 * SCALE)
+            assert dry.returncode == 0 and b"Dry run: nothing published. Image carries 1 function(s): reply" in dry.stderr, dry
+            assert ask() == (1, 2), client.responses
+            main.write_text(main.read_text().replace('"version=9 served="', '"version=1 served="'))
             for old, new in (('"version=1 served="', '"version=2 served="'), ("STORE.served += 1", "STORE.served += 10")):
                 main.write_text(main.read_text().replace(old, new))
                 patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project)],
@@ -247,17 +253,17 @@ def check_idle_patches(launcher, memory=""):
                 assert patched.returncode == 0, patched
             # The table is complete: both edited functions, named for the operator.
             assert b"Image carries 2 function(s): " in patched.stderr and b"reply" in patched.stderr and b"remember" in patched.stderr, patched.stderr
-            assert ask() == (2, 11), client.responses
+            assert ask() == (2, 12), client.responses
 
             def undo():
                 return subprocess.run([str(launcher), "patch", "--undo", "--manifest-path", str(project)],
                                       capture_output=True, timeout=600 * SCALE)
             # Undo restores the previous table without compiling, back to the original program.
-            assert undo().returncode == 0 and ask() == (2, 12), client.responses
-            assert undo().returncode == 0 and ask() == (1, 13), client.responses
+            assert undo().returncode == 0 and ask() == (2, 13), client.responses
+            assert undo().returncode == 0 and ask() == (1, 14), client.responses
             refused = undo()
             assert refused.returncode != 0 and b"nothing to undo" in refused.stderr, refused
-            assert ask() == (1, 14), client.responses
+            assert ask() == (1, 15), client.responses
             # A binary replaced by an ordinary build is not patched through the old session.
             plain = subprocess.run([str(launcher), "build", "--manifest-path", str(project)], capture_output=True,
                                    timeout=600 * SCALE)
