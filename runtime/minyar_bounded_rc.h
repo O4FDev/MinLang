@@ -259,6 +259,22 @@ RC_BOUNDED_INLINE void rc_bounded_object_unit(void) {
 
 #undef RC_BOUNDED_INLINE
 
+/* A retired frame's owners are all released: keep it for reuse within the
+ * cache allowance, otherwise free it. */
+static void rc_bounded_cache_frame(RcFrame *frame) {
+    size_t bytes = rc_heap_charge(frame, sizeof(*frame));
+    if (frame->locals) bytes += rc_heap_charge(frame->locals, frame->local_capacity * (sizeof(void *) + sizeof(size_t)));
+    if (bytes <= MINYAR_FRAME_CACHE_BYTES &&
+        rc_bounded_cached_frame_bytes <= MINYAR_FRAME_CACHE_BYTES - bytes) {
+        frame->previous = rc_free_frames;
+        rc_free_frames = frame;
+        rc_bounded_cached_frame_bytes += bytes;
+    } else {
+        rc_heap_deallocate(frame->locals);
+        rc_heap_deallocate(frame);
+    }
+}
+
 static void rc_bounded_frame_unit(void) {
     RcFrame *frame = rc_bounded_frame_head;
     if (frame->local_count) {
@@ -271,17 +287,7 @@ static void rc_bounded_frame_unit(void) {
     }
     rc_bounded_frame_head = frame->previous;
     if (!rc_bounded_frame_head) rc_bounded_frame_tail = NULL;
-    size_t bytes = rc_heap_charge(frame, sizeof(*frame));
-    if (frame->locals) bytes += rc_heap_charge(frame->locals, frame->local_capacity * (sizeof(void *) + sizeof(size_t)));
-    if (bytes <= MINYAR_FRAME_CACHE_BYTES &&
-        rc_bounded_cached_frame_bytes <= MINYAR_FRAME_CACHE_BYTES - bytes) {
-        frame->previous = rc_free_frames;
-        rc_free_frames = frame;
-        rc_bounded_cached_frame_bytes += bytes;
-    } else {
-        rc_heap_deallocate(frame->locals);
-        rc_heap_deallocate(frame);
-    }
+    rc_bounded_cache_frame(frame);
     rc_pending_count--;
 }
 
@@ -467,6 +473,44 @@ size_t minyar_rc_poll(size_t budget) {
         return 0;
     }
     return rc_bounded_poll_work(budget);
+}
+
+/* Frame exit with nothing else pending, the commonest service point. The
+ * scheduler would give this frame every unit: one per written owner slot, in
+ * reverse order, then one to retire it. Do exactly that here without queueing
+ * the frame or entering the general scheduler. If a release queues an object,
+ * link the frame with its remaining slots and continue in the scheduler from
+ * the state it would have reached. Returns 0 when the general path must run. */
+static int rc_bounded_leave_direct(RcFrame *frame) {
+    if (rc_pending_count || frame->written_count >= MINYAR_RC_POLL_BUDGET) return 0;
+    size_t work = 0;
+    frame->local_count = frame->written_count;
+    rc_bounded_next_queue = 2;
+    while (frame->local_count) {
+        size_t index = rc_bounded_local_indices(frame)[--frame->local_count];
+        void *value = rc_bounded_local_value(frame, index);
+        /* A completed frame is already initialized for its next activation. */
+        frame->locals[index] = NULL;
+        rc_drop(value);
+        work++;
+        if (rc_pending_count) {
+            frame->previous = NULL;
+            rc_bounded_frame_head = rc_bounded_frame_tail = frame;
+            rc_pending_count++;
+            size_t more = rc_bounded_poll_work(MINYAR_RC_POLL_BUDGET - work);
+#ifdef MINYAR_RC_TESTING
+            rc_bounded_last_work = work + more;
+#else
+            (void)more;
+#endif
+            return 1;
+        }
+    }
+    rc_bounded_cache_frame(frame);
+#ifdef MINYAR_RC_TESTING
+    rc_bounded_last_work = work + 1;
+#endif
+    return 1;
 }
 
 void minyar_rc_release(void *value) {

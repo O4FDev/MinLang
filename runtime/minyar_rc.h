@@ -363,6 +363,7 @@ void minyar_rc_leave(void) {
 #ifdef MINYAR_BOUNDED_RC
     rc_frames = frame->previous;
     rc_bounded_retire_temporaries(frame);
+    if (rc_bounded_leave_direct(frame)) return;
     frame->local_count = frame->written_count;
     frame->previous = NULL;
     if (rc_bounded_frame_tail) rc_bounded_frame_tail->previous = frame;
