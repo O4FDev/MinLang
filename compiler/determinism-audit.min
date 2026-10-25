@@ -49,6 +49,8 @@ record DeterminismModule {
     signatures: List<Text>
     addressTaken: List<Boolean>
     addressReady: Boolean
+    collectionCallbacks: List<Integer>
+    collectionReady: Boolean
     buckets: List<Integer>
     sourceSymbols: List<Integer>
 }
@@ -230,7 +232,7 @@ function determinismLookupName(module: DeterminismModule, name: Text): Integer {
 function parseDeterminismModule(context: CompilerContext, output: List<Text>): DeterminismModule {
     let text = joinText(output)
     let code = Bytes(text)
-    let module = DeterminismModule { code: code, text: text, ascii: code.length == text.length, names: [], kinds: [], nameStarts: [], nameEnds: [], starts: [], ends: [], signatures: [], addressTaken: [], addressReady: false, buckets: [], sourceSymbols: [] }
+    let module = DeterminismModule { code: code, text: text, ascii: code.length == text.length, names: [], kinds: [], nameStarts: [], nameEnds: [], starts: [], ends: [], signatures: [], addressTaken: [], addressReady: false, collectionCallbacks: [], collectionReady: false, buckets: [], sourceSymbols: [] }
     let position = 0
     while position < code.length {
         let lineEnd = determinismLineEnd(code, position)
@@ -285,6 +287,42 @@ function parseDeterminismModule(context: CompilerContext, output: List<Text>): D
         symbol = symbol + 1
     }
     return module
+}
+
+// A Map stores its key's hash, equality and copy functions when it is created,
+// possibly by the caller, and the runtime calls them during every operation.
+// Any reachable Map operation therefore may reach every registered callback.
+function determinismCollectionCallbacks(module: DeterminismModule): List<Integer> {
+    if module.collectionReady { return module.collectionCallbacks }
+    module.collectionReady = true
+    let code = module.code
+    let index = 0
+    while index < module.names.length {
+        if module.kinds[index] == 1 {
+            let scan = determinismLineEnd(code, module.starts[index])
+            while scan < module.ends[index] {
+                if code[scan] == 64 && determinismStartsWith(code, scan, "@minyar_map_new_record(") {
+                    let close = determinismFindByte(code, scan, determinismLineEnd(code, scan), 41)
+                    let argument = scan + 23
+                    while argument < close {
+                        if code[argument] == 64 {
+                            let end = determinismNameEnd(code, argument)
+                            let target = determinismLookup(module, determinismNameFirst(code, argument, end), determinismNameLast(code, argument, end))
+                            if target >= 0 && module.kinds[target] == 1 { module.collectionCallbacks.add(target) }
+                            argument = end
+                        } else {
+                            argument = argument + 1
+                        }
+                    }
+                    scan = close
+                } else {
+                    scan = scan + 1
+                }
+            }
+        }
+        index = index + 1
+    }
+    return module.collectionCallbacks
 }
 
 // A function whose address is taken anywhere may be the target of any
@@ -388,11 +426,24 @@ function determinismHelp(effect: Text): Text {
 }
 
 
+// Methods are compiled as Record$method or Record$method$private.
+function determinismMethodName(name: Text): Text {
+    let readable = name
+    let suffix = "$private"
+    if readable.length > suffix.length && readable.slice(readable.length - suffix.length, readable.length) == suffix { readable = readable.slice(0, readable.length - suffix.length) }
+    let dollar = findCharacter(readable, '$')
+    if dollar > 0 { return readable.slice(0, dollar) + "." + readable.slice(dollar + 1, readable.length) }
+    return readable
+}
+
 function determinismReadable(context: CompilerContext, module: DeterminismModule, index: Integer): Text {
     let symbol = module.sourceSymbols[index]
-    if symbol >= 0 { return readableDeclarationName(context.functionNames[symbol]) }
+    if symbol >= 0 { return determinismMethodName(readableDeclarationName(context.functionNames[symbol])) }
     let name = module.names[index]
     if resultPrefix(name, ".minyar.closure.") { return "an anonymous function" }
+    if resultPrefix(name, ".minyar.derived.hash") { return "a Map key's hash" }
+    if resultPrefix(name, ".minyar.derived.equal") { return "a Map key's equality" }
+    if resultPrefix(name, ".minyar.derived.copy") { return "a Map key's copy" }
     let constant = "minyar.constant|"
     if resultPrefix(name, constant) {
         let end = constant.length
@@ -407,6 +458,7 @@ record DeterminismSearch {
     indirectEdges: List<Boolean>
     queue: List<Integer>
     indirect: List<Text>
+    collections: Boolean
     effect: Text
     detail: Text
     at: Integer
@@ -471,6 +523,15 @@ function determinismScan(context: CompilerContext, module: DeterminismModule, se
                 if module.kinds[target] == 3 {
                     let effect = determinismExternalEffect(module.names[target])
                     if effect != "" { determinismViolation(search, effect, module.names[target], index) }
+                    if !search.collections && resultPrefix(module.names[target], "minyar_map") {
+                        search.collections = true
+                        let callbacks = determinismCollectionCallbacks(module)
+                        let callback = 0
+                        while callback < callbacks.length {
+                            determinismReach(search, callbacks[callback], index, true)
+                            callback = callback + 1
+                        }
+                    }
                 } else {
                     determinismReach(search, target, index, false)
                 }
@@ -503,7 +564,7 @@ function auditDeterministicRoots(context: CompilerContext, output: List<Text>, r
             let indirectEdges: List<Boolean> = []
             let index = 0
             while index < module.names.length { parents.add(-2); indirectEdges.add(false); index = index + 1 }
-            let search = DeterminismSearch { parents: parents, indirectEdges: indirectEdges, queue: [], indirect: [], effect: "", detail: "", at: -1 }
+            let search = DeterminismSearch { parents: parents, indirectEdges: indirectEdges, queue: [], indirect: [], collections: false, effect: "", detail: "", at: -1 }
             determinismReach(search, start, -1, false)
             let next = 0
             while next < search.queue.length && search.effect == "" {

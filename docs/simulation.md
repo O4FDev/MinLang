@@ -78,7 +78,9 @@ parallel execution, inline assembly, volatile machine access or native code.
 Pure native libraries are allowed: `math`, `unicode`, `sha256`, `aes`,
 `securecrypto` and `json` number parsing. A call through a callback value counts
 as a call to every function whose address the program takes with that
-signature, so a callback built by the caller is checked too. The error names the
+signature, so a callback built by the caller is checked too. Any reachable Map
+operation also reaches the key hash, equality and copy functions of every Map
+the program creates, because a Map built by the caller carries them. The error names the
 whole path:
 
 ```text
