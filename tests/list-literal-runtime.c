@@ -55,7 +55,7 @@ static void release_list(MinyarList *list) {
 
 static void cleanup(void) {
 #ifdef MINYAR_COMPILER_ARENA
-    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena, &large_list_arena};
+    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena};
     for (size_t i = 0; i < sizeof(arenas) / sizeof(*arenas); ++i) {
         MinyarArenaBlock *block = arenas[i]->block;
         while (block) {

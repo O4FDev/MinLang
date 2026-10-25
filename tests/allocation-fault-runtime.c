@@ -270,7 +270,7 @@ __attribute__((destructor)) static void fault_report(void) {
     int corrupted = 0;
 #ifdef MINYAR_COMPILER_ARENA
     /* Arenas intentionally survive to process exit, bypassing free/realloc. */
-    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena, &large_list_arena};
+    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena};
     for (size_t index = 0; index < sizeof(arenas) / sizeof(*arenas); index++) {
         for (MinyarArenaBlock *block = arenas[index]->block; block; block = block->next) {
             if (!fault_suffix_valid((FaultHeader *)block - 1)) corrupted = 1;
@@ -321,14 +321,14 @@ __attribute__((destructor)) static void fault_report(void) {
 
 #ifdef MINYAR_FAULT_ARENA_SELF_TEST
 int main(void) {
-    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena, &large_list_arena};
+    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena};
     for (size_t index = 0; index < sizeof(arenas) / sizeof(*arenas); index++) {
         arena_allocate(arenas[index], arenas[index]->block_size, _Alignof(max_align_t));
         arena_allocate(arenas[index], 1, _Alignof(max_align_t));
     }
     size_t corrupt = fault_index("MINYAR_FAULT_CORRUPT_ARENA");
     if (corrupt) {
-        assert(corrupt <= 8);
+        assert(corrupt <= 6);
         MinyarArenaBlock *block = arenas[(corrupt - 1) / 2]->block;
         if ((corrupt - 1) % 2) block = block->next;
         FaultHeader *header = (FaultHeader *)block - 1;

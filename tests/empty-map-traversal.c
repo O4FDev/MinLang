@@ -236,8 +236,8 @@ int main(int argc, char **argv) {
     free(rc_pending);
 #endif
 #else
-    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena, &large_list_arena};
-    for (size_t i = 0; i < 4; i++) while (arenas[i]->block) {
+    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena};
+    for (size_t i = 0; i < sizeof(arenas) / sizeof(*arenas); i++) while (arenas[i]->block) {
         MinyarArenaBlock *block = arenas[i]->block; arenas[i]->block = block->next; free(block);
     }
 #endif
