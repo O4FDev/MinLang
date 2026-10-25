@@ -187,8 +187,10 @@ sys.exit(subprocess.run(["make", "-s", "-C", sys.argv[2]] + sys.argv[3:]).return
                    "--expect", "kernel checks passed", "--timeout", "0.1"]
         # Discard the terminal copy while retaining the real serial log, so a
         # continuously writing guest cannot exhaust the test runner's memory.
+        # The guard only catches a driver that never stops; it must exceed the
+        # driver's own TERM-then-KILL shutdown (up to 4 s) plus two Python starts.
         result = subprocess.run(command, env=dict(self.env, OSDEV_FAKE_MODE="chatty-hang"),
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=5)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=30)
         self.assertEqual(result.returncode, 124, result.stderr.decode())
         self.assertIn(b"timed out", result.stderr)
         self.assertGreater(self.log.stat().st_size, 65536)
