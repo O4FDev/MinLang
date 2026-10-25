@@ -360,7 +360,8 @@ minyar build --hot --release
 minyar patch --release
 ```
 
-The same rules apply: function-body edits only, single-threaded programs only,
+A package's `memory` setting applies to these builds and their patches. The
+same rules apply: function-body edits only, single-threaded programs only,
 and each accepted generation stays resident. An incompatible edit is refused
 and running copies keep their current code. Another `build --hot` starts a new
 session: copies of earlier builds keep running their code but receive no later

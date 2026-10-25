@@ -209,13 +209,17 @@ def check(launcher, release, deploy, relocate=False):
               " requests, 0 errors, update at request " + str(first_v2))
 
 
-def check_idle_patches(launcher):
-    """Two patches published while the server is idle both take effect: each table is complete."""
+def check_idle_patches(launcher, memory=""):
+    """Two patches published while the server is idle both take effect: each table is complete.
+    With memory set, the package's reclamation profile also applies to the patchable build."""
     source = launcher.parent / "benchmarks/livepatch/server"
     with tempfile.TemporaryDirectory(prefix="minyar-live-idle-") as temporary:
         project = Path(temporary) / "server"
         (project / "src").mkdir(parents=True)
-        (project / "Minyar.toml").write_text((source / "Minyar.toml").read_text())
+        manifest = (source / "Minyar.toml").read_text()
+        if memory:
+            manifest = manifest.replace('kind = "bin"\n', 'kind = "bin"\nmemory = "' + memory + '"\n')
+        (project / "Minyar.toml").write_text(manifest)
         main = project / "src/main.min"
         main.write_text((source / "src/main.min").read_text())
         built = subprocess.run([str(launcher), "build", "--hot", "--manifest-path", str(project)],
@@ -241,7 +245,7 @@ def check_idle_patches(launcher):
         finally:
             server.kill()
             server.wait()
-    print("idle patches: two publications without calls between them both apply")
+    print("idle patches" + (" (" + memory + ")" if memory else "") + ": two publications without calls between them both apply")
 
 
 def main():
@@ -254,6 +258,7 @@ def main():
         check(args.launcher.resolve(), args.profile == "release", False)
     if args.mode != "watch":
         check_idle_patches(args.launcher.resolve())
+        check_idle_patches(args.launcher.resolve(), "eager")
         check(args.launcher.resolve(), args.profile == "release", True)
         check(args.launcher.resolve(), args.profile == "release", True, True)
 
