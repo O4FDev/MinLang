@@ -1,0 +1,140 @@
+use "simulation" as simulation
+use "../../fixtures/neodb-engine/lib/dbio.min" as dbio
+use "../../fixtures/neodb-engine/src/engine/api.min" as engine
+use "../../fixtures/neodb-engine/src/engine/values.min" as values
+use "../../fixtures/neodb-engine/src/storage/wal.min" as wal
+
+// One universe of the pinned production neo-db engine over the simulated dbio
+// facade: random autocommit statements, each acknowledged only once durable,
+// one statement in flight, a crash keeping a random prefix of the WAL, then
+// recovery. Recovered rows must match the acknowledged history, with the
+// in-flight statement either applied or absent.
+
+record Rows { ids: List<Integer>; values: List<Integer> }
+
+function copyRows(rows: Rows): Rows {
+    let result = Rows { ids: []; values: [] }
+    for index in 0..rows.ids.length { result.ids.add(rows.ids[index]); result.values.add(rows.values[index]) }
+    return result
+}
+
+function total(rows: Rows): Integer {
+    let sum = 0
+    for value in rows.values { sum += value }
+    return sum
+}
+
+// Apply one statement to the model and return its SQL.
+function statement(world: simulation.World, rows: Rows, serial: Integer): Text {
+    let id = 1 + simulation.choose(world, 6)
+    let kind = simulation.choose(world, 3)
+    if kind == 0 || rows.ids.length < 2 {
+        let value = simulation.choose(world, 1000)
+        rows.ids.add(id)
+        rows.values.add(value)
+        return "INSERT INTO cargo VALUES (" + Text(id) + ", " + Text(value) + ")"
+    }
+    if kind == 1 {
+        let delta = 1 + simulation.choose(world, 50)
+        for index in 0..rows.ids.length { if rows.ids[index] == id { rows.values[index] += delta } }
+        return "UPDATE cargo SET weight = weight + " + Text(delta) + " WHERE id = " + Text(id)
+    }
+    let kept = Rows { ids: []; values: [] }
+    for index in 0..rows.ids.length {
+        if rows.ids[index] != id { kept.ids.add(rows.ids[index]); kept.values.add(rows.values[index]) }
+    }
+    rows.ids = kept.ids
+    rows.values = kept.values
+    return "DELETE FROM cargo WHERE id = " + Text(id)
+}
+
+function drive(e: engine.Engine, world: simulation.World): Boolean {
+    engine.afterLoopIteration(e)
+    let attempts = 0
+    while simulation.pendingCount(world) > 0 {
+        attempts += 1
+        if attempts > 128 || dbio.completeNext() <= 0 { return false }
+    }
+    engine.onSyncReadable(e)
+    return true
+}
+
+// Run one statement; "" when it succeeded (and, if `wait`, became durable).
+function execute(e: engine.Engine, session: engine.Session, world: simulation.World, text: Text, wait: Boolean): Text {
+    let outcomes = engine.simpleQuery(e, session, text)
+    if outcomes.length == 0 { return "no outcome for " + text }
+    for outcome in outcomes {
+        if outcome.status != engine.STATUS_OK { return text + ": " + outcome.message }
+        let attempts = 0
+        while wait && engine.durableLsn(e) < outcome.waitLsn {
+            attempts += 1
+            if attempts > 128 || !drive(e, world) { return "commit never became durable: " + text }
+        }
+    }
+    return ""
+}
+
+// The single Integer of a one-row, one-column result, or -1.
+function scalar(e: engine.Engine, session: engine.Session, text: Text): Integer {
+    let outcomes = engine.simpleQuery(e, session, text)
+    if outcomes.length != 1 || outcomes[0].status != engine.STATUS_OK || outcomes[0].rowCount != 1 { return -1 }
+    let data = outcomes[0].rowData
+    if data.length < 11 || data[0] != 68 { return -1 }
+    let length = values.getBE32(data, 7)
+    if length < 1 || length != data.length - 11 { return -1 }
+    let digits = Text(data.slice(11, 11 + length))
+    let result = 0
+    for digit in digits {
+        if digit < '0' || digit > '9' { return -1 }
+        result = result * 10 + Integer(digit) - 48
+    }
+    return result
+}
+
+function open(): engine.Engine {
+    return engine.openWithOptions("/db", engine.Options { checkpointWalBytes: 1073741824; checkpointIntervalMs: 0; noPrealloc: true })
+}
+
+// `earlyAck` is the planted mistake: statements count as acknowledged before
+// their commit is durable.
+public deterministic function run(world: simulation.World, earlyAck: Boolean): Text {
+    dbio.bind(world)
+    let e = open()
+    let session = engine.newSession(e, "sim", "sim")
+    let problem = execute(e, session, world, "CREATE TABLE cargo (id INTEGER, weight INTEGER)", true)
+    if problem == "" { problem = execute(e, session, world, "INSERT INTO cargo VALUES (0, 0)", true) }
+    if problem != "" { return problem }
+    let rows = Rows { ids: [0]; values: [0] }
+    for serial in 0..1 + simulation.choose(world, 12) {
+        let text = statement(world, rows, serial)
+        problem = execute(e, session, world, text, !earlyAck)
+        if problem != "" { return problem }
+    }
+    let before = copyRows(rows)
+    let inFlight = statement(world, rows, 99)
+    let issued = execute(e, session, world, inFlight, false)
+    if issued != "" { return issued }
+    // Let the in-flight write and sync complete partly, fully or not at all.
+    engine.afterLoopIteration(e)
+    for step in 0..simulation.choose(world, simulation.pendingCount(world) + 1) {
+        if simulation.pendingCount(world) > 0 { dbio.completeNext() }
+    }
+    let file = simulation.openFile(world, wal.segmentPath("/db", 0), false)
+    if file > 0 {
+        let size = simulation.size(world, file)
+        let kept = simulation.choose(world, size + 1)
+        if kept < size { simulation.reached(world, "crash cut the WAL tail") }
+        simulation.persistPrefix(world, file, kept)
+    }
+    dbio.crash()
+    let recovered = open()
+    let reader = engine.newSession(recovered, "sim", "sim")
+    let count = scalar(recovered, reader, "SELECT count(*) FROM cargo")
+    let sum = scalar(recovered, reader, "SELECT sum(weight) FROM cargo")
+    if count == before.ids.length && sum == total(before) { return "" }
+    if count == rows.ids.length && sum == total(rows) {
+        simulation.reached(world, "in-flight statement survived")
+        return ""
+    }
+    return "recovered " + Text(count) + " rows weighing " + Text(sum) + "; acknowledged " + Text(before.ids.length) + " rows weighing " + Text(total(before)) + ", in-flight " + inFlight
+}

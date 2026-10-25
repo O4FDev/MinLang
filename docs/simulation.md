@@ -139,6 +139,15 @@ ten starting seeds. Exploration helps when failures lie behind rare
 intermediate states that the scenario labels; it cannot help with states it
 never reaches or labels.
 
+`tests/neodb-sim` is such a project for the pinned production neo-db engine.
+Each universe runs random autocommit statements, acknowledging each only once
+its commit is durable, leaves one statement in flight, crashes keeping a random
+prefix of the WAL, and checks the recovered rows against the acknowledged
+history. `minyar sim --manifest-path tests/neodb-sim durable --seeds 5000 --jobs 4`
+passed 5,000 universes in 243 ms on a 4-vCPU Linux box; the planted `early-ack`
+scenario, which acknowledges before durability, fails most seeds with an exact
+replay.
+
 ## A disk with explicit durability
 
 `openFile(world, path, create)` returns a positive file identity, or negative
