@@ -45,15 +45,17 @@ static long long text_search_next(const MinyarText *text, const MinyarText *need
         return found ? found - text->bytes : -1;
     }
     for (long long i = start, matched = 0; i < text->byte_length; i++) {
-        if (!matched) {
-            /* Outside a partial match, jump to the next possible first byte. */
-            const unsigned char *next = memchr(text->bytes + i, needle->bytes[0],
-                                               (size_t)(text->byte_length - i));
-            if (!next) return -1;
-            i = next - text->bytes;
-        }
         while (matched && text->bytes[i] != needle->bytes[matched]) matched = table[matched - 1];
-        if (text->bytes[i] == needle->bytes[matched]) matched++;
+        if (text->bytes[i] == needle->bytes[matched]) {
+            matched++;
+        } else {
+            /* No partial match remains: skip to the next possible first byte. */
+            const unsigned char *next = memchr(text->bytes + i + 1, needle->bytes[0],
+                                               (size_t)(text->byte_length - i - 1));
+            if (!next) return -1;
+            i = next - text->bytes - 1;
+            continue;
+        }
         if (matched == needle->byte_length) return i + 1 - matched;
     }
     return -1;
