@@ -135,6 +135,26 @@ minimum within one major version. Packages cannot run install scripts or supply
 native implementations. See [packages](packages.md) for the complete resolution,
 cache, security and offline testing contract.
 
+## Extensions
+
+A program can let other developers extend it with ordinary library packages.
+It supports this by providing `extension-template/`: a library package whose
+file names and contents may say `{{name}}`, usually depending on the program's
+SDK package by a relative path. `minyar new PATH --extension HOST` copies that
+template, puts the new package's name everywhere it says `{{name}}`, and rewrites
+the template's path dependencies so they resolve from PATH:
+
+```sh
+minyar new sparkle --extension ../neo-db
+cd sparkle && minyar test
+```
+
+The program then lists the extension like any dependency (`minyar add sparkle
+--path ../sparkle`). Nothing is loaded at run time: the extension compiles into
+the program, so the compiler checks it, LTO optimizes across the boundary and
+`minyar patch` can update its function bodies in a running process. neo-db's
+template and walkthrough are in its `docs/extensions-walkthrough.md`.
+
 ## Builds and tests
 
 Commands discover `Minyar.toml` in the current directory or its parents. Supply

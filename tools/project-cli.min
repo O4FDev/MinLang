@@ -12,7 +12,7 @@ use "./driver-support.min" as host
 use "system" as system
 use "files" as files
 
-record Options { command: Text; manifest: Text; path: Text; name: Text; root: Text; registry: Text; description: Text; errorFormat: Text; release: Boolean; library: Boolean; locked: Boolean; offline: Boolean; force: Boolean; incremental: Boolean; watch: Boolean; hot: Boolean; undo: Boolean; dryRun: Boolean; seeds: Integer; first: Integer; jobs: Integer; seed: Integer; explore: Boolean; replay: Text; positionals: List<Text>; arguments: List<Text> }
+record Options { command: Text; manifest: Text; path: Text; name: Text; extension: Text; root: Text; registry: Text; description: Text; errorFormat: Text; release: Boolean; library: Boolean; locked: Boolean; offline: Boolean; force: Boolean; incremental: Boolean; watch: Boolean; hot: Boolean; undo: Boolean; dryRun: Boolean; seeds: Integer; first: Integer; jobs: Integer; seed: Integer; explore: Boolean; replay: Text; positionals: List<Text>; arguments: List<Text> }
 
 function help() {
     print("""
@@ -67,6 +67,8 @@ function help() {
                                   with build, make a binary that minyar patch updates
       --name NAME                 Set the project name for new/init
       --lib                       Create a library with new/init
+      --extension HOST            Create an extension for the project at HOST with new,
+                                  from HOST's extension-template directory
       --root DIR                  Install in $MINYAR_HOME or ~/.minyar by default
       --force                     Replace a binary during install
       --registry URL              Use a package index URL or local directory
@@ -85,7 +87,7 @@ function help() {
     """)
 }
 function parse(): Options {
-    let options = Options { command: processInfo.argument(0); manifest: ""; path: ""; name: ""; root: ""; registry: ""; description: "Minyar source library."; errorFormat: ""; release: false; library: false; locked: false; offline: false; force: false; incremental: true; watch: false; hot: false; undo: false; dryRun: false; seeds: 10000; first: 0; jobs: 1; seed: -1; explore: false; replay: ""; positionals: []; arguments: [] }
+    let options = Options { command: processInfo.argument(0); manifest: ""; path: ""; name: ""; extension: ""; root: ""; registry: ""; description: "Minyar source library."; errorFormat: ""; release: false; library: false; locked: false; offline: false; force: false; incremental: true; watch: false; hot: false; undo: false; dryRun: false; seeds: 10000; first: 0; jobs: 1; seed: -1; explore: false; replay: ""; positionals: []; arguments: [] }
     let seen: List<Text> = []
     let index = 1
     while index < processInfo.argumentCount() {
@@ -125,13 +127,14 @@ function parse(): Options {
                 else if item == "--jobs" { options.jobs = value }
                 else { options.seed = value }
             }
-            else if item == "--manifest-path" || item == "--path" || item == "--name" || item == "--root" || item == "--registry" || item == "--description" || item == "--error-format" {
+            else if item == "--manifest-path" || item == "--path" || item == "--name" || item == "--extension" || item == "--root" || item == "--registry" || item == "--description" || item == "--error-format" {
                 index += 1
                 if index >= processInfo.argumentCount() || processInfo.argument(index) == "" || processInfo.argument(index).startsWith("--") { host.stop(item + " requires a value") }
                 let value = processInfo.argument(index)
                 if item == "--manifest-path" { options.manifest = value }
                 else if item == "--path" { options.path = value }
                 else if item == "--name" { options.name = value }
+                else if item == "--extension" { options.extension = value }
                 else if item == "--registry" { options.registry = value }
                 else if item == "--description" { options.description = value }
                 else if item == "--error-format" {
@@ -146,6 +149,7 @@ function parse(): Options {
     for option in seen {
         let allowed = false
         if option == "--name" || option == "--lib" { allowed = options.command == "new" || options.command == "init" }
+        else if option == "--extension" { allowed = options.command == "new" }
         else if option == "--path" { allowed = options.command == "add" || options.command == "install" || options.command == "doc" }
         else if option == "--root" { allowed = options.command == "install" || options.command == "uninstall" }
         else if option == "--force" { allowed = options.command == "install" }
@@ -194,7 +198,7 @@ function exclusive(path: Text, content: Text) {
     if written < 0 || closed < 0 { host.stop("cannot write " + path) }
 }
 function create(options: Options) {
-    if options.positionals.length > 1 || (options.command == "new" && options.positionals.length != 1) { host.stop("usage: minyar " + options.command + " PATH [--name NAME] [--lib]") }
+    if options.positionals.length > 1 || (options.command == "new" && options.positionals.length != 1) { host.stop("usage: minyar " + options.command + " PATH [--name NAME] [--lib | --extension HOST]") }
     let path = "."
     if options.positionals.length == 1 { path = options.positionals[0] }
     let root = host.resolveName(path)
@@ -203,6 +207,11 @@ function create(options: Options) {
     let name = options.name
     if name == "" { name = host.baseName(root) }
     if !project.validName(name) { host.stop("invalid package name; use --name with letters, digits, '-' or '_', starting with a letter or underscore") }
+    if options.extension != "" {
+        if options.library { host.stop("--extension creates a library already; leave out --lib") }
+        createExtension(options.extension, root, name)
+        return
+    }
     let source = root + "/src/main.min"
     if options.library { source = root + "/src/" + name + ".min" }
     if host.exists(source) { host.stop("refusing to overwrite " + source) }
@@ -221,6 +230,48 @@ function create(options: Options) {
     }
     if !host.exists(root + "/.gitignore") { exclusive(root + "/.gitignore", "/target/\n") }
     print("Created " + name + " at " + root)
+}
+// minyar new PATH --extension HOST: a library package made from HOST's extension-template directory. The host
+// owns its template (its SDK dependency, a starting extension, tests); "{{name}}" in file names and contents
+// becomes the new package's name, and the template's path dependencies are rewritten for the new location.
+function createExtension(hostPath: Text, root: Text, name: Text) {
+    let hostRoot = host.resolveName(hostPath)
+    if !host.isFile(hostRoot + "/Minyar.toml") { host.stop("--extension needs a project directory with a Minyar.toml: " + hostPath) }
+    let hostPackage = project.read(hostRoot)
+    let template = hostRoot + "/extension-template"
+    if !host.isFile(template + "/Minyar.toml") {
+        host.stop(hostPackage.name + " has no extension template; a project supports extensions by providing extension-template/, a library package whose files may say {{name}}")
+    }
+    host.makeDirectories(root)
+    copyTemplate(template, root, name)
+    host.makeDirectories(root + "/tests")
+    let manifest = project.read(root)
+    if manifest.name != name || !project.hasLibrary(manifest) { host.stop(hostPackage.name + "'s extension template must be a library named {{name}} with src/{{name}}.min") }
+    for index in 0..manifest.dependencies.length {
+        if manifest.repositories[index] == "" {
+            let dependency = host.resolveName(template + "/" + manifest.paths[index])
+            if !host.isFile(dependency + "/Minyar.toml") { host.stop("extension template dependency not found: " + manifest.paths[index]) }
+            manifest.paths[index] = project.relative(root, dependency)
+        }
+    }
+    project.atomicWrite(root + "/Minyar.toml", project.render(manifest))
+    if !host.exists(root + "/.gitignore") { exclusive(root + "/.gitignore", "/target/\n") }
+    print("Created " + name + " at " + root + ", an extension for " + hostPackage.name)
+}
+function named(text: Text, name: Text): Text { return host.joined(text.split("{{name}}"), name) }
+function copyTemplate(from: Text, to: Text, name: Text) {
+    for entry in files.list(from) {
+        if entry != "target" && entry != ".git" {
+            let source = from + "/" + entry
+            let destination = to + "/" + named(entry, name)
+            if host.isDirectory(source) {
+                host.makeDirectories(destination)
+                copyTemplate(source, destination, name)
+            } else if host.isFile(source) {
+                exclusive(destination, named(host.readText(source), name))
+            }
+        }
+    }
 }
 function target(root: Text, create: Boolean): Text {
     let path = root + "/target"
