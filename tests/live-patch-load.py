@@ -151,6 +151,19 @@ def check(launcher, release, deploy, relocate=False):
                 assert patched.returncode == 0 and b"Published update" in patched.stderr, patched
                 if relocate:
                     ship(built_state, host / "state")
+            if deploy and not relocate:
+                # A copy started after the publication runs it from its first request.
+                late = subprocess.Popen(command, cwd=project, env=environment, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+                try:
+                    late_port = int(late.stdout.readline().split()[1])
+                    probe = Client(late_port, threading.Event())
+                    with socket.create_connection(("127.0.0.1", late_port), timeout=30 * SCALE) as connection:
+                        probe.exchange(connection)
+                    assert probe.responses == [(2, 1)], probe.responses
+                finally:
+                    late.kill()
+                    late.wait()
             deadline = time.monotonic() + 300 * SCALE
             while not all(c.responses and c.responses[-1][0] == 2 for c in clients):
                 assert time.monotonic() < deadline, ("update never reached every client", output)
@@ -175,6 +188,8 @@ def check(launcher, release, deploy, relocate=False):
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
                 process.wait(30 * SCALE)
+            for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+                output[name] += stream.read() or b""
         errors = [error for client in clients for error in client.errors]
         assert not errors, errors
         for client in clients:
@@ -192,6 +207,41 @@ def check(launcher, release, deploy, relocate=False):
               " requests, 0 errors, update at request " + str(first_v2))
 
 
+def check_idle_patches(launcher):
+    """Two patches published while the server is idle both take effect: each table is complete."""
+    source = launcher.parent / "benchmarks/livepatch/server"
+    with tempfile.TemporaryDirectory(prefix="minyar-live-idle-") as temporary:
+        project = Path(temporary) / "server"
+        (project / "src").mkdir(parents=True)
+        (project / "Minyar.toml").write_text((source / "Minyar.toml").read_text())
+        main = project / "src/main.min"
+        main.write_text((source / "src/main.min").read_text())
+        built = subprocess.run([str(launcher), "build", "--hot", "--manifest-path", str(project)],
+                               capture_output=True, timeout=600 * SCALE)
+        assert built.returncode == 0, built
+        server = subprocess.Popen([str(project / "target/debug/livepatch-server")], stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=dict(os.environ, LIVEPATCH_PORT="0"))
+        try:
+            port = int(server.stdout.readline().split()[1])
+            client = Client(port, threading.Event())
+
+            def ask():
+                with socket.create_connection(("127.0.0.1", port), timeout=30 * SCALE) as connection:
+                    client.exchange(connection)
+                return client.responses[-1]
+            assert ask() == (1, 1)
+            for old, new in (('"version=1 served="', '"version=2 served="'), ("STORE.served += 1", "STORE.served += 10")):
+                main.write_text(main.read_text().replace(old, new))
+                patched = subprocess.run([str(launcher), "patch", "--manifest-path", str(project)],
+                                         capture_output=True, timeout=600 * SCALE)
+                assert patched.returncode == 0, patched
+            assert ask() == (2, 11), client.responses
+        finally:
+            server.kill()
+            server.wait()
+    print("idle patches: two publications without calls between them both apply")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("launcher", type=Path)
@@ -201,6 +251,7 @@ def main():
     if args.mode != "patch":
         check(args.launcher.resolve(), args.profile == "release", False)
     if args.mode != "watch":
+        check_idle_patches(args.launcher.resolve())
         check(args.launcher.resolve(), args.profile == "release", True)
         check(args.launcher.resolve(), args.profile == "release", True, True)
 

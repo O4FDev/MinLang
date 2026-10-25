@@ -147,23 +147,15 @@ static void live_refresh(void) {
         for (size_t i = 1; i < count; ++i)
             if (!strcmp(entries[i - 1].key, entries[i].key)) valid = 0;
     }
-    // An update image may hold only the functions that changed; earlier entries
-    // stay for the rest. Their keys point into earlier tables, kept resident.
-    size_t merged_count = count;
-    for (size_t i = 0; valid && i < live_count; ++i)
-        if (!bsearch(&live_entries[i], entries, count, sizeof *entries, live_compare)) merged_count++;
-    struct live_entry *merged = valid ? malloc(merged_count * sizeof *merged) : NULL;
-    if (!valid || !merged) {
+    if (!valid) {
         fprintf(stderr, "minyar live: update has an invalid function table; keeping current code\n");
         dlclose(handle); free(entries); free(image); free(storage); return;
     }
-    memcpy(merged, entries, count * sizeof *entries);
-    for (size_t i = 0, used = count; i < live_count; ++i)
-        if (!bsearch(&live_entries[i], entries, count, sizeof *entries, live_compare)) merged[used++] = live_entries[i];
-    qsort(merged, merged_count, sizeof *merged, live_compare);
     image->handle = handle; image->previous = live_images; live_images = image;
-    free(entries); free(live_entries);
-    live_entries = merged; live_count = merged_count;
+    // Each table is complete: a function it omits runs its original body.
+    // Earlier tables stay allocated, like their images.
+    free(live_entries);
+    live_entries = entries; live_count = count;
     for (size_t i = 0; i < live_slot_count; ++i)
         __atomic_store_n(live_slots[i].slot, live_lookup(live_slots[i].key, live_slots[i].initial),
                          __ATOMIC_RELEASE);
@@ -206,6 +198,8 @@ static void live_map(void) {
     }
     minyar_live_epoch_seen = __atomic_load_n((const uint64_t *)page, __ATOMIC_ACQUIRE);
     __atomic_store_n(&minyar_live_epoch, (const uint64_t *)page, __ATOMIC_RELEASE);
+    // A copy started after a publication runs it from its first call.
+    live_refresh();
 }
 // Wrappers call here for their first call and after each publication: load
 // any new update, retarget every bound slot, then bind this one.

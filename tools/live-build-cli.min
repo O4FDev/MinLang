@@ -135,9 +135,7 @@ function atomic(path: Text, data: Bytes) {
 }
 // Hot programs map this counter (see tools/live-runtime.c): a new value makes
 // their next call load `current`. Write in place; the mapping must stay valid.
-function announce(path: Text) {
-    let file = files.open(path, files.WRITE + files.CREATE)
-    if file < 0 { host.stop(host.osError(file, path)) }
+function announce(file: Integer, path: Text) {
     let previous = files.readAt(file, 0, 8)
     let epoch = 0
     if previous.length == 8 { epoch = previous.getInt64(0) }
@@ -145,35 +143,17 @@ function announce(path: Text) {
     next.setInt64(0, epoch + 1)
     let written = files.writeAt(file, next, 0, 8, 0)
     files.close(file)
-    if written != 8 { host.stop("cannot announce the live update: " + path) }
+    // The table is already published: report without removing its generation.
+    if written != 8 { system.writeStandardError("minyar: cannot announce the live update: " + path + "\n"); exit(1) }
 }
-// Fingerprints of the bodies running now: the accepted update's, else the
-// original executable's. Empty when the accepted update cannot be verified, so
-// the next image carries every function again.
-function trustedDigests(state: Text): Text {
-    let path = state + "/current"
-    if !host.exists(path) { return state + "/digests" }
-    let current = host.load(path)
-    if current.error != 0 { return "" }
-    let end = 0
-    while end < current.data.length && current.data[end] != 0 { end += 1 }
-    if end == 0 || end >= current.data.length || !textCodec.validUTF8(current.data.slice(0, end)) { return "" }
-    let image = Text(current.data.slice(0, end))
-    let directory = host.parentPath(image)
-    if !image.startsWith(state + "/generation-") || !host.isFile(image) || !host.isFile(directory + "/source-identity") || !host.isFile(directory + "/digests") { return "" }
-    let sidecar = host.load(directory + "/source-identity")
-    let code = host.load(image)
-    if sidecar.error != 0 || code.error != 0 || !textCodec.validUTF8(sidecar.data) { return "" }
-    let lines = host.lines(Text(sidecar.data))
-    if lines.length < 4 || lines[0] != "live-snapshot-v1" || lines[2] != host.hashBytes(code.data) || lines[3] != host.hashBytes(current.data) { return "" }
-    return directory + "/digests"
-}
+// Updates compare against the original executable's fingerprints, so every
+// table names all functions changed so far and replaces the previous one.
+// Reverting every edit publishes a whole-program image of the original code.
 function liveImage(generated: Text, state: Text, initial: Boolean): live.Image {
-    let digests = ""
-    if !initial && host.isFile(state + "/exports") { digests = trustedDigests(state) }
-    if digests == "" { return live.transform(generated, system.monotonicNanoseconds(), initial) }
-    let published = live.decodePairs(host.readText(digests))
-    return live.transformUpdate(generated, system.monotonicNanoseconds(), published, live.decodePairs(host.readText(state + "/exports")))
+    if initial || !host.isFile(state + "/exports") || !host.isFile(state + "/digests") { return live.transform(generated, system.monotonicNanoseconds(), initial) }
+    let image = live.transformUpdate(generated, system.monotonicNanoseconds(), live.decodePairs(host.readText(state + "/digests")), live.decodePairs(host.readText(state + "/exports")))
+    if image.error == "" && image.names.length == 0 && host.exists(state + "/current") { return live.transform(generated, system.monotonicNanoseconds(), false) }
+    return image
 }
 function llvmString(value: Text): Text {
     let hex = "0123456789ABCDEF"
@@ -310,14 +290,19 @@ function buildLive() {
             table.addBytes(Bytes(image.names[position])); table.add(0)
             table.addBytes(Bytes(image.symbols[position])); table.add(0)
         }
-        atomic(staging + "/digests", Bytes(image.digests))
         atomic(staging + "/source-identity", Bytes("live-snapshot-v1\n" + identity + "\n" + host.hashFile(library) + "\n" + host.hashBytes(table) + "\n"))
         let candidate = staging + "/candidate"
         atomic(candidate, table)
         if publish {
-            // minyar patch: no watcher supervises running copies, so promote here.
+            // minyar patch: no watcher supervises running copies, so promote here,
+            // one publisher at a time; every step that can fail runs before the rename.
+            let lock = host.lockExclusive(state + "/publish.lock")
+            if lock < 0 { host.stop(host.osError(lock, state + "/publish.lock")) }
+            let epoch = files.open(state + "/current.epoch", files.WRITE + files.CREATE)
+            if epoch < 0 { host.stop(host.osError(epoch, state + "/current.epoch")) }
             if files.rename(candidate, state + "/current") != 0 { host.stop("cannot publish live build: " + state + "/current") }
-            announce(state + "/current.epoch")
+            announce(epoch, state + "/current.epoch")
+            files.close(lock)
             system.writeStandardError("Published update; running copies load it on their next call\n")
             return
         }
