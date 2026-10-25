@@ -404,17 +404,82 @@ function parseBinary(context: CompilerContext, localNames: List<Text>, localType
             if findText(globals, declaration) < 0 { globals.add(declaration) }
             borrowReference(output, state, left, leftType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
         }
+        let textPiece = -1
+        if operator == "+" && leftType == 2 {
+            textPiece = output.length
+            output.add("")
+        }
         setType(resultType, 0)
         let right = parseBinary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, level + 1)
-        left = emitBinary(context, globals, output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType, tokenLines, operatorLocation)
-        if leftPiece >= 0 {
-            if tokensMakeCall(tokenKinds, tokenTexts, operatorLocation + 1, state[0]) { context.callTargets.add(-1) }
-            settleBorrow(context, output, state, leftPiece, leftValue, leftType, leftCalls)
+        if textPiece >= 0 && leftOwner < 0 && resultType[0] == 2 && tokenKinds[state[0]] == 4 && tokenTexts[state[0]] == "+" {
+            endSyntaxNode(context.syntax, syntaxNode, state[0], 2)
+            if resultType.length > 1 { keepTransferredOwner(output, resultType[1]) }
+            left = compileTextChain(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, left, textPiece, leftCalls, right, level)
+        } else {
+            left = emitBinary(context, globals, output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType, tokenLines, operatorLocation)
+            if leftPiece >= 0 {
+                if tokensMakeCall(tokenKinds, tokenTexts, operatorLocation + 1, state[0]) { context.callTargets.add(-1) }
+                settleBorrow(context, output, state, leftPiece, leftValue, leftType, leftCalls)
+            }
+            endSyntaxNode(context.syntax, syntaxNode, state[0], resultType[0])
         }
-        endSyntaxNode(context.syntax, syntaxNode, state[0], resultType[0])
         level = operatorLevel(tokenKinds, tokenTexts, state)
     }
     return left
+}
+
+// A last-use read offers its local's owner to a consumer. An interpolation
+// only borrows its parts, so the local keeps its owner.
+function keepTransferredOwner(output: List<Text>, owner: Integer) {
+    if owner >= 0 && output[owner] == "  ; minyar-owned-local-transfer\n" {
+        output[owner] = ""
+        output[owner + 1] = ""
+    }
+}
+
+// `a + b + c` on Text is one interpolation over all its parts: one exactly
+// sized result instead of a joined temporary per `+`. A part is borrowed; it
+// gets a count only if a later part runs user code that could replace its
+// holder. Two parts keep the join, and so does a chain whose first part is
+// owned (a result, or a local's last use): its join can grow it in place.
+function compileTextChain(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, first: Text, firstPiece: Integer, firstCalls: Integer, second: Text, level: Integer): Text {
+    let tokenKinds = context.tokenKinds
+    let tokenTexts = context.tokenTexts
+    let parts: List<Text> = [first, second]
+    let pieces: List<Integer> = [firstPiece, output.length]
+    let calls: List<Integer> = [firstCalls, context.callTargets.length]
+    output.add("")
+    while tokenKinds[state[0]] == 4 && tokenTexts[state[0]] == "+" {
+        let location = state[0]
+        let syntaxNode = wrapSyntaxOperand(context.syntax, 221, location)
+        state[0] = state[0] + 1
+        setType(resultType, 0)
+        let part = parseBinary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, level + 1)
+        if resultType.length > 1 { keepTransferredOwner(output, resultType[1]) }
+        // Reports the same mismatch as a single `+`.
+        if resultType[0] != 2 { let ignored = emitBinary(context, globals, output, textState, state, "+", first, 2, -1, part, resultType[0], resultType, context.tokenLines, location) }
+        parts.add(part)
+        pieces.add(output.length)
+        output.add("")
+        calls.add(context.callTargets.length)
+        endSyntaxNode(context.syntax, syntaxNode, state[0], 2)
+    }
+    let index = 0
+    while index < parts.length {
+        settleBorrow(context, output, state, pieces[index], parts[index], 2, calls[index])
+        index = index + 1
+    }
+    let slots: List<Text> = []
+    index = 0
+    while index < parts.length {
+        slots.add(", i64 2, i64 " + valueAsListSlot(output, textState, state, parts[index], 2))
+        index = index + 1
+    }
+    let value = valueName(textState, newTemporary(state))
+    output.add("  " + value + " = call ptr (i64, ...) @minyar_interpolate(i64 " + Text(parts.length) + joinText(slots) + ")\n")
+    setType(resultType, 2)
+    ownResult(output, state, value, resultType)
+    return value
 }
 
 function checkedIntegerLiteral(digits: Text, negative: Boolean, locations: SourceMap, location: Integer): Text {

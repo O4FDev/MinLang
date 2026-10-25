@@ -605,6 +605,10 @@ Character values are written straight into that buffer; a Float is formatted
 twice on the stack, once to measure it. There is no parts List and no
 temporary Text per scalar. Text parts are borrowed; one read from a field or
 element is counted only when a later part calls code that could replace it.
+A chain of three or more Text values joined with `+`, such as
+`name + ": " + value`, compiles to the same single call. A chain whose first
+value is owned, such as a call result or a local at its last use in
+`text = text + a + b`, keeps its joins so that value can grow in place.
 
 Multi-line Text uses three quotes. Its opening delimiter is followed by a
 newline, and its closing delimiter sits on its own line:
