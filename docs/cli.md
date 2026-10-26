@@ -360,8 +360,11 @@ untouched. Existing function signatures, records, constants and globals, other
 manifest settings, native bodies and initialization must stay unchanged, and
 nothing may be removed. A new `global` (its initializer would have to run), a
 new native library or C layout, a new runtime requirement (cycle collection,
-callbacks, threads) and top-level statements also need a restart. Adding
-modules needs incremental builds (the default). Incompatible edits are rejected
+callbacks, threads) and top-level statements also need a restart. Generated
+names do not depend on where code sits: modules are named by their path, Text
+and List constants by their content, anonymous functions by their enclosing
+function, so code added elsewhere leaves other functions' updates unchanged.
+Incompatible edits are rejected
 with the reason; stop and run again to accept them. Managed threads and parallel
 loops work: each call runs whichever version is current, so a thread or loop
 running across an update can mix both versions (slots are retargeted one at a

@@ -4,17 +4,18 @@ use "./driver-support.min" as host
 use "text" as textCodec
 
 // digests: each function's body fingerprint; exports: each function's wrapper in
-// this image; cells: each module state cell's LLVM type; modules: the source
-// file behind each module number; shapes: each generic instance's code apart
-// from its own name (all only meaningful for the original executable).
+// this image; cells: each module state cell's LLVM type; shapes: each generic
+// instance's code apart from its own name (all only meaningful for the original
+// executable). Function names do not depend on import order: whole programs tag
+// each module by its path (compiler/stages/modules.min, wholeProgramModuleTag).
 // added: functions an update introduces.
-public record Image { llvm: Text; names: List<Text>; symbols: List<Text>; signature: Text; digests: Text; exports: Text; cells: Text; modules: Text; shapes: Text; added: List<Text>; error: Text }
+public record Image { llvm: Text; names: List<Text>; symbols: List<Text>; signature: Text; digests: Text; exports: Text; cells: Text; shapes: Text; added: List<Text>; error: Text }
 // What an update is compared with: the original executable's session files.
-public record Session { digests: Map<Text, Text>; exports: Map<Text, Text>; cells: Map<Text, Text>; modules: Map<Text, Text>; shapes: Map<Text, Text> }
-public function session(digests: Text, exports: Text, cells: Text, modules: Text, shapes: Text): Session {
-    return Session { digests: decodePairs(digests); exports: decodePairs(exports); cells: decodePairs(cells); modules: decodePairs(modules); shapes: decodePairs(shapes) }
+public record Session { digests: Map<Text, Text>; exports: Map<Text, Text>; cells: Map<Text, Text>; shapes: Map<Text, Text> }
+public function session(digests: Text, exports: Text, cells: Text, shapes: Text): Session {
+    return Session { digests: decodePairs(digests); exports: decodePairs(exports); cells: decodePairs(cells); shapes: decodePairs(shapes) }
 }
-public function sessionOf(image: Image): Session { return session(image.digests, image.exports, image.cells, image.modules, image.shapes) }
+public function sessionOf(image: Image): Session { return session(image.digests, image.exports, image.cells, image.shapes) }
 public record Symbol { token: Text; raw: Text; end: Integer; error: Text }
 record Function { name: Text; raw: Text; wrapper: Text; body: Text; language: Boolean; result: Text; returned: Text; parameters: Text; arguments: Text; signature: Text; error: Text }
 record Rewritten { text: Text; error: Text }
@@ -232,7 +233,7 @@ function escaped(value: Text): Text {
     }
     return joinText(parts)
 }
-function failed(message: Text): Image { return Image { llvm: ""; names: []; symbols: []; signature: ""; digests: ""; exports: ""; cells: ""; modules: ""; shapes: ""; added: []; error: message } }
+function failed(message: Text): Image { return Image { llvm: ""; names: []; symbols: []; signature: ""; digests: ""; exports: ""; cells: ""; shapes: ""; added: []; error: message } }
 function scalar(value: Text): Boolean { return host.listed(["void", "i64", "i32", "i1", "double", "ptr"], value) }
 function definition(line: Text, generation: Integer, index: Integer, initial: Boolean): Function {
     let found = Function { name: ""; raw: ""; wrapper: ""; body: ""; language: false; result: ""; returned: ""; parameters: ""; arguments: ""; signature: ""; error: "" }
@@ -689,7 +690,7 @@ function transformWith(llvm: Text, generation: Integer, initial: Boolean, prune:
     for index in 0..functions.length { if functions[index].language && kept[index] { output.add(wrapper(functions[index], index, generation)) } }
     return Image { llvm: joinText(output); names: names; symbols: symbols; signature: imageSignature(parsed);
         digests: imageDigests(parsed); exports: encodePairs(digestKeys, exportValues); cells: encodePairs(cellNames, cellTypes);
-        modules: moduleNumbers(parsed).encoded; shapes: genericShapes(parsed); added: []; error: "" }
+        shapes: genericShapes(parsed); added: []; error: "" }
 }
 
 // An update image holds the functions whose fingerprint differs from the
@@ -705,12 +706,6 @@ function transformWith(llvm: Text, generation: Integer, initial: Boolean, prune:
 public function transformUpdate(llvm: Text, generation: Integer, original: Session): Image {
     let parsed = parse(llvm, generation, false)
     if parsed.error != "" { return failed(parsed.error) }
-    let numbered = renumbered(llvm, parsed, original.modules)
-    if numbered.error != "" { return failed(numbered.error) }
-    if numbered.text != llvm {
-        parsed = parse(numbered.text, generation, false)
-        if parsed.error != "" { return failed(parsed.error) }
-    }
     let instances = genericChange(parsed, original.shapes)
     if instances != "" { return failed(instances) }
     let published = original.digests
@@ -786,134 +781,9 @@ public function transformUpdate(llvm: Text, generation: Integer, original: Sessi
         for index in 0..functions.length { if fresh[index] && namesBySymbol[functions[index].raw] == functions[index].wrapper { output.add(wrapper(functions[index], index, generation)) } }
     }
     return Image { llvm: joinText(output); names: names; symbols: symbols; signature: imageSignature(parsed);
-        digests: imageDigests(parsed); exports: ""; cells: ""; modules: ""; shapes: ""; added: added; error: "" }
+        digests: imageDigests(parsed); exports: ""; cells: ""; shapes: ""; added: added; error: "" }
 }
 
-// Module numbers in symbol names (minyar_module_<N>_) follow import order, so a
-// module added in the middle renumbers the ones after it. Each language
-// function's body names its source file (; minyar-debug-function:
-// line|column|path, just before its definition), which identifies its module.
-record Modules { paths: Map<Text, Text>; numbers: List<Text>; encoded: Text; error: Text }
-function moduleNumber(raw: Text): Text {
-    let prefix = ".minyar.fn.minyar_module_"
-    if !raw.startsWith(prefix) { return "" }
-    let data = Bytes(raw)
-    let index = prefix.byteLength
-    let start = index
-    while index < data.length && data[index] >= 48 && data[index] <= 57 { index += 1 }
-    if index == start || index >= data.length || data[index] != 95 { return "" }
-    return textCodec.decodeOrStop(data.slice(start, index))
-}
-function moduleNumbers(parsed: Parsed): Modules {
-    let result = Modules { paths: Map<Text, Text>(); numbers: []; encoded: ""; error: "" }
-    let marker = "; minyar-debug-function: "
-    for index in 0..parsed.functions.length {
-        let number = moduleNumber(parsed.functions[index].raw)
-        if number == "" { continue }
-        // The comment comes just before the definition.
-        let first = parsed.starts[index] - 1
-        while first > 0 && parsed.lines[first - 1].startsWith(";") && first > parsed.starts[index] - 4 { first -= 1 }
-        for position in max(0, first)..parsed.ends[index] {
-            let line = parsed.lines[position]
-            if !line.startsWith(marker) { continue }
-            let fields = host.textAfter(line, marker).split("|")
-            if fields.length < 3 { break }
-            let rest: List<Text> = []
-            for part in 2..fields.length { rest.add(fields[part]) }
-            let path = host.joined(rest, "|")
-            if path == "" { break }
-            if !result.paths.has(number) { result.paths[number] = path; result.numbers.add(number) }
-            else if result.paths[number] != path { result.error = "generated LLVM gives module " + number + " two source files"; return result }
-            break
-        }
-    }
-    let values: List<Text> = []
-    for number in result.numbers { values.add(result.paths[number]) }
-    result.encoded = encodePairs(result.numbers, values)
-    return result
-}
-function largest(numbers: List<Text>, start: Integer): Integer {
-    let result = start
-    for number in numbers { result = max(result, textCodec.integer(number).unwrapOr(0)) }
-    return result
-}
-// The update's LLVM with its module numbers changed to the executable's
-// (`original`: number -> source file); new modules get numbers of their own.
-function renumbered(llvm: Text, parsed: Parsed, original: Map<Text, Text>): Rewritten {
-    let found = moduleNumbers(parsed)
-    if found.error != "" { return Rewritten { text: ""; error: found.error } }
-    let byPath = Map<Text, Text>()
-    let originalNumbers: List<Text> = []
-    for number in original { byPath[original[number]] = number; originalNumbers.add(number) }
-    let next = largest(found.numbers, largest(originalNumbers, 0)) + 1
-    let mapping = Map<Text, Text>()
-    let same = true
-    found.numbers.sort()
-    for number in found.numbers {
-        let path = found.paths[number]
-        if byPath.has(path) { mapping[number] = byPath[path] }
-        else { mapping[number] = Text(next); next += 1 }
-        if mapping[number] != number { same = false }
-    }
-    if same { return Rewritten { text: llvm; error: "" } }
-    return renumberText(llvm, mapping)
-}
-// Rewrites minyar_module_<N>_ inside symbol and type names only: string data
-// and comments keep their bytes.
-function renumberText(llvm: Text, mapping: Map<Text, Text>): Rewritten {
-    let data = Bytes(llvm)
-    let result = Bytes()
-    let pattern = Bytes("minyar_module_")
-    let index = 0
-    let inName = false
-    let quoted = false
-    while index < data.length {
-        let byte = data[index]
-        if !inName {
-            if byte == 59 {
-                while index < data.length && data[index] != 10 { result.add(data[index]); index += 1 }
-                continue
-            }
-            if byte == 34 {
-                result.add(byte); index += 1
-                while index < data.length && data[index] != 34 { result.add(data[index]); index += 1 }
-                if index < data.length { result.add(data[index]); index += 1 }
-                continue
-            }
-            result.add(byte); index += 1
-            if (byte == 64 || byte == 37) && index < data.length {
-                inName = true
-                quoted = data[index] == 34
-                if quoted { result.add(34); index += 1 }
-            }
-            continue
-        }
-        let ends = (quoted && byte == 34) || (!quoted && !identifier(byte))
-        if ends {
-            inName = false
-            if quoted { result.add(byte); index += 1 }
-            continue
-        }
-        let matched = index + pattern.length <= data.length
-        let offset = 0
-        while matched && offset < pattern.length { if data[index + offset] != pattern[offset] { matched = false }; offset += 1 }
-        if matched {
-            let start = index + pattern.length
-            let end = start
-            while end < data.length && data[end] >= 48 && data[end] <= 57 { end += 1 }
-            if end > start && end < data.length && data[end] == 95 {
-                let number = textCodec.decodeOrStop(data.slice(start, end))
-                if !mapping.has(number) { return Rewritten { text: ""; error: "hot reload cannot renumber module " + number + " (it defines no functions); stop and run again" } }
-                result.addBytes(pattern)
-                result.addBytes(Bytes(mapping[number]))
-                index = end
-                continue
-            }
-        }
-        result.add(byte); index += 1
-    }
-    return Rewritten { text: textCodec.decodeOrStop(result); error: "" }
-}
 // Generic instances are numbered by first use (minyar_generic_function_<N>_),
 // so an edit can give an existing name to another instantiation. Their code
 // apart from their own name tells instances apart.

@@ -108,7 +108,7 @@ let literalIr = "@.message = private unnamed_addr constant [3 x i8] c\"ab\\00\"\
 let literalInitial = live.transform(literalIr, 0, true)
 let literalUpdate = live.transformUpdate(host.replaceText(literalIr, "c\"ab\\00\"", "c\"cd\\00\""), 4, live.sessionOf(literalInitial))
 test.check(literalUpdate.error == "" && literalUpdate.names.length == 1 && literalUpdate.names[0] == ".minyar.fn.message", "editing a literal recompiles the functions that read it")
-let everything = live.transformUpdate(ir, 3, live.session(initial.digests, live.encodePairs([], []), initial.cells, "", ""))
+let everything = live.transformUpdate(ir, 3, live.session(initial.digests, live.encodePairs([], []), initial.cells, ""))
 test.check(everything.error == "" && everything.added.length == 6, "functions the executable lacks are added: " + everything.error)
 let closureIr = "define internal i64 @.minyar.closure.7(i64 %value) {\nentry:\n  %next = add i64 %value, 1\n  ret i64 %next\n}\ndefine ptr @.minyar.fn.outer() uwtable {\nentry:\n  ret ptr @.minyar.closure.7\n}\ndefine i64 @.minyar.fn.other() uwtable {\nentry:\n  ret i64 1\n}\n"
 let closureInitial = live.transform(closureIr, 0, true)
@@ -172,24 +172,20 @@ let stateIr = "@\"minyar.constant|fresh|value\" = internal global i64 0\n" + add
 test.check(host.hasText(live.transformUpdate(stateIr, 8, live.sessionOf(addInitial)).error, "cannot add module state (fresh)"), "new module state needs a restart")
 test.check(live.wellFormed(addInitial.exports) && !live.wellFormed("live-pairs-v1\n3:ab\n") && !live.wellFormed(""), "malformed session files are recognised")
 
-// Module numbers follow import order: an update that adds a module before
-// others is renumbered to the executable's modules by their source files.
-function moduleIr(first: Text, second: Text): Text {
+// Whole programs tag each module by its path, not its import position, so an
+// update that adds a module carries only the new code; other names are unchanged.
+function moduleIr(): Text {
     let parts: List<Text> = []
-    parts.add("@\"minyar.constant|minyar_module_" + first + "_COUNT|value\" = internal global i64 0\n")
-    parts.add("; minyar-debug-function: 1|1|/src/count.min\ndefine i64 @.minyar.fn.minyar_module_" + first + "_count() uwtable {\nentry:\n  %value = load i64, ptr @\"minyar.constant|minyar_module_" + first + "_COUNT|value\"\n  ret i64 %value\n}\n")
-    parts.add("; minyar-debug-function: 1|1|/src/other.min\ndefine i64 @.minyar.fn.minyar_module_" + second + "_other() uwtable {\nentry:\n  %value = call i64 @.minyar.fn.minyar_module_" + first + "_count()\n  ret i64 %value\n}\n")
-    parts.add("define i32 @main() {\nentry:\n  %value = call i64 @.minyar.fn.minyar_module_" + second + "_other()\n  ret i32 0\n}\n")
+    parts.add("@\"minyar.constant|minyar_module_0123456789abcdef_COUNT|value\" = internal global i64 0\n")
+    parts.add("define i64 @.minyar.fn.minyar_module_0123456789abcdef_count() uwtable {\nentry:\n  %value = load i64, ptr @\"minyar.constant|minyar_module_0123456789abcdef_COUNT|value\"\n  ret i64 %value\n}\n")
+    parts.add("define i64 @.minyar.fn.minyar_module_fedcba9876543210_other() uwtable {\nentry:\n  %value = call i64 @.minyar.fn.minyar_module_0123456789abcdef_count()\n  ret i64 %value\n}\n")
+    parts.add("define i32 @main() {\nentry:\n  %value = call i64 @.minyar.fn.minyar_module_fedcba9876543210_other()\n  ret i32 0\n}\n")
     return joinText(parts)
 }
-let modulesInitial = live.transformProgram(moduleIr("1", "2"), 0, true)
-test.check(modulesInitial.error == "" && live.decodePairs(modulesInitial.modules)["1"] == "/src/count.min", "the original image records each module's source file: " + modulesInitial.error)
-let insertedIr = moduleIr("2", "3") + "; minyar-debug-function: 1|1|/src/fresh.min\ndefine i64 @.minyar.fn.minyar_module_1_fresh() uwtable {\nentry:\n  ret i64 7\n}\n"
-let inserted = live.transformUpdate(insertedIr, 9, live.sessionOf(modulesInitial))
-test.check(inserted.error == "" && inserted.names.length == 1 && inserted.added.length == 1 && host.hasText(inserted.added[0], "minyar_module_4_fresh"), "a module added before others keeps their numbers and gets a new one: " + inserted.error + " " + host.joined(inserted.added, ","))
-test.check(host.hasText(inserted.llvm, "@\"minyar.constant|minyar_module_1_COUNT|value\" = external global i64") && !host.hasText(inserted.llvm, "minyar_module_2_COUNT"), "renumbered module state still names the executable's cell")
-let swappedIr = host.replaceText(host.replaceText(moduleIr("1", "2"), "/src/count.min", "/src/swap.min"), "/src/other.min", "/src/count.min")
-test.check(live.transformUpdate(swappedIr, 9, live.sessionOf(modulesInitial)).error != "", "two modules that swap numbers cannot keep their state")
+let modulesInitial = live.transformProgram(moduleIr(), 0, true)
+test.check(modulesInitial.error == "", "module image: " + modulesInitial.error)
+let inserted = live.transformUpdate(moduleIr() + "define i64 @.minyar.fn.minyar_module_00112233445566ff_fresh() uwtable {\nentry:\n  ret i64 7\n}\n", 9, live.sessionOf(modulesInitial))
+test.check(inserted.error == "" && inserted.names.length == 1 && inserted.added.length == 1 && host.hasText(inserted.added[0], "minyar_module_00112233445566ff_fresh"), "an added module carries only its own function: " + inserted.error)
 
 // Generic instances are numbered by first use; a renumbering that gives an
 // existing name another instantiation's code is refused.

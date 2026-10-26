@@ -3,8 +3,10 @@
 #else
 #define DEPTH_SYMBOL(name) name
 #endif
+/* tests/calldepth.min defines DEPTH_DEEP_NATIVE and DEPTH_RUN: whole-program names
+ * tag each module with a digest of its path, so the symbols depend on the checkout. */
 extern MinyarText *depth_test_language(void)
-    __asm__(DEPTH_SYMBOL(".minyar.fn.minyar_module_0_deepNative")) __attribute__((weak));
+    __asm__(DEPTH_SYMBOL(DEPTH_DEEP_NATIVE)) __attribute__((weak));
 MinyarText *minyar_depthtest_bounce(void) {
     assert(depth_test_language);
     MinyarText *value = depth_test_language();
@@ -12,7 +14,7 @@ MinyarText *minyar_depthtest_bounce(void) {
     return minyar_integer_text(42);
 }
 extern MinyarRecord *depth_test_run(long long, MinyarRecord *)
-    __asm__(DEPTH_SYMBOL(".minyar.fn.minyar_module_1_run")) __attribute__((weak));
+    __asm__(DEPTH_SYMBOL(DEPTH_RUN)) __attribute__((weak));
 #ifdef __APPLE__
 MinyarText *depth_test_language(void) { abort(); }
 MinyarRecord *depth_test_run(long long depth, MinyarRecord *callback) {

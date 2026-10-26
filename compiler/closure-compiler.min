@@ -318,6 +318,78 @@ function prepareCallbackSymbols(kinds: List<Integer>, texts: List<Text>, lines: 
     }
 }
 
+// An anonymous function's symbol names its enclosing declaration and its
+// ordinal among that declaration's anonymous functions (in source order), never
+// a token position: code added elsewhere keeps the name, so a live patch does
+// not see the enclosing function as changed. Top-level code counts as `$top`.
+// Returned without '@'; quoted when the declaration's name is.
+function closureSymbol(context: CompilerContext, start: Integer): Text {
+    if context.closureSymbols.length == 0 { nameClosures(context) }
+    let found = genericIndexGet(context.closurePositions, Text(start))
+    if found < 0 { failCompiler("missing anonymous function name") }
+    return context.closureSymbols[found]
+}
+
+function nameClosures(context: CompilerContext) {
+    let names = context.functionNames
+    let positions: List<Integer> = []
+    let prefix = "#Environment:"
+    let index = 0
+    while index < names.length {
+        let name = names[index]
+        if name.length > prefix.length && name.startsWith(prefix) {
+            let digit = prefix.length
+            let position = 0
+            while digit < name.length && name[digit] != ':' { position = position * 10 + Integer(name[digit]) - Integer('0'); digit = digit + 1 }
+            positions.add(position)
+        }
+        index = index + 1
+    }
+    // Declarations in source order; the enclosing one is the last starting at or before a position.
+    let syntax = context.syntax
+    let declarations: List<Integer> = []
+    index = 0
+    while index < syntax.declarations.length {
+        let node = syntax.declarations[index]
+        let symbol = syntax.nodes[node].symbol
+        let previous = -1
+        if declarations.length > 0 { previous = syntax.nodes[declarations[declarations.length - 1]].start }
+        if symbol >= 0 && symbol < names.length && syntax.nodes[node].start > previous { declarations.add(node) }
+        index = index + 1
+    }
+    let owners: List<Integer> = []
+    index = 0
+    while index < positions.length {
+        let position = positions[index]
+        let low = 0
+        let high = declarations.length
+        while low < high {
+            let middle = (low + high) / 2
+            if syntax.nodes[declarations[middle]].start <= position { low = middle + 1 } else { high = middle }
+        }
+        let owner = -1
+        if low > 0 && position < syntax.nodes[declarations[low - 1]].end { owner = declarations[low - 1] }
+        owners.add(owner)
+        index = index + 1
+    }
+    index = 0
+    while index < positions.length {
+        let ordinal = 1
+        let other = 0
+        while other < positions.length {
+            if owners[other] == owners[index] && positions[other] < positions[index] { ordinal = ordinal + 1 }
+            other = other + 1
+        }
+        let enclosing = "$top"
+        if owners[index] >= 0 { enclosing = names[syntax.nodes[owners[index]].symbol] }
+        let symbol = ".minyar.closure." + enclosing + "." + Text(ordinal)
+        if enclosing[0] == '"' { symbol = "\".minyar.closure." + enclosing.slice(1, enclosing.length - 1) + "." + Text(ordinal) + "\"" }
+        genericIndexPut(context.closurePositions, Text(positions[index]), context.closureSymbols.length)
+        context.closureSymbols.add(symbol)
+        index = index + 1
+    }
+}
+
 function callbackEnvironment(names: List<Text>, position: Integer): Integer {
     let prefix = "#Environment:" + Text(position) + ":"
     let index = 0
@@ -485,7 +557,7 @@ function parseClosure(context: CompilerContext, localNames: List<Text>, localTyp
     noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, signature, 0)
     output.add("  " + callback + " = call ptr @minyar_record_new(i64 3)\n")
     let owner = keepReference(output, state, callback, signature)
-    let code = valueAsListSlot(output, textState, state, "@.minyar.closure." + Text(start), 8)
+    let code = valueAsListSlot(output, textState, state, "@" + closureSymbol(context, start), 8)
     output.add("  call void @minyar_record_set(ptr " + callback + ", i64 0, i64 " + code + ")\n")
     let envSlot = valueAsListSlot(output, textState, state, env, 1000 + environment)
     noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, signature, 1000 + environment)
@@ -498,7 +570,7 @@ function parseClosure(context: CompilerContext, localNames: List<Text>, localTyp
     let type = signature
     if isDeterministicCallbackType(expected, functionNames) && sameCallbackSignature(expected, signature, functionNames) {
         type = expected
-        noteDeterministicValue(context, ".minyar.closure." + Text(start), start, "this anonymous function, passed as " + diagnosticType(context, expected) + ",")
+        noteDeterministicValue(context, closureSymbol(context, start), start, "this anonymous function, passed as " + diagnosticType(context, expected) + ",")
     }
     setType(resultType, type)
     markOwner(resultType, owner)
@@ -639,9 +711,9 @@ function compileClosureBodies(context: CompilerContext, output: List<Text>, glob
             let localLengths: List<Integer> = []
             let pendingDebugTypes: List<Integer> = []
             context.debugTypes = pendingDebugTypes
-            recordRuntimeTrace(context, ".minyar.closure." + Text(start), "anonymous function", start, false)
+            recordRuntimeTrace(context, closureSymbol(context, start), "anonymous function", start, false)
             emitDebugOrigin(output, tokenLines, start, "function")
-            output.add("define " + llvmReturnType(result) + " @.minyar.closure." + Text(start) + "(ptr %environment")
+            output.add("define " + llvmReturnType(result) + " @" + closureSymbol(context, start) + "(ptr %environment")
             let parameter = 0
             while parameter < parameters.length {
                 output.add(", " + llvmType(parameterTypes[parameter]) + " %argument." + Text(parameter))

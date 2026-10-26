@@ -441,3 +441,64 @@ public function replace(source: Text, needle: Text, replacement: Text): Text {
     parts.add(text.decodeOrStop(raw.slice(start, raw.length)))
     return joinText(parts)
 }
+
+// Whole-program symbols tag each module with `minyar_module_` and a digest of its
+// module build identity (compiler/stages/modules.min wholeProgramModuleTag and
+// compiler/stages/incremental.min stableModuleIdentity): "local:<path from the
+// entry's directory>" or "absolute:<normalized path>", digested in reverse.
+// Paths here must not need LLVM escaping.
+public function moduleTag(identity: Text): Text {
+    let forward = Bytes(identity)
+    let code = Bytes()
+    let index = forward.length
+    while index > 0 { index -= 1; code.add(forward[index]) }
+    let first = 5381
+    let second = 2166136261
+    for byte in code {
+        first = (first * 65599 + byte) % 2147483647
+        second = (second * 16777619 + byte) % 4294967291
+    }
+    return "minyar_module_" + hexWord(first) + hexWord(second)
+}
+function hexWord(value: Integer): Text {
+    let digits = "0123456789abcdef"
+    let pieces: List<Text> = []
+    let place = 268435456
+    while place > 0 {
+        let digit = value / place % 16
+        pieces.add(digits.slice(digit, digit + 1))
+        place = place / 16
+    }
+    return joinText(pieces)
+}
+// Where `before` + minyar_module_<16 hex digits>_<name> + `after` (a whole-program
+// symbol of any module) starts in text, or -1.
+public function findModuleSymbol(text: Text, before: Text, name: Text, after: Text): Integer {
+    let marker = before + "minyar_module_"
+    let suffix = "_" + name + after
+    let offset = 0
+    let rest = text
+    let found = rest.find(marker)
+    while found >= 0 {
+        let tail = found + marker.length + 16
+        if tail + suffix.length <= rest.length && rest.slice(tail, tail + suffix.length) == suffix { return offset + found }
+        offset = offset + found + 1
+        rest = rest.slice(found + 1, rest.length)
+        found = rest.find(marker)
+    }
+    return -1
+}
+// The same for a language function symbol: `before`@.minyar.fn.minyar_module_<tag>_<name>(
+public function findModuleFunction(text: Text, before: Text, name: Text): Integer { return findModuleSymbol(text, before + "@.minyar.fn.", name, "(") }
+public function moduleFunction(line: Text, name: Text): Boolean { return findModuleFunction(line, "", name) >= 0 }
+public function moduleFunctionCount(text: Text, name: Text): Integer {
+    let count = 0
+    let rest = text
+    let found = findModuleFunction(rest, "", name)
+    while found >= 0 {
+        count += 1
+        rest = rest.slice(found + 1, rest.length)
+        found = findModuleFunction(rest, "", name)
+    }
+    return count
+}

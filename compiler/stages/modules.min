@@ -261,9 +261,19 @@ function loadModule(library: Text, path: Text, isEntry: Boolean, modulePaths: Li
     return module
 }
 
+// A whole program's module tag: `minyar_module_` and a digest of the module's
+// identity. Token passes read whole-program names as identifiers, so the
+// quoted names of module builds cannot be used here.
+function wholeProgramModuleTag(identity: Text): Text {
+    return "minyar_module_" + genericInstanceDigest(identity)
+}
+
 function qualifiedDeclarationName(module: Integer, name: Text, identities: List<Text>): Text {
     let qualified = "minyar_module_" + Text(module) + "_" + name
-    if identities.length > 0 {
+    // Whole programs tag modules with identifiers (see wholeProgramModuleTag);
+    // module builds quote their escaped path identities, which start "nim.".
+    if identities.length > 0 && identities[module].startsWith("minyar_module_") { qualified = identities[module] + "_" + name }
+    else if identities.length > 0 {
         qualified = "\".minyar.fn.minyar.module|" + name + "|" + identities[module] + "\""
     }
     if module == 0 && name == "main" {
@@ -741,13 +751,23 @@ function compileEntryMode(path: Text, stackOwnerLimit: Integer, library: Text, m
     if modulePaths.length == 1 && modulePublic[0] == 0 && !hasMethodDeclarations(moduleTokenKinds, moduleTokenTexts) {
         // Hand the only module's tokens over; compileTokens may release them.
         moduleTokenLines.stage = 2
-        let entryOnly: List<Boolean> = []
-        return compileTokens(moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationStarts, declarationEnds, stackOwnerLimit, entryOnly, functionPieces)
+        return compileTokens(moduleTokenKinds, moduleTokenTexts, moduleTokenLines, declarationStarts, declarationEnds, stackOwnerLimit, newGenericIndex(), functionPieces)
     }
-    let internalModules: List<Boolean> = []
-    if internalImports {
-        let flagged = 0
-        while flagged < modulePaths.length { internalModules.add(flagged != entry); flagged = flagged + 1 }
+    // Each module is tagged by its module build identity (stableModuleIdentity: its path from the entry's
+    // directory, otherwise its whole path), never by import order or package root order: adding an import or a
+    // package keeps every other name, so a live patch sees only the code that changed.
+    let identityRoot = directoryOfPath(modulePaths[entry])
+    if identityRoot != "" && identityRoot != "/" { identityRoot = identityRoot + "/" }
+    let internalModules = newGenericIndex()
+    let tagged = newGenericIndex()
+    let identity = 0
+    while identity < modulePaths.length {
+        let tag = wholeProgramModuleTag(stableModuleIdentity(modulePaths[identity], identityRoot))
+        if genericIndexGet(tagged, tag) >= 0 { failCompiler("modules " + modulePaths[genericIndexGet(tagged, tag)] + " and " + modulePaths[identity] + " hash to the same name; rename one of them") }
+        genericIndexPut(tagged, tag, identity)
+        identities.add(tag)
+        if internalImports && identity != entry { genericIndexPut(internalModules, tag, 1) }
+        identity = identity + 1
     }
 
     let declarationOwners: List<Integer> = []
