@@ -1,0 +1,820 @@
+// In-memory HNSW graph (Malkov and Yashunin), following pgvector 0.8's hnsw access method: m neighbours per
+// upper layer and 2 * m on layer 0, ef_construction candidates per insert, levels drawn with ml = 1 / ln(m) from a
+// seeded PRNG, pgvector's neighbour-selection heuristic with pruned connections kept, and its cached "closer"
+// flags so that shrinking a full neighbour list usually needs only a few distance computations.
+//
+// Storage is contiguous: rows in one Bytes (normalized for cosine), every node's neighbour lists in one Bytes
+// block (layer 0 first, then each upper layer), with a parallel Bytes of float32 neighbour distances at the same
+// offsets. A list is an int32 header (count, plus CLOSER_SET when every slot's closer flag is current) followed
+// by int32 slots holding node * 2 + closer. Ids are arbitrary Integers mapped to internal node numbers.
+//
+// remove(id) only marks the node deleted: searches still traverse it but never return it, and it does not count
+// towards ef, so a search still returns ef live rows when they are reachable. vacuum() repairs every live node
+// that links to a deleted one (pgvector's RepairGraphElement: find its neighbours again, then add it back to
+// theirs) and compacts the storage, renumbering nodes.
+use "math" as math
+use "./ann.min" as ann
+
+public constant DEFAULT_M = 16
+public constant DEFAULT_EF_CONSTRUCTION = 64
+public constant DEFAULT_EF_SEARCH = 40
+constant MAX_LEVEL = 16
+constant CLOSER_SET = 65536
+constant COUNT_MASK = 65535
+
+public record Hnsw {
+    dimensions: Integer
+    metric: Integer
+    rowBytes: Integer
+    m: Integer
+    m0: Integer
+    efConstruction: Integer
+    ml: Float
+    seed: Integer
+    rng: ann.Rng
+    nodes: Integer           // allocated nodes, deleted ones included
+    live: Integer
+    entry: Integer           // -1 when empty
+    maxLevel: Integer
+    vectors: Bytes           // rowBytes per node
+    ids: List<Integer>       // node -> id
+    levels: Bytes            // node -> top level
+    deleted: Bytes           // node -> 1 when removed
+    base: List<Integer>      // node -> byte offset of its lists in links/dists
+    links: Bytes
+    dists: Bytes
+    byId: ann.IntMap         // live id -> node
+    // search scratch
+    visited: Bytes           // node -> stamp of the last search that reached it (1..255)
+    stamp: Integer
+    fresh: List<Integer>     // unvisited neighbours of the node being expanded
+    touchLines: Integer      // 64-byte lines of each fresh row loaded ahead of its distance (0 = none): plain
+                             // loads standing in for prefetches, so the rows' cache misses overlap
+    touched: Integer         // sum of the touched bytes, kept so the loads stay
+    distances: Integer       // distance computations so far (diagnostics)
+    candidates: ann.Heap
+    found: ann.Heap
+    query: Bytes             // the search query in index form
+    seeds: List<Integer>
+    seedDist: List<Float>
+    seedCount: Integer
+    layer: List<Integer>
+    layerDist: List<Float>
+    layerCount: Integer
+    bestNode: Integer
+    bestDist: Float
+    // neighbour-selection scratch
+    sNode: List<Integer>
+    sDist: List<Float>
+    sCloser: List<Boolean>
+    sSlot: List<Integer>
+    sCount: Integer
+    chosen: List<Integer>
+    chosenCount: Integer
+    added: List<Integer>
+    addedCount: Integer
+    dropped: List<Integer>
+    droppedCount: Integer
+    pruned: Integer
+}
+
+// A new empty graph. metric is one of ann.L2, ann.INNER_PRODUCT, ann.COSINE, ann.L1, ann.HAMMING, ann.JACCARD
+// (dimensions counts bits for the last two). pgvector's limits: 2 <= m <= 100, 4 <= efConstruction <= 1000 and
+// efConstruction >= 2 * m.
+public function newHnsw(dimensions: Integer, metric: Integer, m: Integer, efConstruction: Integer, seed: Integer): Hnsw {
+    if dimensions < 1 { fail("hnsw: dimensions must be positive") }
+    if metric < ann.L2 || metric > ann.SPARSE_L1 { fail("hnsw: unknown metric " + Text(metric)) }
+    if m < 2 || m > 100 { fail("hnsw: m must be between 2 and 100") }
+    if efConstruction < 4 || efConstruction > 1000 { fail("hnsw: ef_construction must be between 4 and 1000") }
+    if efConstruction < 2 * m { fail("hnsw: ef_construction must be greater than or equal to 2 * m") }
+    let rb = ann.rowBytes(metric, dimensions)
+    let ni: List<Integer> = []
+    let nf: List<Float> = []
+    let nb: List<Boolean> = []
+    let g = Hnsw {
+        dimensions: dimensions; metric: metric; rowBytes: rb; m: m; m0: 2 * m; efConstruction: efConstruction
+        ml: 1.0 / math.log(Float(m)); seed: seed; rng: ann.newRng(seed); nodes: 0; live: 0; entry: -1; maxLevel: -1
+        vectors: Bytes(); ids: []; levels: Bytes(); deleted: Bytes(); base: []; links: Bytes(); dists: Bytes()
+        byId: ann.newIntMap(16); visited: Bytes(); stamp: 0; fresh: []; touchLines: (rb + 63) / 64; touched: 0
+        distances: 0
+        candidates: ann.newHeap(); found: ann.newHeap()
+        query: Bytes(rb); seeds: []; seedDist: []; seedCount: 0; layer: []; layerDist: []; layerCount: 0
+        bestNode: -1; bestDist: 0.0; sNode: ni; sDist: nf; sCloser: nb; sSlot: []; sCount: 0; chosen: []
+        chosenCount: 0; added: []; addedCount: 0; dropped: []; droppedCount: 0; pruned: -1
+    }
+    return g
+}
+
+// Live rows in the graph.
+public function Hnsw.count(): Integer { return self.live }
+
+// Sparse rows: widen every row slot to hold `capacity` elements (rows keep their packed contents).
+public deterministic function Hnsw.growSparse(capacity: Integer) {
+    if !ann.isSparseMetric(self.metric) || capacity <= self.dimensions { return }
+    let oldRb = self.rowBytes
+    let rb = ann.rowBytes(self.metric, capacity)
+    let v = Bytes(self.nodes * rb)
+    let x = 0
+    while x < self.nodes {
+        let used = 4 + self.vectors.getInt32(x * oldRb) * 8
+        let i = 0
+        while i < used {
+            v[x * rb + i] = self.vectors[x * oldRb + i]
+            i += 1
+        }
+        x += 1
+    }
+    self.vectors = v
+    self.rowBytes = rb
+    self.dimensions = capacity
+    self.touchLines = (rb + 63) / 64
+    if self.query.length < rb { self.query.resize(rb) }
+}
+
+// Rows marked deleted and not yet vacuumed.
+public function Hnsw.deletedCount(): Integer { return self.nodes - self.live }
+
+public function Hnsw.contains(id: Integer): Boolean { return self.byId.get(id, -1) >= 0 }
+
+// A NULL query: every distance is zero (pgvector), so the search returns ef rows in no particular order; these
+// are the first ef live nodes. Returns the count.
+public deterministic function Hnsw.anyRows(ef: Integer, outIds: List<Integer>): Integer {
+    outIds.clear()
+    let n = 0
+    while n < self.nodes && outIds.length < ef {
+        if self.deleted[n] == 0 { outIds.add(self.ids[n]) }
+        n += 1
+    }
+    return outIds.length
+}
+
+// Approximate heap bytes held by the graph (storage, id map and scratch).
+public function Hnsw.memoryBytes(): Integer {
+    return self.vectors.length + self.links.length + self.dists.length + self.levels.length + self.deleted.length +
+        self.visited.length + (self.ids.length + self.base.length) * 8 + self.byId.memoryBytes()
+}
+
+// ---------------------------------------------------------------- small helpers
+
+function setInt(list: List<Integer>, i: Integer, v: Integer) {
+    while list.length <= i { list.add(0) }
+    list[i] = v
+}
+
+function setFloat(list: List<Float>, i: Integer, v: Float) {
+    while list.length <= i { list.add(0.0) }
+    list[i] = v
+}
+
+function setBool(list: List<Boolean>, i: Integer, v: Boolean) {
+    while list.length <= i { list.add(false) }
+    list[i] = v
+}
+
+function Hnsw.capacity(level: Integer): Integer {
+    if level == 0 { return self.m0 }
+    return self.m
+}
+
+// Byte offset of node x's list header for `level`.
+function Hnsw.listOffset(x: Integer, level: Integer): Integer {
+    if level == 0 { return self.base[x] }
+    return self.base[x] + (1 + self.m0 + (level - 1) * (1 + self.m)) * 4
+}
+
+// Distance from the row at q[qo..] to node x.
+deterministic function Hnsw.dist(q: Bytes, qo: Integer, x: Integer, bound: Float): Float {
+    self.distances += 1
+    return ann.distance(self.metric, q, qo, self.vectors, x * self.rowBytes, self.dimensions, bound)
+}
+
+deterministic function Hnsw.randomLevel(): Integer {
+    let u = 1.0 - self.rng.nextFloat()
+    let level = Integer(-math.log(u) * self.ml)
+    if level > MAX_LEVEL { level = MAX_LEVEL }
+    return level
+}
+
+// ---------------------------------------------------------------- search
+
+// Greedy descent on one layer from bestNode towards q (deleted nodes are fine stepping stones).
+deterministic function Hnsw.greedy(q: Bytes, qo: Integer, level: Integer) {
+    let changed = true
+    while changed {
+        changed = false
+        let o = self.listOffset(self.bestNode, level)
+        let n = self.links.getInt32(o) & COUNT_MASK
+        let j = 0
+        while j < n {
+            let nb = self.links.getInt32(o + 4 + j * 4) >> 1
+            let d = self.dist(q, qo, nb, self.bestDist)
+            if d < self.bestDist {
+                self.bestNode = nb
+                self.bestDist = d
+                changed = true
+            }
+            j += 1
+        }
+    }
+}
+
+// Advance the visited stamp, clearing the stamps when it wraps.
+deterministic function Hnsw.nextStamp() {
+    self.stamp += 1
+    if self.stamp == 256 {
+        let n = self.visited.length
+        self.visited.resize(0)
+        self.visited.resize(n)
+        self.stamp = 1
+    }
+}
+
+// How many 64-byte lines of each newly reached row a search loads before computing distances (default: the
+// whole row). Tuning knob for memory-bound searches; results do not depend on it.
+public function Hnsw.setTouchLines(lines: Integer) { self.touchLines = lines }
+
+// Start a search at the entry point and descend greedily to `level` + 1; leaves bestNode/bestDist.
+deterministic function Hnsw.descend(q: Bytes, qo: Integer, level: Integer) {
+    self.bestNode = self.entry
+    self.bestDist = self.dist(q, qo, self.entry, ann.infinity())
+    let lc = self.maxLevel
+    while lc > level {
+        self.greedy(q, qo, lc)
+        lc -= 1
+    }
+}
+
+// The ef nearest live nodes to q on one layer, reached from the seeds; `skip` (or -1) is traversed but never
+// returned. Leaves them nearest-first in layer/layerDist/layerCount.
+deterministic function Hnsw.searchLayer(q: Bytes, qo: Integer, ef: Integer, level: Integer, skip: Integer) {
+    self.nextStamp()
+    let stamp = self.stamp
+    let visited = self.visited
+    let vectors = self.vectors
+    let rb = self.rowBytes
+    let lines = self.touchLines
+    let deleted = self.deleted
+    let links = self.links
+    let cand = self.candidates
+    let found = self.found
+    cand.clear()
+    found.clear()
+    let i = 0
+    while i < self.seedCount {
+        let e = self.seeds[i]
+        if visited[e] != stamp {
+            visited[e] = stamp
+            let d = self.seedDist[i]
+            cand.pushMin(d, e)
+            if e != skip && deleted[e] == 0 { found.offerSmallest(d, e, ef) }
+        }
+        i += 1
+    }
+    let inf = ann.infinity()
+    while cand.length > 0 {
+        let c = cand.item[0]
+        if found.length >= ef && cand.dist[0] > found.dist[0] { break }
+        cand.popMin()
+        let o = self.listOffset(c, level)
+        let n = links.getInt32(o) & COUNT_MASK
+        // collect the unvisited neighbours, loading the start of each row so their cache misses overlap
+        let fresh = 0
+        let touch = 0
+        let j = 0
+        while j < n {
+            let nb = links.getInt32(o + 4 + j * 4) >> 1
+            j += 1
+            if visited[nb] == stamp { continue }
+            visited[nb] = stamp
+            setInt(self.fresh, fresh, nb)
+            fresh += 1
+            let t = 0
+            while t < lines {
+                touch += vectors[nb * rb + t * 64]
+                t += 1
+            }
+        }
+        self.touched = wrappingAdd(self.touched, touch)
+        j = 0
+        while j < fresh {
+            let nb = self.fresh[j]
+            j += 1
+            let full = found.length >= ef
+            let bound = inf
+            if full { bound = found.dist[0] }
+            let d = self.dist(q, qo, nb, bound)
+            if !full || d < bound {
+                cand.pushMin(d, nb)
+                if nb != skip && deleted[nb] == 0 {
+                    if full { found.popMax() }
+                    found.pushMax(d, nb)
+                }
+            }
+        }
+    }
+    self.layerCount = found.drainAscending(self.layer, self.layerDist, 0)
+}
+
+// Up to k live rows nearest to the query (dimensions float32 values, or packed bits, at q[offset..]) using a
+// candidate list of ef (pgvector's hnsw.ef_search, default 40; like pgvector at most ef rows come back, so pass
+// ef >= k). Writes ids and operator distances nearest-first into outIds[0..] and outDistances[0..], growing
+// the Lists when needed, and returns the number written.
+public deterministic function Hnsw.search(q: Bytes, offset: Integer, k: Integer, ef: Integer, outIds: List<Integer>,
+        outDistances: List<Float>): Integer {
+    if self.live == 0 || k <= 0 { return 0 }
+    if !ann.storeRow(self.metric, q, offset, self.query, 0, self.dimensions) {
+        // a zero cosine query: pgvector normalizes it to itself, so every row is at the same distance
+        let i = 0
+        while i < self.rowBytes {
+            self.query[i] = 0
+            i += 1
+        }
+    }
+    let width = ef
+    if width < 1 { width = 1 }
+    self.descend(self.query, 0, 0)
+    setInt(self.seeds, 0, self.bestNode)
+    setFloat(self.seedDist, 0, self.bestDist)
+    self.seedCount = 1
+    self.searchLayer(self.query, 0, width, 0, -1)
+    let n = self.layerCount
+    if n > k { n = k }
+    let i = 0
+    while i < n {
+        setInt(outIds, i, self.ids[self.layer[i]])
+        setFloat(outDistances, i, ann.reported(self.metric, self.layerDist[i]))
+        i += 1
+    }
+    return n
+}
+
+// ---------------------------------------------------------------- insert
+
+// Add a row (dimensions float32 values, or packed bits, at v[offset..]; the graph keeps its own copy). An id
+// already present is replaced. Returns false, storing nothing, for a cosine row with zero norm (pgvector skips
+// those) or a row containing NaN or an infinity.
+public deterministic function Hnsw.insert(id: Integer, v: Bytes, offset: Integer): Boolean {
+    if self.byId.get(id, -1) >= 0 { self.remove(id) }
+    let x = self.nodes
+    let vo = x * self.rowBytes
+    self.vectors.resize(vo + self.rowBytes)
+    if !ann.storeRow(self.metric, v, offset, self.vectors, vo, self.dimensions) {
+        self.vectors.resize(vo)
+        return false
+    }
+    let level = self.randomLevel()
+    let b = self.links.length
+    let size = (1 + self.m0 + level * (1 + self.m)) * 4
+    self.links.resize(b + size)
+    self.dists.resize(b + size)
+    self.base.add(b)
+    self.ids.add(id)
+    self.levels.add(level)
+    self.deleted.add(0)
+    self.visited.add(0)
+    self.nodes += 1
+    self.live += 1
+    self.byId.put(id, x)
+    if self.live == 1 {
+        // the first live row (any others were removed) becomes the entry point
+        self.entry = x
+        self.maxLevel = level
+        return true
+    }
+    self.link(x, level)
+    if level > self.maxLevel {
+        self.entry = x
+        self.maxLevel = level
+    }
+    return true
+}
+
+// Find x's neighbours on layers min(level, maxLevel) .. 0 and connect them both ways (pgvector's
+// HnswFindElementNeighbors followed by its connection updates).
+deterministic function Hnsw.link(x: Integer, level: Integer) {
+    let q = self.vectors
+    let qo = x * self.rowBytes
+    let top = level
+    if top > self.maxLevel { top = self.maxLevel }
+    self.descend(q, qo, top)
+    setInt(self.seeds, 0, self.bestNode)
+    setFloat(self.seedDist, 0, self.bestDist)
+    self.seedCount = 1
+    let lc = top
+    while lc >= 0 {
+        self.searchLayer(q, qo, self.efConstruction, lc, x)
+        self.connect(x, lc)
+        if self.layerCount > 0 {
+            let i = 0
+            while i < self.layerCount {
+                setInt(self.seeds, i, self.layer[i])
+                setFloat(self.seedDist, i, self.layerDist[i])
+                i += 1
+            }
+            self.seedCount = self.layerCount
+        }
+        lc -= 1
+    }
+}
+
+// Select x's neighbours on `level` from the layer results and add x to each of theirs.
+deterministic function Hnsw.connect(x: Integer, level: Integer) {
+    let n = self.layerCount
+    let i = 0
+    while i < n {
+        setInt(self.sNode, i, self.layer[i])
+        setFloat(self.sDist, i, self.layerDist[i])
+        setBool(self.sCloser, i, false)
+        setInt(self.sSlot, i, -1)
+        i += 1
+    }
+    self.sCount = n
+    self.select(self.capacity(level), true, -1)
+    let o = self.listOffset(x, level)
+    let r = 0
+    while r < self.chosenCount {
+        let e = self.chosen[r]
+        let flag = 0
+        if self.sCloser[e] { flag = 1 }
+        self.links.setInt32(o + 4 + r * 4, self.sNode[e] * 2 + flag)
+        self.dists.setFloat32(o + 4 + r * 4, self.sDist[e])
+        r += 1
+    }
+    let count = self.chosenCount
+    self.links.setInt32(o, count + CLOSER_SET)
+    r = 0
+    while r < count {
+        let nb = self.links.getInt32(o + 4 + r * 4) >> 1
+        self.addConnection(nb, level, x, self.dists.getFloat32(o + 4 + r * 4))
+        r += 1
+    }
+}
+
+// Add x (at distance d) to nb's list on `level`, shrinking a full list with the heuristic (pgvector's
+// HnswUpdateConnection): the one candidate left out is replaced by x, unless x is the one left out.
+deterministic function Hnsw.addConnection(nb: Integer, level: Integer, x: Integer, d: Float) {
+    let o = self.listOffset(nb, level)
+    let header = self.links.getInt32(o)
+    let count = header & COUNT_MASK
+    let j = 0
+    while j < count {
+        if self.links.getInt32(o + 4 + j * 4) >> 1 == x { return }
+        j += 1
+    }
+    if count < self.capacity(level) {
+        self.links.setInt32(o + 4 + count * 4, x * 2)
+        self.dists.setFloat32(o + 4 + count * 4, d)
+        self.links.setInt32(o, count + 1)              // the new slot has no closer flag yet
+        return
+    }
+    // gather the current neighbours and x, sorted nearest-first (insertion sort; at most 2 * m + 1)
+    setInt(self.sNode, count, 0)
+    setFloat(self.sDist, count, 0.0)
+    setBool(self.sCloser, count, false)
+    setInt(self.sSlot, count, 0)
+    j = 0
+    while j <= count {
+        let node = x
+        let nd = d
+        let closer = false
+        let slot = -1
+        if j < count {
+            let s = self.links.getInt32(o + 4 + j * 4)
+            node = s >> 1
+            closer = (s & 1) == 1
+            nd = self.dists.getFloat32(o + 4 + j * 4)
+            slot = j
+        }
+        let p = j
+        while p > 0 && self.sDist[p - 1] > nd {
+            self.sNode[p] = self.sNode[p - 1]
+            self.sDist[p] = self.sDist[p - 1]
+            self.sCloser[p] = self.sCloser[p - 1]
+            self.sSlot[p] = self.sSlot[p - 1]
+            p -= 1
+        }
+        setInt(self.sNode, p, node)
+        setFloat(self.sDist, p, nd)
+        setBool(self.sCloser, p, closer)
+        setInt(self.sSlot, p, slot)
+        j += 1
+    }
+    self.sCount = count + 1
+    let newIdx = 0
+    while self.sSlot[newIdx] != -1 { newIdx += 1 }
+    self.select(count, (header & CLOSER_SET) == 0, newIdx)
+    let i = 0
+    while i < self.sCount {
+        let slot = self.sSlot[i]
+        if slot >= 0 {
+            let flag = 0
+            if self.sCloser[i] { flag = 1 }
+            self.links.setInt32(o + 4 + slot * 4, self.sNode[i] * 2 + flag)
+        }
+        i += 1
+    }
+    let out = self.sSlot[self.pruned]
+    if out >= 0 {
+        let flag = 0
+        if self.sCloser[newIdx] { flag = 1 }
+        self.links.setInt32(o + 4 + out * 4, x * 2 + flag)
+        self.dists.setFloat32(o + 4 + out * 4, d)
+    }
+    self.links.setInt32(o, count + CLOSER_SET)
+}
+
+// pgvector's HnswSelectNeighbors over the sorted candidates sNode/sDist (closer flags in sCloser): a candidate
+// is kept when it is closer to the base element than to every candidate kept so far; then the nearest dropped
+// candidates fill the remaining room. With mustCalculate false the cached flags are reused and only the new
+// candidate (newIdx) and the candidates its arrival can affect are recomputed. Leaves the kept candidates'
+// indexes in chosen[0..chosenCount) and the one left out (when there is exactly one) in pruned.
+deterministic function Hnsw.select(lm: Integer, mustCalculate: Boolean, newIdx: Integer) {
+    self.chosenCount = 0
+    self.addedCount = 0
+    self.droppedCount = 0
+    let removedAny = false
+    let i = 0
+    while i < self.sCount && self.chosenCount < lm {
+        let closer = self.sCloser[i]
+        if mustCalculate {
+            closer = self.closerThanAll(i, self.chosen, self.chosenCount)
+        } else if self.addedCount > 0 {
+            if closer {
+                closer = self.closerThanAll(i, self.added, self.addedCount)
+                if !closer { removedAny = true }
+            } else if removedAny {
+                closer = self.closerThanAll(i, self.chosen, self.chosenCount)
+                if closer {
+                    setInt(self.added, self.addedCount, i)
+                    self.addedCount += 1
+                }
+            }
+        } else if i == newIdx {
+            closer = self.closerThanAll(i, self.chosen, self.chosenCount)
+            if closer {
+                setInt(self.added, self.addedCount, i)
+                self.addedCount += 1
+            }
+        }
+        self.sCloser[i] = closer
+        if closer {
+            setInt(self.chosen, self.chosenCount, i)
+            self.chosenCount += 1
+        } else {
+            setInt(self.dropped, self.droppedCount, i)
+            self.droppedCount += 1
+        }
+        i += 1
+    }
+    let j = 0
+    while j < self.droppedCount && self.chosenCount < lm {
+        setInt(self.chosen, self.chosenCount, self.dropped[j])
+        self.chosenCount += 1
+        j += 1
+    }
+    if j < self.droppedCount {
+        self.pruned = self.dropped[j]
+    } else {
+        self.pruned = self.sCount - 1
+    }
+}
+
+// Is candidate e nearer the base element than to every candidate in set[0..count)?
+deterministic function Hnsw.closerThanAll(e: Integer, set: List<Integer>, count: Integer): Boolean {
+    if count == 0 { return true }
+    let eo = self.sNode[e] * self.rowBytes
+    let de = self.sDist[e]
+    let t = 0
+    while t < count {
+        let other = self.sNode[set[t]]
+        let d = ann.distance(self.metric, self.vectors, eo, self.vectors, other * self.rowBytes, self.dimensions, de)
+        if d <= de { return false }
+        t += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- delete and vacuum
+
+// Mark a row deleted; false when the id is not in the graph.
+public deterministic function Hnsw.remove(id: Integer): Boolean {
+    let x = self.byId.get(id, -1)
+    if x < 0 { return false }
+    self.byId.remove(id)
+    self.deleted[x] = 1
+    self.live -= 1
+    return true
+}
+
+// Repair the links around deleted rows and drop them from storage, renumbering the remaining nodes. Returns
+// the number of rows dropped. Costs a neighbour search for every live node that links to a deleted one.
+public deterministic function Hnsw.vacuum(): Integer {
+    let dropped = self.nodes - self.live
+    if dropped == 0 { return 0 }
+    if self.live == 0 {
+        self.compact()
+        return dropped
+    }
+    if self.deleted[self.entry] == 1 {
+        // pgvector picks a new entry point first: the live node with the highest level
+        let best = -1
+        let bestLevel = -1
+        let x = 0
+        while x < self.nodes {
+            if self.deleted[x] == 0 && self.levels[x] > bestLevel {
+                best = x
+                bestLevel = self.levels[x]
+            }
+            x += 1
+        }
+        self.entry = best
+        self.maxLevel = bestLevel
+    }
+    let x = 0
+    while x < self.nodes {
+        if self.deleted[x] == 0 && self.linksDeleted(x) { self.link(x, self.levels[x]) }
+        x += 1
+    }
+    self.compact()
+    return dropped
+}
+
+deterministic function Hnsw.linksDeleted(x: Integer): Boolean {
+    let level = 0
+    while level <= self.levels[x] {
+        let o = self.listOffset(x, level)
+        let n = self.links.getInt32(o) & COUNT_MASK
+        let j = 0
+        while j < n {
+            if self.deleted[self.links.getInt32(o + 4 + j * 4) >> 1] == 1 { return true }
+            j += 1
+        }
+        level += 1
+    }
+    return false
+}
+
+// Rebuild storage with only the live nodes, in their current order.
+deterministic function Hnsw.compact() {
+    let renumber: List<Integer> = []
+    let next = 0
+    let x = 0
+    while x < self.nodes {
+        if self.deleted[x] == 0 {
+            renumber.add(next)
+            next += 1
+        } else {
+            renumber.add(-1)
+        }
+        x += 1
+    }
+    let vectors = Bytes()
+    let ids: List<Integer> = []
+    let levels = Bytes()
+    let deleted = Bytes()
+    let base: List<Integer> = []
+    let links = Bytes()
+    let dists = Bytes()
+    let visited = Bytes()
+    let byId = ann.newIntMap(next)
+    x = 0
+    while x < self.nodes {
+        if renumber[x] >= 0 {
+            let rb = self.rowBytes
+            vectors.addBytes(self.vectors.slice(x * rb, x * rb + rb))
+            ids.add(self.ids[x])
+            levels.add(self.levels[x])
+            deleted.add(0)
+            visited.add(0)
+            byId.put(self.ids[x], renumber[x])
+            let nb = links.length
+            base.add(nb)
+            let size = (1 + self.m0 + self.levels[x] * (1 + self.m)) * 4
+            links.resize(nb + size)
+            dists.resize(nb + size)
+            let level = 0
+            while level <= self.levels[x] {
+                let o = self.listOffset(x, level)
+                let no = nb + (o - self.base[x])
+                let header = self.links.getInt32(o)
+                let n = header & COUNT_MASK
+                let kept = 0
+                let j = 0
+                while j < n {
+                    let s = self.links.getInt32(o + 4 + j * 4)
+                    let to = renumber[s >> 1]
+                    if to >= 0 {
+                        links.setInt32(no + 4 + kept * 4, to * 2 + (s & 1))
+                        dists.setFloat32(no + 4 + kept * 4, self.dists.getFloat32(o + 4 + j * 4))
+                        kept += 1
+                    }
+                    j += 1
+                }
+                if kept == n {
+                    links.setInt32(no, header)
+                } else {
+                    links.setInt32(no, kept)
+                }
+                level += 1
+            }
+        }
+        x += 1
+    }
+    if next == 0 {
+        self.entry = -1
+        self.maxLevel = -1
+    } else {
+        self.entry = renumber[self.entry]
+    }
+    self.vectors = vectors
+    self.ids = ids
+    self.levels = levels
+    self.deleted = deleted
+    self.base = base
+    self.links = links
+    self.dists = dists
+    self.visited = visited
+    self.byId = byId
+    self.stamp = 0
+    self.nodes = next
+    self.live = next
+}
+
+// ---------------------------------------------------------------- inspection
+
+// A hash of the graph's structure (entry point, levels and every neighbour list), for determinism checks.
+public function Hnsw.checksum(): Integer {
+    let h = wrappingAdd(wrappingMultiply(self.entry, 1000003), self.nodes)
+    let i = 0
+    while i + 4 <= self.links.length {
+        h = wrappingAdd(wrappingMultiply(h, 1099511628211), self.links.getInt32(i))
+        i += 4
+    }
+    i = 0
+    while i < self.levels.length {
+        h = wrappingAdd(wrappingMultiply(h, 31), self.levels[i])
+        i += 1
+    }
+    return h
+}
+
+// Total neighbour-list entries on layer 0 over live nodes (graph-degree diagnostics).
+public function Hnsw.edgeCount(): Integer {
+    let total = 0
+    let x = 0
+    while x < self.nodes {
+        if self.deleted[x] == 0 { total += self.links.getInt32(self.base[x]) & COUNT_MASK }
+        x += 1
+    }
+    return total
+}
+
+// Live nodes that no search can reach (graph-connectivity diagnostics): from the entry point, each layer from
+// the top down extends the reached set along that layer's links, as a search descends. Layer 0 alone is often
+// not strongly connected from the entry point (on SIFT about half the rows sit in basins that only upper-layer
+// links lead into), so this counts through every layer.
+public function Hnsw.unreachableCount(): Integer {
+    if self.entry < 0 { return 0 }
+    let seen = Bytes(self.nodes)
+    seen[self.entry] = 1
+    let level = self.maxLevel
+    while level >= 0 {
+        let queue: List<Integer> = []
+        let x = 0
+        while x < self.nodes {
+            if seen[x] == 1 && self.levels[x] >= level { queue.add(x) }
+            x += 1
+        }
+        let head = 0
+        while head < queue.length {
+            let y = queue[head]
+            head += 1
+            let o = self.listOffset(y, level)
+            let n = self.links.getInt32(o) & COUNT_MASK
+            let j = 0
+            while j < n {
+                let nb = self.links.getInt32(o + 4 + j * 4) >> 1
+                if seen[nb] == 0 {
+                    seen[nb] = 1
+                    queue.add(nb)
+                }
+                j += 1
+            }
+        }
+        level -= 1
+    }
+    let missing = 0
+    let x = 0
+    while x < self.nodes {
+        if seen[x] == 0 && self.deleted[x] == 0 { missing += 1 }
+        x += 1
+    }
+    return missing
+}
+
+// The level of the row with this id, or -1.
+public function Hnsw.levelOf(id: Integer): Integer {
+    let x = self.byId.get(id, -1)
+    if x < 0 { return -1 }
+    return self.levels[x]
+}

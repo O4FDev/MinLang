@@ -1,0 +1,662 @@
+// General arrays. An array value is its canonical PostgreSQL text form, what array_out prints: {1,2,3},
+// {{1,2},{3,4}}, {"a b",NULL,""} or [0:1]={7,8}. Keeping that form as the stored value means arrays store, copy
+// and print like text (the way NUMERIC without a typmod is kept as its text, values.T_NUMTEXT). Operations that
+// need the elements (comparisons, hashing, casts, ANY, unnest, subscripts, the binary wire format) split the form
+// with `parse`. Element texts are canonical as well (the element type's own output), so every array the engine
+// builds or reads goes through the element type's input and output once (exec.min arrayIn).
+//
+// The engine type id of an array type is values.T_PGTEXT + its pg_type oid (values.arrayOf, arrayElemType).
+use "./values.min" as v
+use "text" as utf8
+
+public constant MAXDIM = 6
+
+// A parsed array: dimensions, lower bounds and the element texts (quotes and escapes removed) laid out in one
+// buffer, elements in row-major order.
+public record Arr {
+    ndim: Integer
+    dims: List<Integer>
+    lbs: List<Integer>
+    data: Bytes
+    starts: List<Integer>
+    lens: List<Integer>
+    nulls: List<Boolean>
+    ok: Boolean
+    code: Text               // SQLSTATE, message and detail of a malformed input (ok = false)
+    msg: Text
+    detail: Text
+}
+
+public function newArr(): Arr {
+    return Arr { ndim: 0; dims: []; lbs: []; data: Bytes(); starts: []; lens: []; nulls: []; ok: true; code: ""; msg: ""; detail: "" }
+}
+
+public function Arr.reset() {
+    self.ndim = 0
+    self.dims.clear()
+    self.lbs.clear()
+    self.data.clear()
+    self.starts.clear()
+    self.lens.clear()
+    self.nulls.clear()
+    self.ok = true
+    self.code = ""
+    self.msg = ""
+    self.detail = ""
+}
+
+public function Arr.count(): Integer { return self.starts.length }
+
+public function Arr.isNull(i: Integer): Boolean { return self.nulls[i] }
+
+// Element i's text as a fresh Bytes (prefer data/starts/lens views on hot paths).
+public function Arr.elem(i: Integer): Bytes {
+    let s = self.starts[i]
+    return self.data.slice(s, s + self.lens[i])
+}
+
+// Append an element (its canonical text) or a NULL; one-dimensional arrays grow with this.
+public function Arr.add(b: Bytes, o: Integer, l: Integer) {
+    self.starts.add(self.data.length)
+    self.lens.add(l)
+    self.nulls.add(false)
+    let i = 0
+    while i < l {
+        self.data.add(b[o + i])
+        i += 1
+    }
+}
+
+public function Arr.addNull() {
+    self.starts.add(self.data.length)
+    self.lens.add(0)
+    self.nulls.add(true)
+}
+
+// Make the elements added so far a one-dimensional array starting at index 1 (or empty).
+public function Arr.oneDimension() {
+    self.dims.clear()
+    self.lbs.clear()
+    if self.starts.length == 0 {
+        self.ndim = 0
+        return
+    }
+    self.ndim = 1
+    self.dims.add(self.starts.length)
+    self.lbs.add(1)
+}
+
+function malformed(a: Arr, input: Bytes, o: Integer, l: Integer, detail: Text) {
+    if !a.ok { return }
+    a.ok = false
+    a.code = "22P02"
+    a.msg = "malformed array literal: \"" + utf8.decodeOrStop(input.slice(o, o + l)) + "\""
+    a.detail = detail
+}
+
+function isSpace(c: Integer): Boolean {
+    return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12
+}
+
+function skipSpace(b: Bytes, i: Integer, e: Integer): Integer {
+    let j = i
+    while j < e && isSpace(b[j]) { j += 1 }
+    return j
+}
+
+// Signed decimal integer at b[i..e) for dimension decorations; returns the end position, value in out[0].
+function readInt(b: Bytes, i: Integer, e: Integer, out: List<Integer>): Integer {
+    let j = i
+    let neg = false
+    if j < e && (b[j] == 45 || b[j] == 43) {
+        neg = b[j] == 45
+        j += 1
+    }
+    let start = j
+    let x = 0
+    while j < e && b[j] >= 48 && b[j] <= 57 && x < 1000000000000 {
+        x = x * 10 + (b[j] - 48)
+        j += 1
+    }
+    if j == start { return -1 }
+    if neg { x = -x }
+    out[0] = x
+    return j
+}
+
+// Parse the text form b[o, o + l) (array_in). On malformed input a.ok is false with SQLSTATE/message/detail.
+public function parse(b: Bytes, o: Integer, l: Integer, a: Arr) {
+    a.reset()
+    let e = o + l
+    let i = skipSpace(b, o, e)
+    let explicitDims: List<Integer> = []
+    let explicitLbs: List<Integer> = []
+    let num: List<Integer> = [0]
+    if i < e && b[i] == 91 {
+        while i < e && b[i] == 91 {
+            if explicitDims.length == MAXDIM {
+                a.ok = false
+                a.code = "54000"
+                a.msg = "number of array dimensions exceeds the maximum allowed (" + Text(MAXDIM) + ")"
+                return
+            }
+            i = skipSpace(b, i + 1, e)
+            let j = readInt(b, i, e, num)
+            if j < 0 {
+                malformed(a, b, o, l, "\"[\" must introduce explicitly-specified array dimensions.")
+                return
+            }
+            let lo = 1
+            let hi = num[0]
+            i = skipSpace(b, j, e)
+            if i < e && b[i] == 58 {
+                lo = num[0]
+                i = skipSpace(b, i + 1, e)
+                j = readInt(b, i, e, num)
+                if j < 0 {
+                    malformed(a, b, o, l, "Missing array dimension value.")
+                    return
+                }
+                hi = num[0]
+                i = skipSpace(b, j, e)
+            }
+            if i >= e || b[i] != 93 {
+                malformed(a, b, o, l, "Missing \"]\" after array dimensions.")
+                return
+            }
+            if hi < lo - 1 {
+                a.ok = false
+                a.code = "2202E"
+                a.msg = "upper bound cannot be less than lower bound"
+                return
+            }
+            explicitDims.add(hi - lo + 1)
+            explicitLbs.add(lo)
+            i = skipSpace(b, i + 1, e)
+        }
+        if i >= e || b[i] != 61 {
+            malformed(a, b, o, l, "Missing \"=\" after array dimensions.")
+            return
+        }
+        i = skipSpace(b, i + 1, e)
+    }
+    if i >= e || b[i] != 123 {
+        malformed(a, b, o, l, "Array value must start with \"{\" or dimension information.")
+        return
+    }
+    // nesting: counts[d] counts the items of the open sub-array at depth d; dims[d] is fixed by the first one
+    let counts: List<Integer> = []
+    let fixed: List<Integer> = []
+    let ndim = -1              // depth of the leaf level, known after the first element (or first "}")
+    let depth = 0
+    let expectItem = true      // just after "{" or ","
+    let afterItem = false      // just after an element or a "}" of a sub-array
+    while true {
+        i = skipSpace(b, i, e)
+        if i >= e {
+            malformed(a, b, o, l, "Unexpected end of input.")
+            return
+        }
+        let c = b[i]
+        if c == 123 {
+            if afterItem || (ndim >= 0 && depth >= ndim) {
+                malformed(a, b, o, l, "Unexpected \"{\" character.")
+                return
+            }
+            if depth == MAXDIM {
+                a.ok = false
+                a.code = "54000"
+                a.msg = "number of array dimensions exceeds the maximum allowed (" + Text(MAXDIM) + ")"
+                return
+            }
+            if depth > 0 { counts[depth - 1] += 1 }
+            if counts.length <= depth {
+                counts.add(0)
+                fixed.add(-1)
+            }
+            counts[depth] = 0
+            depth += 1
+            i += 1
+            expectItem = true
+            afterItem = false
+            continue
+        }
+        if c == 125 {
+            if expectItem && counts[depth - 1] > 0 {
+                malformed(a, b, o, l, "Unexpected \"}\" character.")
+                return
+            }
+            let d = depth - 1
+            if ndim < 0 {
+                // "{}" before any element: an empty array, legal only as the whole value
+                if d != 0 {
+                    malformed(a, b, o, l, "Unexpected \"}\" character.")
+                    return
+                }
+                ndim = 0
+            }
+            if ndim > 0 {
+                if d >= ndim {
+                    malformed(a, b, o, l, "Unexpected \"}\" character.")
+                    return
+                }
+                if fixed[d] < 0 {
+                    fixed[d] = counts[d]
+                } else if fixed[d] != counts[d] {
+                    malformed(a, b, o, l, "Multidimensional arrays must have sub-arrays with matching dimensions.")
+                    return
+                }
+            }
+            depth -= 1
+            i += 1
+            expectItem = false
+            afterItem = true
+            if depth == 0 { break }
+            continue
+        }
+        if c == 44 {
+            if expectItem || !afterItem {
+                malformed(a, b, o, l, "Unexpected \",\" character.")
+                return
+            }
+            i += 1
+            expectItem = true
+            afterItem = false
+            continue
+        }
+        // an element
+        if afterItem {
+            malformed(a, b, o, l, "Unexpected array element.")
+            return
+        }
+        if ndim < 0 { ndim = depth }
+        if depth != ndim {
+            malformed(a, b, o, l, "Unexpected array element.")
+            return
+        }
+        counts[depth - 1] += 1
+        let start = a.data.length
+        if c == 34 {
+            i += 1
+            let closed = false
+            while i < e {
+                let x = b[i]
+                if x == 92 {
+                    i += 1
+                    if i >= e { break }
+                    a.data.add(b[i])
+                } else if x == 34 {
+                    closed = true
+                    i += 1
+                    break
+                } else {
+                    a.data.add(x)
+                }
+                i += 1
+            }
+            if !closed {
+                malformed(a, b, o, l, "Unexpected end of input.")
+                return
+            }
+            a.starts.add(start)
+            a.lens.add(a.data.length - start)
+            a.nulls.add(false)
+        } else {
+            // unquoted: up to an unescaped "," or "}", trailing unescaped whitespace dropped
+            let keep = start         // data length up to the last non-space or escaped byte
+            let escaped = false
+            while i < e {
+                let x = b[i]
+                if x == 44 || x == 125 { break }
+                if x == 123 || x == 34 {
+                    malformed(a, b, o, l, "Unexpected \"" + utf8.decodeOrStop(b.slice(i, i + 1)) + "\" character.")
+                    return
+                }
+                if x == 92 {
+                    i += 1
+                    if i >= e { break }
+                    a.data.add(b[i])
+                    keep = a.data.length
+                    escaped = true
+                } else {
+                    a.data.add(x)
+                    if !isSpace(x) { keep = a.data.length }
+                }
+                i += 1
+            }
+            a.data.resize(keep)
+            let len = a.data.length - start
+            let isNull = !escaped && len == 4 && isNullWord(a.data, start)
+            if isNull { a.data.resize(start) }
+            a.starts.add(start)
+            a.lens.add(a.data.length - start)
+            a.nulls.add(isNull)
+        }
+        expectItem = false
+        afterItem = true
+    }
+    i = skipSpace(b, i, e)
+    if i < e {
+        malformed(a, b, o, l, "Junk after closing right brace.")
+        return
+    }
+    if ndim <= 0 {
+        a.ndim = 0
+        if explicitDims.length > 0 {
+            malformed(a, b, o, l, "Specified array dimensions do not match array contents.")
+        }
+        return
+    }
+    a.ndim = ndim
+    let d = 0
+    while d < ndim {
+        a.dims.add(fixed[d])
+        a.lbs.add(1)
+        d += 1
+    }
+    if explicitDims.length > 0 {
+        if explicitDims.length != ndim {
+            malformed(a, b, o, l, "Specified array dimensions do not match array contents.")
+            return
+        }
+        d = 0
+        while d < ndim {
+            if explicitDims[d] != a.dims[d] {
+                malformed(a, b, o, l, "Specified array dimensions do not match array contents.")
+                return
+            }
+            a.lbs[d] = explicitLbs[d]
+            d += 1
+        }
+    }
+}
+
+function isNullWord(b: Bytes, at: Integer): Boolean {
+    return (b[at] == 78 || b[at] == 110) && (b[at + 1] == 85 || b[at + 1] == 117) &&
+        (b[at + 2] == 76 || b[at + 2] == 108) && (b[at + 3] == 76 || b[at + 3] == 108)
+}
+
+// Does element text need double quotes in the output (array_out's rule)?
+function needsQuotes(b: Bytes, o: Integer, l: Integer): Boolean {
+    if l == 0 { return true }
+    if l == 4 && isNullWord(b, o) { return true }
+    let i = 0
+    while i < l {
+        let c = b[o + i]
+        if c == 34 || c == 92 || c == 123 || c == 125 || c == 44 || isSpace(c) { return true }
+        i += 1
+    }
+    return false
+}
+
+// Append one element's text in array_out form (quoted and escaped when needed).
+public function addElem(out: Bytes, b: Bytes, o: Integer, l: Integer) {
+    if !needsQuotes(b, o, l) {
+        let i = 0
+        while i < l {
+            out.add(b[o + i])
+            i += 1
+        }
+        return
+    }
+    out.add(34)
+    let i = 0
+    while i < l {
+        let c = b[o + i]
+        if c == 34 || c == 92 { out.add(92) }
+        out.add(c)
+        i += 1
+    }
+    out.add(34)
+}
+
+function addNullWord(out: Bytes) {
+    out.add(78)
+    out.add(85)
+    out.add(76)
+    out.add(76)
+}
+
+// Append the canonical text form of a (array_out).
+public function format(a: Arr, out: Bytes) {
+    if a.ndim == 0 || a.starts.length == 0 {
+        out.add(123)
+        out.add(125)
+        return
+    }
+    let decorate = false
+    for lb in a.lbs {
+        if lb != 1 { decorate = true }
+    }
+    if decorate {
+        let d = 0
+        while d < a.ndim {
+            out.add(91)
+            v.addInt(out, a.lbs[d])
+            out.add(58)
+            v.addInt(out, a.lbs[d] + a.dims[d] - 1)
+            out.add(93)
+            d += 1
+        }
+        out.add(61)
+    }
+    let idx: List<Integer> = []
+    let d = 0
+    while d < a.ndim {
+        idx.add(0)
+        d += 1
+    }
+    let k = 0
+    let total = a.starts.length
+    // open the braces of every level, then walk the elements closing and reopening levels as indexes wrap
+    d = 0
+    while d < a.ndim {
+        out.add(123)
+        d += 1
+    }
+    while k < total {
+        if a.nulls[k] {
+            addNullWord(out)
+        } else {
+            addElem(out, a.data, a.starts[k], a.lens[k])
+        }
+        k += 1
+        // advance the multi-index
+        let level = a.ndim - 1
+        idx[level] += 1
+        let closed = 0
+        while level > 0 && idx[level] == a.dims[level] {
+            idx[level] = 0
+            level -= 1
+            idx[level] += 1
+            closed += 1
+        }
+        if k == total {
+            break
+        }
+        let c = 0
+        while c < closed {
+            out.add(125)
+            c += 1
+        }
+        out.add(44)
+        c = 0
+        while c < closed {
+            out.add(123)
+            c += 1
+        }
+    }
+    d = 0
+    while d < a.ndim {
+        out.add(125)
+        d += 1
+    }
+}
+
+// ---------------------------------------------------------------- element order and hashing (core types)
+
+function cmpInt(x: Integer, y: Integer): Integer {
+    if x < y { return -1 }
+    if x > y { return 1 }
+    return 0
+}
+
+// Float order: -0 equals 0, NaN is greater than everything and equal to itself (float8_cmp).
+function cmpFloat(x: Float, y: Float): Integer {
+    let xn = x != x
+    let yn = y != y
+    if xn || yn {
+        if xn && yn { return 0 }
+        if xn { return 1 }
+        return -1
+    }
+    if x < y { return -1 }
+    if x > y { return 1 }
+    return 0
+}
+
+// Can elements of type et be ordered by this module (true for every core type; extension types need their
+// ordering callback, see exec.min)?
+public function coreOrdered(et: Integer): Boolean { return !v.isExtType(et) }
+
+// Integer key of a date/time/interval element text for ordering, or the text order when it does not parse.
+function timeKey(et: Integer, b: Bytes, o: Integer, l: Integer, q: v.Parsed): Integer {
+    if et == v.T_DATE {
+        v.parseDate(b, o, l, q)
+        return q.i
+    }
+    if et == v.T_INTERVAL {
+        v.parseInterval(b, o, l, 0, q)
+        return q.i + q.aux * 86400000000 + q.aux2 * 2592000000000
+    }
+    if et == v.T_TIME {
+        let tmp = Bytes("2000-01-01 ")
+        tmp.addBytes(b.slice(o, o + l))
+        v.parseTimestamp(tmp, 0, tmp.length, q)
+        return q.i
+    }
+    v.parseTimestamp(b, o, l, q)
+    return q.i
+}
+
+global ELEM_PARSED: v.Parsed = v.newParsed()
+global ELEM_PARSED2: v.Parsed = v.newParsed()
+
+// Order of two non-null element texts of core type et.
+public function cmpElems(et: Integer, a: Bytes, ao: Integer, al: Integer, b: Bytes, bo: Integer, bl: Integer): Integer {
+    let q = ELEM_PARSED
+    let r = ELEM_PARSED2
+    if v.isIntType(et) || et == v.T_OID || et == v.T_XID || et == v.T_REGCLASS || et == v.T_REGTYPE {
+        v.parseInt(a, ao, al, q, -9223372036854775807 - 1, 9223372036854775807)
+        v.parseInt(b, bo, bl, r, -9223372036854775807 - 1, 9223372036854775807)
+        if q.ok && r.ok { return cmpInt(q.i, r.i) }
+    } else if v.isFloatType(et) {
+        v.parseFloat(a, ao, al, q)
+        v.parseFloat(b, bo, bl, r)
+        if q.ok && r.ok { return cmpFloat(q.f, r.f) }
+    } else if et == v.T_NUMERIC || et == v.T_NUMTEXT {
+        return v.cmpNumText(a, ao, al, b, bo, bl)
+    } else if et == v.T_DATE || et == v.T_TIMESTAMP || et == v.T_TIMESTAMPTZ || et == v.T_TIME || et == v.T_INTERVAL {
+        let x = timeKey(et, a, ao, al, q)
+        let okx = q.ok
+        let y = timeKey(et, b, bo, bl, r)
+        if okx && r.ok { return cmpInt(x, y) }
+    } else if et == v.T_BPCHAR {
+        return v.compareBytes(a, ao, v.trimmedLen(a, ao, al), b, bo, v.trimmedLen(b, bo, bl))
+    }
+    return v.compareBytes(a, ao, al, b, bo, bl)
+}
+
+// Hash of a non-null element text of core type et, consistent with cmpElems equality.
+public function hashElem(et: Integer, b: Bytes, o: Integer, l: Integer): Integer {
+    let q = ELEM_PARSED
+    if v.isIntType(et) || et == v.T_OID || et == v.T_XID {
+        v.parseInt(b, o, l, q, -9223372036854775807 - 1, 9223372036854775807)
+        if q.ok { return v.hashInt(q.i) }
+    } else if v.isFloatType(et) {
+        v.parseFloat(b, o, l, q)
+        if q.ok { return v.hashFloat(q.f) }
+    } else if et == v.T_NUMERIC || et == v.T_NUMTEXT {
+        return v.hashNumText(b, o, l)
+    } else if et == v.T_BPCHAR {
+        return v.hashBytes(b, o, v.trimmedLen(b, o, l))
+    }
+    return v.hashBytes(b, o, l)
+}
+
+// array_cmp after the elements compared equal pairwise up to the shorter one: more elements is greater, then
+// fewer dimensions, then dimension lengths and lower bounds.
+public function cmpShape(x: Arr, y: Arr): Integer {
+    let c = cmpInt(x.count(), y.count())
+    if c != 0 { return c }
+    c = cmpInt(x.ndim, y.ndim)
+    if c != 0 { return c }
+    let d = 0
+    while d < x.ndim {
+        c = cmpInt(x.dims[d], y.dims[d])
+        if c != 0 { return c }
+        c = cmpInt(x.lbs[d], y.lbs[d])
+        if c != 0 { return c }
+        d += 1
+    }
+    return 0
+}
+
+// Order of two parsed arrays of core element type et (NULL elements sort after every value).
+public function cmpArrs(et: Integer, x: Arr, y: Arr): Integer {
+    let n = x.count()
+    if y.count() < n { n = y.count() }
+    let i = 0
+    while i < n {
+        let xn = x.nulls[i]
+        let yn = y.nulls[i]
+        if xn || yn {
+            if !(xn && yn) {
+                if xn { return 1 }
+                return -1
+            }
+        } else {
+            let c = cmpElems(et, x.data, x.starts[i], x.lens[i], y.data, y.starts[i], y.lens[i])
+            if c != 0 { return c }
+        }
+        i += 1
+    }
+    return cmpShape(x, y)
+}
+
+global CMP_X: Arr = newArr()
+global CMP_Y: Arr = newArr()
+
+// Order of two array texts of core element type et; malformed texts (never stored) compare as bytes.
+public function compare(et: Integer, a: Bytes, ao: Integer, al: Integer, b: Bytes, bo: Integer, bl: Integer): Integer {
+    let x = CMP_X
+    let y = CMP_Y
+    parse(a, ao, al, x)
+    parse(b, bo, bl, y)
+    if !x.ok || !y.ok { return v.compareBytes(a, ao, al, b, bo, bl) }
+    return cmpArrs(et, x, y)
+}
+
+// Hash of an array text of core element type et, consistent with compare() == 0.
+public function hash(et: Integer, b: Bytes, o: Integer, l: Integer): Integer {
+    let x = CMP_X
+    parse(b, o, l, x)
+    if !x.ok { return v.hashBytes(b, o, l) }
+    let h = v.hashInt(x.ndim)
+    let d = 0
+    while d < x.ndim {
+        h = v.hashCombine(h, x.dims[d])
+        h = v.hashCombine(h, x.lbs[d])
+        d += 1
+    }
+    let i = 0
+    while i < x.count() {
+        if x.nulls[i] {
+            h = v.hashCombine(h, 7)
+        } else {
+            h = v.hashCombine(h, hashElem(et, x.data, x.starts[i], x.lens[i]))
+        }
+        i += 1
+    }
+    return h
+}

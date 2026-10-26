@@ -16,6 +16,7 @@ use "./json.min" as js
 use "../sql/lexer.min" as lexer
 use "./ext.min" as ext
 use "../search/index.min" as si
+use "./array.min" as arr
 use "neodb-sdk" as sdk
 use "../../lib/dbio.min" as dbio
 use "text" as utf8
@@ -67,6 +68,9 @@ public constant EX_EXTFN = 60    // extension function (ext.min): a = args start
 public constant EX_SEARCH = 61       // col ==> query: a = column expr, b = query text expr
 public constant EX_SEARCH_SCORE = 62 // tin.score(ctid): exact BM25 of the current row
 public constant EX_SEARCH_HL = 63    // tin.highlight(col): a = text expr
+public constant EX_ARRAY = 64    // ARRAY[...] (evalArrayCtor)
+public constant EX_QUANTARR = 65 // x op ANY/ALL (array) (evalQuantArray)
+public constant EX_ARRSUB = 66   // ARRAY(subquery): a = root, b = output expression, c = 1 when correlated
 
 // arithmetic modes
 public constant AM_INT = 0
@@ -183,6 +187,8 @@ public constant FN_ARRAY_UPPER = 303
 public constant FN_ARRAY_LOWER = 304
 public constant FN_ARRAY_LENGTH = 305
 public constant FN_REL_SIZE = 306
+public constant FN_SERIAL_SEQ = 307      // pg_get_serial_sequence(table, column)
+public constant FN_TABLE_VISIBLE = 308   // pg_table_is_visible(oid)
 public constant FN_CAT_END = 349
 
 // ---- operator kinds
@@ -210,6 +216,11 @@ public constant O_CATALOG = 50
 public constant O_SRF = 51
 public constant O_WINDOW = 52
 public constant O_SEARCH = 53     // full-text search scan: a = slot, b = search state, c = residual filter
+public constant O_UNNEST = 54     // FROM unnest(...): a = slot, b = temp, c = olist block [n, array exprs..., ordinality]
+// extension index scan (ORDER BY column <op> value LIMIT n over hnsw/ivfflat): a = slot, b = cat.AnnIndex id,
+// c = query expression, d = filter or -1, e = p.annRows position, f = rows needed (LIMIT + OFFSET) or -1 for all;
+// the rows come nearest first, an ORDER BY above sorts them by the operator's value
+public constant O_ANN = 55
 
 // aggregate kinds
 public constant AG_COUNT_STAR = 1
@@ -242,6 +253,8 @@ public constant AG_CORR = 112
 // extension aggregate (sdk Extension.aggregate): spec field 6 = its call (p.calls), field 7 = ext.agg index; the
 // group's state is the aggregate column's bytes, replaced by each step and turned into the result by finish
 public constant AG_EXT = 200
+// array_agg: spec field 4 = its buffer list (p.aggBufs), one Bytes of element texts per group
+public constant AG_ARRAY_AGG = 201
 // aggregate spec stride: kind, arg, distinct map+1, filter, extra node (min/max tmp, string_agg separator),
 // distinct temp, second arg, first regression column
 public constant AGS = 8
@@ -255,6 +268,8 @@ public record Env {
     session: Integer       // session running the current statement (temp-table namespace)
     tempCount: Integer     // live temp tables in the catalog (0: no temp lookups, plan cache usable)
     notes: List<Text>      // pg_notify(channel, payload) calls of the running statement, as pairs
+    settingNames: List<Text>   // the session's SET values (extension index search effort: hnsw.ef_search, ...)
+    settingValues: List<Text>
 }
 
 public record Plan {
@@ -317,6 +332,40 @@ public record Plan {
     calls: List<sdk.Call>    // EX_EXTFN calls (ed); calls[0] serves extension type input/output (created lazily)
     host: sdk.Host
     searches: List<SearchState>
+    preempted: Boolean       // this statement yielded (C2): it reads rows changed since its start from txn's versions
+    // arrays (array.min): parse/build scratch, element registers (created on first use), array_agg buffers
+    arrA: arr.Arr
+    arrB: arr.Arr
+    arrTmp: Bytes
+    elemRegs: List<Integer>
+    aggBufs: List<List<Bytes>>
+    annRows: List<List<Integer>>   // O_ANN result rows (one list per operator)
+    annSeen: List<List<Integer>>   // O_ANN rows of a limited search already considered, when it is widened
+}
+
+// Plans being executed, innermost at RUNNING_DEPTH - 1 (a statement suspended at a yield point stays below the nested
+// ones).
+global RUNNING: List<Plan> = []
+global RUNNING_DEPTH: List<Integer> = [0]
+
+public function runningPush(p: Plan) {
+    let d = RUNNING_DEPTH[0]
+    if d < RUNNING.length { RUNNING[d] = p } else { RUNNING.add(p) }
+    RUNNING_DEPTH[0] = d + 1
+}
+
+public function runningPop() {
+    let d = RUNNING_DEPTH[0]
+    if d > 0 {
+        RUNNING[d - 1].preempted = false
+        RUNNING_DEPTH[0] = d - 1
+    }
+}
+
+// The running statement is about to yield: from now on it reads row versions as of its start.
+public function markPreempted() {
+    let d = RUNNING_DEPTH[0]
+    if d > 0 { RUNNING[d - 1].preempted = true }
 }
 
 public function newPlan(env: Env): Plan {
@@ -328,6 +377,8 @@ public function newPlan(env: Env): Plan {
         temps: []; maps: []; chains: []; keys: []
         err: false; errCode: ""; errMsg: ""; errDetail: ""; blockedBy: -1; env: env; empty: Bytes(); pq: v.newParsed()
         numBuf: Bytes(); nanText: Bytes("NaN"); regexNodes: []; regexes: []; calls: []; host: extHost(); searches: []
+        preempted: false
+        arrA: arr.newArr(); arrB: arr.newArr(); arrTmp: Bytes(); elemRegs: []; aggBufs: []; annRows: []; annSeen: []
     }
 }
 
@@ -394,8 +445,8 @@ function hostParseFloat(b: Bytes, o: Integer, l: Integer, isFloat4: Boolean, r: 
 }
 
 public function extHost(): sdk.Host { return sdk.Host {
-    addFloat: function(out, f, isFloat4) { hostAddFloat(out, f, isFloat4) }
-    parseFloat: function(b, o, l, isFloat4, r) { hostParseFloat(b, o, l, isFloat4, r) }
+    addFloat: hostAddFloat
+    parseFloat: hostParseFloat
     clock: function() { return dbio.wallClockMicros() }
     random: function(count) { return dbio.randomBytes(count) }
 } }
@@ -479,7 +530,11 @@ function evalExtFn(p: Plan, n: Integer) {
     c.output = scratchOf(p, n)
     c.modifier = -1
     let f = ext.fn(p.ec[n])
-    f.def.body(c)
+    if f.def.volatile {
+        c.invokeVolatile(f.def.volatileBody)
+    } else {
+        c.invoke(f.def.body)
+    }
     if callFailed(p, c) { return }
     takeCallResult(p, c, n, p.et[n])
 }
@@ -507,7 +562,7 @@ function extInput(p: Plan, b: Bytes, o: Integer, l: Integer, dst: Integer, to: I
     c.begin()
     c.output = scratchOf(p, dst)
     c.modifier = typmod
-    ext.typeDef(to).input(c)
+    c.invoke(ext.typeDef(to).input)
     if callFailed(p, c) { return }
     takeCallResult(p, c, dst, to)
 }
@@ -522,7 +577,7 @@ function extOutput(p: Plan, src: Integer, t: Integer, out: Bytes) {
     c.begin()
     c.output = out
     c.modifier = -1
-    ext.typeDef(t).output(c)
+    c.invoke(ext.typeDef(t).output)
     callFailed(p, c)
 }
 
@@ -535,15 +590,15 @@ function extCompareCells(c: tb.Column, a: Integer, b: Integer): Integer {
     if EXT_COMPARE.length == 0 { EXT_COMPARE.add(ext.newCall(2, extHost())) }
     let call = EXT_COMPARE[0]
     call.nulls[0] = false
-    call.buffers[0] = c.heap
-    call.offsets[0] = tb.textOff(c, a)
+    call.buffers[0] = tb.textBuf(c, a)
+    call.offsets[0] = tb.textAt(c, a)
     call.lengths[0] = tb.textLen(c, a)
     call.nulls[1] = false
-    call.buffers[1] = c.heap
-    call.offsets[1] = tb.textOff(c, b)
+    call.buffers[1] = tb.textBuf(c, b)
+    call.offsets[1] = tb.textAt(c, b)
     call.lengths[1] = tb.textLen(c, b)
     call.begin()
-    d.compare(call)
+    call.invoke(d.compare)
     return call.resultInteger
 }
 
@@ -555,7 +610,7 @@ public function extText(t: Integer, b: Bytes, o: Integer, l: Integer): Text {
     c.lengths[0] = l
     c.begin()
     c.output = Bytes()
-    ext.typeDef(t).output(c)
+    c.invoke(ext.typeDef(t).output)
     if c.failed { return "" }
     return utf8.decodeOrStop(c.output)
 }
@@ -574,7 +629,7 @@ function extSend(p: Plan, src: Integer, t: Integer, out: Bytes) {
         c.begin()
         c.output = out
         c.modifier = -1
-        d.send(c)
+        c.invoke(d.send)
         callFailed(p, c)
     } else {
         extOutput(p, src, t, out)
@@ -597,7 +652,7 @@ public function extReceive(p: Plan, b: Bytes, dst: Integer, to: Integer, typmod:
     c.begin()
     c.output = scratchOf(p, dst)
     c.modifier = typmod
-    d.receive(c)
+    c.invoke(d.receive)
     if callFailed(p, c) { return }
     takeCallResult(p, c, dst, to)
 }
@@ -614,14 +669,28 @@ function extCheck(p: Plan, src: Integer, dst: Integer, t: Integer, typmod: Integ
     c.lengths[0] = p.rLen[src]
     c.begin()
     c.modifier = typmod
-    d.check(c)
+    c.invoke(d.check)
     callFailed(p, c)
 }
 
 // Casts that involve an extension type: text <-> extension (input/output), extension -> itself (typmod), and
 // casts an extension declares (vector -> halfvec).
-function extCast(p: Plan, src: Integer, from: Integer, dst: Integer, to: Integer, typmod: Integer) {
+function extCast(p: Plan, src: Integer, from: Integer, dst: Integer, to: Integer, typmod: Integer, explicit: Boolean) {
     if from == to {
+        let d = ext.typeDef(to)
+        if explicit && typmod >= 0 && d.hasResize {
+            let c = ioCall(p)
+            setCallArg(p, c, 0, src)
+            c.begin()
+            c.output = scratchOf(p, dst)
+            c.modifier = typmod
+            c.explicit = true
+            d.resize(c)
+            c.explicit = false
+            if callFailed(p, c) { return }
+            takeCallResult(p, c, dst, to)
+            return
+        }
         extCheck(p, src, dst, to, typmod)
         return
     }
@@ -634,7 +703,9 @@ function extCast(p: Plan, src: Integer, from: Integer, dst: Integer, to: Integer
             c.begin()
             c.output = scratchOf(p, dst)
             c.modifier = typmod
-            k.def.body(c)
+            c.explicit = explicit
+            c.invoke(k.def.body)
+            c.explicit = false
             if callFailed(p, c) { return }
             takeCallResult(p, c, dst, to)
             return
@@ -820,7 +891,7 @@ public function cmpNumRegs(p: Plan, a: Integer, b: Integer): Integer {
 // Numeric value of a cell as a Num (any numeric storage form).
 function cellNum(c: tb.Column, r: Integer): nm.Num {
     if c.type == v.T_NUMTEXT || (c.perRowScale && c.scales[r] == SCALE_BIG) {
-        return v.numOfText(c.heap, tb.textOff(c, r), tb.textLen(c, r))
+        return v.numOfText(tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r))
     }
     let x = tb.getInt(c, r)
     if !c.perRowScale && x == NUM_NAN_CELL { return nm.nan() }
@@ -921,6 +992,14 @@ public function loadCell(p: Plan, n: Integer, c: tb.Column, r: Integer) {
     }
     if v.isTextType(t) {
         let ref = c.data.getInt64(r * 8)
+        if ref < 0 {
+            // a compressed value (COMPRESSION zstd): the register owns a decompressed copy
+            let b = tb.textBuf(c, r)
+            p.rBuf[n] = b
+            p.rOff[n] = 0
+            p.rLen[n] = b.length
+            return
+        }
         p.rBuf[n] = c.heap
         p.rOff[n] = (ref >> 24) & 1099511627775
         p.rLen[n] = ref & 16777215
@@ -1055,6 +1134,7 @@ public function hashReg(p: Plan, n: Integer): Integer {
     let cl = classOf(t)
     if cl == CL_INT { return v.hashInt(p.rInt[n]) }
     if cl == CL_TEXT {
+        if v.isGeneralArray(t) { return arr.hash(v.arrayElemType(t), p.rBuf[n], p.rOff[n], p.rLen[n]) }
         let len = p.rLen[n]
         if t == v.T_BPCHAR { len = v.trimmedLen(p.rBuf[n], p.rOff[n], len) }
         return v.hashBytes(p.rBuf[n], p.rOff[n], len)
@@ -1070,6 +1150,7 @@ public function hashReg(p: Plan, n: Integer): Integer {
 // Compare two non-null registers of the same class. cl: class, bp: bpchar semantics.
 public function cmpRegs(p: Plan, a: Integer, b: Integer, cl: Integer): Integer {
     if cl == CL_INT { return ix.cmpInt(p.rInt[a], p.rInt[b]) }
+    if cl == CL_ARRAY { return arrayCmp(p, a, b) }
     if cl == CL_TEXT { return v.compareBytes(p.rBuf[a], p.rOff[a], p.rLen[a], p.rBuf[b], p.rOff[b], p.rLen[b]) }
     if cl == CL_FLT { return ix.cmpFloat(p.rFlt[a], p.rFlt[b]) }
     if cl == CL_NUM { return cmpNumRegs(p, a, b) }
@@ -1088,10 +1169,10 @@ public function regEqualsCell(p: Plan, n: Integer, c: tb.Column, r: Integer): Bo
     let t = c.type
     if t == v.T_NUMTEXT || t == v.T_NUMERIC { return cmpRegCellNum(p, n, c, r) == 0 }
     if v.isTextType(t) {
-        if t == v.T_BPCHAR {
-            return ix.cmpText(t, p.rBuf[n], p.rOff[n], p.rLen[n], c.heap, tb.textOff(c, r), tb.textLen(c, r)) == 0
+        if t == v.T_BPCHAR || v.isGeneralArray(t) {
+            return ix.cmpText(t, p.rBuf[n], p.rOff[n], p.rLen[n], tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r)) == 0
         }
-        return v.equalBytes(p.rBuf[n], p.rOff[n], p.rLen[n], c.heap, tb.textOff(c, r), tb.textLen(c, r))
+        return v.equalBytes(p.rBuf[n], p.rOff[n], p.rLen[n], tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r))
     }
     if t == v.T_FLOAT8 || t == v.T_FLOAT4 { return ix.cmpFloat(p.rFlt[n], tb.getFloat(c, r)) == 0 }
     if t == v.T_INTERVAL {
@@ -1267,6 +1348,12 @@ function encodeBinary(p: Plan, n: Integer, t: Integer, out: Bytes) {
         v.addBE16(out, p.rInt[n])
         return
     }
+    if t == v.T_BYTEA {
+        // bytea_send: the raw bytes (the text form is the hex escape)
+        v.addBE32(out, p.rLen[n])
+        appendView(out, p.rBuf[n], p.rOff[n], p.rLen[n])
+        return
+    }
     if t == v.T_BOOL {
         v.addBE32(out, 1)
         out.add(p.rInt[n] & 1)
@@ -1302,7 +1389,7 @@ function encodeBinary(p: Plan, n: Integer, t: Integer, out: Bytes) {
         return
     }
     if v.isArrayType(t) {
-        encodeArrayBinary(p.rBuf[n], p.rOff[n], p.rLen[n], t, out)
+        encodeArrayBinary(p, n, t, out)
         return
     }
     // text-like and anything else: raw text bytes
@@ -1310,55 +1397,6 @@ function encodeBinary(p: Plan, n: Integer, t: Integer, out: Bytes) {
     out.addInt32(0)
     formatReg(p, n, t, out)
     v.setBE32(out, at, out.length - at - 4)
-}
-
-// Binary array format (array_send) of a catalog array kept as text ("{1,2}" or the vector form "1 2").
-function encodeArrayBinary(b: Bytes, o: Integer, l: Integer, t: Integer, out: Bytes) {
-    let elems: List<Bytes> = []
-    let nulls: List<Boolean> = []
-    splitArrayText(b, o, l, v.isVectorType(t), elems, nulls)
-    let et = v.arrayElemType(t)
-    let at = out.length
-    out.addInt32(0)
-    let hasNull = 0
-    for x in nulls {
-        if x { hasNull = 1 }
-    }
-    if elems.length == 0 {
-        v.addBE32(out, 0)
-        v.addBE32(out, 0)
-        v.addBE32(out, v.typeOid(et))
-    } else {
-        v.addBE32(out, 1)
-        v.addBE32(out, hasNull)
-        v.addBE32(out, v.typeOid(et))
-        v.addBE32(out, elems.length)
-        v.addBE32(out, v.arrayLowerBound(t))
-        let i = 0
-        while i < elems.length {
-            if nulls[i] {
-                v.addBE32(out, -1)
-            } else if et == v.T_INT2 {
-                v.addBE32(out, 2)
-                v.addBE16(out, textInt(elems[i]))
-            } else if et == v.T_OID {
-                v.addBE32(out, 4)
-                v.addBE32(out, textInt(elems[i]))
-            } else {
-                v.addBE32(out, elems[i].length)
-                out.addBytes(elems[i])
-            }
-            i += 1
-        }
-    }
-    v.setBE32(out, at, out.length - at - 4)
-}
-
-function textInt(b: Bytes): Integer {
-    let q = v.newParsed()
-    v.parseInt(b, 0, b.length, q, -2147483648, 4294967295)
-    if !q.ok { return 0 }
-    return q.i
 }
 
 // Elements of an array's text form: "{a,b,\"c d\",NULL}" or a vector "1 2 3". Quoted elements are unescaped.
@@ -1409,6 +1447,1213 @@ public function splitArrayText(b: Bytes, o: Integer, l: Integer, vector: Boolean
         while i < e && b[i] == 32 { i += 1 }
         if i < e && b[i] == 44 { i += 1 }
     }
+}
+
+// ---------------------------------------------------------------- arrays (text form and parsing: array.min)
+
+// Comparison class of general arrays (element by element, cmpRegs / arrayCmp).
+public constant CL_ARRAY = 6
+
+// Element register k of the plan, typed t for this use. Created on first use (a plan is reused across
+// executions, so this happens once); element registers hold one element while an array is read or built.
+public function elemReg(p: Plan, k: Integer, t: Integer): Integer {
+    while p.elemRegs.length <= k { p.elemRegs.add(addExpr(p, EX_CONST, v.T_UNKNOWN, 0, 0, 0, 0)) }
+    let r = p.elemRegs[k]
+    p.et[r] = t
+    return r
+}
+
+function copyShape(from: arr.Arr, to: arr.Arr) {
+    to.reset()
+    to.ndim = from.ndim
+    for d in from.dims { to.dims.add(d) }
+    for lb in from.lbs { to.lbs.add(lb) }
+}
+
+function arrayFailed(p: Plan, a: arr.Arr): Boolean {
+    if a.ok { return false }
+    if !p.err {
+        raise(p, a.code, a.msg)
+        p.errDetail = a.detail
+    }
+    return true
+}
+
+// Register n's array text parsed into a (false with p.err set when malformed).
+function parseReg(p: Plan, n: Integer, a: arr.Arr): Boolean {
+    arr.parse(p.rBuf[n], p.rOff[n], p.rLen[n], a)
+    return !arrayFailed(p, a)
+}
+
+// Set register n to the canonical text of `a`.
+public function setArrayResult(p: Plan, n: Integer, a: arr.Arr) {
+    let s = scratchOf(p, n)
+    arr.format(a, s)
+    setTextReg(p, n, s, 0, s.length)
+}
+
+// Append register r's value (type t) to `a` as its canonical element text, or a NULL element.
+public function addElemReg(p: Plan, a: arr.Arr, r: Integer, t: Integer) {
+    if p.rNull[r] != 0 {
+        a.addNull()
+        return
+    }
+    let tmp = p.arrTmp
+    tmp.clear()
+    formatReg(p, r, t, tmp)
+    a.add(tmp, 0, tmp.length)
+}
+
+// Element i of a into register r of type t (typmod applies). The element text is staged so the register's
+// view survives later uses of `a`: text values in r's own scratch, everything else in the plan's scratch.
+function loadElem(p: Plan, a: arr.Arr, i: Integer, r: Integer, t: Integer, typmod: Integer) {
+    if a.nulls[i] {
+        p.rNull[r] = 1
+        return
+    }
+    parseInto(p, a.data, a.starts[i], a.lens[i], false, r, t, typmod, 0)
+}
+
+function loadElemOwned(p: Plan, a: arr.Arr, i: Integer, r: Integer, t: Integer, typmod: Integer) {
+    if a.nulls[i] {
+        p.rNull[r] = 1
+        return
+    }
+    let stage = p.arrTmp
+    if classOf(t) == CL_TEXT && !v.isExtType(t) { stage = scratchOf(p, r) }
+    stage.clear()
+    let s = a.starts[i]
+    let l = a.lens[i]
+    let k = 0
+    while k < l {
+        stage.add(a.data[s + k])
+        k += 1
+    }
+    parseInto(p, stage, 0, l, false, r, t, typmod, 0)
+}
+
+// Text -> array of type t in register dst (array_in): every element goes through its type's input (typmod
+// applies to the elements, as in vector(3)[]) and output, so the stored text is canonical.
+public function arrayIn(p: Plan, b: Bytes, o: Integer, l: Integer, dst: Integer, t: Integer, typmod: Integer) {
+    let a = p.arrA
+    arr.parse(b, o, l, a)
+    if arrayFailed(p, a) { return }
+    let et = v.arrayElemType(t)
+    let out = p.arrB
+    copyShape(a, out)
+    let er = elemReg(p, 0, et)
+    let i = 0
+    while i < a.count() {
+        loadElem(p, a, i, er, et, typmod)
+        if p.err { return }
+        addElemReg(p, out, er, et)
+        if p.err { return }
+        i += 1
+    }
+    setArrayResult(p, dst, out)
+}
+
+// Array -> array of another element type, or the same type under an element typmod (castReg).
+function castArray(p: Plan, src: Integer, from: Integer, dst: Integer, to: Integer, typmod: Integer, explicit: Boolean) {
+    let a = p.arrA
+    if !parseReg(p, src, a) { return }
+    let fe = v.arrayElemType(from)
+    let te = v.arrayElemType(to)
+    let out = p.arrB
+    copyShape(a, out)
+    let e1 = elemReg(p, 0, fe)
+    let e2 = elemReg(p, 1, te)
+    let i = 0
+    while i < a.count() {
+        if a.nulls[i] {
+            out.addNull()
+        } else {
+            loadElem(p, a, i, e1, fe, -1)
+            if p.err { return }
+            castReg(p, e1, fe, e2, te, typmod, explicit, 0)
+            if p.err { return }
+            addElemReg(p, out, e2, te)
+        }
+        i += 1
+    }
+    setArrayResult(p, dst, out)
+}
+
+global EXT_ELEM_CALL: List<sdk.Call> = []
+
+// Order of two non-null extension element texts: both through the type's input, then its ordering callback
+// (or the stored bytes when it declares none).
+function cmpExtElems(p: Plan, et: Integer, x: arr.Arr, i: Integer, y: arr.Arr, j: Integer): Integer {
+    let r1 = elemReg(p, 2, et)
+    let r2 = elemReg(p, 3, et)
+    loadElem(p, x, i, r1, et, -1)
+    loadElem(p, y, j, r2, et, -1)
+    if p.err { return 0 }
+    let d = ext.typeDef(et)
+    if !d.hasCompare { return v.compareBytes(p.rBuf[r1], p.rOff[r1], p.rLen[r1], p.rBuf[r2], p.rOff[r2], p.rLen[r2]) }
+    if EXT_ELEM_CALL.length == 0 { EXT_ELEM_CALL.add(ext.newCall(2, extHost())) }
+    let call = EXT_ELEM_CALL[0]
+    setCallArg(p, call, 0, r1)
+    setCallArg(p, call, 1, r2)
+    call.begin()
+    d.compare(call)
+    return call.resultInteger
+}
+
+// array_cmp of two non-null array registers of the same type (NULL elements sort after values).
+public function arrayCmp(p: Plan, a: Integer, b: Integer): Integer {
+    let et = v.arrayElemType(p.et[a])
+    if !v.isExtType(et) { return arr.compare(et, p.rBuf[a], p.rOff[a], p.rLen[a], p.rBuf[b], p.rOff[b], p.rLen[b]) }
+    let x = arr.newArr()
+    let y = arr.newArr()
+    arr.parse(p.rBuf[a], p.rOff[a], p.rLen[a], x)
+    arr.parse(p.rBuf[b], p.rOff[b], p.rLen[b], y)
+    if !x.ok || !y.ok { return v.compareBytes(p.rBuf[a], p.rOff[a], p.rLen[a], p.rBuf[b], p.rOff[b], p.rLen[b]) }
+    let n = x.count()
+    if y.count() < n { n = y.count() }
+    let i = 0
+    while i < n {
+        if x.nulls[i] || y.nulls[i] {
+            if !(x.nulls[i] && y.nulls[i]) {
+                if x.nulls[i] { return 1 }
+                return -1
+            }
+        } else {
+            let c = cmpExtElems(p, et, x, i, y, i)
+            if c != 0 { return c }
+        }
+        i += 1
+    }
+    return arr.cmpShape(x, y)
+}
+
+// ARRAY[...]: a = args start, b = count, c = 1 when the items are arrays (the result has one more dimension).
+function evalArrayCtor(p: Plan, n: Integer) {
+    let start = p.ea[n]
+    let cnt = p.eb[n]
+    let i = 0
+    while i < cnt {
+        ev(p, p.eargs[start + i])
+        if p.err { return }
+        i += 1
+    }
+    let out = p.arrB
+    out.reset()
+    if p.ec[n] == 0 {
+        i = 0
+        while i < cnt {
+            let x = p.eargs[start + i]
+            addElemReg(p, out, x, p.et[x])
+            i += 1
+        }
+        out.oneDimension()
+        setArrayResult(p, n, out)
+        return
+    }
+    // sub-arrays: every non-empty one must have the same shape; NULL sub-arrays count as empty
+    let a = p.arrA
+    let items = 0
+    let empties = 0
+    i = 0
+    while i < cnt {
+        let x = p.eargs[start + i]
+        if p.rNull[x] != 0 {
+            empties += 1
+        } else {
+            if !parseReg(p, x, a) { return }
+            if a.count() == 0 {
+                empties += 1
+            } else {
+                if items == 0 {
+                    out.ndim = a.ndim + 1
+                    out.dims.add(0)
+                    out.lbs.add(1)
+                    for d in a.dims { out.dims.add(d) }
+                    for lb in a.lbs { out.lbs.add(lb) }
+                } else {
+                    let same = a.ndim + 1 == out.ndim
+                    let d = 0
+                    while same && d < a.ndim {
+                        if a.dims[d] != out.dims[d + 1] || a.lbs[d] != out.lbs[d + 1] { same = false }
+                        d += 1
+                    }
+                    if !same {
+                        raise(p, "2202E", "multidimensional arrays must have array expressions with matching dimensions")
+                        return
+                    }
+                }
+                let k = 0
+                while k < a.count() {
+                    if a.nulls[k] { out.addNull() } else { out.add(a.data, a.starts[k], a.lens[k]) }
+                    k += 1
+                }
+                items += 1
+            }
+        }
+        i += 1
+    }
+    if items > 0 && empties > 0 {
+        raise(p, "2202E", "multidimensional arrays must have array expressions with matching dimensions")
+        return
+    }
+    if items == 0 {
+        out.reset()
+    } else {
+        out.dims[0] = items
+    }
+    setArrayResult(p, n, out)
+}
+
+// lhs op ANY/ALL (array): a = lhs, b = array, c = op | all << 8 | class << 16, d = comparison type
+// (elements are cast to it when it differs from the element type).
+function evalQuantArray(p: Plan, n: Integer) {
+    let lhs = p.ea[n]
+    let ar = p.eb[n]
+    ev(p, lhs)
+    ev(p, ar)
+    if p.err { return }
+    if p.rNull[ar] != 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let op = p.ec[n] & 255
+    let all = ((p.ec[n] >> 8) & 1) == 1
+    let cl = (p.ec[n] >> 16) & 255
+    let ct = p.ed[n]
+    let et = v.arrayElemType(p.et[ar])
+    let a = p.arrA
+    if !parseReg(p, ar, a) { return }
+    if a.count() == 0 {
+        setBoolReg(p, n, all)
+        return
+    }
+    if p.rNull[lhs] != 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let e1 = elemReg(p, 0, et)
+    let e2 = e1
+    if ct != et { e2 = elemReg(p, 1, ct) }
+    let sawNull = false
+    let i = 0
+    while i < a.count() {
+        if a.nulls[i] {
+            sawNull = true
+        } else {
+            loadElem(p, a, i, e1, et, -1)
+            if ct != et { castReg(p, e1, et, e2, ct, -1, false, 0) }
+            if p.err { return }
+            let c = cmpRegs(p, lhs, e2, cl)
+            let res = false
+            if op == OPR_EQ { res = c == 0 }
+            if op == OPR_NE { res = c != 0 }
+            if op == OPR_LT { res = c < 0 }
+            if op == OPR_LE { res = c <= 0 }
+            if op == OPR_GT { res = c > 0 }
+            if op == OPR_GE { res = c >= 0 }
+            if all && !res {
+                setBoolReg(p, n, false)
+                return
+            }
+            if !all && res {
+                setBoolReg(p, n, true)
+                return
+            }
+        }
+        i += 1
+    }
+    if sawNull {
+        p.rNull[n] = 1
+        return
+    }
+    setBoolReg(p, n, all)
+}
+
+function evalArraySubquery(p: Plan, n: Integer) {
+    let correlated = p.ec[n] == 1
+    if !correlated && p.eState[n] != 0 { return }
+    let root = p.ea[n]
+    let out = p.eb[n]
+    // the subquery's rows may use the plan's array scratch, so collect into a fresh array
+    let a = arr.newArr()
+    let tmp = Bytes()
+    let et = p.et[out]
+    open(p, root)
+    while next(p, root) {
+        ev(p, out)
+        if p.err { return }
+        if p.rNull[out] != 0 {
+            a.addNull()
+        } else {
+            tmp.clear()
+            formatReg(p, out, et, tmp)
+            a.add(tmp, 0, tmp.length)
+        }
+    }
+    if p.err { return }
+    a.oneDimension()
+    setArrayResult(p, n, a)
+    p.eState[n] = 1
+}
+
+// A new array_agg buffer list (one per array_agg call in a plan).
+public function addAggBufs(p: Plan): Integer {
+    p.aggBufs.add([])
+    return p.aggBufs.length - 1
+}
+
+// Element texts so far of group g of array_agg buffer list bi.
+function aggBuf(p: Plan, bi: Integer, g: Integer): Bytes {
+    let bufs = p.aggBufs[bi]
+    while bufs.length <= g { bufs.add(Bytes()) }
+    return bufs[g]
+}
+
+// The integer value of session setting `name`, or `fallback`.
+public function intSetting(env: Env, name: Text, fallback: Integer): Integer {
+    let i = 0
+    while i < env.settingNames.length {
+        if env.settingNames[i] == name {
+            let q = v.newParsed()
+            let b = Bytes(env.settingValues[i])
+            v.parseInt(b, 0, b.length, q, -2147483648, 2147483647)
+            if q.ok { return q.i }
+            return fallback
+        }
+        i += 1
+    }
+    return fallback
+}
+
+public function addAnnRows(p: Plan): Integer {
+    p.annSeen.add([])
+    p.annRows.add([])
+    return p.annRows.length - 1
+}
+
+// O_ANN open: search the index for the query value with the session's search effort (hnsw.ef_search,
+// ivfflat.probes); next walks the rows, skipping ones this transaction cannot see.
+function openAnn(p: Plan, o: Integer) {
+    p.os1[o] = 0
+    p.os2[o] = 0
+    p.os3[o] = 0
+    annSearch(p, o, p.of[o])
+}
+
+// Run the index search for the query value: `want` rows (-1: all the method gives) into the op's row list.
+function annSearch(p: Plan, o: Integer, want: Integer) {
+    let rows = p.annRows[p.oe[o]]
+    rows.clear()
+    p.os1[o] = 0
+    p.os2[o] = 0
+    let q = p.oc[o]
+    ev(p, q)
+    if p.err { return }
+    let x = p.env.cat.annIdx[p.ob[o]]
+    if x.tableId < 0 { return }
+    let def = ext.method(x.method)
+    let effort = intSetting(p.env, def.effortSetting, def.effortDefault)
+    if p.rNull[q] != 0 {
+        // a NULL query: the method returns rows at distance zero, as pgvector does; the ORDER BY sees NULLs
+        p.os2[o] = def.search(x.handle, p.empty, 0, -1, effort, -1, rows)
+        return
+    }
+    p.os2[o] = def.search(x.handle, p.rBuf[q], p.rOff[q], p.rLen[q], effort, want, rows)
+}
+
+function nextAnn(p: Plan, o: Integer): Boolean {
+    let s = p.oa[o]
+    let t = p.slotBase[s]
+    let f = p.od[o]
+    while true {
+        let rows = p.annRows[p.oe[o]]
+        let seen = p.annSeen[p.oe[o]]
+        while p.os1[o] < p.os2[o] {
+            let r = rows[p.os1[o]]
+            p.os1[o] += 1
+            if p.os3[o] == 0 || !hasInt(seen, r) {
+                if r < t.nrows && positionRow(p, s, t, r) && filterOk(p, f) { return true }
+                if p.err { return false }
+            }
+        }
+        // a search limited to LIMIT + OFFSET rows ran out because some of them were deleted or not visible (the
+        // index keeps them until they are gone for every transaction): search again for every row, skipping the
+        // ones already considered (pgvector's scan simply reads on)
+        if p.of[o] < 0 || p.os3[o] == 1 || p.os2[o] < p.of[o] { return false }
+        seen.clear()
+        let k = 0
+        while k < p.os2[o] {
+            seen.add(rows[k])
+            k += 1
+        }
+        p.os3[o] = 1
+        annSearch(p, o, -1)
+        if p.err { return false }
+    }
+    return false
+}
+
+function hasInt(xs: List<Integer>, x: Integer): Boolean {
+    for y in xs {
+        if y == x { return true }
+    }
+    return false
+}
+
+// FROM unnest: open evaluates the arrays and fills the temp table (padded with NULLs, optional ordinality).
+function openUnnest(p: Plan, o: Integer) {
+    let t = p.temps[p.ob[o]]
+    tb.truncate(t)
+    let blk = p.oc[o]
+    let cnt = p.olist[blk]
+    let ord = p.olist[blk + 1 + cnt] == 1
+    let rows = 0
+    let i = 0
+    while i < cnt {
+        let e = p.olist[blk + 1 + i]
+        ev(p, e)
+        if p.err { return }
+        if p.rNull[e] == 0 {
+            let elems: List<Bytes> = []
+            let nulls: List<Boolean> = []
+            if !arrayElemTexts(p, e, elems, nulls) { return }
+            let c = t.cols[i]
+            let er = elemReg(p, 0, c.type)
+            let k = 0
+            while k < elems.length {
+                while rows <= k {
+                    let r = tb.reserveRow(t, 0)
+                    let j = 0
+                    while j < t.cols.length {
+                        tb.setNull(t.cols[j], r)
+                        j += 1
+                    }
+                    if ord { tb.setInt(t.cols[cnt], r, r + 1) }
+                    rows += 1
+                }
+                if !nulls[k] {
+                    let b = elems[k]
+                    parseInto(p, b, 0, b.length, false, er, c.type, -1, 0)
+                    if p.err { return }
+                    storeCell(p, er, c, k)
+                }
+                k += 1
+            }
+        }
+        i += 1
+    }
+    if ord {
+        let r = 0
+        while r < rows {
+            tb.clearNull(t.cols[cnt], r)
+            r += 1
+        }
+    }
+}
+
+function nextUnnest(p: Plan, o: Integer): Boolean {
+    let t = p.temps[p.ob[o]]
+    let pos = p.os1[o]
+    if pos >= t.nrows { return false }
+    let s = p.oa[o]
+    p.slotTable[s] = t
+    p.slotRow[s] = pos
+    p.os1[o] = pos + 1
+    return true
+}
+
+// a[i][j] / a[lo:hi]: a = array, b = args start, c = number of subscripts, d = 1 for a slice (args are
+// lo, hi pairs, -1 for an omitted bound). Out-of-range elements and wrong subscript counts give NULL (as in
+// PostgreSQL); a slice is a fresh array with lower bounds 1.
+function evalSubscript(p: Plan, n: Integer) {
+    let a = p.ea[n]
+    ev(p, a)
+    let start = p.eb[n]
+    let cnt = p.ec[n]
+    let slice = p.ed[n] == 1
+    let nargs = cnt
+    if slice { nargs = cnt * 2 }
+    let i = 0
+    while i < nargs {
+        let x = p.eargs[start + i]
+        if x >= 0 {
+            ev(p, x)
+            if p.rNull[x] != 0 {
+                p.rNull[n] = 1
+                return
+            }
+        }
+        i += 1
+    }
+    if p.err { return }
+    if p.rNull[a] != 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let at = p.et[a]
+    if v.isVectorType(at) {
+        // int2vector / oidvector: one dimension starting at 0
+        let elems: List<Bytes> = []
+        let nulls: List<Boolean> = []
+        splitArrayText(p.rBuf[a], p.rOff[a], p.rLen[a], true, elems, nulls)
+        let k = p.rInt[p.eargs[start]]
+        if slice || cnt != 1 || k < 0 || k >= elems.length {
+            p.rNull[n] = 1
+            return
+        }
+        let e = elems[k]
+        parseInto(p, e, 0, e.length, false, n, p.et[n], -1, 0)
+        return
+    }
+    let x = p.arrA
+    if !parseReg(p, a, x) { return }
+    let et = v.arrayElemType(at)
+    if !slice {
+        if cnt != x.ndim || x.count() == 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let pos = 0
+        let d = 0
+        while d < cnt {
+            let k = p.rInt[p.eargs[start + d]] - x.lbs[d]
+            if k < 0 || k >= x.dims[d] {
+                p.rNull[n] = 1
+                return
+            }
+            pos = pos * x.dims[d] + k
+            d += 1
+        }
+        loadElemOwned(p, x, pos, n, et, -1)
+        return
+    }
+    // slice: subscripts beyond the array's dimensions make it empty; missing ones take the whole dimension
+    let out = p.arrB
+    out.reset()
+    if x.count() == 0 || cnt > x.ndim {
+        setArrayResult(p, n, out)
+        return
+    }
+    let lo: List<Integer> = []
+    let hi: List<Integer> = []
+    let d = 0
+    let empty = false
+    while d < x.ndim {
+        let l0 = x.lbs[d]
+        let h0 = x.lbs[d] + x.dims[d] - 1
+        if d < cnt {
+            let le = p.eargs[start + d * 2]
+            let he = p.eargs[start + d * 2 + 1]
+            if le >= 0 && p.rInt[le] > l0 { l0 = p.rInt[le] }
+            if he >= 0 && p.rInt[he] < h0 { h0 = p.rInt[he] }
+        }
+        if h0 < l0 { empty = true }
+        lo.add(l0 - x.lbs[d])
+        hi.add(h0 - x.lbs[d])
+        d += 1
+    }
+    if empty {
+        setArrayResult(p, n, out)
+        return
+    }
+    out.ndim = x.ndim
+    d = 0
+    while d < x.ndim {
+        out.dims.add(hi[d] - lo[d] + 1)
+        out.lbs.add(1)
+        d += 1
+    }
+    // walk the selected box in row-major order
+    let idx: List<Integer> = []
+    for l in lo { idx.add(l) }
+    while true {
+        let pos = 0
+        d = 0
+        while d < x.ndim {
+            pos = pos * x.dims[d] + idx[d]
+            d += 1
+        }
+        if x.nulls[pos] { out.addNull() } else { out.add(x.data, x.starts[pos], x.lens[pos]) }
+        let level = x.ndim - 1
+        idx[level] += 1
+        while level > 0 && idx[level] > hi[level] {
+            idx[level] = lo[level]
+            level -= 1
+            idx[level] += 1
+        }
+        if idx[0] > hi[0] { break }
+    }
+    setArrayResult(p, n, out)
+}
+
+// Elements of an array register as texts (for unnest and _pg_expandarray): false with p.err when malformed.
+function arrayElemTexts(p: Plan, n: Integer, elems: List<Bytes>, nulls: List<Boolean>): Boolean {
+    let at = p.et[n]
+    if v.isVectorType(at) {
+        splitArrayText(p.rBuf[n], p.rOff[n], p.rLen[n], true, elems, nulls)
+        return true
+    }
+    let a = arr.newArr()
+    arr.parse(p.rBuf[n], p.rOff[n], p.rLen[n], a)
+    if arrayFailed(p, a) { return false }
+    let i = 0
+    while i < a.count() {
+        elems.add(a.elem(i))
+        nulls.add(a.nulls[i])
+        i += 1
+    }
+    return true
+}
+
+// Binary array format (array_send): ndim, has-null flag, element oid, (length, lower bound) per dimension,
+// then each element as length + its own binary form (-1 for NULL).
+function encodeArrayBinary(p: Plan, n: Integer, t: Integer, out: Bytes) {
+    let et = v.arrayElemType(t)
+    let at = out.length
+    out.addInt32(0)
+    let elemOid = v.typeOid(et)
+    if t == v.T_ACLARRAY { elemOid = 1033 }
+    if v.isVectorType(t) {
+        let elems: List<Bytes> = []
+        let nulls: List<Boolean> = []
+        splitArrayText(p.rBuf[n], p.rOff[n], p.rLen[n], true, elems, nulls)
+        v.addBE32(out, 1)
+        v.addBE32(out, 0)
+        v.addBE32(out, elemOid)
+        v.addBE32(out, elems.length)
+        v.addBE32(out, 0)
+        let er = elemReg(p, 0, et)
+        for e in elems {
+            parseInto(p, e, 0, e.length, false, er, et, -1, 0)
+            encodeBinary(p, er, et, out)
+        }
+        v.setBE32(out, at, out.length - at - 4)
+        return
+    }
+    let a = arr.newArr()
+    arr.parse(p.rBuf[n], p.rOff[n], p.rLen[n], a)
+    if arrayFailed(p, a) { return }
+    let hasNull = 0
+    for x in a.nulls {
+        if x { hasNull = 1 }
+    }
+    v.addBE32(out, a.ndim)
+    v.addBE32(out, hasNull)
+    v.addBE32(out, elemOid)
+    let d = 0
+    while d < a.ndim {
+        v.addBE32(out, a.dims[d])
+        v.addBE32(out, a.lbs[d])
+        d += 1
+    }
+    let er = elemReg(p, 0, et)
+    let i = 0
+    while i < a.count() {
+        if a.nulls[i] {
+            v.addBE32(out, -1)
+        } else if t == v.T_ACLARRAY {
+            v.addBE32(out, a.lens[i])
+            out.addBytes(a.elem(i))
+        } else {
+            loadElem(p, a, i, er, et, -1)
+            if p.err { return }
+            encodeBinary(p, er, et, out)
+        }
+        i += 1
+    }
+    v.setBE32(out, at, out.length - at - 4)
+}
+
+// ---- array functions (FN_ARR_*): evaluated by evalArrayFunc, NULL handling per function
+
+public constant FN_ARR_BASE = 350
+public constant FN_CARDINALITY = 350
+public constant FN_ARRAY_NDIMS = 351
+public constant FN_ARRAY_DIMS = 352
+public constant FN_ARRAY_FILL = 353       // (value, dims int4[] [, lower bounds int4[]]); value may be NULL
+public constant FN_ARRAY_TO_STRING = 354  // (array, delimiter [, null text])
+public constant FN_ARRAY_APPEND = 355
+public constant FN_ARRAY_PREPEND = 356    // (element, array)
+public constant FN_ARRAY_CAT = 357
+public constant FN_ARRAY_POSITION = 358   // (array, element [, start])
+public constant FN_STRING_TO_ARRAY = 359  // (text, delimiter [, null text])
+public constant FN_ARRAY_REMOVE = 360
+public constant FN_JSON_BUILD_OBJECT = 370  // json_build_object(key, value, ...): NULL values allowed
+public constant FN_JSON_BUILD_ARRAY = 371   // json_build_array(value, ...)
+public constant FN_ARR_END = 379
+
+function argNull(p: Plan, n: Integer, i: Integer): Boolean { return p.rNull[argAt(p, n, i)] != 0 }
+
+function addSplitPiece(p: Plan, out: arr.Arr, b: Bytes, o: Integer, l: Integer, nullText: Integer) {
+    if nullText >= 0 && v.equalBytes(b, o, l, p.rBuf[nullText], p.rOff[nullText], p.rLen[nullText]) {
+        out.addNull()
+    } else {
+        out.add(b, o, l)
+    }
+}
+
+// Lengths (or lower bounds) given as an int4[] for array_fill: false with p.err when unusable.
+function intList(p: Plan, r: Integer, out: List<Integer>, what: Text): Boolean {
+    let a = arr.newArr()
+    if !parseReg(p, r, a) { return false }
+    if a.ndim > 1 {
+        raise(p, "2202E", "wrong number of array subscripts")
+        p.errDetail = what + " array must be one-dimensional."
+        return false
+    }
+    let i = 0
+    while i < a.count() {
+        if a.nulls[i] {
+            raise(p, "22004", what + " array must not contain nulls")
+            return false
+        }
+        let q = p.pq
+        v.parseInt(a.data, a.starts[i], a.lens[i], q, -2147483648, 2147483647)
+        out.add(q.i)
+        i += 1
+    }
+    return true
+}
+
+function evalArrayFunc(p: Plan, n: Integer) {
+    let fn = p.ec[n]
+    let cnt = p.eb[n]
+    let i = 0
+    while i < cnt {
+        ev(p, argAt(p, n, i))
+        if p.err { return }
+        i += 1
+    }
+    if fn == FN_JSON_BUILD_OBJECT || fn == FN_JSON_BUILD_ARRAY {
+        let s = scratchOf(p, n)
+        let obj = fn == FN_JSON_BUILD_OBJECT
+        if obj { s.add(123) } else { s.add(91) }
+        i = 0
+        while i < cnt {
+            let x = argAt(p, n, i)
+            if i > 0 { appendView(s, Bytes(", "), 0, 2) }
+            if obj && i % 2 == 0 {
+                if p.rNull[x] != 0 {
+                    raise(p, "22004", "null value not allowed for object key")
+                    return
+                }
+                let key = Bytes()
+                formatReg(p, x, p.et[x], key)
+                addJsonString(s, key, 0, key.length)
+                appendView(s, Bytes(" : "), 0, 3)
+                i += 1
+                x = argAt(p, n, i)
+            }
+            addJsonValue(p, s, x)
+            i += 1
+        }
+        if obj { s.add(125) } else { s.add(93) }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    let a0 = argAt(p, n, 0)
+    if fn == FN_ARRAY_APPEND || fn == FN_ARRAY_PREPEND || fn == FN_ARRAY_CAT {
+        // NULL arrays count as empty; the result is NULL only when both sides are NULL
+        let ar = a0
+        let el = argAt(p, n, 1)
+        if fn == FN_ARRAY_PREPEND {
+            ar = argAt(p, n, 1)
+            el = a0
+        }
+        let out = p.arrB
+        out.reset()
+        let et = v.arrayElemType(p.et[n])
+        if fn == FN_ARRAY_CAT {
+            let x = arr.newArr()
+            let y = arr.newArr()
+            if p.rNull[a0] != 0 && p.rNull[el] != 0 {
+                p.rNull[n] = 1
+                return
+            }
+            if p.rNull[a0] == 0 && !parseReg(p, a0, x) { return }
+            if p.rNull[el] == 0 && !parseReg(p, el, y) { return }
+            if x.count() == 0 {
+                copyReg(p, el, n)
+                if p.rNull[el] != 0 { copyReg(p, a0, n) }
+                return
+            }
+            if y.count() == 0 {
+                copyReg(p, a0, n)
+                return
+            }
+            // same dimensions: concatenate along the first; one dimension less on one side: append it as an item
+            if x.ndim == y.ndim {
+                let d = 1
+                while d < x.ndim {
+                    if x.dims[d] != y.dims[d] {
+                        raise(p, "2202E", "cannot concatenate incompatible arrays")
+                        p.errDetail = "Arrays with differing element dimensions are not compatible for concatenation."
+                        return
+                    }
+                    d += 1
+                }
+                copyShape(x, out)
+                out.dims[0] = x.dims[0] + y.dims[0]
+            } else if x.ndim == y.ndim + 1 || y.ndim == x.ndim + 1 {
+                let big = x
+                let small = y
+                if y.ndim > x.ndim {
+                    big = y
+                    small = x
+                }
+                let d = 0
+                while d < small.ndim {
+                    if small.dims[d] != big.dims[d + 1] {
+                        raise(p, "2202E", "cannot concatenate incompatible arrays")
+                        return
+                    }
+                    d += 1
+                }
+                copyShape(big, out)
+                out.dims[0] = big.dims[0] + 1
+            } else {
+                raise(p, "2202E", "cannot concatenate incompatible arrays")
+                return
+            }
+            for src in [x, y] {
+                let k = 0
+                while k < src.count() {
+                    if src.nulls[k] { out.addNull() } else { out.add(src.data, src.starts[k], src.lens[k]) }
+                    k += 1
+                }
+            }
+            setArrayResult(p, n, out)
+            return
+        }
+        let x = arr.newArr()
+        if p.rNull[ar] == 0 && !parseReg(p, ar, x) { return }
+        if x.ndim > 1 {
+            raise(p, "22000", "argument must be empty or one-dimensional array")
+            return
+        }
+        if fn == FN_ARRAY_PREPEND { addElemReg(p, out, el, et) }
+        let k = 0
+        while k < x.count() {
+            if x.nulls[k] { out.addNull() } else { out.add(x.data, x.starts[k], x.lens[k]) }
+            k += 1
+        }
+        if fn == FN_ARRAY_APPEND { addElemReg(p, out, el, et) }
+        out.oneDimension()
+        if x.count() > 0 { out.lbs[0] = x.lbs[0] }
+        setArrayResult(p, n, out)
+        return
+    }
+    if fn == FN_ARRAY_FILL {
+        if argNull(p, n, 1) || (cnt > 2 && argNull(p, n, 2)) {
+            raise(p, "22004", "dimension array or low bound array cannot be null")
+            return
+        }
+        let dims: List<Integer> = []
+        let lbs: List<Integer> = []
+        if !intList(p, argAt(p, n, 1), dims, "Dimension") { return }
+        if cnt > 2 {
+            if !intList(p, argAt(p, n, 2), lbs, "Low bound") { return }
+            if lbs.length != dims.length {
+                raise(p, "2202E", "wrong number of array subscripts")
+                p.errDetail = "Low bound array has different size than dimensions array."
+                return
+            }
+        }
+        while lbs.length < dims.length { lbs.add(1) }
+        if dims.length > arr.MAXDIM {
+            raise(p, "54000", "number of array dimensions (" + Text(dims.length) + ") exceeds the maximum allowed (" + Text(arr.MAXDIM) + ")")
+            return
+        }
+        let total = 1
+        for d in dims {
+            if d < 0 {
+                raise(p, "2202E", "array size exceeds the maximum allowed (134217727)")
+                return
+            }
+            total = total * d
+            if total > 134217727 {
+                raise(p, "54000", "array size exceeds the maximum allowed (134217727)")
+                return
+            }
+        }
+        let out = p.arrB
+        out.reset()
+        if total == 0 || dims.length == 0 {
+            setArrayResult(p, n, out)
+            return
+        }
+        out.ndim = dims.length
+        for d in dims { out.dims.add(d) }
+        for lb in lbs { out.lbs.add(lb) }
+        let tmp = Bytes()
+        if p.rNull[a0] == 0 { formatReg(p, a0, p.et[a0], tmp) }
+        let k = 0
+        while k < total {
+            if p.rNull[a0] != 0 { out.addNull() } else { out.add(tmp, 0, tmp.length) }
+            k += 1
+        }
+        setArrayResult(p, n, out)
+        return
+    }
+    if fn == FN_STRING_TO_ARRAY {
+        if p.rNull[a0] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let d = argAt(p, n, 1)
+        let nullText = -1
+        if cnt > 2 && !argNull(p, n, 2) { nullText = argAt(p, n, 2) }
+        let out = p.arrB
+        out.reset()
+        let b = p.rBuf[a0]
+        let o = p.rOff[a0]
+        let e = o + p.rLen[a0]
+        if e > o {
+            if p.rNull[d] != 0 {
+                // NULL delimiter: every character is an element
+                let j = o
+                while j < e {
+                    let k = j + 1
+                    while k < e && (b[k] & 192) == 128 { k += 1 }
+                    addSplitPiece(p, out, b, j, k - j, nullText)
+                    j = k
+                }
+            } else if p.rLen[d] == 0 {
+                addSplitPiece(p, out, b, o, e - o, nullText)
+            } else {
+                let dl = p.rLen[d]
+                let pos = o
+                let j = o
+                while true {
+                    if j + dl <= e && v.equalBytes(b, j, dl, p.rBuf[d], p.rOff[d], dl) {
+                        addSplitPiece(p, out, b, pos, j - pos, nullText)
+                        j += dl
+                        pos = j
+                    } else if j >= e {
+                        addSplitPiece(p, out, b, pos, e - pos, nullText)
+                        break
+                    } else {
+                        j += 1
+                    }
+                }
+            }
+        }
+        out.oneDimension()
+        setArrayResult(p, n, out)
+        return
+    }
+    // the rest are strict in the array argument
+    if p.rNull[a0] != 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let x = arr.newArr()
+    if !parseReg(p, a0, x) { return }
+    if fn == FN_CARDINALITY {
+        setIntReg(p, n, x.count())
+        return
+    }
+    if fn == FN_ARRAY_NDIMS {
+        if x.ndim == 0 {
+            p.rNull[n] = 1
+            return
+        }
+        setIntReg(p, n, x.ndim)
+        return
+    }
+    if fn == FN_ARRAY_DIMS {
+        if x.ndim == 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let s = scratchOf(p, n)
+        let d = 0
+        while d < x.ndim {
+            s.add(91)
+            v.addInt(s, x.lbs[d])
+            s.add(58)
+            v.addInt(s, x.lbs[d] + x.dims[d] - 1)
+            s.add(93)
+            d += 1
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_ARRAY_TO_STRING {
+        let d = argAt(p, n, 1)
+        if p.rNull[d] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        let nullText = -1
+        if cnt > 2 && !argNull(p, n, 2) { nullText = argAt(p, n, 2) }
+        let s = scratchOf(p, n)
+        let first = true
+        let k = 0
+        while k < x.count() {
+            if !x.nulls[k] || nullText >= 0 {
+                if !first { appendView(s, p.rBuf[d], p.rOff[d], p.rLen[d]) }
+                first = false
+                if x.nulls[k] {
+                    appendView(s, p.rBuf[nullText], p.rOff[nullText], p.rLen[nullText])
+                } else {
+                    appendView(s, x.data, x.starts[k], x.lens[k])
+                }
+            }
+            k += 1
+        }
+        setTextReg(p, n, s, 0, s.length)
+        return
+    }
+    if fn == FN_ARRAY_POSITION || fn == FN_ARRAY_REMOVE {
+        if x.ndim > 1 {
+            raise(p, "0A000", "searching for elements in multidimensional arrays is not supported")
+            return
+        }
+        let el = argAt(p, n, 1)
+        let et = v.arrayElemType(p.et[a0])
+        let er = elemReg(p, 0, et)
+        let cl = cmpClassOfType(et)
+        if fn == FN_ARRAY_REMOVE {
+            let out = p.arrB
+            out.reset()
+            let k = 0
+            while k < x.count() {
+                let drop = false
+                if x.nulls[k] {
+                    drop = p.rNull[el] != 0
+                } else if p.rNull[el] == 0 {
+                    loadElem(p, x, k, er, et, -1)
+                    if p.err { return }
+                    drop = cmpRegs(p, er, el, cl) == 0
+                }
+                if !drop {
+                    if x.nulls[k] { out.addNull() } else { out.add(x.data, x.starts[k], x.lens[k]) }
+                }
+                k += 1
+            }
+            out.oneDimension()
+            setArrayResult(p, n, out)
+            return
+        }
+        let from = 0
+        if cnt > 2 {
+            if argNull(p, n, 2) {
+                raise(p, "22004", "initial position must not be null")
+                return
+            }
+            from = p.rInt[argAt(p, n, 2)] - 1
+            if x.count() > 0 { from = p.rInt[argAt(p, n, 2)] - x.lbs[0] }
+            if from < 0 { from = 0 }
+        }
+        let k = from
+        while k < x.count() {
+            let hit = false
+            if x.nulls[k] {
+                hit = p.rNull[el] != 0
+            } else if p.rNull[el] == 0 {
+                loadElem(p, x, k, er, et, -1)
+                if p.err { return }
+                hit = cmpRegs(p, er, el, cl) == 0
+            }
+            if hit {
+                setIntReg(p, n, k + x.lbs[0])
+                return
+            }
+            k += 1
+        }
+        p.rNull[n] = 1
+        return
+    }
+    p.rNull[n] = 1
+}
+
+// A JSON string literal for b[o, o + l) (escape_json).
+function addJsonString(out: Bytes, b: Bytes, o: Integer, l: Integer) {
+    let hex = Bytes("0123456789abcdef")
+    out.add(34)
+    let i = 0
+    while i < l {
+        let c = b[o + i]
+        if c == 34 || c == 92 {
+            out.add(92)
+            out.add(c)
+        } else if c == 10 {
+            out.add(92)
+            out.add(110)
+        } else if c == 13 {
+            out.add(92)
+            out.add(114)
+        } else if c == 9 {
+            out.add(92)
+            out.add(116)
+        } else if c == 8 {
+            out.add(92)
+            out.add(98)
+        } else if c == 12 {
+            out.add(92)
+            out.add(102)
+        } else if c < 32 {
+            appendView(out, Bytes("\\u00"), 0, 4)
+            out.add(hex[c / 16])
+            out.add(hex[c % 16])
+        } else {
+            out.add(c)
+        }
+        i += 1
+    }
+    out.add(34)
+}
+
+// Register x as a JSON value (to_json): numbers and booleans bare (non-finite floats quoted), arrays as JSON
+// arrays, NULL as null, everything else as a JSON string of its text form.
+function addJsonValue(p: Plan, out: Bytes, x: Integer) {
+    if p.rNull[x] != 0 {
+        appendView(out, Bytes("null"), 0, 4)
+        return
+    }
+    let t = p.et[x]
+    let txt = Bytes()
+    formatReg(p, x, t, txt)
+    if t == v.T_BOOL {
+        if p.rInt[x] != 0 { appendView(out, Bytes("true"), 0, 4) } else { appendView(out, Bytes("false"), 0, 5) }
+        return
+    }
+    if v.isIntType(t) || t == v.T_OID {
+        out.addBytes(txt)
+        return
+    }
+    // finite numbers are bare; NaN and the infinities are JSON strings
+    let finite = txt.length > 0 && txt[txt.length - 1] != 121 && txt[0] != 78
+    if (v.isFloatType(t) || t == v.T_NUMERIC || t == v.T_NUMTEXT) && finite {
+        out.addBytes(txt)
+        return
+    }
+    if v.isGeneralArray(t) {
+        let a = arr.newArr()
+        arr.parse(txt, 0, txt.length, a)
+        let et = v.arrayElemType(t)
+        let er = elemReg(p, 0, et)
+        out.add(91)
+        let k = 0
+        while k < a.count() {
+            if k > 0 { out.add(44) }
+            loadElemOwned(p, a, k, er, et, -1)
+            if p.err { return }
+            addJsonValue(p, out, er)
+            k += 1
+        }
+        out.add(93)
+        return
+    }
+    addJsonString(out, txt, 0, txt.length)
+}
+
+// Comparison class of values of type t (arrays element by element, bpchar without trailing blanks).
+public function cmpClassOfType(t: Integer): Integer {
+    if t == v.T_BPCHAR { return CL_BPCHAR }
+    if v.isGeneralArray(t) { return CL_ARRAY }
+    return classOf(t)
 }
 
 // PG binary numeric: ndigits, weight, sign, dscale, base-10000 digits.
@@ -1513,7 +2758,17 @@ public function castReg(p: Plan, src: Integer, from: Integer, dst: Integer, to: 
         return
     }
     if v.isExtType(from) || v.isExtType(to) {
-        extCast(p, src, from, dst, to, typmod)
+        extCast(p, src, from, dst, to, typmod, explicit)
+        return
+    }
+    if v.isGeneralArray(to) && (from != to || typmod >= 0) {
+        if v.isGeneralArray(from) {
+            castArray(p, src, from, dst, to, typmod, explicit)
+        } else if classOf(from) == CL_TEXT {
+            arrayIn(p, p.rBuf[src], p.rOff[src], p.rLen[src], dst, to, typmod)
+        } else {
+            raise(p, "42846", "cannot cast type " + v.typeName(from) + " to " + v.typeName(to))
+        }
         return
     }
     let fc = classOf(from)
@@ -2016,6 +3271,10 @@ public function parseInto(p: Plan, b: Bytes, o: Integer, l: Integer, fromBpchar:
         extInput(p, b, o, l, dst, to, typmod)
         return
     }
+    if v.isGeneralArray(to) {
+        arrayIn(p, b, o, l, dst, to, typmod)
+        return
+    }
     if to == v.T_INT4 || to == v.T_INT8 || to == v.T_INT2 || to == v.T_OID {
         let lo = -9223372036854775807 - 1
         let hi = 9223372036854775807
@@ -2351,7 +3610,8 @@ function constNode(p: Plan, n: Integer): Boolean {
         return cst(p, p.ea[n])
     }
     if k == EX_LIKE { return cst(p, p.ea[n]) && cst(p, p.eb[n]) && cst(p, p.ed[n]) }
-    if k == EX_COALESCE || k == EX_GREATEST { return argsConst(p, p.ea[n], p.eb[n]) }
+    if k == EX_COALESCE || k == EX_GREATEST || k == EX_ARRAY { return argsConst(p, p.ea[n], p.eb[n]) }
+    if k == EX_QUANTARR { return cst(p, p.ea[n]) && cst(p, p.eb[n]) }
     if k == EX_INLIST { return cst(p, p.ea[n]) && argsConst(p, p.eb[n], p.ec[n] & 1048575) }
     if k == EX_CASE { return cst(p, p.ea[n]) && argsConst(p, p.eb[n], 2 * p.ec[n]) && cst(p, p.ed[n]) }
     if k == EX_FUNC {
@@ -2826,6 +4086,8 @@ public function ev(p: Plan, n: Integer) {
     if k == EX_CAST {
         let a = p.ea[n]
         ev(p, a)
+        // a failed operand has no value to cast (an extension's check would read an empty one)
+        if p.err { return }
         if extCastCached(p, n, a) { return }
         castReg(p, a, p.et[a], n, p.et[n], p.ec[n], p.eb[n] == 1, p.ed[n])
         extCastRemember(p, n, a)
@@ -2834,6 +4096,7 @@ public function ev(p: Plan, n: Integer) {
     if k == EX_LITCAST {
         let a = p.ea[n]
         ev(p, a)
+        if p.err { return }
         if p.rNull[a] != 0 {
             p.rNull[n] = 1
             return
@@ -3087,6 +4350,18 @@ public function ev(p: Plan, n: Integer) {
     }
     if k == EX_SUBSCRIPT {
         evalSubscript(p, n)
+        return
+    }
+    if k == EX_ARRAY {
+        evalArrayCtor(p, n)
+        return
+    }
+    if k == EX_QUANTARR {
+        evalQuantArray(p, n)
+        return
+    }
+    if k == EX_ARRSUB {
+        evalArraySubquery(p, n)
         return
     }
     if k == EX_FIELD {
@@ -3366,6 +4641,10 @@ function evalFunc(p: Plan, n: Integer) {
     }
     if fn >= FN_CAT_BASE && fn <= FN_CAT_END {
         evalCatFunc(p, n)
+        return
+    }
+    if fn >= FN_ARR_BASE && fn <= FN_ARR_END {
+        evalArrayFunc(p, n)
         return
     }
     if fn >= FN_STR_BASE && fn < FN_CAT_BASE {
@@ -4321,6 +5600,22 @@ function inSet(c: Integer, chars: Bytes, co: Integer, cl: Integer): Boolean {
 
 // Visibility-aware positioning of slot s on row r of its base table. Returns false if invisible.
 function positionRow(p: Plan, s: Integer, t: tb.Table, r: Integer): Boolean {
+    if p.preempted && txn.retaining(p.env.tm) {
+        // changed by another session while this statement was suspended: read it as of the statement's start
+        let sc0 = p.slotScratch[s]
+        if sc0.id != -2 {
+            sc0 = tb.cloneSchema(t, -2)
+            p.slotScratch[s] = sc0
+        }
+        let k = txn.retainedRow(p.env.tm, t, r, sc0)
+        if k == 0 { return false }
+        if k == 1 {
+            p.slotTable[s] = sc0
+            p.slotRow[s] = 0
+            p.slotOrig[s] = r
+            return true
+        }
+    }
     let st = t.state[r]
     if st == 0 {
         p.slotTable[s] = t
@@ -4491,6 +5786,14 @@ public function open(p: Plan, o: Integer) {
         buildSetOp(p, o)
         return
     }
+    if k == O_UNNEST {
+        openUnnest(p, o)
+        return
+    }
+    if k == O_ANN {
+        openAnn(p, o)
+        return
+    }
     if k == O_CATALOG {
         let sn = p.od[o]
         if p.eState[sn] == 0 {
@@ -4640,6 +5943,8 @@ public function next(p: Plan, o: Integer): Boolean {
         return true
     }
     if k == O_DISTINCT { return nextDistinct(p, o) }
+    if k == O_UNNEST { return nextUnnest(p, o) }
+    if k == O_ANN { return nextAnn(p, o) }
     if k == O_CATALOG {
         let s = p.oa[o]
         let t = p.temps[p.ob[o]]
@@ -4761,7 +6066,7 @@ function nextHashEq(p: Plan, o: Integer) : Boolean {
 
 // ---- ordered range: a = slot, b = ord index id, c = filter, d = olist block:
 // [loN, loStrict, hiN, hiStrict, loKeyIdx, hiKeyIdx, desc, lo exprs..., hi exprs...]
-// state: os1 = main pos, os2 = delta pos, os3 = done flag
+// state: os1 = chunk, os2 = position in it, os3 = done flag
 function openRange(p: Plan, o: Integer) {
     let blk = p.od[o]
     let loN = p.olist[blk]
@@ -4789,8 +6094,8 @@ function openRange(p: Plan, o: Integer) {
     }
     if loN > 0 {
         lo.n = loN
-        p.os1[o] = ix.lowerBoundKey(t, ix0.cols, ix0.main, lo, loStrict)
-        p.os2[o] = ix.lowerBoundKey(t, ix0.cols, ix0.delta, lo, loStrict)
+        p.os1[o] = ix.ordSeekChunk(ix0, t, lo, loStrict)
+        p.os2[o] = ix.ordSeekPos(ix0, t, p.os1[o], lo, loStrict)
     } else {
         p.os1[o] = 0
         p.os2[o] = 0
@@ -4808,33 +6113,22 @@ function nextRange(p: Plan, o: Integer): Boolean {
     let t = p.slotBase[s]
     let hi = p.keys[p.olist[blk + 5]]
     let f = p.oc[o]
-    let nmain = ix0.main.length / 8
-    let nd = ix0.delta.length / 8
+    let chunks = ix0.chunks
     while true {
-        let pm = p.os1[o]
-        let pd = p.os2[o]
-        let r = -1
-        if pm < nmain && pd < nd {
-            let a = ix0.main.getInt64(pm * 8)
-            let b = ix0.delta.getInt64(pd * 8)
-            if ix.cmpRows(t, ix0.cols, a, b) <= 0 {
-                r = a
-                p.os1[o] = pm + 1
-            } else {
-                r = b
-                p.os2[o] = pd + 1
-            }
-        } else if pm < nmain {
-            r = ix0.main.getInt64(pm * 8)
-            p.os1[o] = pm + 1
-        } else if pd < nd {
-            r = ix0.delta.getInt64(pd * 8)
-            p.os2[o] = pd + 1
-        } else {
+        let ci = p.os1[o]
+        let pi = p.os2[o]
+        while ci < chunks.length && pi >= chunks[ci].length / 8 {
+            ci += 1
+            pi = 0
+        }
+        if ci >= chunks.length {
             p.os3[o] = 1
             p.slotRow[s] = -1
             return false
         }
+        let r = chunks[ci].getInt64(pi * 8)
+        p.os1[o] = ci
+        p.os2[o] = pi + 1
         if tb.isNull(t.cols[ix0.cols[0]], r) {
             // NULL keys sort last and never satisfy a range bound
             p.os3[o] = 1
@@ -5268,6 +6562,11 @@ function buildAgg(p: Plan, o: Integer) {
     chain.clear()
     let child = p.oa[o]
     let extraBase = ng + na
+    let ai = 0
+    while ai < na {
+        if p.olist[ab + ai * AGS] == AG_ARRAY_AGG { p.aggBufs[p.olist[ab + ai * AGS + 4]] = [] }
+        ai += 1
+    }
     // SELECT count(*) ... WHERE col ==> '...': the count comes from the search index's bitmaps
     if ng == 0 && na == 1 && p.olist[ab] == AG_COUNT_STAR && p.olist[ab + 2] == 0 && p.olist[ab + 3] < 0 &&
        p.ok[child] == O_SEARCH && p.oc[child] < 0 {
@@ -5421,7 +6720,7 @@ function accumulate(p: Plan, o: Integer, t: tb.Table, g: Integer, ng: Integer, n
             continue
         }
         ev(p, arg)
-        if p.rNull[arg] != 0 {
+        if p.rNull[arg] != 0 && kind != AG_ARRAY_AGG {
             i += 1
             continue
         }
@@ -5599,6 +6898,21 @@ function accumulate(p: Plan, o: Integer, t: tb.Table, g: Integer, ng: Integer, n
             } else if p.rInt[arg] != 0 {
                 tb.setInt(c, g, 1)
             }
+        } else if kind == AG_ARRAY_AGG {
+            let buf = aggBuf(p, p.olist[ab + i * AGS + 4], g)
+            if buf.length > 0 { buf.add(44) }
+            if p.rNull[arg] != 0 {
+                buf.addBytes(Bytes("NULL"))
+            } else {
+                let tmp = p.arrTmp
+                tmp.clear()
+                formatReg(p, arg, p.et[arg], tmp)
+                arr.addElem(buf, tmp, 0, tmp.length)
+            }
+            if tb.isNull(c, g) {
+                tb.clearNull(c, g)
+                tb.setText(c, g, p.empty, 0, 0)
+            }
         } else if kind == AG_STRING_AGG {
             // separator is evaluated from the extra expr (stored in tmp slot's arg); default ","
             let sepE = p.olist[ab + i * AGS + 4]
@@ -5608,7 +6922,7 @@ function accumulate(p: Plan, o: Integer, t: tb.Table, g: Integer, ng: Integer, n
                 tb.setText(c, g, p.rBuf[arg], p.rOff[arg], p.rLen[arg])
             } else {
                 let s = Bytes()
-                s.addBytes(c.heap.slice(tb.textOff(c, g), tb.textOff(c, g) + tb.textLen(c, g)))
+                s.addBytes(tb.textBytes(c, g))
                 if p.rNull[sepE] == 0 { appendView(s, p.rBuf[sepE], p.rOff[sepE], p.rLen[sepE]) }
                 appendView(s, p.rBuf[arg], p.rOff[arg], p.rLen[arg])
                 tb.setText(c, g, s, 0, s.length)
@@ -5733,15 +7047,15 @@ function extAggStep(p: Plan, c: tb.Column, g: Integer, arg: Integer, ci: Integer
         call.lengths[0] = 0
     } else {
         call.nulls[0] = false
-        call.buffers[0] = c.heap
-        call.offsets[0] = tb.textOff(c, g)
+        call.buffers[0] = tb.textBuf(c, g)
+        call.offsets[0] = tb.textAt(c, g)
         call.lengths[0] = tb.textLen(c, g)
     }
     setCallArg(p, call, 1, arg)
     call.begin()
     call.output = Bytes()
     call.modifier = -1
-    ext.agg(ai).def.step(call)
+    call.invoke(ext.agg(ai).def.step)
     if callFailed(p, call) { return }
     if call.resultNull {
         tb.setNull(c, g)
@@ -5755,6 +7069,23 @@ function finalizeAgg(p: Plan, t: tb.Table, ng: Integer, na: Integer, ab: Integer
     let i = 0
     while i < na {
         let kind = p.olist[ab + i * AGS]
+        if kind == AG_ARRAY_AGG {
+            let c = t.cols[ng + i]
+            let bi = p.olist[ab + i * AGS + 4]
+            let out = Bytes()
+            let g = 0
+            while g < t.nrows {
+                if !tb.isNull(c, g) {
+                    out.clear()
+                    out.add(123)
+                    out.addBytes(aggBuf(p, bi, g))
+                    out.add(125)
+                    tb.setText(c, g, out, 0, out.length)
+                }
+                g += 1
+            }
+            p.aggBufs[bi] = []
+        }
         if kind == AG_EXT {
             let c = t.cols[ng + i]
             let cc = t.cols[extraBase + i * 2]
@@ -5766,7 +7097,7 @@ function finalizeAgg(p: Plan, t: tb.Table, ng: Integer, na: Integer, ab: Integer
                     tb.setNull(c, g)
                 } else {
                     call.nulls[0] = false
-                    call.buffers[0] = c.heap.slice(tb.textOff(c, g), tb.textOff(c, g) + tb.textLen(c, g))
+                    call.buffers[0] = tb.textBytes(c, g)
                     call.offsets[0] = 0
                     call.lengths[0] = tb.textLen(c, g)
                     call.nulls[1] = false
@@ -5774,7 +7105,7 @@ function finalizeAgg(p: Plan, t: tb.Table, ng: Integer, na: Integer, ab: Integer
                     call.begin()
                     call.output = Bytes()
                     call.modifier = -1
-                    fin(call)
+                    call.invoke(fin)
                     if callFailed(p, call) { return }
                     if call.resultNull { tb.setNull(c, g) } else { tb.setText(c, g, call.output, 0, call.output.length) }
                 }
@@ -6209,33 +7540,6 @@ function evalRegex(p: Plan, n: Integer) {
 }
 
 // arr[i] on a catalog array (int2vector/oidvector count from 0, arrays from 1); NULL when out of range.
-function evalSubscript(p: Plan, n: Integer) {
-    let a = p.ea[n]
-    let b = p.eb[n]
-    ev(p, a)
-    ev(p, b)
-    if p.rNull[a] != 0 || p.rNull[b] != 0 {
-        p.rNull[n] = 1
-        return
-    }
-    let at = p.et[a]
-    let k = p.rInt[b]
-    if k < -1000000000 || k > 1000000000 {
-        p.rNull[n] = 1
-        return
-    }
-    let elems: List<Bytes> = []
-    let nulls: List<Boolean> = []
-    splitArrayText(p.rBuf[a], p.rOff[a], p.rLen[a], v.isVectorType(at), elems, nulls)
-    let pos = k - v.arrayLowerBound(at)
-    if pos < 0 || pos >= elems.length || nulls[pos] {
-        p.rNull[n] = 1
-        return
-    }
-    let e = elems[pos]
-    parseInto(p, e, 0, e.length, false, n, p.et[n], -1, 0)
-}
-
 // (rec).x / (rec).n of a record "(x,n)" from information_schema._pg_expandarray.
 function evalField(p: Plan, n: Integer) {
     let a = p.ea[n]
@@ -6328,17 +7632,53 @@ function evalCatFunc(p: Plan, n: Integer) {
         let at = p.et[a0]
         let dim = 1
         if cnt > 1 { dim = p.rInt[argAt(p, n, 1)] }
-        let elems: List<Bytes> = []
-        let nulls: List<Boolean> = []
-        splitArrayText(p.rBuf[a0], p.rOff[a0], p.rLen[a0], v.isVectorType(at), elems, nulls)
-        if dim != 1 || elems.length == 0 {
+        let count = 0
+        let lb = v.arrayLowerBound(at)
+        if v.isVectorType(at) {
+            let elems: List<Bytes> = []
+            let nulls: List<Boolean> = []
+            splitArrayText(p.rBuf[a0], p.rOff[a0], p.rLen[a0], true, elems, nulls)
+            count = elems.length
+            if dim != 1 { count = 0 }
+        } else {
+            let x = arr.newArr()
+            if !parseReg(p, a0, x) { return }
+            if dim >= 1 && dim <= x.ndim {
+                count = x.dims[dim - 1]
+                lb = x.lbs[dim - 1]
+            }
+        }
+        if count == 0 {
             p.rNull[n] = 1
             return
         }
-        let lb = v.arrayLowerBound(at)
-        if fn == FN_ARRAY_UPPER { p.rInt[n] = lb + elems.length - 1 }
+        if fn == FN_ARRAY_UPPER { p.rInt[n] = lb + count - 1 }
         if fn == FN_ARRAY_LOWER { p.rInt[n] = lb }
-        if fn == FN_ARRAY_LENGTH { p.rInt[n] = elems.length }
+        if fn == FN_ARRAY_LENGTH { p.rInt[n] = count }
+        return
+    }
+    if fn == FN_SERIAL_SEQ {
+        let a1 = argAt(p, n, 1)
+        let tname = viewText(p.rBuf[a0], p.rOff[a0], p.rLen[a0])
+        let col = viewText(p.rBuf[a1], p.rOff[a1], p.rLen[a1])
+        let seq = pgc.serialSequence(c, tname, col)
+        if seq == "?" {
+            if pgc.relOidByName(c, tname) < 0 {
+                raise(p, "42P01", "relation \"" + tname + "\" does not exist")
+            } else {
+                raise(p, "42703", "column \"" + col + "\" of relation \"" + tname + "\" does not exist")
+            }
+            return
+        }
+        if seq == "" {
+            p.rNull[n] = 1
+            return
+        }
+        setTextResult(p, n, seq)
+        return
+    }
+    if fn == FN_TABLE_VISIBLE {
+        setBoolReg(p, n, pgc.relVisible(p.rInt[a0]))
         return
     }
     if fn == FN_REL_SIZE {
@@ -6394,6 +7734,12 @@ function nextSrf(p: Plan, o: Integer): Boolean {
             p.os1[o] = 0
         }
         if !next(p, child) { return false }
+        if kind == 4 {
+            if !fillZippedSrfs(p, t, blk) { return false }
+            p.os1[o] = 1
+            p.os2[o] = 0
+            continue
+        }
         if kind == 3 {
             let lo = p.olist[blk + 1]
             let hi = p.olist[blk + 2]
@@ -6414,35 +7760,27 @@ function nextSrf(p: Plan, o: Integer): Boolean {
             }
             continue
         }
-        let arr = p.olist[blk + 1]
-        ev(p, arr)
+        let arrE = p.olist[blk + 1]
+        ev(p, arrE)
         tb.truncate(t)
-        if p.rNull[arr] == 0 {
-            let at = p.et[arr]
+        if p.rNull[arrE] == 0 {
             let elems: List<Bytes> = []
             let nulls: List<Boolean> = []
-            splitArrayText(p.rBuf[arr], p.rOff[arr], p.rLen[arr], v.isVectorType(at), elems, nulls)
+            if !arrayElemTexts(p, arrE, elems, nulls) { return false }
+            let c0 = t.cols[0]
+            let er = elemReg(p, 0, c0.type)
             let i = 0
             while i < elems.length {
                 let r = tb.reserveRow(t, 0)
-                let c0 = t.cols[0]
                 if nulls[i] {
                     tb.setNull(c0, r)
-                } else if v.isTextType(c0.type) {
-                    tb.setText(c0, r, elems[i], 0, elems[i].length)
                 } else {
-                    let q = p.pq
-                    let lo = -2147483648
-                    let hi = 2147483647
-                    if c0.type == v.T_INT2 {
-                        lo = -32768
-                        hi = 32767
-                    }
-                    v.parseInt(elems[i], 0, elems[i].length, q, lo, hi)
-                    if q.ok { tb.setInt(c0, r, q.i) } else { tb.setNull(c0, r) }
+                    parseInto(p, elems[i], 0, elems[i].length, false, er, c0.type, -1, 0)
+                    if p.err { return false }
+                    storeCell(p, er, c0, r)
                 }
                 if t.cols.length > 1 { tb.setInt(t.cols[1], r, i + 1) }
-                // record form "(x,n)" for a bare _pg_expandarray(arr) target
+                // record form "(x,n)" for a bare _pg_expandarray(arrE) target
                 if t.cols.length > 2 {
                     let rec = Bytes()
                     rec.add(40)
@@ -6458,6 +7796,87 @@ function nextSrf(p: Plan, o: Integer): Boolean {
         p.os1[o] = 1
         p.os2[o] = 0
     }
+}
+
+// One child row's results of zipped set-returning functions (spec kind 4, see plan.setupZippedSrfs) into t.
+function fillZippedSrfs(p: Plan, t: tb.Table, blk: Integer): Boolean {
+    tb.truncate(t)
+    let n = p.olist[blk + 1]
+    let pos = blk + 2
+    let rows = 0
+    let i = 0
+    while i < n {
+        let kind = p.olist[pos]
+        let c = t.cols[i]
+        let k = 0
+        if kind == 2 {
+            let e = p.olist[pos + 1]
+            pos += 2
+            ev(p, e)
+            if p.err { return false }
+            if p.rNull[e] == 0 {
+                let elems: List<Bytes> = []
+                let nulls: List<Boolean> = []
+                if !arrayElemTexts(p, e, elems, nulls) { return false }
+                let er = elemReg(p, 0, c.type)
+                while k < elems.length {
+                    rows = zipRow(t, rows, k)
+                    if !nulls[k] {
+                        parseInto(p, elems[k], 0, elems[k].length, false, er, c.type, -1, 0)
+                        if p.err { return false }
+                        storeCell(p, er, c, k)
+                    }
+                    k += 1
+                }
+            }
+        } else {
+            let lo = p.olist[pos + 1]
+            let hi = p.olist[pos + 2]
+            let st = p.olist[pos + 3]
+            pos += 4
+            ev(p, lo)
+            ev(p, hi)
+            let step = 1
+            if st >= 0 {
+                ev(p, st)
+                if p.rNull[st] != 0 { step = 0 } else { step = p.rInt[st] }
+                if p.rNull[st] == 0 && step == 0 {
+                    raise(p, "22023", "step size cannot equal zero")
+                    return false
+                }
+            }
+            if p.err { return false }
+            if p.rNull[lo] == 0 && p.rNull[hi] == 0 && step != 0 {
+                let cur = p.rInt[lo]
+                let stop = p.rInt[hi]
+                while (step > 0 && cur <= stop) || (step < 0 && cur >= stop) {
+                    rows = zipRow(t, rows, k)
+                    tb.clearNull(c, k)
+                    tb.setInt(c, k, cur)
+                    k += 1
+                    if (step > 0 && cur > 9223372036854775807 - step) || (step < 0 && cur < -9223372036854775807 - 1 - step) { break }
+                    cur += step
+                }
+            }
+        }
+        i += 1
+    }
+    return true
+}
+
+// Make sure row k exists (new rows start all NULL); returns the row count.
+function zipRow(t: tb.Table, rows: Integer, k: Integer): Integer {
+    let r = rows
+    while r <= k {
+        let nr = tb.reserveRow(t, 0)
+        let j = 0
+        while j < t.cols.length {
+            tb.setNull(t.cols[j], nr)
+            j += 1
+        }
+        r += 1
+    }
+    return r
 }
 
 // ---- window functions: a = child, b = temp T, c = T's slot, e = olist block, f = chain (output order)
@@ -6631,6 +8050,12 @@ public record SearchState {
     filter: Integer         // residual filter of the O_SEARCH (top-k checks it per candidate)
     hl: Bytes
     buf: Bytes
+    dense: Float            // tin.score(ctid, dense_ratio): > 0 elides dense terms from scores (TIN's default)
+    denseSet: Boolean
+    // queries compiled and computed ahead by searchPrefetch (a plan cached for one SQL shape serves every
+    // connection, so several texts can wait at once); ensureSearch takes the one for its text
+    preTexts: List<Text>
+    preCps: List<si.Compiled>
 }
 
 global EXEC_EPOCH: List<Integer> = [1]
@@ -6642,7 +8067,7 @@ public function addSearch(p: Plan, index: Integer, slot: Integer, query: Integer
     p.searches.add(SearchState {
         index: index; slot: slot; query: query; text: ""; cps: []; rows: Bytes(); scores: []; pos: 0; topk: 0
         sortable: false; topkMode: false; curRow: -1; curScore: 0.0; scored: false; epoch: 0; filter: -1
-        hl: Bytes(); buf: Bytes()
+        hl: Bytes(); buf: Bytes(); dense: 0.0; denseSet: false; preTexts: []; preCps: []
     })
     return p.searches.length - 1
 }
@@ -6657,23 +8082,65 @@ function ensureSearch(p: Plan, ss: SearchState): Boolean {
     let sx = p.env.cat.searchIdx[ss.index]
     // settle first: validating rows can add terms the query names
     let refresh = false
-    if ss.epoch != EXEC_EPOCH[0] {
+    // (a pinned index belongs to this statement, suspended earlier: it keeps the state it searched)
+    if ss.epoch != EXEC_EPOCH[0] && !sx.pinned {
         si.settleIndex(sx, p.slotBase[ss.slot])
         ss.epoch = EXEC_EPOCH[0]
         refresh = true
     }
-    if ss.cps.length == 0 || txt != ss.text || !si.current(sx, ss.cps[0]) {
+    if (ss.cps.length == 0 || txt != ss.text) && ss.preTexts.length > 0 {
+        let k = 0
+        while k < ss.preTexts.length {
+            if ss.preTexts[k] == txt {
+                ss.cps = [ss.preCps[k]]
+                ss.text = txt
+                ss.preTexts[k] = ""
+            }
+            k += 1
+        }
+    }
+    if ss.cps.length == 0 || txt != ss.text || (!sx.pinned && !si.current(sx, ss.cps[0])) {
         let cp = si.compile(sx, txt)
         if cp.err != "" {
             raise(p, "42601", "syntax error in search query: " + cp.err + " at position " + Text(cp.errPos + 1))
             return false
         }
+        if ss.dense > 0.0 { si.setDenseRatio(sx, cp, ss.dense) }
         ss.cps = [cp]
         ss.text = txt
     } else if refresh {
         si.refreshStats(sx, ss.cps[0])
     }
     return true
+}
+
+// Searches of a planned statement that a sort turns into a top k (ORDER BY score DESC LIMIT k, no residual filter):
+// compiled, with their index, table and k, so a loop pass can compute several statements' main chunks in one
+// dispatch (si.prefetchTopK) before running them.
+public function searchPrefetch(p: Plan, ixs: List<si.Index>, ts: List<tb.Table>, cps: List<si.Compiled>, ks: List<Integer>) {
+    let o = 0
+    while o < p.ok.length {
+        if p.ok[o] == O_SORT && p.od[o] > 0 {
+            let child = p.oa[o]
+            if p.ok[child] == O_SEARCH && p.oc[child] < 0 && p.searches[p.ob[child]].sortable {
+                let ss = p.searches[p.ob[child]]
+                if ensureSearch(p, ss) {
+                    ixs.add(p.env.cat.searchIdx[ss.index])
+                    ts.add(p.slotBase[ss.slot])
+                    cps.add(ss.cps[0])
+                    ks.add(p.od[o])
+                    if ss.preTexts.length >= 64 {
+                        ss.preTexts = []
+                        ss.preCps = []
+                    }
+                    ss.preTexts.add(ss.text)
+                    ss.preCps.add(ss.cps[0])
+                }
+                p.err = false
+            }
+        }
+        o += 1
+    }
 }
 
 function searchReader(p: Plan, ss: SearchState): si.Reader {
@@ -6691,7 +8158,7 @@ function searchVisible(p: Plan, ss: SearchState, r: Integer, out: Bytes): Boolea
     let c = p.slotTable[s].cols[p.env.cat.searchIdx[ss.index].column]
     let row = p.slotRow[s]
     if tb.isNull(c, row) { return false }
-    out.addBytes(c.heap.slice(tb.textOff(c, row), tb.textOff(c, row) + tb.textLen(c, row)))
+    out.addBytes(tb.textBytes(c, row))
     return true
 }
 
@@ -6699,7 +8166,7 @@ function searchAccept(p: Plan, ss: SearchState, r: Integer): Boolean {
     if ss.filter < 0 { return true }
     let s = ss.slot
     let t = p.slotBase[s]
-    if t.state[r] == 0 {
+    if t.state[r] == 0 && !p.preempted {
         p.slotTable[s] = t
         p.slotRow[s] = r
     } else if !positionRow(p, s, t, r) {
@@ -6740,7 +8207,7 @@ function nextSearch(p: Plan, o: Integer): Boolean {
         let r = ss.rows.getInt64(i * 8)
         ss.pos = i + 1
         if r >= t.nrows { continue }
-        if t.state[r] == 0 {
+        if t.state[r] == 0 && !p.preempted {
             p.slotTable[s] = t
             p.slotRow[s] = r
         } else if !positionRow(p, s, t, r) {
@@ -6830,13 +8297,41 @@ function evalSearchExpr(p: Plan, n: Integer) {
         p.rFlt[n] = 0.0
         return
     }
-    let sc = si.referenceScore(sx, cp, c.heap, tb.textOff(c, r0), tb.textLen(c, r0))
+    let sc = si.referenceScore(sx, cp, tb.textBuf(c, r0), tb.textAt(c, r0), tb.textLen(c, r0))
     if sc < 0.0 { sc = 0.0 }
     p.rFlt[n] = sc
 }
 
-// Faceted counts over a search scan: one pass over the result rows reading the group column directly (no per-row
-// expression evaluation). Only count(*) aggregates over a column of the searched table; false = use the general path.
+// Canonical text of an integer expression over one row of the searched table (slot s): its columns, constants,
+// arithmetic, negation and casts; "" when it reads anything else (then the index keeps no facet for it).
+function rowKeySig(p: Plan, n: Integer, s: Integer): Text {
+    let k = p.ek[n]
+    if k == EX_COL {
+        if p.ea[n] != s { return "" }
+        return "c" + Text(p.eb[n])
+    }
+    if k == EX_CONST {
+        if p.rNull[n] != 0 { return "null" }
+        if classOf(p.et[n]) == CL_INT { return "i" + Text(p.rInt[n]) + ":" + Text(p.et[n]) }
+        return ""
+    }
+    if k == EX_ARITH {
+        let a = rowKeySig(p, p.ea[n], s)
+        let b = rowKeySig(p, p.eb[n], s)
+        if a == "" || b == "" { return "" }
+        return "(" + a + " " + Text(p.ec[n]) + "/" + Text(p.ed[n]) + ":" + Text(p.et[n]) + " " + b + ")"
+    }
+    if k == EX_NEG || k == EX_CAST {
+        let a = rowKeySig(p, p.ea[n], s)
+        if a == "" { return "" }
+        return Text(k) + "[" + Text(p.et[n]) + "," + Text(p.eb[n]) + "," + Text(p.ec[n]) + "," + Text(p.ed[n]) + "](" + a + ")"
+    }
+    return ""
+}
+
+// GROUP BY over a search scan (one key: a column of the searched table or an integer expression over its row). The
+// index's facet bitmaps answer count(*) by popcount and hand other aggregates the rows of each group; otherwise one
+// pass over the result rows reads the key directly. False = use the general path.
 function searchFacet(p: Plan, o: Integer, t: tb.Table, blk: Integer, ng: Integer, na: Integer, ab: Integer, extraBase: Integer): Boolean {
     let child = p.oa[o]
     let ss = p.searches[p.ob[child]]
@@ -6845,39 +8340,88 @@ function searchFacet(p: Plan, o: Integer, t: tb.Table, blk: Integer, ng: Integer
     let byExpr = p.ek[g] != EX_COL
     if byExpr && classOf(p.et[g]) != CL_INT { return false }
     if !byExpr && p.ea[g] != ss.slot { return false }
+    let countsOnly = true
     let i = 0
     while i < na {
-        if p.olist[ab + i * AGS] != AG_COUNT_STAR || p.olist[ab + i * AGS + 2] != 0 || p.olist[ab + i * AGS + 3] >= 0 { return false }
+        if p.olist[ab + i * AGS] != AG_COUNT_STAR || p.olist[ab + i * AGS + 2] != 0 || p.olist[ab + i * AGS + 3] >= 0 { countsOnly = false }
+        if p.olist[ab + i * AGS + 2] != 0 || p.olist[ab + i * AGS] == AG_EXT { return false }   // DISTINCT / extension state: general path
         i += 1
     }
     let base = p.slotBase[ss.slot]
     let col = base.cols[0]
     if !byExpr { col = base.cols[p.eb[g]] }
     if !byExpr && col.width == 16 { return false }
-    if !byExpr {
-        // low-cardinality column: counts from the index's per-value bitmaps (popcount of result AND value)
+    let sig = ""
+    if byExpr { sig = rowKeySig(p, g, ss.slot) }
+    if !byExpr || sig != "" {
+        // counts per value from the index's facet (per-value bitmaps or per-row codes)
         if !ensureSearch(p, ss) { return p.err }
         let sx = p.env.cat.searchIdx[ss.index]
+        let s0 = ss.slot
+        let bad: List<Boolean> = [false]
+        let key = si.FacetKey {
+            column: -1; expr: sig
+            value: function(r: Integer): Integer {
+                p.slotTable[s0] = base
+                p.slotRow[s0] = r
+                ev(p, g)
+                if p.err {
+                    clearError(p)
+                    bad[0] = true
+                    return 0
+                }
+                return p.rInt[g]
+            }
+            isNull: function(r: Integer): Boolean {
+                p.slotTable[s0] = base
+                p.slotRow[s0] = r
+                ev(p, g)
+                if p.err {
+                    clearError(p)
+                    bad[0] = true
+                    return false
+                }
+                return p.rNull[g] != 0
+            }
+            failed: function(): Boolean { return bad[0] }
+        }
+        if !byExpr { key.column = p.eb[g] }
         let freps: List<Integer> = []
         let fcounts: List<Integer> = []
-        if si.facetCounts(sx, base, ss.cps[0], p.eb[g], searchReader(p, ss), freps, fcounts) {
+        let groups: List<Bytes> = []
+        if si.facetCounts(sx, base, ss.cps[0], key, searchReader(p, ss), freps, fcounts, !countsOnly, groups) {
             let k0 = 0
             while k0 < freps.length {
-                p.slotTable[ss.slot] = base
-                p.slotRow[ss.slot] = freps[k0]
+                p.slotTable[s0] = base
+                p.slotRow[s0] = freps[k0]
                 ev(p, g)
                 let row = newGroup(p, t, blk, ng, na, ab)
-                let a0 = 0
-                while a0 < na {
-                    tb.setInt(t.cols[ng + a0], row, fcounts[k0])
-                    a0 += 1
+                if countsOnly {
+                    let a0 = 0
+                    while a0 < na {
+                        tb.setInt(t.cols[ng + a0], row, fcounts[k0])
+                        a0 += 1
+                    }
+                } else {
+                    // other aggregates: accumulate over the group's rows (all live: the facet declines locked rows)
+                    let gr = groups[k0]
+                    let j = 0
+                    while j < gr.length / 8 {
+                        p.slotTable[s0] = base
+                        p.slotRow[s0] = gr.getInt64(j * 8)
+                        accumulate(p, o, t, row, ng, na, ab, extraBase)
+                        if p.err { return true }
+                        j += 1
+                    }
                 }
                 k0 += 1
             }
             finalizeAgg(p, t, ng, na, ab, extraBase)
             return true
         }
+        if bad[0] { clearError(p) }
     }
+    if !countsOnly { return false }
     openSearch(p, child)
     if p.err { return true }
     let rows = ss.rows
@@ -6913,7 +8457,7 @@ function searchFacet(p: Plan, o: Integer, t: tb.Table, blk: Integer, ng: Integer
             if byExpr {
                 // integer value of the expression
             } else if isText {
-                key = v.hashBytes(col.heap, tb.textOff(col, r), tb.textLen(col, r))
+                key = v.hashBytes(tb.textBuf(col, r), tb.textAt(col, r), tb.textLen(col, r))
             } else if col.type == v.T_FLOAT8 || col.type == v.T_FLOAT4 {
                 key = v.hashFloat(tb.getFloat(col, r))
             } else {
@@ -6930,7 +8474,7 @@ function searchFacet(p: Plan, o: Integer, t: tb.Table, blk: Integer, ng: Integer
                     // exact integer keys
                 } else if isText {
                     let q = reps[gi]
-                    if !v.equalBytes(col.heap, tb.textOff(col, q), tb.textLen(col, q), col.heap, tb.textOff(col, r), tb.textLen(col, r)) { return false }
+                    if !v.equalBytes(tb.textBuf(col, q), tb.textAt(col, q), tb.textLen(col, q), tb.textBuf(col, r), tb.textAt(col, r), tb.textLen(col, r)) { return false }
                 } else if col.type == v.T_FLOAT8 || col.type == v.T_FLOAT4 {
                     if tb.getFloat(col, reps[gi]) != tb.getFloat(col, r) { return false }
                 }

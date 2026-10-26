@@ -1,0 +1,407 @@
+// Snowball runtime for the generated stemmers in this directory: a byte-level port of SnowballEnv from rust-stemmers
+// 1.2.0 (src/snowball/snowball_env.rs), the crate TIN/Lead stems with. Its behaviour is copied exactly, quirks
+// included (eq_s does not check the limit, slice_from leaves ket alone), so every generated stemmer gives the same
+// stems as rust_stemmers. The word is UTF-8 in `cur`; cursor, limits, bra and ket are byte offsets.
+// Allocation-free once warm: an Env is reused for every word and edits happen in place.
+//
+// Tables are Bytes built once at start-up by the generated modules (`hex` below):
+//   pool      all literal strings of one stemmer, back to back
+//   among     20 bytes per entry, int32 each: string offset in pool, string length, substring index, result, routine
+//   grouping  bit (c - min) set for every code point c of the grouping
+
+public record Env {
+    cur: Bytes          // the word being stemmed
+    cursor: Integer
+    limit: Integer
+    lb: Integer         // limit_backward
+    bra: Integer
+    ket: Integer
+    common: Integer     // amongSearch result: common prefix length with the chosen entry
+    iv: List<Integer>   // integer and boolean variables of the running stemmer (booleans as 0/1)
+    sv: List<Bytes>     // string variables
+}
+
+public function newEnv(): Env {
+    return Env { cur: Bytes(); cursor: 0; limit: 0; lb: 0; bra: 0; ket: 0; common: 0; iv: []; sv: [] }
+}
+
+// Load buf[off .. off + len) as the word and reset the variables (ni integers/booleans, ns strings), as
+// SnowballEnv::create and a fresh Context do.
+public function start(z: Env, buf: Bytes, off: Integer, len: Integer, ni: Integer, ns: Integer) {
+    z.cur.clear()
+    let i = 0
+    while i < len {
+        z.cur.add(buf[off + i])
+        i += 1
+    }
+    z.cursor = 0
+    z.limit = len
+    z.lb = 0
+    z.bra = 0
+    z.ket = len
+    while z.iv.length < ni { z.iv.add(0) }
+    i = 0
+    while i < ni {
+        z.iv[i] = 0
+        i += 1
+    }
+    while z.sv.length < ns { z.sv.add(Bytes()) }
+    i = 0
+    while i < ns {
+        z.sv[i].clear()
+        i += 1
+    }
+}
+
+// Bytes from lower-case hex digits (table initialisers).
+public function hex(t: Text): Bytes {
+    let s = Bytes(t)
+    let out = Bytes()
+    let i = 0
+    while i + 1 < s.length {
+        out.add(nibble(s[i]) * 16 + nibble(s[i + 1]))
+        i += 2
+    }
+    return out
+}
+
+function nibble(c: Integer): Integer {
+    if c >= 97 { return c - 87 }
+    return c - 48
+}
+
+// ---------------------------------------------------------------- characters
+
+function isCharBoundary(z: Env, i: Integer): Boolean {
+    let n = z.cur.length
+    if i == 0 || i == n { return true }
+    if i < 0 || i > n { return false }
+    return (z.cur[i] & 0xC0) != 0x80
+}
+
+public function nextChar(z: Env) {
+    z.cursor += 1
+    while z.cursor < z.cur.length && !isCharBoundary(z, z.cursor) { z.cursor += 1 }
+}
+
+public function previousChar(z: Env) {
+    z.cursor -= 1
+    while z.cursor > 0 && !isCharBoundary(z, z.cursor) { z.cursor -= 1 }
+}
+
+// Code point of the (valid UTF-8) character starting at i.
+function decodeAt(z: Env, i: Integer): Integer {
+    let s = z.cur
+    let b = s[i]
+    if b < 0x80 { return b }
+    if b < 0xE0 {
+        if i + 1 >= s.length { return b }
+        return ((b & 31) << 6) | (s[i + 1] & 63)
+    }
+    if b < 0xF0 {
+        if i + 2 >= s.length { return b }
+        return ((b & 15) << 12) | ((s[i + 1] & 63) << 6) | (s[i + 2] & 63)
+    }
+    if i + 3 >= s.length { return b }
+    return ((b & 7) << 18) | ((s[i + 1] & 63) << 12) | ((s[i + 2] & 63) << 6) | (s[i + 3] & 63)
+}
+
+// The byte offset `delta` characters from the cursor (byte_index_for_hop); may fall outside the word.
+public function hopIndex(z: Env, delta: Integer): Integer {
+    let res = z.cursor
+    let d = delta
+    if d > 0 {
+        while d > 0 {
+            res += 1
+            d -= 1
+            while res <= z.cur.length && !isCharBoundary(z, res) { res += 1 }
+        }
+    } else if d < 0 {
+        while d < 0 {
+            res -= 1
+            d += 1
+            while res >= 0 && !isCharBoundary(z, res) { res -= 1 }
+        }
+    }
+    return res
+}
+
+// Number of characters in the word (current.chars().count()).
+public function charCount(z: Env): Integer {
+    let k = 0
+    for b in z.cur {
+        if (b & 0xC0) != 0x80 { k += 1 }
+    }
+    return k
+}
+
+// ---------------------------------------------------------------- groupings
+
+function inSet(g: Bytes, ch: Integer, min: Integer, max: Integer): Boolean {
+    if ch > max || ch < min { return false }
+    let k = ch - min
+    return (g[k >> 3] & (1 << (k & 7))) != 0
+}
+
+public function inGrouping(z: Env, g: Bytes, min: Integer, max: Integer): Boolean {
+    if z.cursor >= z.limit { return false }
+    if !inSet(g, decodeAt(z, z.cursor), min, max) { return false }
+    nextChar(z)
+    return true
+}
+
+public function inGroupingB(z: Env, g: Bytes, min: Integer, max: Integer): Boolean {
+    if z.cursor <= z.lb { return false }
+    previousChar(z)
+    let ch = decodeAt(z, z.cursor)
+    nextChar(z)
+    if !inSet(g, ch, min, max) { return false }
+    previousChar(z)
+    return true
+}
+
+public function outGrouping(z: Env, g: Bytes, min: Integer, max: Integer): Boolean {
+    if z.cursor >= z.limit { return false }
+    if inSet(g, decodeAt(z, z.cursor), min, max) { return false }
+    nextChar(z)
+    return true
+}
+
+public function outGroupingB(z: Env, g: Bytes, min: Integer, max: Integer): Boolean {
+    if z.cursor <= z.lb { return false }
+    previousChar(z)
+    let ch = decodeAt(z, z.cursor)
+    nextChar(z)
+    if inSet(g, ch, min, max) { return false }
+    previousChar(z)
+    return true
+}
+
+// ---------------------------------------------------------------- literals
+
+// s[off .. off + n) follows the cursor: move past it. Like rust-stemmers this checks the cursor against the limit
+// but not the end of the string.
+public function eqS(z: Env, s: Bytes, off: Integer, n: Integer): Boolean {
+    if z.cursor >= z.limit { return false }
+    if z.cursor + n > z.cur.length { return false }
+    let i = 0
+    while i < n {
+        if z.cur[z.cursor + i] != s[off + i] { return false }
+        i += 1
+    }
+    z.cursor += n
+    return true
+}
+
+// s[off .. off + n) precedes the cursor: move before it.
+public function eqSB(z: Env, s: Bytes, off: Integer, n: Integer): Boolean {
+    if z.cursor - z.lb < n { return false }
+    let at = z.cursor - n
+    if !isCharBoundary(z, at) { return false }
+    let i = 0
+    while i < n {
+        if z.cur[at + i] != s[off + i] { return false }
+        i += 1
+    }
+    z.cursor = at
+    return true
+}
+
+public function eqV(z: Env, s: Bytes): Boolean { return eqS(z, s, 0, s.length) }
+
+public function eqVB(z: Env, s: Bytes): Boolean { return eqSB(z, s, 0, s.length) }
+
+// ---------------------------------------------------------------- edits
+
+// Replace cur[bra .. ket) with s[off .. off + n); returns the length change. Moves the limit and the cursor as
+// SnowballEnv::replace_s does.
+function replaceS(z: Env, bra: Integer, ket: Integer, s: Bytes, off: Integer, n: Integer): Integer {
+    let w = z.cur
+    let len = w.length
+    let adj = n - (ket - bra)
+    if adj > 0 {
+        w.resize(len + adj)
+        let i = len - 1
+        while i >= ket {
+            w[i + adj] = w[i]
+            i -= 1
+        }
+    } else if adj < 0 {
+        let i = ket
+        while i < len {
+            w[i + adj] = w[i]
+            i += 1
+        }
+        w.resize(len + adj)
+    }
+    let i = 0
+    while i < n {
+        w[bra + i] = s[off + i]
+        i += 1
+    }
+    z.limit += adj
+    if z.cursor >= ket {
+        z.cursor += adj
+    } else if z.cursor > bra {
+        z.cursor = bra
+    }
+    return adj
+}
+
+// <- 'literal': replace the slice [bra, ket). Like rust-stemmers, ket is not moved.
+public function sliceFrom(z: Env, s: Bytes, off: Integer, n: Integer): Boolean {
+    replaceS(z, z.bra, z.ket, s, off, n)
+    return true
+}
+
+public function sliceFromV(z: Env, s: Bytes): Boolean {
+    replaceS(z, z.bra, z.ket, s, 0, s.length)
+    return true
+}
+
+public function sliceDel(z: Env): Boolean {
+    replaceS(z, z.bra, z.ket, z.cur, 0, 0)
+    return true
+}
+
+public function insert(z: Env, bra: Integer, ket: Integer, s: Bytes, off: Integer, n: Integer) {
+    let adj = replaceS(z, bra, ket, s, off, n)
+    if bra <= z.bra { z.bra += adj }
+    if bra <= z.ket { z.ket += adj }
+}
+
+public function insertV(z: Env, bra: Integer, ket: Integer, s: Bytes) { insert(z, bra, ket, s, 0, s.length) }
+
+// -> s: copy the slice [bra, ket) into dst.
+public function sliceTo(z: Env, dst: Bytes) {
+    dst.clear()
+    let i = z.bra
+    while i < z.ket {
+        dst.add(z.cur[i])
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------- among
+
+public function amongLen(t: Bytes, i: Integer): Integer { return t.getInt32(i * 20 + 4) }
+public function amongSub(t: Bytes, i: Integer): Integer { return t.getInt32(i * 20 + 8) }
+public function amongResult(t: Bytes, i: Integer): Integer { return t.getInt32(i * 20 + 12) }
+public function amongRoutine(t: Bytes, i: Integer): Integer { return t.getInt32(i * 20 + 16) }
+
+// Binary search of find_among: the index of the entry the substring loop starts from; z.common is its common
+// prefix length with the text after the cursor.
+public function amongSearch(z: Env, pool: Bytes, t: Bytes): Integer {
+    let i = 0
+    let j = t.length / 20
+    let c = z.cursor
+    let l = z.limit
+    let ci = 0
+    let cj = 0
+    let firstKeyInspected = false
+    while true {
+        let k = i + ((j - i) >> 1)
+        let diff = 0
+        let common = min(ci, cj)
+        let woff = t.getInt32(k * 20)
+        let wlen = t.getInt32(k * 20 + 4)
+        while common < wlen {
+            if c + common == l {
+                diff = -1
+                break
+            }
+            diff = z.cur[c + common] - pool[woff + common]
+            if diff != 0 { break }
+            common += 1
+        }
+        if diff < 0 {
+            j = k
+            cj = common
+        } else {
+            i = k
+            ci = common
+        }
+        if j - i <= 1 {
+            if i > 0 { break }
+            if j == i { break }
+            if firstKeyInspected { break }
+            firstKeyInspected = true
+        }
+    }
+    z.common = ci
+    return i
+}
+
+// find_among_b's binary search, reading backwards from the cursor.
+public function amongSearchB(z: Env, pool: Bytes, t: Bytes): Integer {
+    let i = 0
+    let j = t.length / 20
+    let c = z.cursor
+    let lb = z.lb
+    let ci = 0
+    let cj = 0
+    let firstKeyInspected = false
+    while true {
+        let k = i + ((j - i) >> 1)
+        let diff = 0
+        let common = min(ci, cj)
+        let woff = t.getInt32(k * 20)
+        let wlen = t.getInt32(k * 20 + 4)
+        while common < wlen {
+            if c - common == lb {
+                diff = -1
+                break
+            }
+            diff = z.cur[c - common - 1] - pool[woff + wlen - 1 - common]
+            if diff != 0 { break }
+            common += 1
+        }
+        if diff < 0 {
+            j = k
+            cj = common
+        } else {
+            i = k
+            ci = common
+        }
+        if j - i <= 1 {
+            if i > 0 { break }
+            if j == i { break }
+            if firstKeyInspected { break }
+            firstKeyInspected = true
+        }
+    }
+    z.common = ci
+    return i
+}
+
+// find_among for tables without routines: the result of the longest entry matching after the cursor, cursor
+// moved past it; 0 when none matches.
+public function findAmong(z: Env, pool: Bytes, t: Bytes): Integer {
+    let c = z.cursor
+    let i = amongSearch(z, pool, t)
+    while true {
+        let wlen = amongLen(t, i)
+        if z.common >= wlen {
+            z.cursor = c + wlen
+            return amongResult(t, i)
+        }
+        i = amongSub(t, i)
+        if i < 0 { return 0 }
+    }
+    return 0
+}
+
+public function findAmongB(z: Env, pool: Bytes, t: Bytes): Integer {
+    let c = z.cursor
+    let i = amongSearchB(z, pool, t)
+    while true {
+        let wlen = amongLen(t, i)
+        if z.common >= wlen {
+            z.cursor = c - wlen
+            return amongResult(t, i)
+        }
+        i = amongSub(t, i)
+        if i < 0 { return 0 }
+    }
+    return 0
+}

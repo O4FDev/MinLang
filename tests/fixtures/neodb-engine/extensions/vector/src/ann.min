@@ -1,0 +1,669 @@
+// Shared pieces of the in-memory approximate nearest-neighbour indexes (hnsw.min, ivfflat.min): metrics and their
+// distance kernels over packed rows, a seeded PRNG, binary heaps on parallel Lists and an Integer -> Integer map.
+// Nothing here reads a clock, host randomness or files, so the indexes stay reproducible under `minyar sim`.
+//
+// Rows are stored packed: float metrics use `dimensions` little-endian float32 values (4 bytes each, the vector
+// type's own representation), bit metrics use ceil(dimensions / 8) bytes of packed bits (the bit type without
+// its int32 length header). Distances inside an index are "graph distances" that order rows like pgvector's
+// operators: squared L2 for <->, the negative inner product for <#> and <=> (cosine rows are normalized first),
+// L1 for <+>, Hamming for <~> and Jaccard for <%>. `reported` turns a graph distance into the operator's value.
+use "math" as math
+
+public constant L2 = 0
+public constant INNER_PRODUCT = 1
+public constant COSINE = 2
+public constant L1 = 3
+public constant HAMMING = 4
+public constant JACCARD = 5
+
+// The metric for a pgvector operator class suffix or operator: "l2", "ip", "cosine", "l1", "hamming", "jaccard"
+// (also "<->", "<#>", "<=>", "<+>", "<~>", "<%>"); -1 when unknown.
+public function metricNamed(name: Text): Integer {
+    if name == "l2" || name == "<->" { return L2 }
+    if name == "ip" || name == "<#>" { return INNER_PRODUCT }
+    if name == "cosine" || name == "<=>" { return COSINE }
+    if name == "l1" || name == "<+>" { return L1 }
+    if name == "hamming" || name == "<~>" { return HAMMING }
+    if name == "jaccard" || name == "<%>" { return JACCARD }
+    return -1
+}
+
+public function metricName(metric: Integer): Text {
+    if metric == L2 { return "l2" }
+    if metric == INNER_PRODUCT { return "ip" }
+    if metric == COSINE { return "cosine" }
+    if metric == L1 { return "l1" }
+    if metric == HAMMING { return "hamming" }
+    if metric == JACCARD { return "jaccard" }
+    return "unknown"
+}
+
+public function isBitMetric(metric: Integer): Boolean { return metric == HAMMING || metric == JACCARD }
+
+// sparsevec rows (hnsw only): SPARSE_L2 + the dense metric (L2, INNER_PRODUCT, COSINE, L1). A row slot holds
+// int32 count, then that many int32 indices (ascending) and float32 values, packed; `dimensions` is the slot's
+// capacity in elements, so rows of any count up to it fit and the kernels read each row's own count.
+public constant SPARSE_L2 = 6
+public constant SPARSE_IP = 7
+public constant SPARSE_COSINE = 8
+public constant SPARSE_L1 = 9
+
+public function isSparseMetric(metric: Integer): Boolean { return metric >= SPARSE_L2 && metric <= SPARSE_L1 }
+
+// Bytes per stored row.
+public function rowBytes(metric: Integer, dimensions: Integer): Integer {
+    if isBitMetric(metric) { return (dimensions + 7) / 8 }
+    if isSparseMetric(metric) { return 4 + dimensions * 8 }
+    return dimensions * 4
+}
+
+// ---------------------------------------------------------------- float kernels
+//
+// Every kernel compares the row at a[ao..] with the row at b[bo..], using four independent float64 sums. On the
+// bench box a 128-dimension call costs about 45 ns. Checking both rows' bounds up front (so LLVM can drop the
+// per-load checks), blocks with constant trip counts, eight sums, or a float64 query measured 42-47 ns: the
+// float32 to float64 conversions dominate (only a compile-time dimension count, which lets LLVM vectorize,
+// reached 24 ns).
+
+public deterministic function l2Squared(a: Bytes, ao: Integer, b: Bytes, bo: Integer, dimensions: Integer): Float {
+    let bytes = dimensions * 4
+    let s0 = 0.0
+    let s1 = 0.0
+    let s2 = 0.0
+    let s3 = 0.0
+    let i = 0
+    let end = bytes - 15
+    while i < end {
+        let p = bo + i
+        let r = ao + i
+        let d0 = a.getFloat32(r) - b.getFloat32(p)
+        let d1 = a.getFloat32(r + 4) - b.getFloat32(p + 4)
+        let d2 = a.getFloat32(r + 8) - b.getFloat32(p + 8)
+        let d3 = a.getFloat32(r + 12) - b.getFloat32(p + 12)
+        s0 += d0 * d0
+        s1 += d1 * d1
+        s2 += d2 * d2
+        s3 += d3 * d3
+        i += 16
+    }
+    while i < bytes {
+        let d = a.getFloat32(ao + i) - b.getFloat32(bo + i)
+        s0 += d * d
+        i += 4
+    }
+    return (s0 + s1) + (s2 + s3)
+}
+
+// Squared L2, abandoning once a partial sum (checked every 32 dimensions) passes `bound`; the result is then
+// some value > bound.
+public deterministic function l2SquaredBounded(a: Bytes, ao: Integer, b: Bytes, bo: Integer, dimensions: Integer,
+        bound: Float): Float {
+    let bytes = dimensions * 4
+    let s0 = 0.0
+    let s1 = 0.0
+    let s2 = 0.0
+    let s3 = 0.0
+    let i = 0
+    let chunks = bytes - 127
+    while i < chunks {
+        let stop = i + 128
+        while i < stop {
+            let p = bo + i
+            let r = ao + i
+        let r = ao + i
+            let d0 = a.getFloat32(r) - b.getFloat32(p)
+            let d1 = a.getFloat32(r + 4) - b.getFloat32(p + 4)
+            let d2 = a.getFloat32(r + 8) - b.getFloat32(p + 8)
+            let d3 = a.getFloat32(r + 12) - b.getFloat32(p + 12)
+            s0 += d0 * d0
+            s1 += d1 * d1
+            s2 += d2 * d2
+            s3 += d3 * d3
+            i += 16
+        }
+        let partial = (s0 + s1) + (s2 + s3)
+        if partial > bound { return partial }
+    }
+    let end = bytes - 15
+    while i < end {
+        let p = bo + i
+        let r = ao + i
+        let d0 = a.getFloat32(r) - b.getFloat32(p)
+        let d1 = a.getFloat32(r + 4) - b.getFloat32(p + 4)
+        let d2 = a.getFloat32(r + 8) - b.getFloat32(p + 8)
+        let d3 = a.getFloat32(r + 12) - b.getFloat32(p + 12)
+        s0 += d0 * d0
+        s1 += d1 * d1
+        s2 += d2 * d2
+        s3 += d3 * d3
+        i += 16
+    }
+    while i < bytes {
+        let d = a.getFloat32(ao + i) - b.getFloat32(bo + i)
+        s0 += d * d
+        i += 4
+    }
+    return (s0 + s1) + (s2 + s3)
+}
+
+public deterministic function dot(a: Bytes, ao: Integer, b: Bytes, bo: Integer, dimensions: Integer): Float {
+    let bytes = dimensions * 4
+    let s0 = 0.0
+    let s1 = 0.0
+    let s2 = 0.0
+    let s3 = 0.0
+    let i = 0
+    let end = bytes - 15
+    while i < end {
+        let p = bo + i
+        let r = ao + i
+        s0 += a.getFloat32(r) * b.getFloat32(p)
+        s1 += a.getFloat32(r + 4) * b.getFloat32(p + 4)
+        s2 += a.getFloat32(r + 8) * b.getFloat32(p + 8)
+        s3 += a.getFloat32(r + 12) * b.getFloat32(p + 12)
+        i += 16
+    }
+    while i < bytes {
+        s0 += a.getFloat32(ao + i) * b.getFloat32(bo + i)
+        i += 4
+    }
+    return (s0 + s1) + (s2 + s3)
+}
+
+// L1, abandoning like l2SquaredBounded.
+public deterministic function l1(a: Bytes, ao: Integer, b: Bytes, bo: Integer, dimensions: Integer, bound: Float): Float {
+    let bytes = dimensions * 4
+    let s0 = 0.0
+    let s1 = 0.0
+    let s2 = 0.0
+    let s3 = 0.0
+    let i = 0
+    let chunks = bytes - 127
+    while i < chunks {
+        let stop = i + 128
+        while i < stop {
+            let p = bo + i
+            let r = ao + i
+        let r = ao + i
+            s0 += abs(a.getFloat32(r) - b.getFloat32(p))
+            s1 += abs(a.getFloat32(r + 4) - b.getFloat32(p + 4))
+            s2 += abs(a.getFloat32(r + 8) - b.getFloat32(p + 8))
+            s3 += abs(a.getFloat32(r + 12) - b.getFloat32(p + 12))
+            i += 16
+        }
+        let partial = (s0 + s1) + (s2 + s3)
+        if partial > bound { return partial }
+    }
+    while i < bytes {
+        s0 += abs(a.getFloat32(ao + i) - b.getFloat32(bo + i))
+        i += 4
+    }
+    return (s0 + s1) + (s2 + s3)
+}
+
+// ---------------------------------------------------------------- bit kernels
+
+function popcount64(word: Integer): Integer {
+    let x = wrappingSubtract(word, (word >> 1) & 6148914691236517205)            // 0x5555...
+    x = (x & 3689348814741910323) + ((x >> 2) & 3689348814741910323)             // 0x3333...
+    x = (x + (x >> 4)) & 1085102592571150095                                     // 0x0f0f...
+    return (wrappingMultiply(x, 72340172838076673) >> 56) & 255                  // 0x0101...
+}
+
+public deterministic function hamming(a: Bytes, ao: Integer, b: Bytes, bo: Integer, bytes: Integer): Float {
+    let n = 0
+    let i = 0
+    while i + 8 <= bytes {
+        n += popcount64(a.getInt64(ao + i) ^ b.getInt64(bo + i))
+        i += 8
+    }
+    while i < bytes {
+        n += popcount64(a[ao + i] ^ b[bo + i])
+        i += 1
+    }
+    return Float(n)
+}
+
+// pgvector's jaccard_distance: 1 - |a & b| / |a | b|, and 0 when both are empty.
+public deterministic function jaccard(a: Bytes, ao: Integer, b: Bytes, bo: Integer, bytes: Integer): Float {
+    let both = 0
+    let ca = 0
+    let cb = 0
+    let i = 0
+    while i + 8 <= bytes {
+        let x = a.getInt64(ao + i)
+        let y = b.getInt64(bo + i)
+        both += popcount64(x & y)
+        ca += popcount64(x)
+        cb += popcount64(y)
+        i += 8
+    }
+    while i < bytes {
+        let x = a[ao + i]
+        let y = b[bo + i]
+        both += popcount64(x & y)
+        ca += popcount64(x)
+        cb += popcount64(y)
+        i += 1
+    }
+    if ca == 0 && cb == 0 { return 0.0 }
+    return 1.0 - Float(both) / Float(ca + cb - both)
+}
+
+// ---------------------------------------------------------------- metric dispatch
+
+// Graph distance between the rows at a[ao..] and b[bo..] (see the header). `bound` lets L2 and L1
+// stop early: when the true distance exceeds `bound` the result is some value > bound. Pass infinity() for an
+// exact value.
+public deterministic function distance(metric: Integer, a: Bytes, ao: Integer, b: Bytes, bo: Integer, dimensions: Integer,
+        bound: Float): Float {
+    if metric == L2 { return l2SquaredBounded(a, ao, b, bo, dimensions, bound) }
+    if metric == INNER_PRODUCT || metric == COSINE { return -dot(a, ao, b, bo, dimensions) }
+    if metric == L1 { return l1(a, ao, b, bo, dimensions, bound) }
+    if metric == HAMMING { return hamming(a, ao, b, bo, (dimensions + 7) / 8) }
+    if isSparseMetric(metric) { return sparseDistance(metric, a, ao, b, bo) }
+    return jaccard(a, ao, b, bo, (dimensions + 7) / 8)
+}
+
+// Sparse rows (count, indices, values): a merge over the two index lists. Cosine rows are normalized, so like
+// the dense kernels the graph distance is the negative dot product for IP and cosine.
+public deterministic function sparseDistance(metric: Integer, a: Bytes, ao: Integer, b: Bytes, bo: Integer): Float {
+    let na = a.getInt32(ao)
+    let nb = b.getInt32(bo)
+    let av = ao + 4 + na * 4
+    let bv = bo + 4 + nb * 4
+    let i = 0
+    let j = 0
+    let sum = 0.0
+    let dotOnly = metric == SPARSE_IP || metric == SPARSE_COSINE
+    while i < na || j < nb {
+        let x = 2147483647
+        let y = 2147483647
+        if i < na { x = a.getInt32(ao + 4 + i * 4) }
+        if j < nb { y = b.getInt32(bo + 4 + j * 4) }
+        let d = 0.0
+        if x == y {
+            let p = a.getFloat32(av + i * 4)
+            let q = b.getFloat32(bv + j * 4)
+            if dotOnly { sum += p * q } else { d = p - q }
+            i += 1
+            j += 1
+        } else if x < y {
+            if !dotOnly { d = a.getFloat32(av + i * 4) }
+            i += 1
+        } else {
+            if !dotOnly { d = b.getFloat32(bv + j * 4) }
+            j += 1
+        }
+        if metric == SPARSE_L2 {
+            sum += d * d
+        } else if metric == SPARSE_L1 {
+            if d < 0.0 { sum -= d } else { sum += d }
+        }
+    }
+    if dotOnly { return -sum }
+    return sum
+}
+
+public constant INFINITY = 1.0e308
+
+public function infinity(): Float { return INFINITY * 10.0 }
+
+// The value of the pgvector operator for a graph distance: l2_distance, the negative inner product (<#>),
+// cosine_distance (computed on normalized rows), l1, hamming or jaccard.
+public function reported(metric: Integer, graphDistance: Float): Float {
+    if metric == L2 || metric == SPARSE_L2 { return math.sqrt(graphDistance) }
+    if metric == COSINE || metric == SPARSE_COSINE { return 1.0 + graphDistance }
+    return graphDistance
+}
+
+// Copy `bytes` bytes from src[so..] to dst[0..].
+public deterministic function copyRow(src: Bytes, so: Integer, dst: Bytes, bytes: Integer) {
+    let i = 0
+    while i + 8 <= bytes {
+        dst.setInt64(i, src.getInt64(so + i))
+        i += 8
+    }
+    while i < bytes {
+        dst[i] = src[so + i]
+        i += 1
+    }
+}
+
+// Copy the row at src[so..] into dst[dstOffset..] in index form: cosine rows are normalized (in float64,
+// stored as float32). Returns false, writing nothing useful, for a cosine row with zero norm (pgvector does not
+// index those) or for a float row containing NaN or an infinity.
+public deterministic function storeRow(metric: Integer, src: Bytes, so: Integer, dst: Bytes, dstOffset: Integer,
+        dimensions: Integer): Boolean {
+    if isSparseMetric(metric) { return storeSparse(metric, src, so, dst, dstOffset) }
+    if isBitMetric(metric) {
+        let n = (dimensions + 7) / 8
+        let i = 0
+        while i < n {
+            dst[dstOffset + i] = src[so + i]
+            i += 1
+        }
+        return true
+    }
+    let scale = 1.0
+    if metric == COSINE {
+        let sum = 0.0
+        let i = 0
+        while i < dimensions {
+            let f = src.getFloat32(so + i * 4)
+            sum += f * f
+            i += 1
+        }
+        let norm = math.sqrt(sum)
+        if !(norm > 0.0) || norm > INFINITY { return false }
+        scale = 1.0 / norm
+    }
+    let i = 0
+    while i < dimensions {
+        let f = src.getFloat32(so + i * 4)
+        if f != f || f > INFINITY || f < -INFINITY { return false }
+        dst.setFloat32(dstOffset + i * 4, f * scale)
+        i += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- seeded PRNG (splitmix64)
+
+public record Rng {
+    state: Integer
+}
+
+public function newRng(seed: Integer): Rng { return Rng { state: seed } }
+
+public deterministic function Rng.next(): Integer {
+    self.state = wrappingAdd(self.state, -7046029254386353131)
+    let z = self.state
+    z = wrappingMultiply(z ^ ((z >> 30) & 17179869183), -4658895280553007687)
+    z = wrappingMultiply(z ^ ((z >> 27) & 137438953471), -7723592293110705685)
+    return z ^ ((z >> 31) & 8589934591)
+}
+
+// Uniform in [0, 1) with 53 random bits.
+public deterministic function Rng.nextFloat(): Float {
+    let bits = (self.next() >> 11) & 9007199254740991
+    return Float(bits) * 1.1102230246251565e-16
+}
+
+// Uniform in [0, n).
+public deterministic function Rng.below(n: Integer): Integer {
+    let bits = (self.next() >> 1) & 9223372036854775807
+    return bits % n
+}
+
+// ---------------------------------------------------------------- binary heaps on parallel Lists
+
+// A heap of (distance, item) pairs; use either the Min or the Max operations on one heap, not both.
+public record Heap {
+    dist: List<Float>
+    item: List<Integer>
+    length: Integer
+}
+
+public function newHeap(): Heap {
+    let d: List<Float> = []
+    let i: List<Integer> = []
+    return Heap { dist: d; item: i; length: 0 }
+}
+
+public function Heap.clear() { self.length = 0 }
+
+public deterministic function Heap.pushMin(d: Float, item: Integer) {
+    let i = self.length
+    if i == self.dist.length {
+        self.dist.add(d)
+        self.item.add(item)
+    }
+    self.length += 1
+    while i > 0 {
+        let parent = (i - 1) / 2
+        let pd = self.dist[parent]
+        if pd <= d { break }
+        self.dist[i] = pd
+        self.item[i] = self.item[parent]
+        i = parent
+    }
+    self.dist[i] = d
+    self.item[i] = item
+}
+
+public deterministic function Heap.popMin() {
+    self.length -= 1
+    let n = self.length
+    if n == 0 { return }
+    let d = self.dist[n]
+    let item = self.item[n]
+    let i = 0
+    while true {
+        let c = i * 2 + 1
+        if c >= n { break }
+        let cd = self.dist[c]
+        if c + 1 < n {
+            let rd = self.dist[c + 1]
+            if rd < cd {
+                c += 1
+                cd = rd
+            }
+        }
+        if d <= cd { break }
+        self.dist[i] = cd
+        self.item[i] = self.item[c]
+        i = c
+    }
+    self.dist[i] = d
+    self.item[i] = item
+}
+
+public deterministic function Heap.pushMax(d: Float, item: Integer) {
+    let i = self.length
+    if i == self.dist.length {
+        self.dist.add(d)
+        self.item.add(item)
+    }
+    self.length += 1
+    while i > 0 {
+        let parent = (i - 1) / 2
+        let pd = self.dist[parent]
+        if pd >= d { break }
+        self.dist[i] = pd
+        self.item[i] = self.item[parent]
+        i = parent
+    }
+    self.dist[i] = d
+    self.item[i] = item
+}
+
+public deterministic function Heap.popMax() {
+    self.length -= 1
+    let n = self.length
+    if n == 0 { return }
+    let d = self.dist[n]
+    let item = self.item[n]
+    let i = 0
+    while true {
+        let c = i * 2 + 1
+        if c >= n { break }
+        let cd = self.dist[c]
+        if c + 1 < n {
+            let rd = self.dist[c + 1]
+            if rd > cd {
+                c += 1
+                cd = rd
+            }
+        }
+        if d >= cd { break }
+        self.dist[i] = cd
+        self.item[i] = self.item[c]
+        i = c
+    }
+    self.dist[i] = d
+    self.item[i] = item
+}
+
+// Keep the `limit` smallest distances in a max-heap.
+public deterministic function Heap.offerSmallest(d: Float, item: Integer, limit: Integer) {
+    if self.length < limit {
+        self.pushMax(d, item)
+        return
+    }
+    if limit > 0 && d < self.dist[0] {
+        self.popMax()
+        self.pushMax(d, item)
+    }
+}
+
+// Empty a max-heap into outItems/outDist nearest-first, starting at position `at` (Lists grow as needed);
+// returns the number written.
+public deterministic function Heap.drainAscending(outItems: List<Integer>, outDist: List<Float>, at: Integer): Integer {
+    let n = self.length
+    while outItems.length < at + n { outItems.add(0) }
+    while outDist.length < at + n { outDist.add(0.0) }
+    let i = n - 1
+    while i >= 0 {
+        outItems[at + i] = self.item[0]
+        outDist[at + i] = self.dist[0]
+        self.popMax()
+        i -= 1
+    }
+    return n
+}
+
+// ---------------------------------------------------------------- Integer -> Integer map
+
+// Linear probing over Bytes with backward-shift deletion; any key except the largest Integer.
+public record IntMap {
+    keys: Bytes      // 8 bytes per slot; 0 = empty, else key + 1
+    vals: Bytes
+    mask: Integer
+    count: Integer
+}
+
+public function newIntMap(capacity: Integer): IntMap {
+    let n = 16
+    while n < capacity * 2 { n = n * 2 }
+    return IntMap { keys: Bytes(n * 8); vals: Bytes(n * 8); mask: n - 1; count: 0 }
+}
+
+deterministic function hashKey(key: Integer): Integer {
+    let z = wrappingAdd(key, -7046029254386353131)
+    z = wrappingMultiply(z ^ ((z >> 30) & 17179869183), -4658895280553007687)
+    z = wrappingMultiply(z ^ ((z >> 27) & 137438953471), -7723592293110705685)
+    return z ^ ((z >> 31) & 8589934591)
+}
+
+// The value for key, or `missing`.
+public deterministic function IntMap.get(key: Integer, missing: Integer): Integer {
+    let k = key + 1
+    let i = hashKey(key) & self.mask
+    while true {
+        let s = self.keys.getInt64(i * 8)
+        if s == 0 { return missing }
+        if s == k { return self.vals.getInt64(i * 8) }
+        i = (i + 1) & self.mask
+    }
+    return missing
+}
+
+public deterministic function IntMap.put(key: Integer, value: Integer) {
+    if (self.count + 1) * 4 > (self.mask + 1) * 3 { self.grow() }
+    let k = key + 1
+    let i = hashKey(key) & self.mask
+    while true {
+        let s = self.keys.getInt64(i * 8)
+        if s == 0 {
+            self.keys.setInt64(i * 8, k)
+            self.vals.setInt64(i * 8, value)
+            self.count += 1
+            return
+        }
+        if s == k {
+            self.vals.setInt64(i * 8, value)
+            return
+        }
+        i = (i + 1) & self.mask
+    }
+}
+
+deterministic function IntMap.grow() {
+    let oldKeys = self.keys
+    let oldVals = self.vals
+    let n = (self.mask + 1) * 2
+    self.keys = Bytes(n * 8)
+    self.vals = Bytes(n * 8)
+    self.mask = n - 1
+    self.count = 0
+    let i = 0
+    let total = oldKeys.length / 8
+    while i < total {
+        let s = oldKeys.getInt64(i * 8)
+        if s != 0 { self.put(s - 1, oldVals.getInt64(i * 8)) }
+        i += 1
+    }
+}
+
+public deterministic function IntMap.remove(key: Integer): Boolean {
+    let k = key + 1
+    let i = hashKey(key) & self.mask
+    while true {
+        let s = self.keys.getInt64(i * 8)
+        if s == 0 { return false }
+        if s == k { break }
+        i = (i + 1) & self.mask
+    }
+    let j = i
+    while true {
+        j = (j + 1) & self.mask
+        let s = self.keys.getInt64(j * 8)
+        if s == 0 { break }
+        let home = hashKey(s - 1) & self.mask
+        let between = false
+        if i <= j {
+            between = home > i && home <= j
+        } else {
+            between = home > i || home <= j
+        }
+        if !between {
+            self.keys.setInt64(i * 8, s)
+            self.vals.setInt64(i * 8, self.vals.getInt64(j * 8))
+            i = j
+        }
+    }
+    self.keys.setInt64(i * 8, 0)
+    self.count -= 1
+    return true
+}
+
+public function IntMap.memoryBytes(): Integer { return self.keys.length + self.vals.length }
+
+// A stored sparsevec (int32 dim, int32 count, indices, values) at src[so..] as a sparse row at dst[dstOffset..]
+// (count, indices, values), normalized for cosine; dst grows when the row does not fit (the search query
+// buffer). False for a cosine row with zero norm.
+public deterministic function storeSparse(metric: Integer, src: Bytes, so: Integer, dst: Bytes, dstOffset: Integer): Boolean {
+    let n = src.getInt32(so + 4)
+    if dst.length < dstOffset + 4 + n * 8 { dst.resize(dstOffset + 4 + n * 8) }
+    let scale = 1.0
+    if metric == SPARSE_COSINE {
+        let sum = 0.0
+        let k = 0
+        while k < n {
+            let f = src.getFloat32(so + 8 + n * 4 + k * 4)
+            sum += f * f
+            k += 1
+        }
+        if !(sum > 0.0) { return false }
+        scale = 1.0 / math.sqrt(sum)
+    }
+    dst.setInt32(dstOffset, n)
+    let k = 0
+    while k < n {
+        dst.setInt32(dstOffset + 4 + k * 4, src.getInt32(so + 8 + k * 4))
+        dst.setFloat32(dstOffset + 4 + n * 4 + k * 4, src.getFloat32(so + 8 + n * 4 + k * 4) * scale)
+        k += 1
+    }
+    return true
+}

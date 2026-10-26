@@ -1,11 +1,12 @@
 // Dense vectors: vector (float4 elements, 4 bytes) and halfvec (IEEE half elements, 2 bytes), little-endian, the
 // dimension count is length / width. One implementation serves both; `half` picks the element width.
-// Arithmetic follows pgvector: distances accumulate in float4 (an overflow gives Infinity), results are checked
-// for overflow and underflow, and halfvec values are rounded to half precision.
+// Arithmetic follows pgvector: distances accumulate in real float4 arithmetic in pgvector's own order
+// (float4.min), results are checked for overflow and underflow, and halfvec values are rounded to half precision.
 use "neodb-sdk" as sdk
 use "math" as math
 use "./half.min" as fp16
 use "text" as utf8
+use "./float4.min" as f4
 
 public constant MAX_DIM = 16000
 constant FLT_MAX = 3.4028234663852886e38
@@ -61,7 +62,9 @@ public function register(x: sdk.Extension, half: Boolean) {
     x.operator(">=", t, t, t + "_ge")
     x.operator(">", t, t, t + "_gt")
     x.aggregate("avg", t, t, function(call) { accumulate(call, half) }, function(call) { finish(call, half, true) })
-    x.aggregate("sum", t, t, function(call) { accumulate(call, half) }, function(call) { finish(call, half, false) })
+    // sum adds in float4 (halfvec: half) at every row like pgvector's vector_add, so rounding and overflow
+    // happen where they happen there; avg keeps float8 sums (vector_accum)
+    x.aggregate("sum", t, t, function(call) { sumStep(call, half) }, sumFinish)
 }
 
 // ---------------------------------------------------------------- elements
@@ -79,17 +82,12 @@ function typeName(half: Boolean): Text {
 function count(call: sdk.Call, i: Integer, half: Boolean): Integer { return call.length(i) / width(half) }
 
 function at(call: sdk.Call, i: Integer, k: Integer, half: Boolean): Float {
-    if half { return fp16.toFloat(call.uint16(i, k * 2)) }
+    if half { return f4.halfToFloat(call.uint16(i, k * 2)) }
     return call.float32(i, k * 4)
 }
 
-global ROUND: Bytes = Bytes(4)
-
 // f rounded to float4.
-public function f32(f: Float): Float {
-    ROUND.setFloat32(0, f)
-    return ROUND.getFloat32(0)
-}
+public function f32(f: Float): Float { return f4.f32(f) }
 
 // Append f as an element (float4 or half); false (with the error set) when it overflows the element type.
 function add(call: sdk.Call, out: Bytes, f: Float, half: Boolean, what: Text): Boolean {
@@ -291,100 +289,41 @@ function sameDims(call: sdk.Call, half: Boolean): Integer {
     return a
 }
 
-// A float4 running total that overflowed is infinite.
-function overflowed(f: Float): Float {
-    if f > FLT_MAX { return 1.0 / 0.0 }
-    if f < -FLT_MAX { return -1.0 / 0.0 }
-    return f
-}
-
-function squared(call: sdk.Call, n: Integer, half: Boolean): Float {
-    let sum = 0.0
-    if half {
-        let i = 0
-        while i < n {
-            let d = at(call, 0, i, true) - at(call, 1, i, true)
-            sum += d * d
-            i += 1
-        }
-        return overflowed(sum)
-    }
-    let a = call.buffer(0)
-    let ao = call.offset(0)
-    let b = call.buffer(1)
-    let bo = call.offset(1)
-    let i = 0
-    while i < n {
-        let d = a.getFloat32(ao + i * 4) - b.getFloat32(bo + i * 4)
-        sum += d * d
-        i += 1
-    }
-    return overflowed(sum)
-}
-
-function dot(call: sdk.Call, n: Integer, half: Boolean): Float {
-    let sum = 0.0
-    if half {
-        let i = 0
-        while i < n {
-            sum += at(call, 0, i, true) * at(call, 1, i, true)
-            i += 1
-        }
-        return overflowed(sum)
-    }
-    let a = call.buffer(0)
-    let ao = call.offset(0)
-    let b = call.buffer(1)
-    let bo = call.offset(1)
-    let i = 0
-    while i < n {
-        sum += a.getFloat32(ao + i * 4) * b.getFloat32(bo + i * 4)
-        i += 1
-    }
-    return overflowed(sum)
+function kernel(call: sdk.Call, n: Integer, half: Boolean, mode: Integer): Float {
+    if half { return f4.halfKernel(call.buffer(0), call.offset(0), call.buffer(1), call.offset(1), n, mode) }
+    return f4.vectorKernel(call.buffer(0), call.offset(0), call.buffer(1), call.offset(1), n, mode)
 }
 
 public deterministic function l2Distance(call: sdk.Call, half: Boolean) {
     let n = sameDims(call, half)
-    if n >= 0 { call.returnFloat(math.sqrt(squared(call, n, half))) }
+    if n >= 0 { call.returnFloat(math.sqrt(kernel(call, n, half, 0))) }
 }
 
 deterministic function l2Squared(call: sdk.Call, half: Boolean) {
     let n = sameDims(call, half)
-    if n >= 0 { call.returnFloat(squared(call, n, half)) }
+    if n >= 0 { call.returnFloat(kernel(call, n, half, 0)) }
 }
 
 deterministic function innerProduct(call: sdk.Call, half: Boolean) {
     let n = sameDims(call, half)
-    if n >= 0 { call.returnFloat(dot(call, n, half)) }
+    if n >= 0 { call.returnFloat(kernel(call, n, half, 1)) }
 }
 
 deterministic function negativeInnerProduct(call: sdk.Call, half: Boolean) {
     let n = sameDims(call, half)
-    if n >= 0 { call.returnFloat(-dot(call, n, half)) }
+    if n >= 0 { call.returnFloat(-kernel(call, n, half, 1)) }
 }
 
 deterministic function cosineDistance(call: sdk.Call, half: Boolean) {
     let n = sameDims(call, half)
     if n < 0 { return }
-    let d = 0.0
-    let na = 0.0
-    let nb = 0.0
-    let i = 0
-    while i < n {
-        let x = at(call, 0, i, half)
-        let y = at(call, 1, i, half)
-        d += x * y
-        na += x * x
-        nb += y * y
-        i += 1
+    let similarity = 0.0
+    if half {
+        similarity = f4.halfCosine(call.buffer(0), call.offset(0), call.buffer(1), call.offset(1), n)
+    } else {
+        similarity = f4.vectorCosine(call.buffer(0), call.offset(0), call.buffer(1), call.offset(1), n)
     }
-    let similarity = overflowed(d) / math.sqrt(overflowed(na) * overflowed(nb))
     // a zero or overflowing vector gives NaN, as in pgvector
-    if similarity != similarity {
-        call.returnFloat(similarity)
-        return
-    }
     if similarity > 1.0 { similarity = 1.0 }
     if similarity < -1.0 { similarity = -1.0 }
     call.returnFloat(1.0 - similarity)
@@ -392,32 +331,18 @@ deterministic function cosineDistance(call: sdk.Call, half: Boolean) {
 
 deterministic function l1Distance(call: sdk.Call, half: Boolean) {
     let n = sameDims(call, half)
-    if n < 0 { return }
-    let sum = 0.0
-    let i = 0
-    while i < n {
-        let d = at(call, 0, i, half) - at(call, 1, i, half)
-        if d < 0.0 { d = -d }
-        sum += d
-        i += 1
-    }
-    call.returnFloat(overflowed(sum))
+    if n >= 0 { call.returnFloat(kernel(call, n, half, 2)) }
 }
 
 // ---------------------------------------------------------------- single-vector functions
 
 deterministic function dims(call: sdk.Call, half: Boolean) { call.returnInteger(count(call, 0, half)) }
 
+// pgvector's norm loops: double sums of squares (vector: SSE2-vectorised; halfvec: in order).
 function sumSquares(call: sdk.Call, half: Boolean): Float {
     let n = count(call, 0, half)
-    let sum = 0.0
-    let i = 0
-    while i < n {
-        let x = at(call, 0, i, half)
-        sum += x * x
-        i += 1
-    }
-    return sum
+    if half { return f4.halfSumSquares(call.buffer(0), call.offset(0), n) }
+    return f4.vectorSumSquares(call.buffer(0), call.offset(0), n)
 }
 
 deterministic function norm(call: sdk.Call, half: Boolean) { call.returnFloat(math.sqrt(sumSquares(call, half))) }
@@ -428,8 +353,9 @@ deterministic function l2Normalize(call: sdk.Call, half: Boolean) {
     let out = call.output
     let i = 0
     while i < n {
+        // (float) (x / norm): the double quotient rounded to float4 (halfvec: then to half)
         let x = 0.0
-        if len > 0.0 { x = at(call, 0, i, half) / len }
+        if len > 0.0 { x = f32(at(call, 0, i, half) / len) }
         if !add(call, out, x, half, "") { return }
         i += 1
     }
@@ -585,6 +511,16 @@ deterministic function accumulate(call: sdk.Call, half: Boolean) {
     }
 }
 
+deterministic function sumStep(call: sdk.Call, half: Boolean) {
+    if call.isNull(0) {
+        call.output.addBytes(call.bytes(1))
+        return
+    }
+    elementwise(call, half, 0)
+}
+
+deterministic function sumFinish(call: sdk.Call) { call.output.addBytes(call.bytes(0)) }
+
 deterministic function finish(call: sdk.Call, half: Boolean, divide: Boolean) {
     let n = call.length(0) / 8
     let rows = Float(call.integer(1))
@@ -619,4 +555,192 @@ deterministic function convert(call: sdk.Call, fromHalf: Boolean, toHalf: Boolea
         i += 1
     }
     checkDims(call, n, toHalf)
+}
+
+// ---------------------------------------------------------------- arrays: int4[], float4[], float8[], numeric[]
+
+// Casts and functions between arrays and vector (half = false) or halfvec, and pgvector's aggregate state
+// functions over float8[] ({count, sum_1, ..., sum_dim}).
+public function registerArrays(x: sdk.Extension, half: Boolean) {
+    let t = typeName(half)
+    x.cast("int4[]", t, function(call) { fromArray(call, half, true, call.modifier) })
+    x.cast("float4[]", t, function(call) { fromArray(call, half, true, call.modifier) })
+    x.cast("float8[]", t, function(call) { fromArray(call, half, false, call.modifier) })
+    x.cast("numeric[]", t, function(call) { fromArray(call, half, true, call.modifier) })
+    let a = "array_to_" + t
+    x.define(a, ["int4[]", "int4", "bool"], t, function(call) { fromArray(call, half, true, call.integer(1)) })
+    x.define(a, ["float4[]", "int4", "bool"], t, function(call) { fromArray(call, half, true, call.integer(1)) })
+    x.define(a, ["float8[]", "int4", "bool"], t, function(call) { fromArray(call, half, false, call.integer(1)) })
+    x.define(a, ["numeric[]", "int4", "bool"], t, function(call) { fromArray(call, half, true, call.integer(1)) })
+    x.cast(t, "float4[]", function(call) { toArray(call, half) })
+    x.define(t + "_to_float4", [t, "int4", "bool"], "float4[]", function(call) { toArray(call, half) })
+    x.define(t + "_accum", ["float8[]", t], "float8[]", function(call) { stateAccum(call, half) })
+    x.define(t + "_avg", ["float8[]"], t, function(call) { stateAvg(call, half) })
+    x.define(t + "_combine", ["float8[]", "float8[]"], "float8[]", stateCombine)
+}
+
+// Dimension checks with an explicit typmod (array_to_vector passes it as an argument, a cast in call.modifier).
+function checkDimsWith(call: sdk.Call, dim: Integer, half: Boolean, typmod: Integer) {
+    let saved = call.modifier
+    call.modifier = typmod
+    checkDims(call, dim, half)
+    call.modifier = saved
+}
+
+// array_to_vector / array_to_halfvec: float4 = the elements read as reals (int4, float4, numeric), else
+// double precision values converted to real.
+deterministic function fromArray(call: sdk.Call, half: Boolean, float4: Boolean, typmod: Integer) {
+    let a = sdk.newNumbers()
+    call.numbers(0, float4, a)
+    if a.dimensions > 1 {
+        call.fail("22000", "array must be 1-D")
+        return
+    }
+    if a.hasNull {
+        call.fail("22004", "array must not contain nulls")
+        return
+    }
+    let n = a.values.length
+    checkDimsWith(call, n, half, typmod)
+    if call.failed { return }
+    let out = call.output
+    let start = out.length
+    for value in a.values {
+        let f = f32(value)
+        if half {
+            let shown = Bytes()
+            call.addFloat4(shown, f)
+            if !add(call, out, f, true, utf8.decodeOrStop(shown)) { return }
+        } else {
+            out.addFloat32(f)
+        }
+    }
+    let i = 0
+    while i < n {
+        let f = 0.0
+        if half { f = fp16.toFloat(out.getUInt16(start + i * 2)) } else { f = out.getFloat32(start + i * 4) }
+        if !checkElement(call, f, half) { return }
+        i += 1
+    }
+}
+
+deterministic function toArray(call: sdk.Call, half: Boolean) {
+    let n = count(call, 0, half)
+    let values: List<Float> = []
+    let i = 0
+    while i < n {
+        values.add(at(call, 0, i, half))
+        i += 1
+    }
+    call.returnNumbers(values, n, true)
+}
+
+// pgvector's CheckStateArray: one dimension, at least the count, no NULLs.
+function readState(call: sdk.Call, i: Integer, caller: Text, into: sdk.Numbers): Boolean {
+    call.numbers(i, false, into)
+    if into.dimensions != 1 || into.hasNull || !into.ok || into.values.length < 1 {
+        call.fail("XX000", caller + ": expected state array")
+        return false
+    }
+    return true
+}
+
+deterministic function stateAccum(call: sdk.Call, half: Boolean) {
+    let s = sdk.newNumbers()
+    if !readState(call, 0, typeName(half) + "_accum", s) { return }
+    let dim = s.values.length - 1
+    let vdim = count(call, 1, half)
+    let fresh = dim == 0
+    if fresh {
+        dim = vdim
+    } else if dim != vdim {
+        call.fail("22000", "expected " + Text(dim) + " dimensions, not " + Text(vdim))
+        return
+    }
+    let values: List<Float> = [s.values[0] + 1.0]
+    let i = 0
+    while i < dim {
+        let x = at(call, 1, i, half)
+        if fresh {
+            values.add(x)
+        } else {
+            let v = s.values[i + 1] + x
+            if v > 1.7976931348623157e308 || v < -1.7976931348623157e308 {
+                call.fail("22003", "value out of range: overflow")
+                return
+            }
+            values.add(v)
+        }
+        i += 1
+    }
+    call.returnNumbers(values, dim + 1, false)
+}
+
+deterministic function stateAvg(call: sdk.Call, half: Boolean) {
+    let s = sdk.newNumbers()
+    if !readState(call, 0, typeName(half) + "_avg", s) { return }
+    let n = s.values[0]
+    if n == 0.0 {
+        call.returnNull()
+        return
+    }
+    let dim = s.values.length - 1
+    checkDimsWith(call, dim, half, -1)
+    if call.failed { return }
+    let out = call.output
+    let i = 0
+    while i < dim {
+        let f = f32(s.values[i + 1] / n)
+        if half {
+            let shown = Bytes()
+            call.addFloat4(shown, f)
+            if !add(call, out, f, true, utf8.decodeOrStop(shown)) { return }
+            if !checkElement(call, fp16.toFloat(fp16.fromFloat(f)), true) { return }
+        } else {
+            if !checkElement(call, f, false) { return }
+            out.addFloat32(f)
+        }
+        i += 1
+    }
+}
+
+// vector_combine (halfvec_combine is the same C function in pgvector, errors included).
+deterministic function stateCombine(call: sdk.Call) {
+    let s1 = sdk.newNumbers()
+    let s2 = sdk.newNumbers()
+    if !readState(call, 0, "vector_combine", s1) { return }
+    if !readState(call, 1, "vector_combine", s2) { return }
+    let dim1 = s1.values.length - 1
+    let dim2 = s2.values.length - 1
+    let values: List<Float> = [s1.values[0] + s2.values[0]]
+    if dim1 == 0 && dim2 == 0 {
+        call.returnNumbers(values, 1, false)
+        return
+    }
+    let dim = dim1
+    if dim1 == 0 { dim = dim2 }
+    checkDimsWith(call, dim, false, -1)
+    if call.failed { return }
+    if dim1 != 0 && dim2 != 0 && dim1 != dim2 {
+        call.fail("22000", "expected " + Text(dim1) + " dimensions, not " + Text(dim2))
+        return
+    }
+    let i = 0
+    while i < dim {
+        let v = 0.0
+        if dim1 == 0 {
+            v = s2.values[i + 1]
+        } else if dim2 == 0 {
+            v = s1.values[i + 1]
+        } else {
+            v = s1.values[i + 1] + s2.values[i + 1]
+            if v > 1.7976931348623157e308 || v < -1.7976931348623157e308 {
+                call.fail("22003", "value out of range: overflow")
+                return
+            }
+        }
+        values.add(v)
+        i += 1
+    }
+    call.returnNumbers(values, dim + 1, false)
 }

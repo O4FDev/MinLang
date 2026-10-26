@@ -1814,6 +1814,7 @@ function parseFuncCall(p: P, name: Text, schema: Integer, pos: Integer): Integer
     }
     let flags = 0
     let args: List<Integer> = []
+    let argNames: List<Integer> = []   // per argument: its name (name => value), "" when positional; empty if none named
     let aggOrder = -1
     if isSym(p, STAR) {
         advance(p)
@@ -1826,9 +1827,18 @@ function parseFuncCall(p: P, name: Text, schema: Integer, pos: Integer): Integer
         }
         while !p.failed {
             if acceptKw(p, kw.VARIADIC) { flags = flags | ast.F_FUNC_VARIADIC }
+            let argName = ""
+            let npos = tstart(p)
             if isLabel(p) && (isSymAt(p, 1, lexer.C_ARROW) || isSymAt(p, 1, lexer.C_COLONEQ)) {
+                argName = lowerAscii(ttext(p))
                 advance(p)
                 advance(p)
+            }
+            if argName != "" {
+                while argNames.length < args.length { argNames.add(mkStr(p, "", npos)) }
+                argNames.add(mkStr(p, argName, npos))
+            } else if argNames.length > 0 {
+                argNames.add(mkStr(p, "", npos))
             }
             args.add(parseExpr(p))
             if !acceptSym(p, COMMA) { break }
@@ -1840,7 +1850,13 @@ function parseFuncCall(p: P, name: Text, schema: Integer, pos: Integer): Integer
         }
     }
     expectSym(p, RP)
-    return parseFuncTail(p, name, schema, args, aggOrder, flags, pos)
+    let call = parseFuncTail(p, name, schema, args, aggOrder, flags, pos)
+    // argument names ride along as a sixth child (a list of string literals); only functions that read them care
+    if argNames.length > 0 && call >= 0 && p.tree.nodes[call].kind == ast.K_FUNC_CALL && p.tree.nodes[call].children.length == 5 {
+        let names = mkList(p, argNames, pos)
+        p.tree.nodes[call].children.add(names)
+    }
+    return call
 }
 
 function parseFuncTail(p: P, name: Text, schema: Integer, args: List<Integer>, aggOrderIn: Integer, flagsIn: Integer, pos: Integer): Integer {
@@ -2917,6 +2933,7 @@ function parseColumnDef(p: P): Integer {
     let name = parseColId(p)
     let t = parseTypeName(p)
     let cons: List<Integer> = []
+    let compression = -1
     let lpos = tstart(p)
     while !p.failed && !isSym(p, COMMA) && !isSym(p, RP) && !isSym(p, SEMI) && tk(p) != lexer.T_EOF {
         if isConstraintAttr(p) {
@@ -2932,8 +2949,16 @@ function parseColumnDef(p: P): Integer {
             while acceptSym(p, DOT) { parseLabel(p) }
             continue
         }
+        // COMPRESSION method (PG 14): kept as the column definition's third child
+        if isLabel(p) && lowerAscii(ttext(p)) == "compression" {
+            advance(p)
+            let mpos = tstart(p)
+            compression = mkStr(p, lowerAscii(parseLabel(p)), mpos)
+            continue
+        }
         cons.add(parseColumnConstraint(p))
     }
+    if compression >= 0 { return mk(p, ast.K_COLUMN_DEF, 0, name, pos, [t, mkList(p, cons, lpos), compression]) }
     return mk(p, ast.K_COLUMN_DEF, 0, name, pos, [t, mkList(p, cons, lpos)])
 }
 
@@ -3165,10 +3190,12 @@ function parseCreateIndex(p: P, pos: Integer): Integer {
         let epos = tstart(p)
         let e = parseExpr(p)
         if acceptKw(p, kw.COLLATE) { parseLabel(p) }
+        let opclass = ""
         if isColId(p) && !isKw(p, kw.NULLS) {
-            // operator class
+            // operator class (kept in the sort item's text; a schema qualification is dropped)
+            opclass = ttext(p)
             advance(p)
-            while acceptSym(p, DOT) { parseLabel(p) }
+            while acceptSym(p, DOT) { opclass = parseLabel(p) }
             if isSym(p, LP) { skipParens(p) }
         }
         let op = ast.SORT_DEFAULT
@@ -3186,7 +3213,7 @@ function parseCreateIndex(p: P, pos: Integer): Integer {
                 nulls = ast.NULLS_LAST
             }
         }
-        let item = mk(p, ast.K_SORT_ITEM, op, "", epos, [e])
+        let item = mk(p, ast.K_SORT_ITEM, op, opclass, epos, [e])
         setInt(p, item, nulls)
         elems.add(item)
         if !acceptSym(p, COMMA) { break }
@@ -3310,6 +3337,24 @@ function parseAlter(p: P): Integer {
         let target = -1
         if acceptKw(p, kw.TO) { target = parseOptionValue(p) }
         return mk(p, ast.K_ALTER_EXTENSION, 0, name, pos, [target])
+    }
+    if acceptKw(p, kw.INDEX) {
+        let iflags = 0
+        if parseIfExists(p) { iflags = ast.F_IF_EXISTS }
+        let name = parseColId(p)
+        while acceptSym(p, DOT) { name = parseColId(p) }
+        if !acceptKw(p, kw.RENAME) {
+            if isLabel(p) {
+                unsupported(p, "ALTER INDEX ... " + ttext(p))
+                return -1
+            }
+            syntaxError(p)
+            return -1
+        }
+        expectKw(p, kw.TO)
+        let npos = tstart(p)
+        let to = mk(p, ast.K_NAME, 0, parseColId(p), npos, p.empty)
+        return mkf(p, ast.K_ALTER_INDEX, 0, name, pos, [to], iflags)
     }
     if !acceptKw(p, kw.TABLE) {
         if isLabel(p) {

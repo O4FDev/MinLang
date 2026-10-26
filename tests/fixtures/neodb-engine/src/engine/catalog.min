@@ -3,11 +3,15 @@ use "./values.min" as v
 use "./table.min" as tb
 use "./index.min" as ix
 use "../search/index.min" as si
+use "./ext.min" as ext
+use "neodb-sdk" as sdk
 
 public record Catalog {
     tables: List<tb.Table>
     hashIdx: List<ix.HashIndex>
     ordIdx: List<ix.OrdIndex>
+    annIdx: List<AnnIndex>
+    annFailure: sdk.IndexFailure   // a row an extension index refused (raised at the end of the statement)
     viewNames: List<Text>
     viewSql: List<Text>
     ddlLog: List<Text>       // replayable DDL in order (snapshot catalog)
@@ -17,10 +21,23 @@ public record Catalog {
     conNames: List<Text>     // index names that back a PRIMARY KEY / UNIQUE constraint (pg_constraint rows)
     nLiveFks: Integer        // foreign keys not dropped: 0 keeps the DML paths free of FK work
     searchIdx: List<si.Index>      // full-text search indexes (tables refer to them by position: tb.Table.searchIds)
-    searchDir: Text                // data directory holding saved search indexes ("" = none)
-    searchLsn: Integer             // checkpoint LSN saved indexes must carry to be loaded (-1 = always rebuild)
     extensions: List<Integer>      // installed extensions (positions in ext.min's registry), in install order
     extensionVersions: List<Text>  // their installed versions
+}
+
+// An index of an extension's access method (CREATE INDEX ... USING hnsw (embedding vector_l2_ops)): an
+// in-memory structure inside the extension (handle), fed one column's stored values by row id; rebuilt when the
+// table loads like every other index.
+public record AnnIndex {
+    id: Integer
+    tableId: Integer          // -1 once dropped
+    name: Text
+    col: Integer
+    method: Integer           // ext.method position
+    opclass: Integer          // position in the method's operator classes
+    operator: Text            // the operator the index orders by (<->)
+    options: sdk.IndexOptions // as created, to rebuild
+    handle: Integer
 }
 
 // FOREIGN KEY (childCols) REFERENCES parent (parentCols). Enforced at statement end (src/engine/fk.min).
@@ -41,8 +58,8 @@ public record ForeignKey {
 }
 
 public function newCatalog(): Catalog {
-    return Catalog { tables: []; hashIdx: []; ordIdx: []; viewNames: []; viewSql: []; ddlLog: []; version: 1; nextOid: 16384
-                     fks: []; conNames: []; nLiveFks: 0; searchIdx: []; searchDir: ""; searchLsn: -1
+    return Catalog { tables: []; hashIdx: []; ordIdx: []; annIdx: []; annFailure: sdk.newIndexFailure(); viewNames: []; viewSql: []; ddlLog: []; version: 1; nextOid: 16384
+                     fks: []; conNames: []; nLiveFks: 0; searchIdx: []
                      extensions: []; extensionVersions: [] }
 }
 
@@ -107,6 +124,7 @@ public function dropTable(c: Catalog, id: Integer) {
         c.ordIdx[oid].tableId = -1
         c.ordIdx[oid].name = ""
     }
+    for aid in t.annIds { dropAnn(c, aid) }
     let dead = tb.newTable(id, "")
     c.tables[id] = dead
     c.version += 1
@@ -120,7 +138,115 @@ public function indexNameExists(c: Catalog, name: Text): Boolean {
     for o in c.ordIdx {
         if o.name == name { return true }
     }
+    for x in c.annIdx {
+        if x.name == name { return true }
+    }
     return false
+}
+
+// An index dropped inside an open transaction block keeps existing under this name prefix until COMMIT.
+public constant DROPPED_INDEX = "pg_neo_dropped_index_"
+
+public function isDroppedIndexName(name: Text): Boolean {
+    let p = Bytes(DROPPED_INDEX)
+    let b = Bytes(name)
+    if b.length < p.length { return false }
+    let i = 0
+    while i < p.length {
+        if b[i] != p[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- extension (ANN) indexes
+
+// Create extension index `name` of method m on column col and fill it from the table's live rows. Returns its
+// id, or -1 with the method's error in options.
+public function addAnnIndex(c: Catalog, t: tb.Table, name: Text, col: Integer, m: Integer, opclass: Integer, options: sdk.IndexOptions, handle: Integer): Integer {
+    let def = ext.method(m)
+    let h = handle
+    if h < 0 { h = def.create(options) }
+    if options.failed { return -1 }
+    let x = AnnIndex { id: c.annIdx.length; tableId: t.id; name: name; col: col; method: m; opclass: opclass
+                       operator: def.opclasses[opclass].operator; options: options; handle: h }
+    c.annIdx.add(x)
+    t.annIds.add(x.id)
+    if !fillAnn(c, t, x) {
+        // a row the method refuses: no index
+        options.fail(c.annFailure.code, c.annFailure.message)
+        takeAnnFailure(c)
+        dropAnn(c, x.id)
+        let kept: List<Integer> = []
+        for aid in t.annIds {
+            if aid != x.id { kept.add(aid) }
+        }
+        t.annIds = kept
+        return -1
+    }
+    c.version += 1
+    return x.id
+}
+
+// Index every live row, and rows open transactions hold (as the core indexes do); false when a row is refused.
+function fillAnn(c: Catalog, t: tb.Table, x: AnnIndex): Boolean {
+    let r = 0
+    while r < t.nrows {
+        let st = t.state[r]
+        if st == 0 || (st & tb.ST_LOCKED) != 0 {
+            annInsert(c, t, x, r)
+            if c.annFailure.failed { return false }
+        }
+        r += 1
+    }
+    ext.method(x.method).built(x.handle)
+    return true
+}
+
+function annInsert(c: Catalog, t: tb.Table, x: AnnIndex, r: Integer) {
+    let col = t.cols[x.col]
+    if tb.isNull(col, r) { return }
+    ext.method(x.method).insert(x.handle, r, col.heap, tb.textOff(col, r), tb.textLen(col, r), c.annFailure)
+}
+
+// The row refusal of the running statement, cleared; failed is false when there is none.
+public function takeAnnFailure(c: Catalog): sdk.IndexFailure {
+    let f = c.annFailure
+    c.annFailure = sdk.newIndexFailure()
+    return f
+}
+
+public function dropAnn(c: Catalog, aid: Integer) {
+    let x = c.annIdx[aid]
+    if x.tableId < 0 { return }
+    ext.method(x.method).drop(x.handle)
+    x.tableId = -1
+    x.name = ""
+    c.version += 1
+}
+
+// Rebuild an extension index from scratch (the table's rows were reloaded or renumbered).
+function rebuildAnn(c: Catalog, t: tb.Table, x: AnnIndex) {
+    let def = ext.method(x.method)
+    def.drop(x.handle)
+    x.handle = def.create(x.options)
+    // rows were accepted when they were stored: a refusal here cannot happen, and is dropped if it does
+    fillAnn(c, t, x)
+    takeAnnFailure(c)
+}
+
+// The live extension index on column col of t whose operator class orders by `operator`, or -1.
+public function findAnnIndexOn(c: Catalog, t: tb.Table, col: Integer, operator: Text): Integer {
+    for aid in t.annIds {
+        let x = c.annIdx[aid]
+        // an index dropped in an open transaction block is hidden under DROPPED_INDEX + N: not used; an
+        // expression index matches by its expression (the same expression can have several hidden columns while a
+        // block drops and re-creates an index)
+        let same = x.col == col
+        if !same && x.col < t.cols.length && tb.isGenerated(t.cols[col]) { same = t.cols[x.col].generated == t.cols[col].generated }
+        if x.tableId >= 0 && same && x.operator == operator && !isDroppedIndexName(x.name) { return aid }
+    }
+    return -1
 }
 
 // Create the index structures for a table. kind: 0 auto (hash + ordered for a single-column key),
@@ -167,21 +293,32 @@ function hasDuplicates(t: tb.Table, h: ix.HashIndex): Boolean {
 }
 
 function ordHasDuplicates(t: tb.Table, o: ix.OrdIndex): Boolean {
-    let n = o.main.length / 8
-    let i = 1
-    while i < n {
-        let a = o.main.getInt64((i - 1) * 8)
-        let b = o.main.getInt64(i * 8)
-        if t.state[a] == 0 && t.state[b] == 0 && ix.rowsEqual(t, o.cols, a, b) { return true }
-        i += 1
+    let prev = -1
+    for c in o.chunks {
+        let i = 0
+        while i < c.length / 8 {
+            let b = c.getInt64(i * 8)
+            if prev >= 0 && t.state[prev] == 0 && t.state[b] == 0 && ix.rowsEqual(t, o.cols, prev, b) { return true }
+            prev = b
+            i += 1
+        }
     }
     return false
+}
+
+public function rebuildAnnIndexes(c: Catalog, t: tb.Table) {
+    for aid in t.annIds {
+        if c.annIdx[aid].tableId >= 0 { rebuildAnn(c, t, c.annIdx[aid]) }
+    }
 }
 
 public function rebuildIndexes(c: Catalog, t: tb.Table) {
     for hid in t.hashIds { ix.hashBuild(c.hashIdx[hid], t) }
     for oid in t.ordIds { ix.ordBuild(c.ordIdx[oid], t) }
     for sid in t.searchIds { si.build(c.searchIdx[sid], t) }
+    for aid in t.annIds {
+        if c.annIdx[aid].tableId >= 0 { rebuildAnn(c, t, c.annIdx[aid]) }
+    }
 }
 
 // ---- full-text search indexes (src/search/index.min)
@@ -190,26 +327,29 @@ public function buildSearchIndexes(c: Catalog, t: tb.Table) {
     for sid in t.searchIds { si.build(c.searchIdx[sid], t) }
 }
 
-public function searchFile(c: Catalog, t: tb.Table, sid: Integer): Text {
-    return c.searchDir + "/search-" + Text(t.id) + "-" + Text(sid) + ".idx"
+// WAL replay (recovery, replica promotion): row r of t is about to change / has changed. Search indexes loaded from
+// the checkpoint image are maintained here, so they need no rebuild; hash and ordered indexes are rebuilt after replay.
+public function searchRowChanging(c: Catalog, t: tb.Table, r: Integer) {
+    for sid in t.searchIds { si.touchRow(c.searchIdx[sid], t, r) }
 }
 
-// A table loaded from its checkpoint image: use the search index saved at the same checkpoint when there is one.
-public function loadSearchIndexes(c: Catalog, t: tb.Table) {
+public function searchRowChanged(c: Catalog, t: tb.Table, r: Integer) {
+    for sid in t.searchIds { si.insertRow(c.searchIdx[sid], t, r) }
+}
+
+public function searchTruncated(c: Catalog, t: tb.Table) {
+    for sid in t.searchIds { si.invalidate(c.searchIdx[sid]) }
+}
+
+// After replay: hash, ordered and extension indexes are rebuilt from the rows; search indexes were maintained (built here only
+// if they never were, e.g. not in the image).
+public function rebuildAfterReplay(c: Catalog, t: tb.Table) {
+    for hid in t.hashIds { ix.hashBuild(c.hashIdx[hid], t) }
+    for oid in t.ordIds { ix.ordBuild(c.ordIdx[oid], t) }
     for sid in t.searchIds {
-        let x = c.searchIdx[sid]
-        if c.searchDir == "" || !si.load(x, t, searchFile(c, t, sid), c.searchLsn) { si.build(x, t) }
+        if !c.searchIdx[sid].built { si.build(c.searchIdx[sid], t) }
     }
-}
-
-// Clean shutdown after the final checkpoint: save every built search index of loaded tables.
-public function saveSearchIndexes(c: Catalog, lsn: Integer) {
-    if c.searchDir == "" { return }
-    for t in c.tables {
-        if !isDropped(t) && t.chunk < 0 {
-            for sid in t.searchIds { si.save(c.searchIdx[sid], t, c.searchDir, searchFile(c, t, sid), lsn) }
-        }
-    }
+    rebuildAnnIndexes(c, t)   // extension (hnsw, ivfflat) indexes have no image: rebuilt from the rows
 }
 
 public function addSearchIndex(c: Catalog, t: tb.Table, name: Text, col: Integer, stemmer: Integer): Integer {
@@ -274,6 +414,9 @@ public function columnIndexed(c: Catalog, t: tb.Table, ci: Integer): Boolean {
     for sid in t.searchIds {
         if c.searchIdx[sid].column == ci { return true }
     }
+    for aid in t.annIds {
+        if c.annIdx[aid].tableId >= 0 && c.annIdx[aid].col == ci { return true }
+    }
     return false
 }
 
@@ -284,6 +427,10 @@ public function indexRemoveRow(c: Catalog, t: tb.Table, r: Integer) {
     }
     for oid in t.ordIds { ix.ordRemove(c.ordIdx[oid], t, r) }
     for sid in t.searchIds { si.touchRow(c.searchIdx[sid], t, r) }
+    for aid in t.annIds {
+        let x = c.annIdx[aid]
+        if x.tableId >= 0 { ext.method(x.method).remove(x.handle, r) }
+    }
 }
 
 public function indexInsertRow(c: Catalog, t: tb.Table, r: Integer) {
@@ -293,6 +440,9 @@ public function indexInsertRow(c: Catalog, t: tb.Table, r: Integer) {
     }
     for oid in t.ordIds { ix.ordInsert(c.ordIdx[oid], t, r) }
     for sid in t.searchIds { si.insertRow(c.searchIdx[sid], t, r) }
+    for aid in t.annIds {
+        if c.annIdx[aid].tableId >= 0 { annInsert(c, t, c.annIdx[aid], r) }
+    }
 }
 
 // Find a hash index whose columns are exactly `cols` (any order), or -1.

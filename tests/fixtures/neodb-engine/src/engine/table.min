@@ -8,6 +8,7 @@
 // scales are written by other modules directly; checkpoints detect their changes by content hash instead.
 use "../../lib/dbio.min" as dbio
 use "./values.min" as v
+use "./zcodec.min" as zc
 
 public constant ST_DEAD = 1     // row deleted (or never committed)
 public constant ST_LOCKED = 2   // row is owned by an open or committing transaction (see the lock map)
@@ -88,6 +89,8 @@ public record Column {
     defaultKind: Integer   // 0 none, 1 constant text (cast at insert), 2 serial (sequence), 3 current_timestamp, 4 expr sql
     defaultText: Text
     defaultNull: Boolean
+    generated: Text        // expression index key (ADR-015): SQL of the expression this hidden column stores, else ""
+    compress: Boolean      // text column created with COMPRESSION zstd: long values are stored compressed (see textBuf)
 }
 
 public record Table {
@@ -100,6 +103,7 @@ public record Table {
     lockedCount: Integer
     hashIds: List<Integer>     // catalog hash index ids
     ordIds: List<Integer>      // catalog ordered index ids
+    annIds: List<Integer>      // catalog extension index ids (cat.AnnIndex: hnsw, ivfflat)
     pkCols: List<Integer>      // primary key columns (empty if none)
     serial: Integer            // last value handed out by serial/identity defaults
     isTemp: Boolean
@@ -145,14 +149,26 @@ public function newColumn(name: Text, type: Integer, typmod: Integer, notNull: B
     return Column {
         name: name; type: type; typmod: typmod; notNull: notNull; width: v.storageWidth(type)
         data: Bytes(); heap: Bytes(); nulls: Bytes(); scales: Bytes(); perRowScale: perRow; fixedScale: fixedScale
-        heapDead: 0; heapShared: 0; segs: []; defaultKind: 0; defaultText: ""; defaultNull: true
+        heapDead: 0; heapShared: 0; segs: []; defaultKind: 0; defaultText: ""; defaultNull: true; generated: ""; compress: false
     }
+}
+
+// Columns that store an expression index's key are named with this prefix; queries never see them in * lists.
+public constant GENERATED_PREFIX = "pg_neo_expr_"
+
+public function isGenerated(c: Column): Boolean { return c.generated != "" }
+
+public function hasGenerated(t: Table): Boolean {
+    for c in t.cols {
+        if c.generated != "" { return true }
+    }
+    return false
 }
 
 public function newTable(id: Integer, name: Text): Table {
     return Table {
         id: id; name: name; cols: []; nrows: 0; state: Bytes(); live: 0; lockedCount: 0
-        hashIds: []; ordIds: []; pkCols: []; serial: 0; isTemp: false; checks: []; chunk: -1; paged: []; searchIds: []
+        hashIds: []; ordIds: []; annIds: []; pkCols: []; serial: 0; isTemp: false; checks: []; chunk: -1; paged: []; searchIds: []
     }
 }
 
@@ -332,20 +348,111 @@ public function setInterval(c: Column, r: Integer, micros: Integer, days: Intege
 
 // ---- text
 
+// A text ref is (heap offset << 24) | stored length. In a column created with COMPRESSION zstd, a value of at least
+// Z_MIN bytes is stored as uvarint(its length) + one zstd frame when that saves at least an eighth; such refs have their
+// top bit set (Z_FLAG) and the offset in the 39 bits below it. Readers take a value with textBuf/textAt/textLen
+// (a heap view for stored values, a decompressed copy for compressed ones); textOff is for uncompressed refs only.
+constant Z_FLAG = -9223372036854775807 - 1
+constant Z_MIN = 64
+constant OFF_MASK = 549755813887
+
 public function textOff(c: Column, r: Integer): Integer {
-    return (c.data.getInt64(r * 8) >> 24) & 1099511627775
+    let ref = c.data.getInt64(r * 8)
+    if ref < 0 { fail("neo-db: compressed text read through textOff (use textBuf/textAt)") }
+    return (ref >> 24) & OFF_MASK
 }
+
+public function isCompressed(c: Column, r: Integer): Boolean { return c.data.getInt64(r * 8) < 0 }
+
+// Bytes the value occupies in the heap (its length unless compressed).
+public function storedLen(c: Column, r: Integer): Integer { return c.data.getInt64(r * 8) & 16777215 }
 
 public function textLen(c: Column, r: Integer): Integer {
-    return c.data.getInt64(r * 8) & 16777215
+    let ref = c.data.getInt64(r * 8)
+    if ref >= 0 { return ref & 16777215 }
+    let at = (ref >> 24) & OFF_MASK
+    let x = 0
+    let shift = 0
+    while true {
+        let b = c.heap[at]
+        at += 1
+        x = x | ((b & 127) << shift)
+        if b < 128 { break }
+        shift += 7
+    }
+    return x
 }
 
-public function setText(c: Column, r: Integer, buf: Bytes, off: Integer, len: Integer) {
+// The buffer holding row r's text: the heap, or a fresh decompressed copy of a compressed value (offset textAt).
+public function textBuf(c: Column, r: Integer): Bytes {
+    let ref = c.data.getInt64(r * 8)
+    if ref >= 0 { return c.heap }
+    let at = (ref >> 24) & OFF_MASK
+    let end = at + (ref & 16777215)
+    let x = 0
+    let shift = 0
+    while true {
+        let b = c.heap[at]
+        at += 1
+        x = x | ((b & 127) << shift)
+        if b < 128 { break }
+        shift += 7
+    }
+    let out = Bytes(x)
+    let n = zc.decompress(c.heap.slice(at, end), out)
+    if n != x { fail("neo-db: a compressed text value does not decompress (data corrupt)") }
+    return out
+}
+
+public function textAt(c: Column, r: Integer): Integer {
+    let ref = c.data.getInt64(r * 8)
+    if ref >= 0 { return (ref >> 24) & OFF_MASK }
+    return 0
+}
+
+// The value as a fresh Bytes (exact length).
+public function textBytes(c: Column, r: Integer): Bytes {
+    let b = textBuf(c, r)
+    let at = textAt(c, r)
+    if c.data.getInt64(r * 8) < 0 { return b }
+    return b.slice(at, at + textLen(c, r))
+}
+
+function putUVarintTo(out: Bytes, x: Integer) {
+    let u = x
+    while u >= 128 {
+        out.add((u & 127) | 128)
+        u = u >> 7
+    }
+    out.add(u)
+}
+
+public function setText(c: Column, r: Integer, bufIn: Bytes, offIn: Integer, lenIn: Integer) {
+    let buf = bufIn
+    let off = offIn
+    let len = lenIn
+    let flag = 0
+    if c.compress && lenIn >= Z_MIN {
+        // compressed form: uvarint(length) + zstd frame, if it saves at least an eighth
+        let src = bufIn
+        if offIn != 0 || lenIn != bufIn.length { src = bufIn.slice(offIn, offIn + lenIn) }
+        let frame = Bytes(zc.bound(lenIn))
+        let n = zc.compress(src, frame)
+        if n > 0 && n + 4 <= lenIn - lenIn / 8 {
+            let z = Bytes()
+            putUVarintTo(z, lenIn)
+            z.addBytes(frame.slice(0, n))
+            buf = z
+            off = 0
+            len = z.length
+            flag = Z_FLAG
+        }
+    }
     let ref = c.data.getInt64(r * 8)
     let oldLen = ref & 16777215
     let tracked = c.segs.length > 0
     if tracked { touch(c.segs[0], c.data, r * 8) }
-    if oldLen == 0 && r > 0 && len > 0 {
+    if oldLen == 0 && r > 0 && len > 0 && !c.compress {
         // Equal adjacent values (COPY/INSERT of repeated text, e.g. pgbench's blank filler) share one copy.
         let pref = c.data.getInt64(r * 8 - 8)
         if (pref & 16777215) == len {
@@ -357,8 +464,8 @@ public function setText(c: Column, r: Integer, buf: Bytes, off: Integer, len: In
             }
         }
     }
-    if len <= oldLen && oldLen > 0 && ((ref >> 24) & 1099511627775) >= c.heapShared {
-        let at = (ref >> 24) & 1099511627775
+    if len <= oldLen && oldLen > 0 && ((ref >> 24) & OFF_MASK) >= c.heapShared {
+        let at = (ref >> 24) & OFF_MASK
         if tracked { touchRange(c.segs[2], c.heap, at, at + len) }
         let i = 0
         while i + 8 <= len {
@@ -370,7 +477,7 @@ public function setText(c: Column, r: Integer, buf: Bytes, off: Integer, len: In
             i += 1
         }
         c.heapDead += oldLen - len
-        c.data.setInt64(r * 8, (at << 24) | len)
+        c.data.setInt64(r * 8, (at << 24) | len | flag)
         return
     }
     c.heapDead += oldLen
@@ -388,7 +495,7 @@ public function setText(c: Column, r: Integer, buf: Bytes, off: Integer, len: In
             i += 1
         }
     }
-    c.data.setInt64(r * 8, (at << 24) | len)
+    c.data.setInt64(r * 8, (at << 24) | len | flag)
 }
 
 // ---- row state
@@ -446,14 +553,15 @@ public function encodeValue(c: Column, r: Integer, out: Bytes) {
     if v.isTextType(t) {
         let len = textLen(c, r)
         putVarint(out, len)
-        let off = textOff(c, r)
+        let hb = textBuf(c, r)
+        let off = textAt(c, r)
         let i = 0
         while i + 8 <= len {
-            out.addInt64(c.heap.getInt64(off + i))
+            out.addInt64(hb.getInt64(off + i))
             i += 8
         }
         while i < len {
-            out.add(c.heap[off + i])
+            out.add(hb[off + i])
             i += 1
         }
         return
@@ -492,12 +600,12 @@ public function decodeValue(c: Column, r: Integer, b: Bytes, cur: Cursor) {
         return
     }
     if t == v.T_FLOAT8 {
-        c.data.setFloat64(r * 8, b.getFloat64(cur.pos))
+        setFloat(c, r, b.getFloat64(cur.pos))
         cur.pos += 8
         return
     }
     if t == v.T_FLOAT4 {
-        c.data.setFloat32(r * 4, b.getFloat32(cur.pos))
+        setFloat(c, r, b.getFloat32(cur.pos))
         cur.pos += 4
         return
     }
@@ -513,6 +621,35 @@ public function decodeValue(c: Column, r: Integer, b: Bytes, cur: Cursor) {
         c.scales[r] = b[cur.pos]
         cur.pos += 1
     }
+}
+
+// Step over one value written by encodeValue for column c (without decoding it).
+public function skipValue(c: Column, b: Bytes, cur: Cursor) {
+    let tag = b[cur.pos]
+    cur.pos += 1
+    if tag == 0 { return }
+    let t = c.type
+    if v.isTextType(t) {
+        let len = getVarint(b, cur)
+        cur.pos += len
+        return
+    }
+    if t == v.T_FLOAT8 {
+        cur.pos += 8
+        return
+    }
+    if t == v.T_FLOAT4 {
+        cur.pos += 4
+        return
+    }
+    if t == v.T_INTERVAL {
+        getVarint(b, cur)
+        getVarint(b, cur)
+        getVarint(b, cur)
+        return
+    }
+    getVarint(b, cur)
+    if c.perRowScale { cur.pos += 1 }
 }
 
 public function encodeRow(t: Table, r: Integer, out: Bytes) {
@@ -539,7 +676,7 @@ public function copyRow(a: Table, src: Integer, b: Table, dst: Integer) {
         } else {
             clearNull(cb, dst)
             if v.isTextType(ca.type) {
-                setText(cb, dst, ca.heap, textOff(ca, src), textLen(ca, src))
+                setText(cb, dst, textBuf(ca, src), textAt(ca, src), textLen(ca, src))
             } else if ca.width == 16 {
                 cb.data.setInt64(dst * 16, ca.data.getInt64(src * 16))
                 cb.data.setInt64(dst * 16 + 8, ca.data.getInt64(src * 16 + 8))
@@ -575,11 +712,11 @@ public function compactHeaps(t: Table) {
                 let ref = c.data.getInt64(r * 8)
                 let len = ref & 16777215
                 if len > 0 {
-                    let off = (ref >> 24) & 1099511627775
+                    let off = (ref >> 24) & OFF_MASK
                     let at = nh.length
                     if (t.state[r] & ST_DEAD) == 0 || (t.state[r] & ST_LOCKED) != 0 {
                         nh.addBytes(c.heap.slice(off, off + len))
-                        c.data.setInt64(r * 8, (at << 24) | len)
+                        c.data.setInt64(r * 8, (at << 24) | len | (ref & Z_FLAG))
                     } else {
                         c.data.setInt64(r * 8, 0)
                     }
@@ -675,22 +812,23 @@ public function encodeColumnSnap(c: Column, live: Bytes, srcCols: List<Column>, 
         let r = srcRows.getInt64(i * 8)
         if !isNull(sc, r) {
             if v.isTextType(t) {
-                let off = textOff(sc, r)
+                let hb = textBuf(sc, r)
+                let off = textAt(sc, r)
                 let len = textLen(sc, r)
-                if prevLen == len && v.equalBytes(sc.heap, off, len, prevHeap, prevOff, prevLen) {
+                if prevLen == len && v.equalBytes(hb, off, len, prevHeap, prevOff, prevLen) {
                     out.add(0)
                 } else {
                     putUVarint(out, len + 1)
                     let j = 0
                     while j + 8 <= len {
-                        out.addInt64(sc.heap.getInt64(off + j))
+                        out.addInt64(hb.getInt64(off + j))
                         j += 8
                     }
                     while j < len {
-                        out.add(sc.heap[off + j])
+                        out.add(hb[off + j])
                         j += 1
                     }
-                    prevHeap = sc.heap
+                    prevHeap = hb
                     prevOff = off
                     prevLen = len
                 }
@@ -792,11 +930,16 @@ public function decodeTableSnap(t: Table, b: Bytes) {
                     c.data.setInt64(row * 8, prevRef)
                 } else {
                     let len = l1 - 1
-                    let at = c.heap.length
-                    c.heap.addBytes(b.slice(cur.pos, cur.pos + len))
+                    if c.compress {
+                        setText(c, row, b, cur.pos, len)
+                        prevRef = c.data.getInt64(row * 8)
+                    } else {
+                        let at = c.heap.length
+                        c.heap.addBytes(b.slice(cur.pos, cur.pos + len))
+                        prevRef = (at << 24) | len
+                        c.data.setInt64(row * 8, prevRef)
+                    }
                     cur.pos += len
-                    prevRef = (at << 24) | len
-                    c.data.setInt64(row * 8, prevRef)
                 }
             } else if t0 == v.T_FLOAT8 {
                 c.data.setFloat64(row * 8, b.getFloat64(cur.pos))
@@ -903,8 +1046,8 @@ public function faultRow(t: Table, r: Integer) {
             let ref = c.data.getInt64(0)
             let len = ref & 16777215
             c.heap.clear()
-            if len > 0 { segRead(pg.fd, pg.heap[i], (ref >> 24) & 1099511627775, len, c.heap) }
-            c.data.setInt64(0, len)
+            if len > 0 { segRead(pg.fd, pg.heap[i], (ref >> 24) & OFF_MASK, len, c.heap) }
+            c.data.setInt64(0, len | (ref & Z_FLAG))
         }
         i += 1
     }

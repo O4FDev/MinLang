@@ -22,7 +22,11 @@ use "./persist.min" as persist
 use "../storage/datafile.min" as df
 use "./notify.min" as nt
 use "./ext.min" as ext
+use "../search/stemmers.min" as stemmers
+use "../search/index.min" as si
 use "text" as utf8
+use "neodb-sdk" as sdk
+use "./pgcatalog.min" as pgc
 
 public constant STATUS_OK = 0
 public constant STATUS_ERROR = 1
@@ -80,7 +84,9 @@ public record Engine {
     private hasWal: Boolean
     private committing: Bytes
     private durable: Integer
+    private visibleLsn: Integer    // highest commit whose row locks were released before it was durable
     private nextSession: Integer
+    private nextHiddenIndex: Integer   // numbers the hidden names of indexes dropped in open transaction blocks
     private cacheMap: hm.IntMap
     private cache: List<CacheEntry>
     private sk: skel.Skel
@@ -94,6 +100,9 @@ public record Engine {
     private snapBox: List<snapshot.Opened>
     private idleTicks: Integer
     private lastSeenStmt: Integer
+    private lastDdlLsn: Integer        // WAL position of the last self-contained DDL record (transaction-block DDL)
+    private pendSessions: List<Integer>      // recovery: sessions whose transaction block logged DDL and no end yet
+    private pendUndo: List<List<DdlUndo>>    // and that block's undo entries, oldest first
     private nBlocks: Integer
     private nCommits: Integer
     private nReleases: Integer
@@ -106,6 +115,8 @@ public record Engine {
     private snapVersion: Integer   // catalog format of the snapshot tables are loaded from: 2 (round 1) or 3
     private pointHits: Integer     // point lookups answered from an image without loading the table
     private ck: persist.Ckpt       // checkpoint in progress (sliced, M3)
+    private ld: persist.Loader     // table load in progress (sliced first-touch loads, ADR-014)
+    private ldNextNs: Integer      // monotonic ns before which the next load slice waits (duty cycle)
     private ckptGen: Integer       // checkpoints published since open
     private ckptWanted: Integer    // a CHECKPOINT statement waits for checkpoint number ckptWanted
     private ckptPublishUs: Integer // diagnostics: longest publish step on the loop thread
@@ -128,6 +139,14 @@ public record Engine {
     private replOut: Bytes         // WAL record frames not yet handed to the server for the replica
     private replAcked: Integer     // highest WAL LSN the replica made durable
     private replUnacked: Bytes     // frames the replica has not acknowledged yet (resent after a reconnect)
+    private replBase: Integer      // WAL end when replication was enabled: frames up to it are read back from the files
+    private replRefusal: Text      // why the last replica that attached cannot continue from what it holds, or ""
+    private witnessAcked: Integer  // highest LSN the witness stored while the replica was away (docs/adr/017-witness-election.md)
+    private replAttached: Boolean  // a replica is connected: new frames are queued for it in replOut
+    private replPrimary: Integer   // replica: the primary's LSN of the last record this directory holds
+    private replPartials: hm.IntMap        // replica: spilled transactions ('P' records) awaiting their 'E'
+    private replPartialBufs: List<Bytes>
+    private replPending: Integer           // replica: how many of those are open (a checkpoint waits for 0)
 }
 
 // Storage options (docs/STORAGE_API.md "Engine open/close"). checkpointWalBytes: a checkpoint starts once this
@@ -136,10 +155,15 @@ public record Options {
     checkpointWalBytes: Integer
     checkpointIntervalMs: Integer   // also checkpoint this long after the last one if WAL was written (0 = off)
     noPrealloc: Boolean
+    earlyRelease: Boolean           // release a commit's row locks once its record is in the WAL (see commitTxn)
+    slicedLoads: Boolean            // load big tables in slices while the loop serves (server); false: in one step
+    follower: Boolean               // opened by the WAL receiver: keeps spilled transactions still open at the end of
+                                    // recovery for applyReplicated (a server drops them: they never committed)
+    yieldUs: Integer                // a long read-only search yields to short statements after this long (0 = never)
 }
 
 public function defaultOptions(): Options {
-    return Options { checkpointWalBytes: 1073741824; checkpointIntervalMs: 300000; noPrealloc: false }
+    return Options { checkpointWalBytes: 1073741824; checkpointIntervalMs: 300000; noPrealloc: false; earlyRelease: true; slicedLoads: true; follower: false; yieldUs: 1000 }
 }
 
 public record Session {
@@ -155,6 +179,7 @@ public record Session {
     private settingValues: List<Text>
     private copyTable: Integer
     private copyCols: List<Integer>
+    private copyGen: List<pl.GenPlan>     // COPY into a table with expression indexes: computes the hidden columns
     private copyBuf: Bytes
     private copyRows: Integer
     private copyCsv: Boolean
@@ -167,6 +192,10 @@ public record Session {
     private copyImplicit: Boolean
     private copyBinary: Boolean          // COPY FROM ... (FORMAT BINARY): copyBuf holds an unparsed tuple tail
     private copyBinaryHeader: Boolean    // the binary header has been read
+    private copyQuote: Integer           // CSV: QUOTE character (default ")
+    private copyEscape: Integer          // CSV: ESCAPE character (default = QUOTE)
+    private copyScanned: Integer         // CSV: bytes of copyBuf already scanned for the end of the record
+    private copyInQuote: Boolean         // CSV: the scan position is inside a quoted field (newlines belong to the value)
     private savepointNames: List<Text>
     private savepointUndo: Bytes
     private savepointRedo: Bytes
@@ -191,15 +220,22 @@ public record Session {
 
 // Catalog change made inside a transaction block, undone by ROLLBACK (TO SAVEPOINT).
 record DdlUndo {
-    kind: Integer          // UNDO_CREATED, UNDO_DROPPED, UNDO_INDEX
-    tid: Integer
-    name: Text             // table name before the change (UNDO_DROPPED) / created table or index name
+    kind: Integer          // UNDO_*
+    tid: Integer           // table id, or the extension's registry index (UNDO_EXT_*)
+    name: Text             // table name before the change (UNDO_DROPPED) / created table or index name /
+                           // the extension version to restore (UNDO_EXT_DROPPED, UNDO_EXT_ALTERED)
     depth: Integer         // savepoints open when the change was made
+    pos: Integer           // UNDO_EXT_DROPPED: the extension's position in the installed list
 }
 
-constant UNDO_CREATED = 1  // table created: rollback drops it
-constant UNDO_DROPPED = 2  // table dropped: renamed to a hidden name until COMMIT, rollback renames it back
-constant UNDO_INDEX = 3    // index created: rollback drops it
+constant UNDO_CREATED = 1      // table created: rollback drops it
+constant UNDO_DROPPED = 2      // table dropped: renamed to a hidden name until COMMIT, rollback renames it back
+constant UNDO_INDEX = 3        // index created: rollback drops it
+constant UNDO_EXT_CREATED = 4  // extension installed: rollback uninstalls it
+constant UNDO_EXT_DROPPED = 5  // extension uninstalled: rollback installs it again at its old position and version
+constant UNDO_EXT_ALTERED = 6  // extension version changed: rollback restores the old version
+constant UNDO_INDEX_DROPPED = 7  // index dropped: renamed to DROPPED_INDEX + tid (logged) until COMMIT drops it; rollback renames it back
+constant UNDO_INDEX_RENAMED = 8  // ALTER INDEX a RENAME TO b: name is "a\nb"; rollback renames b back to a
 
 // A DECLAREd cursor: the query result is materialized at DECLARE (the cursor's snapshot); an error while
 // producing it is deferred to the FETCH that reaches the failing row, as in PG.
@@ -297,19 +333,19 @@ public function openWithOptions(dataDir: Text, opts: Options): Engine {
     let c = cat.newCatalog()
     let tm = txn.newTxnMgr()
     tm.catalog = [c]
-    let env = ex.Env { cat: c; tm: tm; me: -1; nowMicros: 0; randState: 88172645463325252; session: 0; tempCount: 0; notes: [] }
+    let env = ex.Env { cat: c; tm: tm; me: -1; nowMicros: 0; randState: 88172645463325252; session: 0; tempCount: 0; notes: []; settingNames: []; settingValues: [] }
     let ic = newIdleCopy(env)
     let e = Engine {
         c: c; tm: tm; views: pl.newViewCache(); env: env; dataDir: dataDir; walBox: []; hasWal: false
-        committing: Bytes(); durable: 0; nextSession: 1; cacheMap: hm.newIntMap(256); cache: []; sk: skel.newSkel()
-        replaying: false; ckptLsn: 0; lastCkptTick: 0; ticks: 0; nextXid: 1; sys: blankSession(0, ic); stmtCount: 0; snapBox: []; idleTicks: 0; lastSeenStmt: 0
+        committing: Bytes(); durable: 0; visibleLsn: 0; nextSession: 1; nextHiddenIndex: 0; cacheMap: hm.newIntMap(256); cache: []; sk: skel.newSkel()
+        replaying: false; ckptLsn: 0; lastCkptTick: 0; ticks: 0; nextXid: 1; sys: blankSession(0, ic); stmtCount: 0; snapBox: []; idleTicks: 0; lastSeenStmt: 0; lastDdlLsn: 0; pendSessions: []; pendUndo: []
         nBlocks: 0; nCommits: 0; nReleases: 0; nSyncWakes: 0; lastStatTick: 0; statStmts: 0; opts: opts; closed: false
-        st: persist.newStore(dataDir); snapVersion: 3; pointHits: 0; ck: persist.idleCkpt(); ckptGen: 0; ckptWanted: 0; ckptPublishUs: 0; pubPhase: 0; pubLsn: 0; pubBytes: Bytes(); pubSlot: 0; pubFd: -1; pubSyncer: 0; curSlot: -1; lastCkptMs: dbio.monotonicNanos() / 1000000
-        prepMap: hm.newIntMap(64); prepCache: []; tags: []; noOutcome: newOutcome(); noColumns: []; idleCopy: ic; hub: nt.newHub(); replOn: false; replOut: Bytes(); replAcked: 0; replUnacked: Bytes()
+        st: persist.newStore(dataDir); snapVersion: 3; pointHits: 0; ck: persist.idleCkpt(); ld: persist.idleLoader(); ldNextNs: 0; ckptGen: 0; ckptWanted: 0; ckptPublishUs: 0; pubPhase: 0; pubLsn: 0; pubBytes: Bytes(); pubSlot: 0; pubFd: -1; pubSyncer: 0; curSlot: -1; lastCkptMs: dbio.monotonicNanos() / 1000000
+        prepMap: hm.newIntMap(64); prepCache: []; tags: []; noOutcome: newOutcome(); noColumns: []; idleCopy: ic; hub: nt.newHub(); replOn: false; replOut: Bytes(); replAcked: 0; replUnacked: Bytes(); replBase: 0; replRefusal: ""; witnessAcked: 0; replAttached: false
+        replPrimary: 0; replPartials: hm.newIntMap(16); replPartialBufs: []; replPending: 0
     }
     if dataDir == "" { return e }
     dbio.mkdir(dataDir)
-    c.searchDir = dataDir
     e.replaying = true
     let names = dbio.listDir(dataDir)
     let snap = snapshot.openLatestIn(dataDir, names)
@@ -322,14 +358,16 @@ public function openWithOptions(dataDir: Text, opts: Options): Engine {
         snapLsn = snap.lsn
     }
     let r = wal.openReaderIn(dataDir, names, snapLsn)
-    let partials = hm.newIntMap(16)
-    let partialBufs: List<Bytes> = []
+    // spilled transactions ('P' records) awaiting their 'E': a follower continues them (replPending below)
+    let partials = e.replPartials
+    let partialBufs = e.replPartialBufs
     while wal.next(r) {
         let b = wal.buffer(r)
         let off = wal.payloadOffset(r)
         let len = wal.payloadLength(r)
         if len > 9 && b[off] == 70 {
             // a record stored by a replica: 'F', the primary's LSN, then the primary's record
+            e.replPrimary = b.getInt64(off + 1)
             off += 9
             len -= 9
         }
@@ -356,6 +394,12 @@ public function openWithOptions(dataDir: Text, opts: Options): Engine {
             }
         }
     }
+    if opts.follower {
+        e.replPending = partials.count
+    } else {
+        e.replPartials = hm.newIntMap(16)
+        e.replPartialBufs = []
+    }
     let wopts = wal.defaultOptions()
     if opts.noPrealloc { wopts.preallocate = false }
     e.walBox.add(wal.openWriter(dataDir, r, wopts))
@@ -363,11 +407,9 @@ public function openWithOptions(dataDir: Text, opts: Options): Engine {
     // A snapshot that is alone in the directory went through retention (published + verified); with no WAL after
     // it, close may retire the segments below it without writing a new checkpoint.
     if snap.found && wal.recordsRead(r) == 0 && (snapshot.slotOf(snap) >= 0 || snapshotFiles(names) == 1) { wal.setVerifiedSnapshot(e.walBox[0], snap.lsn) }
-    // tables loaded from now on are exactly their checkpoint images: saved search indexes may be used
-    if snap.found && wal.recordsRead(r) == 0 { c.searchLsn = snap.lsn }
     e.durable = wal.durableLsn(e.walBox[0])
     for t in e.c.tables {
-        if !cat.isDropped(t) && t.chunk < 0 && t.nrows > 0 { cat.rebuildIndexes(e.c, t) }
+        if !cat.isDropped(t) && t.chunk < 0 && t.nrows > 0 { cat.rebuildAfterReplay(e.c, t) }
     }
     if e.snapBox.length > 0 {
         if unloadedCount(e) > 0 {
@@ -379,6 +421,7 @@ public function openWithOptions(dataDir: Text, opts: Options): Engine {
     }
     dropOrphanTemps(e)
     e.replaying = false
+    rollBackOpenBlocks(e)
     return e
 }
 
@@ -426,9 +469,9 @@ function dropSavepoints(e: Engine, s: Session) {
 function blankSession(id: Integer, ic: IdleCopy): Session {
     return Session {
         id: id; user: ""; txSlot: -1; inBlock: false; failed: false; defaultSerializable: false; nextSerializable: false
-        remaining: ""; settingNames: ic.names; settingValues: ic.names; copyTable: -1; copyCols: ic.cols; copyBuf: ic.buf; copyRows: 0
+        remaining: ""; settingNames: ic.names; settingValues: ic.names; copyTable: -1; copyCols: ic.cols; copyGen: []; copyBuf: ic.buf; copyRows: 0
         copyCsv: false; copyDelim: 9; copyNull: ic.buf; copyHeader: false; copyPlan: ic.plan
-        copyBulk: -1; copyErr: ic.err; copyImplicit: false; copyBinary: false; copyBinaryHeader: false; savepointNames: ic.names; savepointUndo: ic.buf; savepointRedo: ic.buf; txStart: 0; xid: 0; waitSlot: -1; waitGen: 0; ckptWait: 0
+        copyBulk: -1; copyErr: ic.err; copyImplicit: false; copyBinary: false; copyBinaryHeader: false; copyQuote: 34; copyEscape: 34; copyScanned: 0; copyInQuote: false; savepointNames: ic.names; savepointUndo: ic.buf; savepointRedo: ic.buf; txStart: 0; xid: 0; waitSlot: -1; waitGen: 0; ckptWait: 0
         txIso: 0; txReadOnly: false; txDeferrable: false; txSnap: false; defaultReadOnly: false; spReadOnly: Bytes()
         cursors: []; ddlUndo: []; tag: 0
         ownSettings: false; ownSavepoints: false
@@ -437,6 +480,7 @@ function blankSession(id: Integer, ic: IdleCopy): Session {
 
 function endCopy(e: Engine, s: Session) {
     s.copyTable = -1
+    if s.copyGen.length > 0 { s.copyGen = [] }
     s.copyPlan = e.idleCopy.plan
     s.copyErr = e.idleCopy.err
     s.copyBuf = e.idleCopy.buf
@@ -475,7 +519,8 @@ function unloadedCount(e: Engine): Integer {
     return n
 }
 
-// Decode a table from the startup snapshot on first touch.
+// Decode a table from the startup snapshot on first touch, in one step (a sliced load of it in progress is
+// completed now).
 function ensureLoaded(e: Engine, tid: Integer, buildIndexes: Boolean) {
     let t = e.c.tables[tid]
     if t.chunk < 0 { return }
@@ -485,17 +530,102 @@ function ensureLoaded(e: Engine, tid: Integer, buildIndexes: Boolean) {
     let o = e.snapBox[0]
     if e.snapVersion == 3 {
         // format v3: pread the table's buffers (indexes included); no decode, no index build
-        persist.loadTable(e.st, e.c, t, imageOf(e, t.id, chunk))
+        if e.ld.active && e.ld.tableId == tid {
+            persist.loadStep(e.st, e.ld, -1)
+            persist.loadFinish(e.st, e.c, t, e.ld)
+            e.tm.lockEpoch += 1
+        } else {
+            persist.loadTable(e.st, e.c, t, imageOf(e, t.id, chunk))
+        }
     } else {
         let b = snapshot.readChunk(o, chunk)
         if b.length > 0 { tb.decodeTableSnap(t, b) }
         if buildIndexes { cat.rebuildIndexes(e.c, t) }
     }
+    tableLoaded(e)
+}
+
+function tableLoaded(e: Engine) {
     e.c.version += 1
     if !e.replaying && unloadedCount(e) == 0 && e.hasWal {
-        snapshot.release(o, e.walBox[0])
+        snapshot.release(e.snapBox[0], e.walBox[0])
         e.snapBox = []
     }
+}
+
+// Sliced first-touch loads (ADR-014). A table bigger than SYNC_LOAD_MAX_ROWS is loaded in slices of about
+// LOAD_SLICE_NS from afterLoopIteration / tick, one table at a time, while the loop keeps serving: point lookups
+// keep reading the image (paged mode) and statements that need the whole table wait parked (STATUS_WOULD_BLOCK)
+// until the load is installed, which bumps the lock epoch so the server retries them. Recovery, DDL and the
+// other one-off paths still load in one step (ensureLoaded).
+constant SYNC_LOAD_MAX_ROWS = 131072      // ~4.5 ms to load at 34 ns per row: not worth slicing
+constant LOAD_SLICE_NS = 250000          // a slice delays the requests waiting behind it: keep it well under 1 ms
+
+function unloadedRows(e: Engine, t: tb.Table): Integer {
+    if e.snapVersion != 3 { return 0 }
+    return imageOf(e, t.id, t.chunk).nrows
+}
+
+function startLoad(e: Engine, t: tb.Table) {
+    if e.ld.active { return }
+    e.ld = persist.loadStart(e.st, e.c, t, imageOf(e, t.id, t.chunk))
+}
+
+// One slice of the load in progress; installs the table when its last piece has been read. Slices take at most
+// half of the loop's time (the next one waits as long as this one ran), so requests keep being served at full rate.
+function loadSlice(e: Engine) {
+    if !e.ld.active { return }
+    let now = dbio.monotonicNanos()
+    if now < e.ldNextNs { return }
+    let tid = e.ld.tableId
+    let t = e.c.tables[tid]
+    if t.chunk < 0 || cat.isDropped(t) || e.snapBox.length == 0 {
+        // loaded in one step meanwhile (ensureLoaded finishes a load of its table) or dropped
+        e.ld = persist.idleLoader()
+        e.tm.lockEpoch += 1
+        return
+    }
+    let done = persist.loadStep(e.st, e.ld, LOAD_SLICE_NS)
+    let end = dbio.monotonicNanos()
+    e.ldNextNs = end + (end - now)
+    if !done { return }
+    t.chunk = -1
+    let t0 = dbio.monotonicNanos()
+    persist.loadFinish(e.st, e.c, t, e.ld)
+    print("neo-db: loaded table " + t.name + " (" + Text(t.nrows) + " rows, " + Text(e.ld.bytes / 1048576) + " MiB) in " +
+          Text(e.ld.steps) + " slices; install " + Text((dbio.monotonicNanos() - t0) / 1000) + " us; longest read " +
+          Text(e.ld.longestNs / 1000) + " us (job " + Text(e.ld.longestJob) + " at " + Text(e.ld.longestBytes / 1048576) + " MiB); longest check " + Text(e.ld.longestCrcNs / 1000) + " us")
+    e.ld = persist.idleLoader()
+    tableLoaded(e)
+    e.tm.lockEpoch += 1
+}
+
+// Statement path: true when every table in ids is loaded (small ones are loaded now); false when the statement
+// must wait for a sliced load (started here if none is running).
+function tablesReady(e: Engine, ids: List<Integer>): Boolean {
+    if e.snapBox.length == 0 { return true }
+    let ready = true
+    for tid in ids {
+        if tid < e.c.tables.length {
+            let t = e.c.tables[tid]
+            if t.chunk >= 0 && !cat.isDropped(t) {
+                if e.snapVersion != 3 || e.replaying || !e.opts.slicedLoads || unloadedRows(e, t) <= SYNC_LOAD_MAX_ROWS {
+                    ensureLoaded(e, tid, true)
+                } else {
+                    startLoad(e, t)
+                    ready = false
+                }
+            }
+        }
+    }
+    return ready
+}
+
+function waitForLoad(s: Session): Outcome {
+    let o = newOutcome()
+    o.status = STATUS_WOULD_BLOCK
+    o.txnStatus = txnStatus(s)
+    return o
 }
 
 // The persisted image of table tid (descriptor chunk read from the snapshot the first time).
@@ -512,10 +642,9 @@ function imageOf(e: Engine, tid: Integer, chunk: Integer): persist.TableImage {
 // from the image costs ~1.1-1.4 us more than from memory (about 11 preads) and loading costs ~34 ns per row
 // (10M rows in 0.34 s, box 2), so once the lookups' extra cost has paid for a load (faults * 32 >= rows), the
 // table is loaded; rarely used tables of idle tenants stay on disk. Total cost stays within 2x of the better choice.
-// The load is one synchronous step that stalls every session of the process, so only tables that load within a few
-// milliseconds (LOOKUP_LOAD_MAX_ROWS) are loaded this way; a 10M-row load put p99.9 at 135 ms in a fixed-rate test
-// (ops/run25/tail_restart.sh). Bigger tables keep paged lookups until loads are sliced.
-constant LOOKUP_LOAD_MAX_ROWS = 131072    // ~4.5 ms to load at 34 ns per row
+// A table that loads within a few milliseconds is loaded in one step; a bigger one gets a sliced load started and
+// keeps answering lookups from its image until that load is installed (one synchronous 10M-row load put p99.9 at
+// 135 ms in a fixed-rate test, ops/run25/tail_restart.sh).
 
 function pointLookup(e: Engine, st: pl.Stmt): Boolean {
     if st.kind != pl.SK_SELECT || st.tableIds.length != 1 || e.snapVersion != 3 { return false }
@@ -540,7 +669,10 @@ function pointLookup(e: Engine, st: pl.Stmt): Boolean {
     }
     if uses != 1 { return false }
     let rows = persist.pagedRows(t)
-    if rows <= LOOKUP_LOAD_MAX_ROWS && persist.faults(t) * 32 >= rows + 2048 { return false }
+    if persist.faults(t) * 32 >= rows + 2048 {
+        if rows <= SYNC_LOAD_MAX_ROWS || !e.opts.slicedLoads { return false }
+        startLoad(e, t)
+    }
     if !persist.pagedSetup(e.st, e.c, t, hid, imageOf(e, tid, t.chunk)) { return false }
     e.pointHits += 1
     return true
@@ -579,7 +711,6 @@ public function close(e: Engine) {
             e.snapBox = []
         }
         let end = wal.appendedLsn(w)
-        if e.ckptLsn == end { cat.saveSearchIndexes(e.c, end) }
         if wal.verifiedSnapshot(w) == end && e.ckptLsn == end {
             wal.closeAfterCheckpoint(w, end, 1)
         } else {
@@ -597,7 +728,7 @@ public function close(e: Engine) {
     e.c = c
     e.tm = txn.newTxnMgr()
     e.tm.catalog = [c]
-    e.env = ex.Env { cat: c; tm: e.tm; me: -1; nowMicros: 0; randState: 1; session: 0; tempCount: 0; notes: [] }
+    e.env = ex.Env { cat: c; tm: e.tm; me: -1; nowMicros: 0; randState: 1; session: 0; tempCount: 0; notes: []; settingNames: []; settingValues: [] }
     e.views = pl.newViewCache()
     e.cache = []
     e.cacheMap = hm.newIntMap(16)
@@ -610,6 +741,7 @@ public function close(e: Engine) {
 public function isClosed(e: Engine): Boolean { return e.closed }
 
 function runDdlText(e: Engine, sql: Text) {
+    if blockControl(e, sql) { return }
     let r = parser.parse(sql)
     if !r.ok { return }
     let s = e.sys
@@ -656,6 +788,8 @@ public function newSession(e: Engine, user: Text, database: Text): Session {
 
 public function closeSession(e: Engine, s: Session) {
     e.env.session = s.id
+    e.env.settingNames = s.settingNames
+    e.env.settingValues = s.settingValues
     // abort any open transaction (undoing its catalog changes) and close cursors
     rollbackSession(e, s)
     nt.dropSession(e.hub, s.id)
@@ -669,6 +803,8 @@ public function closeSession(e: Engine, s: Session) {
         }
         for nm in names {
             e.env.session = s.id
+            e.env.settingNames = s.settingNames
+            e.env.settingValues = s.settingValues
             let r = parser.parse("DROP TABLE " + quoteIdent(nm))
             if r.ok { runUtility(e, s, r.ast, r.ast.statements[0], r.ast.stmtText[0]) }
         }
@@ -721,11 +857,21 @@ function ensureTxn(e: Engine, s: Session): txn.Txn {
 }
 
 // Commit: append redo to the WAL; returns the LSN to wait for (0 if nothing to wait for).
+//
+// Early lock release (default; --lock-release durable turns it off): the row locks go as soon as the commit record
+// is in the WAL buffer, not when it is durable, so the next transaction on a hot row (a pgbench branch, a TPC-C
+// district) runs while this commit's fdatasync is in flight and both commits share one group flush. Safe because
+// nothing that saw this commit's rows can be acknowledged first: a writing transaction commits later in the same
+// WAL, so it is durable only after this one, and a reading transaction's end waits for visibleLsn (below). The
+// client of this commit is still answered only once its record is durable. What changes is that a transaction
+// may read a committed row before that commit is durable; if the server crashes then, the reader cannot have
+// committed either (it is rolled back with the lost commit).
 function commitTxn(e: Engine, s: Session, tx: txn.Txn): Integer {
     s.txSlot = -1
     if tx.redo.length <= 1 && tx.uCount == 0 {
         nt.commitNotes(e.hub, s.id, 0, 0)
         txn.finishEmpty(e.tm, tx)
+        if e.visibleLsn > e.durable { return e.visibleLsn }
         return 0
     }
     if !e.hasWal || e.replaying {
@@ -744,9 +890,16 @@ function commitTxn(e: Engine, s: Session, tx: txn.Txn): Integer {
     } else {
         lsn = walAppend(e, tx.redo)
     }
+    e.nCommits += 1
+    if e.opts.earlyRelease {
+        nt.commit(e.hub, e.c, tx, s.id, lsn, e.durable)
+        e.nReleases += 1
+        txn.finishCommit(e.tm, e.c, tx)
+        e.visibleLsn = lsn
+        return lsn
+    }
     tx.state = txn.TX_COMMITTING
     tx.commitLsn = lsn
-    e.nCommits += 1
     e.committing.addInt64(tx.slot)
     nt.commit(e.hub, e.c, tx, s.id, lsn, e.durable)
     return lsn
@@ -774,37 +927,83 @@ function maybeSpill(e: Engine, s: Session, tx: txn.Txn) {
     tb.putVarint(tx.redo, s.xid)
 }
 
+constant REPL_MEMORY_MAX = 67108864    // unacknowledged frames kept in memory for the replica; older ones are reread
+
 // Every logical WAL record goes through here, so a synchronous replica receives exactly what recovery replays.
 // Frame: LSN after the record (int64), payload length (int32), payload; little-endian.
 function walAppend(e: Engine, rec: Bytes): Integer {
     let lsn = wal.append(e.walBox[0], rec)
     if e.replOn {
-        e.replOut.addInt64(lsn)
-        e.replOut.addInt32(rec.length)
-        e.replOut.addBytes(rec)
+        if e.replAttached {
+            e.replOut.addInt64(lsn)
+            e.replOut.addInt32(rec.length)
+            e.replOut.addBytes(rec)
+        }
         e.replUnacked.addInt64(lsn)
         e.replUnacked.addInt32(rec.length)
         e.replUnacked.addBytes(rec)
+        if e.replUnacked.length > REPL_MEMORY_MAX { spillReplication(e) }
     }
     return lsn
 }
 
+// The replica is far behind or away: frames that are durable here leave memory, and a resume reads them back from
+// the WAL files (replBase: memory starts after it).
+function spillReplication(e: Engine) {
+    let durable = wal.durableLsn(e.walBox[0])
+    let b = e.replUnacked
+    let pos = 0
+    let last = -1
+    while pos + 12 <= b.length && b.getInt64(pos) <= durable {
+        last = b.getInt64(pos)
+        pos += 12 + b.getInt32(pos + 8)
+    }
+    if last < 0 { return }
+    e.replUnacked = b.slice(pos, b.length)
+    if last > e.replBase { e.replBase = last }
+}
+
+// The replica's connection is gone: nothing is queued for it until it attaches again (replicationResume).
+public function replicationDetached(e: Engine) {
+    e.replAttached = false
+    e.replOut = Bytes()
+}
+
+// A commit is durable here and on the replica, or (while the replica is away) here and on the witness.
 function effectiveDurable(e: Engine, local: Integer): Integer {
-    if e.replOn && e.replAcked < local { return e.replAcked }
+    if !e.replOn { return local }
+    let other = e.replAcked
+    if e.witnessAcked > other { other = e.witnessAcked }
+    if other < local { return other }
     return local
 }
 
 // Synchronous replication (primary side). The replica must start from a copy of this data directory taken while
 // the server was stopped; from then on it receives every WAL record, and commits wait for its acknowledgement.
+// Records from before this start (recovered from the WAL) are not waited for, but a replica that lacks some of them
+// gets them from the WAL files when it attaches (replicationResume).
 public function enableReplication(e: Engine) {
     if !e.hasWal { return }
     e.replOn = true
     e.replAcked = wal.appendedLsn(e.walBox[0])
+    e.replBase = e.replAcked
 }
+
+// The frames to send now: only records that are durable here, so a replica never holds a record this server could
+// still lose in a crash (after a restart the same LSNs would carry other records). The rest wait in replOut.
 public function takeReplication(e: Engine): Bytes {
     let b = e.replOut
-    if b.length > 0 { e.replOut = Bytes() }
-    return b
+    if b.length == 0 { return b }
+    let durable = wal.durableLsn(e.walBox[0])
+    let pos = 0
+    while pos + 12 <= b.length && b.getInt64(pos) <= durable { pos += 12 + b.getInt32(pos + 8) }
+    if pos == 0 { return Bytes() }
+    if pos == b.length {
+        e.replOut = Bytes()
+        return b
+    }
+    e.replOut = b.slice(pos, b.length)
+    return b.slice(0, pos)
 }
 public function replicaAcknowledged(e: Engine, lsn: Integer) {
     if !e.replOn || lsn <= e.replAcked { return }
@@ -821,39 +1020,139 @@ function framesAfter(b: Bytes, lsn: Integer): Bytes {
     return b.slice(pos, b.length)
 }
 
-// A replica (re)connected and reports the last primary LSN it holds durably: everything after it, to send first.
-// It cannot report more than it was sent, so acknowledging up to it is safe.
+// A replica (re)connected and reports the last primary LSN it holds durably: everything after it that is durable
+// here, to send first (records from before this server started are read back from the WAL files). It was only ever
+// sent durable records of this history, so acknowledging up to it is safe. A replica that holds more than this WAL,
+// or needs records a checkpoint has removed, cannot continue: replicationRefusal says why (re-seed it).
 public function replicationResume(e: Engine, replicaLsn: Integer): Bytes {
+    e.replRefusal = ""
     if !e.replOn { return Bytes() }
-    e.replOut = Bytes()
-    if replicaLsn > e.replAcked { replicaAcknowledged(e, replicaLsn) }
-    return framesAfter(e.replUnacked, replicaLsn)
-}
-
-// Replica side: the primary LSN of the last intact record this directory holds (records are stored wrapped as
-// 'F' + LSN + record, so the torn-tail rule of the WAL reader makes this exact).
-public function lastReplicatedLsn(dataDir: Text): Integer {
-    let names = dbio.listDir(dataDir)
-    let r = wal.openReaderIn(dataDir, names, 0)
-    let last = 0
-    while wal.next(r) {
-        let b = wal.buffer(r)
-        let off = wal.payloadOffset(r)
-        if wal.payloadLength(r) > 9 && b[off] == 70 { last = b.getInt64(off + 1) }
+    let w = e.walBox[0]
+    if replicaLsn > wal.appendedLsn(w) {
+        e.replRefusal = "the replica holds WAL up to LSN " + Text(replicaLsn) + " but this database's ends at " +
+                        Text(wal.appendedLsn(w)) + ": it is not a copy of this database (re-seed it from a copy of the data directory)"
+        return Bytes()
     }
-    return last
+    let out = Bytes()
+    if replicaLsn < e.replBase {
+        let oldest = wal.oldestSegmentLsn(wal.dataDir(w))
+        if oldest < 0 || replicaLsn < oldest {
+            e.replRefusal = "the replica needs WAL after LSN " + Text(replicaLsn) + ", which a checkpoint here has removed " +
+                            "(re-seed it from a copy of the data directory)"
+            return Bytes()
+        }
+        let r = wal.openReader(wal.dataDir(w), replicaLsn)
+        let last = replicaLsn
+        while last < e.replBase && wal.next(r) {
+            last = wal.endLsn(r)
+            out.addInt64(last)
+            out.addInt32(wal.payloadLength(r))
+            out.addBytes(wal.payload(r))
+        }
+        if last != e.replBase {
+            e.replRefusal = "the WAL here ends at LSN " + Text(last) + " before " + Text(e.replBase) + " (" + wal.stopReason(r) + ")"
+            return Bytes()
+        }
+    }
+    if replicaLsn > e.replAcked { replicaAcknowledged(e, replicaLsn) }
+    e.replOut = framesAfter(e.replUnacked, replicaLsn)
+    e.replAttached = true
+    out.addBytes(takeReplication(e))
+    return out
+}
+public function replicationRefusal(e: Engine): Text { return e.replRefusal }
+
+// The WAL LSN durable on this server's own disk (what a primary asks the witness to store while its replica is away).
+public function localDurableLsn(e: Engine): Integer {
+    if !e.hasWal { return 0 }
+    return wal.durableLsn(e.walBox[0])
 }
 
-// Replica side: store a record received from the primary in this WAL (not applied; recovery applies it when
-// the replica is started as a normal server), and make everything received durable.
+// The witness stored lsn: commits up to it are durable on two of the three nodes.
+public function witnessAcknowledged(e: Engine, lsn: Integer) {
+    if !e.replOn || lsn <= e.witnessAcked { return }
+    e.witnessAcked = lsn
+    releaseDurable(e, effectiveDurable(e, wal.durableLsn(e.walBox[0])))
+}
+
+// Replica side: the primary LSN of the last record this directory holds (recovery takes it from the newest 'F'
+// record, or from the checkpoint when the WAL after it holds none), so a reconnecting primary resends exactly what
+// follows it.
+public function replicatedLsn(e: Engine): Integer { return e.replPrimary }
+
+// Replica side: store a record received from the primary in this WAL as 'F' + the primary's LSN + the record. The
+// receiver makes a batch durable (syncReplicated), acknowledges it, then applies it (applyReplicated).
 public function storeReplicated(e: Engine, primaryLsn: Integer, payload: Bytes) {
     let rec = Bytes()
     rec.add(70)
     rec.addInt64(primaryLsn)
     rec.addBytes(payload)
     wal.append(e.walBox[0], rec)
+    e.replPrimary = primaryLsn
+}
+
+// Replica side (follower apply): apply a stored record to the in-memory state as recovery would, maintaining the
+// indexes, so the replica can checkpoint (bounded WAL) and a promotion replays only what follows its last
+// checkpoint. Records arrive in the primary's commit order; a spilled transaction's 'P' records are buffered until
+// its 'E' record (checkpoints wait meanwhile, see checkpointBlocked).
+public function applyReplicated(e: Engine, payload: Bytes) {
+    if payload.length == 0 { return }
+    e.replaying = true
+    let kind = payload[0]
+    if kind == 67 {
+        applyOpsIndexed(e, payload, 1, payload.length)
+    } else if kind == 80 || kind == 69 {
+        let cur = tb.Cursor { pos: 1 }
+        let xid = tb.getVarint(payload, cur)
+        let idx = hm.get(e.replPartials, xid, -1)
+        if idx < 0 {
+            e.replPartialBufs.add(Bytes())
+            idx = e.replPartialBufs.length - 1
+            hm.put(e.replPartials, xid, idx)
+            e.replPending += 1
+        }
+        let pb = e.replPartialBufs[idx]
+        pb.addBytes(payload.slice(cur.pos, payload.length))
+        if kind == 69 {
+            applyOpsIndexed(e, pb, 0, pb.length)
+            e.replPartialBufs[idx] = Bytes()
+            hm.remove(e.replPartials, xid)
+            e.replPending -= 1
+        }
+    }
+    e.replaying = false
+}
+
+// Like applyOps (recovery), but every row change also updates the table's indexes, so the in-memory state is a
+// complete database at every record boundary.
+function applyOpsIndexed(e: Engine, b: Bytes, start: Integer, end: Integer) {
+    let pos = start
+    while pos < end {
+        let ddl: List<Text> = []
+        let at: List<Integer> = []
+        let need: List<Integer> = []
+        let np = dml.replayOpsIndexed(e.c, b, pos, end, ddl, at, need)
+        if need.length > 0 {
+            ensureLoaded(e, need[0], true)
+            pos = np
+        } else if ddl.length > 0 {
+            runDdlText(e, ddl[0])
+            pos = at[0]
+        } else {
+            pos = np
+            if np >= end { break }
+        }
+    }
 }
 public function syncReplicated(e: Engine) { if e.hasWal { wal.syncNow(e.walBox[0]) } }
+
+// Replica side, on promotion: spilled transactions still waiting for their 'E' record never committed (their
+// primary is gone); drop them so the closing checkpoint can run.
+public function abandonReplicatedPartials(e: Engine) {
+    e.replPartials = hm.newIntMap(16)
+    e.replPartialBufs = []
+    e.replPending = 0
+}
 
 function rollbackSession(e: Engine, s: Session) {
     if s.txSlot >= 0 {
@@ -867,7 +1166,9 @@ function rollbackSession(e: Engine, s: Session) {
     dropSavepoints(e, s)
     s.spReadOnly.clear()
     cursorsAtEnd(s, false)
+    let ddl = s.ddlUndo.length > 0
     undoDdl(e, s, -1)
+    if ddl && !e.replaying { logDdlAuto(e, BLOCK_END + Text(s.id)) }
 }
 
 // Transaction end: non-holdable cursors close; on rollback, holdable ones declared in it close too.
@@ -961,6 +1262,7 @@ public function durableLsn(e: Engine): Integer {
 }
 
 public function afterLoopIteration(e: Engine) {
+    if e.ld.active { loadSlice(e) }
     if !e.hasWal { return }
     if e.ck.active || e.pubPhase > 0 { ckptStep(e, 1000000) }
     if wal.appendedLsn(e.walBox[0]) > wal.writtenLsn(e.walBox[0]) || e.committing.length > 0 {
@@ -988,8 +1290,67 @@ public function lockEpoch(e: Engine): Integer {
     return e.tm.lockEpoch
 }
 
+// ---- preemptible searches (C2, docs/r2/search.md): the server's yield hook runs other sessions' short statements
+// while a long read-only search is suspended between chunks.
+
+// Install the server's nested pass (called at most every budgetNs of a statement's run time).
+public function setYieldHook(e: Engine, hook: () -> Boolean, budgetNs: Integer) { si.setYieldHook(hook, budgetNs) }
+
+// Saved state of the suspended statement around a nested pass.
+public record Suspended {
+    me: Integer
+    nowMicros: Integer
+    session: Integer
+    tempCount: Integer
+}
+
+// A nested pass starts: the running statement reads row versions as of its start from now on; nested statements must
+// not disturb its execution environment.
+public function nestedBegin(e: Engine): Suspended {
+    ex.markPreempted()
+    if !txn.retaining(e.tm) { txn.retainOn(e.tm, e.c) }
+    return Suspended { me: e.env.me; nowMicros: e.env.nowMicros; session: e.env.session; tempCount: e.env.tempCount }
+}
+
+public function nestedEnd(e: Engine, sv: Suspended) {
+    e.env.me = sv.me
+    e.env.nowMicros = sv.nowMicros
+    e.env.session = sv.session
+    e.env.tempCount = sv.tempCount
+}
+
+// Make commits of a nested pass durable without blocking: the WAL writer syncs, held acknowledgements follow.
+public function requestSync(e: Engine) {
+    if e.hasWal && (wal.appendedLsn(e.walBox[0]) > wal.writtenLsn(e.walBox[0]) || e.committing.length > 0) {
+        wal.requestSync(e.walBox[0])
+    }
+}
+
+// The statement that yielded has ended: unpin its indexes, drop the row versions, retry parked statements.
+function endPreemption(e: Engine) {
+    if si.anyPinned() || txn.retaining(e.tm) {
+        si.statementEnd()
+        txn.retainOff(e.tm)
+        e.tm.lockEpoch += 1
+    } else {
+        si.statementEnd()
+    }
+}
+
+public function yieldCount(e: Engine): Integer { return si.yieldCount() }
+
+// Did the last statement wait because another statement is suspended at a yield point (not for a row lock)? The server
+// stops offering such a connection to nested passes (its statements are searches that would wait again).
+global NESTED_BLOCKED: List<Boolean> = [false]
+public function takeNestedBlocked(e: Engine): Boolean {
+    let b = NESTED_BLOCKED[0]
+    NESTED_BLOCKED[0] = false
+    return b
+}
+
 public function tick(e: Engine) {
     e.ticks += 1
+    if e.ld.active { loadSlice(e) }
     if e.ticks - e.lastStatTick >= 50 && e.stmtCount != e.statStmts {
         print("neo-db stats: stmts " + Text(e.stmtCount - e.statStmts) + " commits " + Text(e.nCommits) + " blocks " + Text(e.nBlocks) + " syncWakes " + Text(e.nSyncWakes) + " released " + Text(e.nReleases) + walDiag(e))
         e.lastStatTick = e.ticks
@@ -1041,6 +1402,8 @@ public function simpleQuery(e: Engine, s: Session, sql: Text): List<Outcome> {
     let outs: List<Outcome> = []
     s.remaining = ""
     e.env.session = s.id
+    e.env.settingNames = s.settingNames
+    e.env.settingValues = s.settingValues
     let sqlBytes = Bytes(sql)
     // skeleton cache (probe statements are never cached, so a hit skips the probe check)
     let sk = e.sk
@@ -1245,6 +1608,80 @@ function runEntry(e: Engine, s: Session, ce: CacheEntry, sql: Text, cached: Bool
     return ok
 }
 
+public function hasSearchIndexes(e: Engine): Boolean { return e.c.searchIdx.length > 0 }
+
+public function searchesAhead(): Integer { return si.searchesAhead() }
+
+// Loop passes with several searches waiting (lane parranges, C12): for every SQL text whose plan is already cached and
+// is a search top k (ORDER BY tin.score(...) DESC LIMIT k without a residual filter), compute the main-chunk top k of
+// all of them in one dispatch over every core. The statements then run as usual and find their results waiting; the
+// engine stays single-threaded (workers only read immutable segments and the live bitmap during the dispatch).
+// Returns, per text, whether its search was computed ahead.
+public function prefetchSearches(e: Engine, sessions: List<Session>, sqls: List<Text>): List<Boolean> {
+    let done: List<Boolean> = []
+    let ixs: List<si.Index> = []
+    let ts: List<tb.Table> = []
+    let cps: List<si.Compiled> = []
+    let ks: List<Integer> = []
+    let i = 0
+    while i < sqls.length {
+        let before = cps.length
+        let s = sessions[i]
+        e.env.session = s.id
+        let sk = e.sk
+        skel.scan(Bytes(sqls[i]), sk)
+        if e.env.tempCount == 0 && sk.ok && !s.failed {
+            let idx = hm.get(e.cacheMap, v.hashBytes(sk.key, 0, sk.key.length), -1)
+            if idx >= 0 {
+                let ce = e.cache[idx]
+                if ce.version == e.c.version && ce.stmts.length == 1 && !ce.utility[0] && v.equalBytes(ce.key, 0, ce.key.length, sk.key, 0, sk.key.length) && pinsMatch(ce, sk) {
+                    let st = ce.stmts[0]
+                    if st.kind == pl.SK_SELECT && !st.err && st.catVersion == e.c.version {
+                        let ords = ce.litOrd[0]
+                        let vals = ce.litVals[0]
+                        let j = 0
+                        while j < ords.length {
+                            vals[j] = sk.vals[ords[j]]
+                            j += 1
+                        }
+                        dml.bindLiterals(st, sk.kinds, vals)
+                        st.p.env = e.env
+                        ex.searchPrefetch(st.p, ixs, ts, cps, ks)
+                    }
+                }
+            }
+        }
+        done.add(cps.length > before)
+        i += 1
+    }
+    // one dispatch per index (usually one)
+    let used: List<Boolean> = []
+    i = 0
+    while i < cps.length {
+        used.add(false)
+        i += 1
+    }
+    i = 0
+    while i < cps.length {
+        if !used[i] {
+            let group: List<si.Compiled> = []
+            let gk: List<Integer> = []
+            let j = i
+            while j < cps.length {
+                if !used[j] && ixs[j].id == ixs[i].id && ts[j].id == ts[i].id {
+                    used[j] = true
+                    group.add(cps[j])
+                    gk.add(ks[j])
+                }
+                j += 1
+            }
+            si.prefetchTopK(ixs[i], ts[i], group, gk)
+        }
+        i += 1
+    }
+    return done
+}
+
 public function simpleQueryRemaining(e: Engine, s: Session): Text {
     return s.remaining
 }
@@ -1265,15 +1702,16 @@ function drainNotes(e: Engine, s: Session, o: Outcome) {
 }
 
 function runPlanned(e: Engine, s: Session, st: pl.Stmt, formats: List<Integer>, cols: List<Column>): Outcome {
+    // an aborted transaction block refuses the statement before its planning errors (Postgres checks before analysis)
+    if s.failed {
+        return errOut(s, "25P02", "current transaction is aborted, commands ignored until end of transaction block", 0)
+    }
     if st.err {
         let o = errOut(s, st.errCode, st.errMsg, st.errPos + 1)
         if st.errPos < 0 { o.position = 0 }
         failStatement(e, s)
         o.txnStatus = txnStatus(s)
         return o
-    }
-    if s.failed {
-        return errOut(s, "25P02", "current transaction is aborted, commands ignored until end of transaction block", 0)
     }
     if s.inBlock { s.txSnap = true }
     if st.kind != pl.SK_SELECT && st.tableId >= 0 && readOnlyNow(s) && !pl.isTempName(e.c.tables[st.tableId].name) {
@@ -1282,6 +1720,16 @@ function runPlanned(e: Engine, s: Session, st: pl.Stmt, formats: List<Integer>, 
         if st.kind == pl.SK_DELETE { what = "DELETE" }
         let o = readOnlyError(s, what)
         failStatement(e, s)
+        o.txnStatus = txnStatus(s)
+        return o
+    }
+    // inside a nested pass (another statement is suspended at a yield point): searches wait until it ends, since the
+    // suspended statement holds its index as it was (they are parked and retried when the lock epoch moves)
+    let nestedNow = si.yieldState().nested
+    if nestedNow && st.p.searches.length > 0 {
+        NESTED_BLOCKED[0] = true
+        let o = newOutcome()
+        o.status = STATUS_WOULD_BLOCK
         o.txnStatus = txnStatus(s)
         return o
     }
@@ -1296,7 +1744,7 @@ function runPlanned(e: Engine, s: Session, st: pl.Stmt, formats: List<Integer>, 
         }
         s.waitSlot = -1
     }
-    if e.snapBox.length > 0 && !pointLookup(e, st) { ensureTables(e, st.tableIds) }
+    if e.snapBox.length > 0 && !pointLookup(e, st) && !tablesReady(e, st.tableIds) { return waitForLoad(s) }
     e.stmtCount += 1
     let tx = ensureTxn(e, s)
     // serializable: global serial-execution lock
@@ -1320,6 +1768,9 @@ function runPlanned(e: Engine, s: Session, st: pl.Stmt, formats: List<Integer>, 
     for cn in st.constChecks {
         if !p.err { ex.ev(p, cn) }
     }
+    // a read-only search outside a transaction block may yield to short statements of other sessions (C2)
+    ex.runningPush(p)
+    if !nestedNow { si.statementStart(k == pl.SK_SELECT && !s.inBlock && p.searches.length > 0 && st.tableIds.length == 1) }
     if p.err {
     } else if k == pl.SK_SELECT {
         dml.runSelect(st, formats, run)
@@ -1330,10 +1781,17 @@ function runPlanned(e: Engine, s: Session, st: pl.Stmt, formats: List<Integer>, 
     } else if k == pl.SK_DELETE {
         dml.runDelete(st, e.c, tm, tx, formats, run)
     }
+    ex.runningPop()
+    if !nestedNow { endPreemption(e) }
     if e.c.nLiveFks > 0 && k != pl.SK_SELECT && !p.err && p.blockedBy < 0 && tx.uCount > saveU {
         let topT = -1
         if k == pl.SK_UPDATE { topT = st.tableId }
         fkm.afterStatement(e.c, tm, tx, p, saveU, topT, st.setCols)
+    }
+    if e.c.annFailure.failed {
+        // a row an extension index refused (hnsw: sparsevec with too many elements): the statement fails
+        let f = cat.takeAnnFailure(e.c)
+        if !p.err { ex.raise(p, f.code, f.message) }
     }
     if p.err || p.blockedBy >= 0 {
         txn.rollbackTo(tm, e.c, tx, saveU)
@@ -1433,6 +1891,8 @@ function failStatement(e: Engine, s: Session) {
 // and every execution rebinds its parameters, as with the simple-protocol skeleton cache.
 public function prepare(e: Engine, s: Session, sql: Text, paramTypes: List<Integer>): Prepared {
     e.env.session = s.id
+    e.env.settingNames = s.settingNames
+    e.env.settingValues = s.settingValues
     let sqlBytes = Bytes(sql)
     // temp tables shadow permanent ones per session, so plans are session-specific while any exist
     if e.env.tempCount > 0 { return prepareNew(e, s, sql, sqlBytes, paramTypes) }
@@ -1524,6 +1984,8 @@ public function setPreparedMemo(p: Prepared, b: Bytes) { p.memo = b }
 public function execute(e: Engine, s: Session, p: Prepared, params: List<Bytes>, paramNulls: List<Boolean>,
                         paramFormats: List<Integer>, resultFormats: List<Integer>): Outcome {
     e.env.session = s.id
+    e.env.settingNames = s.settingNames
+    e.env.settingValues = s.settingValues
     if p.err.status == STATUS_ERROR { return p.err }
     if p.utility {
         if p.root == -1 { return okTag(s, "") }
@@ -1640,12 +2102,111 @@ function logDdlAuto(e: Engine, sqlIn: Text) {
     let b = Bytes(sql)
     tb.putVarint(rec, b.length)
     rec.addBytes(b)
-    walAppend(e, rec)
+    e.lastDdlLsn = walAppend(e, rec)
 }
 
 function pushUndo(e: Engine, s: Session, kind: Integer, tid: Integer, name: Text) {
+    pushUndoAt(e, s, kind, tid, name, -1)
+}
+
+function pushUndoAt(e: Engine, s: Session, kind: Integer, tid: Integer, name: Text, pos: Integer) {
     if !s.inBlock || e.replaying { return }
-    s.ddlUndo.add(DdlUndo { kind: kind; tid: tid; name: name; depth: s.savepointUndo.length / 8 })
+    let depth = s.savepointUndo.length / 8
+    s.ddlUndo.add(DdlUndo { kind: kind; tid: tid; name: name; depth: depth; pos: pos })
+    // the block's DDL is logged as it runs; its undo entry goes to the WAL (and the snapshot DDL history) first,
+    // before the change, so recovery can roll back a block that never reached COMMIT (undoing a change that never
+    // reached the WAL does nothing)
+    logDdlAuto(e, BLOCK_UNDO + Text(s.id) + " kind=" + Text(kind) + " tid=" + Text(tid) + " pos=" + Text(pos) + " depth=" + Text(depth) + " name=" + name)
+}
+
+// Control lines in the DDL history (WAL DDL records and snapshot catalogs; SQL comments to the parser): a
+// transaction block's undo entry, the end of the block (committed or rolled back), and a rollback to a savepoint.
+constant BLOCK_UNDO = "--neo block-undo sid="
+constant BLOCK_END = "--neo block-end sid="
+constant BLOCK_KEEP = "--neo block-keep sid="
+constant BLOCK_RELEASE = "--neo block-release sid="
+
+// Recovery: track a control line; false for ordinary DDL.
+function blockControl(e: Engine, sql: Text): Boolean {
+    let at = sql.find("--neo block-")
+    if at < 0 { return false }
+    let line = sql.slice(at, sql.length)
+    let sid = fieldInt(line, "sid=")
+    let k = 0
+    while k < e.pendSessions.length && e.pendSessions[k] != sid { k += 1 }
+    if line.find(BLOCK_UNDO) == 0 {
+        if k == e.pendSessions.length {
+            e.pendSessions.add(sid)
+            e.pendUndo.add([])
+        }
+        let n = line.find(" name=")
+        e.pendUndo[k].add(DdlUndo { kind: fieldInt(line, "kind="); tid: fieldInt(line, "tid="); name: line.slice(n + 6, line.length)
+                                    depth: fieldInt(line, "depth="); pos: fieldInt(line, "pos=") })
+    } else if k < e.pendSessions.length {
+        if line.find(BLOCK_KEEP) == 0 {
+            let keep = fieldInt(line, "depth=")
+            let kept: List<DdlUndo> = []
+            for u in e.pendUndo[k] {
+                if u.depth <= keep { kept.add(u) }
+            }
+            e.pendUndo[k] = kept
+        } else if line.find(BLOCK_RELEASE) == 0 {
+            let to = fieldInt(line, "depth=")
+            for u in e.pendUndo[k] {
+                if u.depth > to { u.depth = to }
+            }
+        } else {
+            let ss: List<Integer> = []
+            let us: List<List<DdlUndo>> = []
+            let j = 0
+            while j < e.pendSessions.length {
+                if j != k {
+                    ss.add(e.pendSessions[j])
+                    us.add(e.pendUndo[j])
+                }
+                j += 1
+            }
+            e.pendSessions = ss
+            e.pendUndo = us
+        }
+    }
+    return true
+}
+
+// The integer after `key` in a control line (-1 when absent).
+function fieldInt(line: Text, key: Text): Integer {
+    let at = line.find(key)
+    if at < 0 { return -1 }
+    let b = Bytes(line)
+    let i = at + Bytes(key).length
+    let neg = false
+    if i < b.length && b[i] == 45 {
+        neg = true
+        i += 1
+    }
+    let n = 0
+    while i < b.length && b[i] >= 48 && b[i] <= 57 {
+        n = n * 10 + (b[i] - 48)
+        i += 1
+    }
+    if neg { return -n }
+    return n
+}
+
+// End of recovery: transaction blocks that logged DDL but never committed or rolled back (the server stopped
+// inside them) are rolled back now, the way ROLLBACK does it, and their end is logged.
+function rollBackOpenBlocks(e: Engine) {
+    let k = 0
+    while k < e.pendSessions.length {
+        let saved = e.sys.ddlUndo
+        e.sys.ddlUndo = e.pendUndo[k]
+        undoDdl(e, e.sys, -1)
+        e.sys.ddlUndo = saved
+        logDdlAuto(e, BLOCK_END + Text(e.pendSessions[k]))
+        k += 1
+    }
+    e.pendSessions = []
+    e.pendUndo = []
 }
 
 // Undo catalog changes made after savepoint level `keep` (all of them for keep = -1), newest first.
@@ -1672,7 +2233,7 @@ function undoDdl(e: Engine, s: Session, keep: Integer) {
                 cat.dropTable(e.c, u.tid)
             }
         } else if u.kind == UNDO_DROPPED {
-            if u.tid < e.c.tables.length && !cat.isDropped(e.c.tables[u.tid]) {
+            if u.tid < e.c.tables.length && !cat.isDropped(e.c.tables[u.tid]) && e.c.tables[u.tid].name != u.name {
                 let t = e.c.tables[u.tid]
                 logDdlAuto(e, "ALTER TABLE " + quoteIdent(t.name) + " RENAME TO " + quoteIdent(u.name))
                 t.name = u.name
@@ -1680,15 +2241,86 @@ function undoDdl(e: Engine, s: Session, keep: Integer) {
             }
         } else if u.kind == UNDO_INDEX {
             if dropIndex(e, u.name) { logDdlAuto(e, "DROP INDEX " + quoteIdent(u.name)) }
+        } else if u.kind == UNDO_INDEX_DROPPED {
+            let hidden = cat.DROPPED_INDEX + Text(u.tid)
+            if cat.indexNameExists(e.c, hidden) {
+                logDdlAuto(e, "ALTER INDEX " + quoteIdent(hidden) + " RENAME TO " + quoteIdent(u.name))
+                renameIndex(e, hidden, u.name)
+            }
+        } else if u.kind == UNDO_INDEX_RENAMED {
+            let nl = u.name.find("\n")
+            let from = u.name.slice(0, nl)
+            let to = u.name.slice(nl + 1, u.name.length)
+            if cat.indexNameExists(e.c, to) && !cat.indexNameExists(e.c, from) {
+                logDdlAuto(e, "ALTER INDEX " + quoteIdent(to) + " RENAME TO " + quoteIdent(from))
+                renameIndex(e, to, from)
+            }
+        } else if u.kind == UNDO_EXT_CREATED {
+            let at = installedAt(e, u.tid)
+            if at >= 0 {
+                removeInstalled(e, at)
+                logDdlAuto(e, "DROP EXTENSION " + quoteIdent(ext.extension(u.tid).name))
+            }
+        } else if u.kind == UNDO_EXT_DROPPED {
+            if installedAt(e, u.tid) < 0 {
+                let pos = u.pos
+                if pos > e.c.extensions.length { pos = e.c.extensions.length }
+                let xs: List<Integer> = []
+                let vs: List<Text> = []
+                let i = 0
+                while i <= e.c.extensions.length {
+                    if i == pos {
+                        xs.add(u.tid)
+                        vs.add(u.name)
+                    }
+                    if i < e.c.extensions.length {
+                        xs.add(e.c.extensions[i])
+                        vs.add(e.c.extensionVersions[i])
+                    }
+                    i += 1
+                }
+                e.c.extensions = xs
+                e.c.extensionVersions = vs
+                logDdlAuto(e, "CREATE EXTENSION " + quoteIdent(ext.extension(u.tid).name) + " VERSION " + pgc.sqlLiteral(u.name))
+            }
+        } else if u.kind == UNDO_EXT_ALTERED {
+            let at = installedAt(e, u.tid)
+            if at >= 0 {
+                e.c.extensionVersions[at] = u.name
+                logDdlAuto(e, "ALTER EXTENSION " + quoteIdent(ext.extension(u.tid).name) + " UPDATE TO " + pgc.sqlLiteral(u.name))
+            }
         }
     }
     e.c.version += 1
+}
+
+// Uninstall the extension at position `at` of the installed list.
+function removeInstalled(e: Engine, at: Integer) {
+    let xs: List<Integer> = []
+    let vs: List<Text> = []
+    let i = 0
+    while i < e.c.extensions.length {
+        if i != at {
+            xs.add(e.c.extensions[i])
+            vs.add(e.c.extensionVersions[i])
+        }
+        i += 1
+    }
+    e.c.extensions = xs
+    e.c.extensionVersions = vs
 }
 
 // COMMIT: tables dropped in the block are dropped for good (logged with the commit record).
 function commitDdl(e: Engine, s: Session) {
     if s.ddlUndo.length == 0 { return }
     let tx = ensureTxn(e, s)
+    // the block's end travels in its commit record: recovery keeps the block's DDL exactly when its rows commit
+    let end = BLOCK_END + Text(s.id)
+    e.c.ddlLog.add(end)
+    tx.redo.add(dml.R_DDL)
+    let eb = Bytes(end)
+    tb.putVarint(tx.redo, eb.length)
+    tx.redo.addBytes(eb)
     for u in s.ddlUndo {
         if u.kind == UNDO_DROPPED && u.tid < e.c.tables.length && !cat.isDropped(e.c.tables[u.tid]) {
             let t = e.c.tables[u.tid]
@@ -1701,6 +2333,14 @@ function commitDdl(e: Engine, s: Session) {
             // rows this transaction touched are released after the commit is durable: keep the (hidden)
             // table object until restart in that case
             if t.lockedCount == 0 { cat.dropTable(e.c, u.tid) }
+        }
+        if u.kind == UNDO_INDEX_DROPPED && dropIndex(e, cat.DROPPED_INDEX + Text(u.tid)) {
+            let sql = "DROP INDEX " + quoteIdent(cat.DROPPED_INDEX + Text(u.tid))
+            e.c.ddlLog.add(sql)
+            tx.redo.add(dml.R_DDL)
+            let b = Bytes(sql)
+            tb.putVarint(tx.redo, b.length)
+            tx.redo.addBytes(b)
         }
     }
     s.ddlUndo = []
@@ -1750,9 +2390,11 @@ function createExtension(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: 
     }
     let x = ext.extension(xi)
     let version = extOption(a, root, "version")
-    if version != "" && version != x.version {
+    // replaying the DDL history may reinstall an older version (a rolled-back DROP EXTENSION logs one)
+    if version != "" && version != x.version && !e.replaying {
         return errOut(s, "22023", "extension \"" + name + "\" has no installation script nor update path for version \"" + version + "\"", 0)
     }
+    if version == "" { version = x.version }
     if installedAt(e, xi) >= 0 {
         if (nd.flags & ast.F_IF_NOT_EXISTS) != 0 {
             let o = okTag(s, "CREATE EXTENSION")
@@ -1762,8 +2404,29 @@ function createExtension(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: 
         return errOut(s, "42710", "extension \"" + name + "\" already exists", 0)
     }
     e.c.extensions.add(xi)
-    e.c.extensionVersions.add(x.version)
+    e.c.extensionVersions.add(version)
+    pushUndo(e, s, UNDO_EXT_CREATED, xi, "")
     return ddlDone(e, s, "CREATE EXTENSION", sql)
+}
+
+// ALTER INDEX [IF EXISTS] name RENAME TO new (every structure of the index: hash, ordered, extension).
+function alterIndex(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let name = nd.text
+    let to = a.nodes[ast.child(a, root, 0)].text
+    if !cat.indexNameExists(e.c, name) {
+        if (nd.flags & ast.F_IF_EXISTS) != 0 {
+            let o = okTag(s, "ALTER INDEX")
+            o.notices.add("relation \"" + name + "\" does not exist, skipping")
+            return o
+        }
+        return errOut(s, "42P01", "relation \"" + name + "\" does not exist", 0)
+    }
+    if cat.indexNameExists(e.c, to) && !e.replaying { return errOut(s, "42P07", "relation \"" + to + "\" already exists", 0) }
+    renameIndex(e, name, to)
+    e.c.version += 1
+    pushUndo(e, s, UNDO_INDEX_RENAMED, -1, name + "\n" + to)
+    return ddlDone(e, s, "ALTER INDEX", sql)
 }
 
 function alterExtension(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
@@ -1782,9 +2445,10 @@ function alterExtension(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: T
         o.notices.add("version \"" + installed + "\" of extension \"" + name + "\" is already installed")
         return o
     }
-    if target != x.version {
+    if target != x.version && !e.replaying {
         return errOut(s, "22023", "extension \"" + name + "\" has no update path from version \"" + installed + "\" to version \"" + target + "\"", 0)
     }
+    pushUndo(e, s, UNDO_EXT_ALTERED, xi, installed)
     e.c.extensionVersions[at] = target
     return ddlDone(e, s, "ALTER EXTENSION", sql)
 }
@@ -1827,6 +2491,10 @@ function dropExtensions(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: T
         }
     }
     if drop.length == 0 { return o }
+    for d in drop {
+        let at = installedAt(e, d)
+        pushUndoAt(e, s, UNDO_EXT_DROPPED, d, e.c.extensionVersions[at], at)
+    }
     let keep: List<Integer> = []
     let keepVersions: List<Text> = []
     let i = 0
@@ -1875,6 +2543,25 @@ function settingValue(s: Session, name: Text): Text {
     return pl.settingDefault(name)
 }
 
+// "" or the error for SET <name> = value when name is an index method's search setting (hnsw.ef_search).
+function checkMethodSetting(e: Engine, name: Text, value: Text): Text {
+    let i = 0
+    while i < ext.methodCount() {
+        let m = ext.method(i)
+        if m.effortSetting == name && ext.findMethod(e.c.extensions, m.name) >= 0 {
+            let q = v.newParsed()
+            let b = Bytes(value)
+            v.parseInt(b, 0, b.length, q, -2147483648, 2147483647)
+            if !q.ok { return "invalid value for parameter \"" + name + "\": \"" + value + "\"" }
+            if q.i < m.effortMin || q.i > m.effortMax {
+                return Text(q.i) + " is outside the valid range for parameter \"" + name + "\" (" + Text(m.effortMin) + " .. " + Text(m.effortMax) + ")"
+            }
+        }
+        i += 1
+    }
+    return ""
+}
+
 function setSetting(s: Session, name: Text, value: Text) {
     if !s.ownSettings {
         s.settingNames = []
@@ -1919,9 +2606,19 @@ function runUtility(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text)
 function runUtilityInner(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
     let nd = a.nodes[root]
     let k = nd.kind
+    if si.yieldState().nested && k != ast.K_TRANSACTION && k != ast.K_SET && k != ast.K_SET_TRANSACTION && k != ast.K_SHOW &&
+       k != ast.K_RESET && k != ast.K_DEALLOCATE && k != ast.K_PREPARE && k != ast.K_EXECUTE && k != ast.K_LISTEN && k != ast.K_NOTIFY {
+        // DDL, COPY, maintenance: wait until the statement suspended at a yield point ends
+        NESTED_BLOCKED[0] = true
+        let o = newOutcome()
+        o.status = STATUS_WOULD_BLOCK
+        o.txnStatus = txnStatus(s)
+        return o
+    }
     e.stmtCount += 1
-    if e.snapBox.length > 0 && !e.replaying && (k == ast.K_COPY || k == ast.K_ALTER_TABLE || k == ast.K_CREATE_INDEX || k == ast.K_TRUNCATE) {
-        // these read or rewrite table data: decode any referenced table first (TRUNCATE just discards it)
+    if e.snapBox.length > 0 && (k == ast.K_COPY || k == ast.K_ALTER_TABLE || k == ast.K_CREATE_INDEX || k == ast.K_TRUNCATE) {
+        // these read or rewrite table data: decode any referenced table first (TRUNCATE just discards it). WAL replay
+        // too: a table image has the columns and indexes of its checkpoint, so DDL after it must apply to loaded data
         let refs: List<Integer> = []
         if k == ast.K_TRUNCATE {
             for ref in ast.items(a, ast.child(a, root, 0)) {
@@ -1951,6 +2648,7 @@ function runUtilityInner(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: 
         if k == ast.K_TRUNCATE { what = "TRUNCATE TABLE" }
         if k == ast.K_CREATE_EXTENSION { what = "CREATE EXTENSION" }
         if k == ast.K_ALTER_EXTENSION { what = "ALTER EXTENSION" }
+        if k == ast.K_ALTER_INDEX { what = "ALTER INDEX" }
         if k == ast.K_DROP {
             what = "DROP TABLE"
             if nd.op == ast.OBJ_VIEW { what = "DROP VIEW" }
@@ -1971,7 +2669,11 @@ function runUtilityInner(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: 
         if name == "default_transaction_read_only" {
             s.defaultReadOnly = value == "on" || value == "true" || value == "1" || value == "yes"
         }
+        let bad = checkMethodSetting(e, name, value)
+        if bad != "" { return errOut(s, "22023", bad, 0) }
         setSetting(s, name, value)
+        e.env.settingNames = s.settingNames
+        e.env.settingValues = s.settingValues
         return okTag(s, "SET")
     }
     if k == ast.K_SET_TRANSACTION {
@@ -2080,6 +2782,7 @@ function runUtilityInner(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: 
     if k == ast.K_CREATE_TABLE_AS { return createTableAs(e, s, a, root, sql) }
     if k == ast.K_CREATE_EXTENSION { return createExtension(e, s, a, root, sql) }
     if k == ast.K_ALTER_EXTENSION { return alterExtension(e, s, a, root, sql) }
+    if k == ast.K_ALTER_INDEX { return alterIndex(e, s, a, root, sql) }
     if k == ast.K_VACUUM { return okTag(s, "VACUUM") }
     if k == ast.K_ANALYZE { return okTag(s, "ANALYZE") }
     if k == ast.K_CHECKPOINT {
@@ -2346,15 +3049,21 @@ function runTxnControl(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcom
         let df = s.txDeferrable
         let tag = word
         let lsn = 0
+        // DDL in the block was logged as it ran (and ROLLBACK logs its undo): the reply waits until those
+        // records are durable too, or a crash could lose an acknowledged CREATE INDEX or revive a rolled-back one
+        let ddl = s.ddlUndo.length > 0
         if op == ast.TX_ROLLBACK || s.failed {
             rollbackSession(e, s)
             tag = "ROLLBACK"
+            if ddl { lsn = e.lastDdlLsn }
         } else {
+            if ddl { lsn = e.lastDdlLsn }
             commitDdl(e, s)
             s.inBlock = false
             if s.txSlot >= 0 {
                 let tx = e.tm.txns[s.txSlot]
-                lsn = commitTxn(e, s, tx)
+                let cl = commitTxn(e, s, tx)
+                if cl > lsn { lsn = cl }
             } else {
                 nt.commitNotes(e.hub, s.id, 0, 0)
             }
@@ -2420,10 +3129,13 @@ function runTxnControl(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcom
             s.savepointRedo.resize((idx + 1) * 8)
             s.spReadOnly.resize(idx + 1)
             cursorsAtSavepoint(s, idx, true)
+            let before = s.ddlUndo.length
             undoDdl(e, s, idx)
+            if s.ddlUndo.length < before && !e.replaying { logDdlAuto(e, BLOCK_KEEP + Text(s.id) + " depth=" + Text(idx)) }
             return okTag(s, "ROLLBACK")
         }
         cursorsAtSavepoint(s, idx, false)
+        if s.ddlUndo.length > 0 && !e.replaying { logDdlAuto(e, BLOCK_RELEASE + Text(s.id) + " depth=" + Text(idx)) }
         for u in s.ddlUndo {
             if u.depth > idx { u.depth = idx }
         }
@@ -2512,6 +3224,7 @@ function defaultFromAst(a: ast.Ast, c: tb.Column, id: Integer) {
         let name = a.nodes[id].text
         if name == "now" || name == "current_timestamp" || name == "localtimestamp" || name == "current_date" {
             c.defaultKind = 3
+            c.defaultText = name    // how pg_get_expr shows it: now() or CURRENT_TIMESTAMP, ...
             return
         }
         if name == "nextval" {
@@ -2538,6 +3251,8 @@ function createTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
     let t = tb.newTable(e.c.tables.length, internal)
     let pkCols: List<Integer> = []
     let uniques: List<List<Integer>> = []
+    let uniqueNames: List<Text> = []     // "" = the default <table>_<columns>_key
+    let pkName = ""
     let fkCons: List<Integer> = []
     let fkColLevel: List<Integer> = []
     let spec = ast.child(a, root, 3)
@@ -2570,7 +3285,6 @@ function createTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
             let tname = a.nodes[tn].text
             let ty = pl.typeInCatalog(e.c, tname)
             if ty < 0 { return errOut(s, "42704", "type \"" + tname + "\" does not exist", a.nodes[tn].position + 1) }
-            if a.nodes[tn].intValue > 0 { return errOut(s, "0A000", "array types are not supported", a.nodes[tn].position + 1) }
             let cn = a.nodes[el].text
             if tb.columnIndex(t, cn) >= 0 { return errOut(s, "42701", "column \"" + cn + "\" specified more than once", 0) }
             let ctm = typmodOf(a, tn, ty)
@@ -2581,10 +3295,28 @@ function createTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
             }
             let cty = ty
             if ty == v.T_NUMERIC { cty = v.numStorageType(ctm) }
+            if a.nodes[tn].intValue > 0 {
+                // an array column: the typmod (varchar(10)[], vector(3)[]) applies to its elements
+                cty = v.arrayOf(ty)
+                if cty == v.T_UNKNOWN { return errOut(s, "42704", "type \"" + tname + "[]\" does not exist", a.nodes[tn].position + 1) }
+            }
             let col = tb.newColumn(cn, cty, ctm, false)
             if tname == "serial" || tname == "bigserial" || tname == "smallserial" {
                 col.defaultKind = 2
                 col.notNull = true
+            }
+            let cm = ast.child(a, el, 2)
+            if cm >= 0 {
+                // COMPRESSION zstd: long values of a text column are stored compressed (per value, docs/r2/search.md)
+                let method = a.nodes[cm].text
+                if !v.isTextType(cty) || cty == v.T_NUMTEXT {
+                    return errOut(s, "0A000", "column data type " + tname + " does not support compression", a.nodes[cm].position + 1)
+                }
+                if method == "zstd" {
+                    col.compress = true
+                } else if method != "default" {
+                    return errOut(s, "0A000", "compression method \"" + method + "\" is not supported (neo-db: zstd or default)", a.nodes[cm].position + 1)
+                }
             }
             tb.addColumn(t, col)
             let ci = t.cols.length - 1
@@ -2595,7 +3327,11 @@ function createTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
                     pkCols = [ci]
                     col.notNull = true
                 }
-                if cop == ast.CONSTR_UNIQUE { uniques.add([ci]) }
+                if cop == ast.CONSTR_UNIQUE {
+                    uniques.add([ci])
+                    uniqueNames.add(a.nodes[con].text)
+                }
+                if cop == ast.CONSTR_PRIMARY_KEY { pkName = a.nodes[con].text }
                 if cop == ast.CONSTR_DEFAULT { defaultFromAst(a, col, ast.child(a, con, 0)) }
                 if cop == ast.CONSTR_IDENTITY {
                     col.defaultKind = 2
@@ -2621,8 +3357,10 @@ function createTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
                 }
                 if cop == ast.CONSTR_PRIMARY_KEY {
                     pkCols = cols
+                    pkName = a.nodes[el].text
                 } else {
                     uniques.add(cols)
+                    uniqueNames.add(a.nodes[el].text)
                 }
             }
         }
@@ -2657,14 +3395,21 @@ function createTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
     if pkCols.length > 0 {
         // multi-column keys also get an ordered index: lookups on a leading prefix (TPC-C) use a range on it
         let wantOrd = v.isTextType(t.cols[pkCols[0]].type) || pkCols.length > 1
-        cat.addIndex(e.c, t, name + "_pkey", pkCols, true, true, true, wantOrd)
-        e.c.conNames.add(name + "_pkey")
+        let pn = name + "_pkey"
+        if pkName != "" { pn = pkName }
+        cat.addIndex(e.c, t, pn, pkCols, true, true, true, wantOrd)
+        e.c.conNames.add(pn)
     }
-    for u in uniques {
+    let ui = 0
+    while ui < uniques.length {
+        let u = uniques[ui]
         let nm = name
         for ci in u { nm = nm + "_" + t.cols[ci].name }
-        cat.addIndex(e.c, t, nm + "_key", u, true, false, true, u.length > 1)
-        e.c.conNames.add(nm + "_key")
+        nm = nm + "_key"
+        if uniqueNames[ui] != "" { nm = uniqueNames[ui] }
+        cat.addIndex(e.c, t, nm, u, true, false, true, u.length > 1)
+        e.c.conNames.add(nm)
+        ui += 1
     }
     for fs in fks {
         let parent = t
@@ -2986,6 +3731,19 @@ function dropColumn(e: Engine, s: Session, t: tb.Table, name: Text, ifExists: Bo
             }
         }
     }
+    // expression indexes reading the column go with it (PG drops dependent indexes)
+    let dep = generatedUsing(t, name)
+    let di = dep.length - 1
+    while di >= 0 {
+        removeColumnAt(e, t, dep[di])
+        di -= 1
+    }
+    removeColumnAt(e, t, tb.columnIndex(t, name))
+    return okTag(s, "")
+}
+
+// Remove column ci of t, and every index that uses it.
+function removeColumnAt(e: Engine, t: tb.Table, ci: Integer) {
     let cols: List<tb.Column> = []
     let i = 0
     while i < t.cols.length {
@@ -3019,10 +3777,21 @@ function dropColumn(e: Engine, s: Session, t: tb.Table, name: Text, ifExists: Bo
         }
     }
     t.ordIds = os
+    // extension (hnsw, ivfflat) indexes: one on the column goes with it, later columns move down one
+    let xs: List<Integer> = []
+    for aid in t.annIds {
+        let x = e.c.annIdx[aid]
+        if x.tableId >= 0 && x.col == ci {
+            cat.dropAnn(e.c, aid)
+        } else {
+            if x.col > ci { x.col -= 1 }
+            xs.add(aid)
+        }
+    }
+    t.annIds = xs
     fkm.columnDropped(e.c, t.id, ci)
     let pk = remapCols(t.pkCols, ci)
     if pk.length < t.pkCols.length { t.pkCols = [] } else { t.pkCols = pk }
-    return okTag(s, "")
 }
 
 // Column positions after dropping column ci (ci itself is left out).
@@ -3042,28 +3811,75 @@ function createIndex(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
     if tid < 0 { return errOut(s, "42P01", "relation \"" + tname + "\" does not exist", 0) }
     let t = e.c.tables[tid]
     let cols: List<Integer> = []
+    let exprs: List<Text> = []      // per element: the expression's SQL, or "" for a plain column
     for el in ast.items(a, ast.child(a, root, 1)) {
         let ex0 = ast.child(a, el, 0)
-        if ast.kind(a, ex0) != ast.K_COLUMN_REF { return errOut(s, "0A000", "expression indexes are not supported", 0) }
-        let ci = tb.columnIndex(t, a.nodes[ex0].text)
-        if ci < 0 { return errOut(s, "42703", "column \"" + a.nodes[ex0].text + "\" does not exist", 0) }
-        cols.add(ci)
+        if ast.kind(a, ex0) == ast.K_COLUMN_REF {
+            let ci = tb.columnIndex(t, a.nodes[ex0].text)
+            if ci < 0 || tb.isGenerated(t.cols[ci]) { return errOut(s, "42703", "column \"" + a.nodes[ex0].text + "\" does not exist", 0) }
+            cols.add(ci)
+            exprs.add("")
+        } else {
+            let text = indexElementText(a, root, sql, el)
+            if text == "" {
+                return errOut(s, "42601", "an index expression must be in parentheses, e.g. CREATE INDEX ON docs ((body->>'user'))", a.nodes[el].position + 1)
+            }
+            let why = notIndexable(text)
+            if why != "" { return errOut(s, "42P17", why, 0) }
+            if pl.partIndex(e.views, tid) >= 0 { return errOut(s, "0A000", "expression indexes on partitioned tables are not supported", 0) }
+            cols.add(-1)
+            exprs.add(text)
+        }
     }
     let name = nd.text
     if name == "" {
         name = tname
-        for ci in cols { name = name + "_" + t.cols[ci].name }
+        let k = 0
+        while k < cols.length {
+            if cols[k] >= 0 { name = name + "_" + t.cols[cols[k]].name } else { name = name + "_expr" }
+            k += 1
+        }
         name = name + "_idx"
+        if cat.indexNameExists(e.c, name) && exprs.length > 0 {
+            // PG numbers clashing generated names: t_expr_idx, t_expr_idx1, ...
+            let n = 1
+            while cat.indexNameExists(e.c, name + Text(n)) { n += 1 }
+            name = name + Text(n)
+        }
     }
     if cat.indexNameExists(e.c, name) {
         if (nd.flags & ast.F_IF_NOT_EXISTS) != 0 { return okTag(s, "CREATE INDEX") }
         return errOut(s, "42P07", "relation \"" + name + "\" already exists", 0)
     }
+    let method = ast.text(a, ast.child(a, root, 5))
+    let xm = ext.findMethod(e.c.extensions, method)
+    // expression elements: a hidden column per expression stores its value for every row (ADR-015); for an
+    // extension method the columns are filled after the method accepted the index (pgvector checks dimensions
+    // before it reads a row)
+    let unfilled: List<Integer> = []
+    let k = 0
+    while k < cols.length {
+        if cols[k] < 0 {
+            if t.lockedCount > 0 && !e.replaying {
+                return errOut(s, "55006", "cannot create an expression index on \"" + displayName(t.name) + "\" while transactions have uncommitted changes to it", 0)
+            }
+            let colName = tb.GENERATED_PREFIX + name + "_" + Text(k)
+            let r = okTag(e.sys, "")
+            if xm >= 0 {
+                r = addGeneratedColumnEmpty(e, t, colName, exprs[k])
+                if r.status != STATUS_ERROR { unfilled.add(t.cols.length - 1) }
+            } else {
+                r = addGeneratedColumn(e, t, colName, exprs[k])
+            }
+            if r.status == STATUS_ERROR { return errOut(s, r.sqlstate, r.message, 0) }
+            cols[k] = t.cols.length - 1
+        }
+        k += 1
+    }
     let unique = (nd.flags & ast.F_UNIQUE) != 0
     if ast.child(a, root, 2) >= 0 { return errOut(s, "0A000", "partial indexes are not supported", 0) }
-    let method = ast.text(a, ast.child(a, root, 5))
     if method == "tin" || method == "search" {
-        // full-text search index (docs/r2/search.md): one text column, optional WITH (stemmer = 'en')
+        // full-text search index (docs/r2/search.md): one text column, optional WITH (stemmer = 'en' | 'fr' | ...)
         if cols.length != 1 { return errOut(s, "0A000", "a " + method + " index covers exactly one text column", 0) }
         if !v.isTextType(t.cols[cols[0]].type) {
             return errOut(s, "42804", "column \"" + t.cols[cols[0]].name + "\" is not text; a " + method + " index needs a text column", 0)
@@ -3077,10 +3893,14 @@ function createIndex(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
                 let vn = ast.child(a, el, 0)
                 if vn >= 0 { val = a.nodes[vn].text }
                 if key == "stemmer" || key == "language" {
-                    if val == "en" || val == "english" || val == "EN" || val == "English" {
-                        stemmer = 1
+                    // Lead's ISO 639-1 codes (stemmers.min); the English aliases predate them
+                    if val == "english" || val == "EN" || val == "English" {
+                        stemmer = stemmers.EN
                     } else if val != "none" && val != "" && val != "simple" {
-                        return errOut(s, "22023", "unknown stemmer \"" + val + "\" (available: en, none)", 0)
+                        stemmer = stemmers.byCode(val)
+                        if stemmer < 0 {
+                            return errOut(s, "22023", "unknown stemmer language code: " + val + " (available: " + stemmers.CODES + ", none)", 0)
+                        }
                     }
                 }
             }
@@ -3089,13 +3909,271 @@ function createIndex(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
         pushUndo(e, s, UNDO_INDEX, t.id, name)
         return ddlDone(e, s, "CREATE INDEX", sql)
     }
+    if xm >= 0 {
+        let o = createExtIndex(e, s, a, root, sql, t, name, cols, xm, unfilled)
+        // a refused index leaves no hidden expression column behind
+        if o.status == STATUS_ERROR && tb.hasGenerated(t) { dropUnusedGenerated(e, t) }
+        return o
+    }
     let wantHash = unique || method == "hash"
     let wantOrd = method != "hash"
     if !cat.addIndex(e.c, t, name, cols, unique, false, wantHash, wantOrd) {
+        if tb.hasGenerated(t) { dropUnusedGenerated(e, t) }
         return errOut(s, "23505", "could not create unique index \"" + name + "\"", 0)
     }
     pushUndo(e, s, UNDO_INDEX, t.id, name)
     return ddlDone(e, s, "CREATE INDEX", sql)
+}
+
+// CREATE INDEX ... USING <extension method> (column [opclass]) [WITH (option = value, ...)].
+function createExtIndex(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text, t: tb.Table, name: Text, cols: List<Integer>, xm: Integer, unfilled: List<Integer>): Outcome {
+    let def = ext.method(xm)
+    if cols.length != 1 { return errOut(s, "0A000", "access method \"" + def.name + "\" does not support multicolumn indexes", 0) }
+    if (a.nodes[root].flags & ast.F_UNIQUE) != 0 { return errOut(s, "0A000", "access method \"" + def.name + "\" does not support unique indexes", 0) }
+    let col = t.cols[cols[0]]
+    let tname = v.typeName(v.sqlType(col.type))
+    let item = ast.items(a, ast.child(a, root, 1))[0]
+    let cls = a.nodes[item].text
+    let oc = -1
+    let i = 0
+    while i < def.opclasses.length {
+        let k = def.opclasses[i]
+        if (cls == "" && k.isDefault && k.type == tname) || k.name == cls { oc = i }
+        i += 1
+    }
+    if oc < 0 {
+        if cls == "" {
+            // Postgres adds a HINT (specify an operator class); neo-db's errors carry no HINT field yet
+            return errOut(s, "42704", "data type " + tname + " has no default operator class for access method \"" + def.name + "\"", 0)
+        }
+        return errOut(s, "42704", "operator class \"" + cls + "\" does not exist for access method \"" + def.name + "\"", 0)
+    }
+    if def.opclasses[oc].type != tname {
+        // bit varying is binary-coercible to bit, so Postgres accepts the class and the method refuses the type
+        if def.opclasses[oc].type == "bit" && (tname == "bit varying" || tname == "varbit") {
+            return errOut(s, "0A000", "type not supported for " + def.name + " index", 0)
+        }
+        return errOut(s, "42804", "operator class \"" + cls + "\" does not accept data type " + tname, 0)
+    }
+    let opts = sdk.IndexOptions { opclass: oc; modifier: col.typmod; names: []; values: []; failed: false; failCode: ""; failMessage: ""; failDetail: "" }
+    let ol = ast.child(a, root, 4)
+    if ol >= 0 {
+        for d in ast.items(a, ol) {
+            opts.names.add(a.nodes[d].text)
+            let vn = ast.child(a, d, 0)
+            if vn >= 0 { opts.values.add(litText(a, vn)) } else { opts.values.add("") }
+        }
+    }
+    // the method accepts or refuses the index (options, dimensions) before any row is read
+    let h = def.create(opts)
+    if opts.failed {
+        let o = errOut(s, opts.failCode, opts.failMessage, 0)
+        o.detail = opts.failDetail
+        return o
+    }
+    for ci in unfilled {
+        let r = fillGeneratedColumn(e, t, ci)
+        if r.status == STATUS_ERROR {
+            def.drop(h)
+            return errOut(s, r.sqlstate, r.message, 0)
+        }
+    }
+    if cat.addAnnIndex(e.c, t, name, cols[0], xm, oc, opts, h) < 0 {
+        let o = errOut(s, opts.failCode, opts.failMessage, 0)
+        o.detail = opts.failDetail
+        return o
+    }
+    pushUndo(e, s, UNDO_INDEX, t.id, name)
+    return ddlDone(e, s, "CREATE INDEX", sql)
+}
+
+// The SQL of index element el (an expression index key): "(expr)" or "name(args)", scanned from the statement
+// text by matching parentheses outside string literals and quoted names; "" if it is neither form.
+function indexElementText(a: ast.Ast, root: Integer, sql: Text, el: Integer): Text {
+    let start = 0
+    let si = 0
+    while si < a.statements.length {
+        if a.statements[si] == root { start = a.stmtStart[si] }
+        si += 1
+    }
+    let charPos = a.nodes[el].position - start
+    let b = Bytes(sql)
+    let bi = 0
+    let ch = 0
+    while bi < b.length && ch < charPos {
+        bi += 1
+        while bi < b.length && (b[bi] & 192) == 128 { bi += 1 }
+        ch += 1
+    }
+    let j = bi
+    if j < b.length && b[j] != 40 {
+        // function call: (qualified) name, then its argument list
+        while j < b.length && (isNameByte(b[j]) || b[j] == 46) { j += 1 }
+        while j < b.length && (b[j] == 32 || b[j] == 9 || b[j] == 10 || b[j] == 13) { j += 1 }
+        if j == bi || j >= b.length || b[j] != 40 { return "" }
+    }
+    let depth = 0
+    let q = j
+    while q < b.length {
+        let c = b[q]
+        if c == 39 || c == 34 {
+            q += 1
+            while q < b.length && b[q] != c { q += 1 }
+        } else if c == 40 {
+            depth += 1
+        } else if c == 41 {
+            depth -= 1
+            if depth == 0 { return utf8.decodeOrStop(b.slice(bi, q + 1)) }
+        }
+        q += 1
+    }
+    return ""
+}
+
+function isNameByte(c: Integer): Boolean {
+    return (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95 || c >= 128
+}
+
+// Why expression text cannot key an index (PG: index expressions must be immutable), or "".
+function notIndexable(text: Text): Text {
+    let g = pl.parseGenerated(text)
+    if g.root < 0 { return "cannot parse the index expression " + text }
+    let stack = [g.root]
+    let top = 1
+    while top > 0 {
+        top -= 1
+        let n = stack[top]
+        if n >= 0 {
+            let nd = g.a.nodes[n]
+            let k = nd.kind
+            if k == ast.K_SUBQUERY_EXPR || k == ast.K_EXISTS || k == ast.K_IN_SUBQUERY || (k == ast.K_QUANTIFIED && (nd.flags & ast.F_SUBQUERY) != 0) {
+                return "cannot use subquery in index expression"
+            }
+            if k == ast.K_PARAM { return "there is no parameter $" + Text(nd.intValue) }
+            if k == ast.K_FUNC_CALL {
+                let f = nd.text
+                if f == "random" || f == "now" || f == "clock_timestamp" || f == "statement_timestamp" || f == "transaction_timestamp" ||
+                   f == "timeofday" || f == "nextval" || f == "currval" || f == "setval" || f == "gen_random_uuid" ||
+                   f == "uuid_generate_v1" || f == "uuid_generate_v4" || f == "txid_current" || f == "pg_backend_pid" ||
+                   f == "count" || f == "sum" || f == "avg" || f == "min" || f == "max" || f == "string_agg" || f == "array_agg" {
+                    return "functions in index expression must be marked IMMUTABLE"
+                }
+            }
+            for c in nd.children {
+                if top < stack.length { stack[top] = c } else { stack.add(c) }
+                top += 1
+            }
+        }
+    }
+    return ""
+}
+
+// Add a hidden column storing expression `text` for every row of t (the key of an expression index).
+function addGeneratedColumn(e: Engine, t: tb.Table, colName: Text, text: Text): Outcome {
+    let o = addGeneratedColumnEmpty(e, t, colName, text)
+    if o.status == STATUS_ERROR { return o }
+    return fillGeneratedColumn(e, t, t.cols.length - 1)
+}
+
+// The hidden column of expression `text`, typed (with the expression's type modifier) but not filled yet.
+function addGeneratedColumnEmpty(e: Engine, t: tb.Table, colName: Text, text: Text): Outcome {
+    // its type is the expression's type over the table
+    let sel = "SELECT " + text + " FROM " + quoteIdent(t.name)
+    let r = parser.parse(sel)
+    if !r.ok || r.ast.statements.length != 1 { return errOut(e.sys, "42601", "cannot parse the index expression " + text, 0) }
+    let st = pl.planStatement(e.c, e.views, e.env, r.ast, r.ast.statements[0], sel, [])
+    if st.err { return errOut(e.sys, st.errCode, st.errMsg, 0) }
+    let ty = st.outTypes[0]
+    if ty == v.T_UNKNOWN { ty = v.T_TEXT }
+    if ty == v.T_NUMERIC { ty = v.T_NUMTEXT }
+    let col = tb.newColumn(colName, ty, st.outMods[0], false)
+    col.generated = text
+    tb.addColumn(t, col)
+    return okTag(e.sys, "")
+}
+
+// Compute hidden column ci for the rows the table has; on an error the column is removed.
+function fillGeneratedColumn(e: Engine, t: tb.Table, ci: Integer): Outcome {
+    let col = t.cols[ci]
+    let g = pl.compileGenerated(e.c, e.views, e.env, ex.newPlan(e.env), t)
+    if g.err != "" {
+        removeColumnAt(e, t, ci)
+        return errOut(e.sys, "42P17", g.err, 0)
+    }
+    let gp = g.p
+    let k = 0
+    while k < g.cols.length {
+        if g.cols[k] == ci {
+            let node = g.nodes[k]
+            let row = 0
+            while row < t.nrows {
+                if (t.state[row] & tb.ST_DEAD) == 0 || (t.state[row] & tb.ST_LOCKED) != 0 {
+                    gp.slotTable[g.slot] = t
+                    gp.slotRow[g.slot] = row
+                    ex.ev(gp, node)
+                    if gp.err {
+                        let msg = gp.errMsg
+                        let code = gp.errCode
+                        removeColumnAt(e, t, ci)
+                        return errOut(e.sys, code, msg, 0)
+                    }
+                    ex.storeCell(gp, node, col, row)
+                }
+                row += 1
+            }
+        }
+        k += 1
+    }
+    return okTag(e.sys, "")
+}
+
+// Column names an expression index's stored expression reads.
+function generatedReads(c: tb.Column): List<Text> {
+    let out: List<Text> = []
+    let g = pl.parseGenerated(c.generated)
+    if g.root < 0 { return out }
+    let stack = [g.root]
+    let top = 1
+    while top > 0 {
+        top -= 1
+        let n = stack[top]
+        if n >= 0 {
+            let nd = g.a.nodes[n]
+            if nd.kind == ast.K_COLUMN_REF {
+                out.add(nd.text)
+            } else {
+                for ch in nd.children {
+                    if top < stack.length { stack[top] = ch } else { stack.add(ch) }
+                    top += 1
+                }
+            }
+        }
+    }
+    return out
+}
+
+// The hidden expression columns of t that read column `name`.
+function generatedUsing(t: tb.Table, name: Text): List<Integer> {
+    let out: List<Integer> = []
+    let i = 0
+    while i < t.cols.length {
+        if tb.isGenerated(t.cols[i]) {
+            for r in generatedReads(t.cols[i]) {
+                if r == name { out.add(i) }
+            }
+        }
+        i += 1
+    }
+    return out
+}
+
+// After DROP INDEX: hidden expression columns no index uses any more go too.
+function dropUnusedGenerated(e: Engine, t: tb.Table) {
+    let i = t.cols.length - 1
+    while i >= 0 {
+        if tb.isGenerated(t.cols[i]) && !cat.columnIndexed(e.c, t, i) { removeColumnAt(e, t, i) }
+        i -= 1
+    }
 }
 
 function dropObjects(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
@@ -3163,8 +4241,8 @@ function dropObjects(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
                     if s.inBlock && !e.replaying {
                         let tt = e.c.tables[dt]
                         let hidden = "pg_neo_dropped_" + Text(dt)
-                        logDdlAuto(e, "ALTER TABLE " + quoteIdent(tt.name) + " RENAME TO " + quoteIdent(hidden))
                         pushUndo(e, s, UNDO_DROPPED, dt, tt.name)
+                        logDdlAuto(e, "ALTER TABLE " + quoteIdent(tt.name) + " RENAME TO " + quoteIdent(hidden))
                         if pl.isTempName(tt.name) && e.env.tempCount > 0 { e.env.tempCount -= 1 }
                         tt.name = hidden
                     } else {
@@ -3182,8 +4260,8 @@ function dropObjects(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
                     // dropped at COMMIT; until then hidden under a name no query can reach
                     let t = e.c.tables[tid]
                     let hidden = "pg_neo_dropped_" + Text(tid)
-                    logDdlAuto(e, "ALTER TABLE " + quoteIdent(t.name) + " RENAME TO " + quoteIdent(hidden))
                     pushUndo(e, s, UNDO_DROPPED, tid, t.name)
+                    logDdlAuto(e, "ALTER TABLE " + quoteIdent(t.name) + " RENAME TO " + quoteIdent(hidden))
                     if pl.isTempName(t.name) && e.env.tempCount > 0 { e.env.tempCount -= 1 }
                     t.name = hidden
                     e.c.version += 1
@@ -3207,6 +4285,18 @@ function dropObjects(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
                 changed = true
             }
         } else if nd.op == ast.OBJ_INDEX {
+            if s.inBlock && !e.replaying && cat.indexNameExists(e.c, name) {
+                // renamed to a hidden name now (logged, so a CREATE INDEX of the same name later in the block replays
+                // in order) and dropped by the commit record; ROLLBACK renames it back
+                let hidden = cat.DROPPED_INDEX + Text(e.nextHiddenIndex)
+                pushUndo(e, s, UNDO_INDEX_DROPPED, e.nextHiddenIndex, name)
+                logDdlAuto(e, "ALTER INDEX " + quoteIdent(name) + " RENAME TO " + quoteIdent(hidden))
+                e.nextHiddenIndex += 1
+                renameIndex(e, name, hidden)
+                e.c.version += 1
+                inBlockDrop = true
+                continue
+            }
             if !dropIndex(e, name) {
                 if !ifExists { return errOut(s, "42704", "index \"" + name + "\" does not exist", 0) }
                 o.notices.add("index \"" + name + "\" does not exist, skipping")
@@ -3228,9 +4318,25 @@ function dropObjects(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
     return d
 }
 
+// Rename every index structure called `from` (an index can be a hash and an ordered structure).
+function renameIndex(e: Engine, from: Text, to: Text) {
+    for t in e.c.tables {
+        for hid in t.hashIds {
+            if e.c.hashIdx[hid].name == from { e.c.hashIdx[hid].name = to }
+        }
+        for oid in t.ordIds {
+            if e.c.ordIdx[oid].name == from { e.c.ordIdx[oid].name = to }
+        }
+        for aid in t.annIds {
+            if e.c.annIdx[aid].name == from { e.c.annIdx[aid].name = to }
+        }
+    }
+}
+
 function dropIndex(e: Engine, name: Text): Boolean {
     let found = false
     for t in e.c.tables {
+        let before = found
         let hs: List<Integer> = []
         for hid in t.hashIds {
             if e.c.hashIdx[hid].name == name {
@@ -3251,6 +4357,17 @@ function dropIndex(e: Engine, name: Text): Boolean {
         }
         t.hashIds = hs
         t.ordIds = os
+        let xs: List<Integer> = []
+        for aid in t.annIds {
+            if e.c.annIdx[aid].name == name {
+                found = true
+                cat.dropAnn(e.c, aid)
+            } else {
+                xs.add(aid)
+            }
+        }
+        t.annIds = xs
+        if found && !before && tb.hasGenerated(t) { dropUnusedGenerated(e, t) }
     }
     if cat.dropSearchIndexNamed(e.c, name) { found = true }
     return found
@@ -3451,6 +4568,9 @@ function alterTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text)
         } else if op == ast.AT_RENAME_COLUMN {
             let ci = tb.columnIndex(t, cn.text)
             if ci < 0 { return errOut(s, "42703", "column \"" + cn.text + "\" does not exist", 0) }
+            if generatedUsing(t, cn.text).length > 0 {
+                return errOut(s, "0A000", "cannot rename column \"" + cn.text + "\": an expression index reads it (drop the index, rename, create it again)", 0)
+            }
             t.cols[ci].name = a.nodes[ast.child(a, cmd, 1)].text
         } else if op == ast.AT_ALTER_COLUMN_TYPE {
             return errOut(s, "0A000", "this ALTER TABLE form is not supported", 0)
@@ -3465,12 +4585,17 @@ function addColumnCmd(e: Engine, s: Session, a: ast.Ast, cmd: Integer, t: tb.Tab
     let tn = ast.child(a, def, 0)
     let ty = pl.typeInCatalog(e.c, a.nodes[tn].text)
     if ty < 0 { return errOut(s, "42704", "type \"" + a.nodes[tn].text + "\" does not exist", 0) }
+    let elemTy = ty
+    if a.nodes[tn].intValue > 0 {
+        ty = v.arrayOf(ty)
+        if ty == v.T_UNKNOWN { return errOut(s, "42704", "type \"" + a.nodes[tn].text + "[]\" does not exist", 0) }
+    }
     let cname = a.nodes[def].text
     if tb.columnIndex(t, cname) >= 0 {
         if (a.nodes[cmd].flags & ast.F_IF_NOT_EXISTS) != 0 { return okTag(s, "") }
         return errOut(s, "42701", "column \"" + cname + "\" of relation \"" + displayName(t.name) + "\" already exists", 0)
     }
-    let ctm = typmodOf(a, tn, ty)
+    let ctm = typmodOf(a, tn, elemTy)
     let cty = ty
     if ty == v.T_NUMERIC { cty = v.numStorageType(ctm) }
     let col = tb.newColumn(cname, cty, ctm, false)
@@ -3544,8 +4669,8 @@ function createTableAs(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Te
     ddl = ddl + ")"
     let lsn0 = 0
     if s.inBlock && !e.replaying {
-        logDdlAuto(e, ddl)
         pushUndo(e, s, UNDO_CREATED, t.id, name)
+        logDdlAuto(e, ddl)
     } else {
         e.c.ddlLog.add(ddl)
         if !e.replaying {
@@ -3791,15 +4916,21 @@ function copyStart(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
     if cl >= 0 {
         for cn in ast.items(a, cl) {
             let ci = tb.columnIndex(t, a.nodes[cn].text)
-            if ci < 0 { return errOut(s, "42703", "column \"" + a.nodes[cn].text + "\" of relation \"" + tname + "\" does not exist", 0) }
+            if ci < 0 || tb.isGenerated(t.cols[ci]) { return errOut(s, "42703", "column \"" + a.nodes[cn].text + "\" of relation \"" + tname + "\" does not exist", 0) }
             s.copyCols.add(ci)
         }
     } else {
         let i = 0
         while i < t.cols.length {
-            s.copyCols.add(i)
+            if !tb.isGenerated(t.cols[i]) { s.copyCols.add(i) }
             i += 1
         }
+    }
+    s.copyGen = []
+    if tb.hasGenerated(t) {
+        let g = pl.compileGenerated(e.c, e.views, e.env, ex.newPlan(e.env), t)
+        if g.err != "" { return errOut(s, "42P17", g.err, 0) }
+        s.copyGen = [g]
     }
     s.copyCsv = false
     s.copyDelim = 9
@@ -3807,6 +4938,10 @@ function copyStart(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
     s.copyHeader = false
     s.copyBinary = false
     s.copyBinaryHeader = false
+    s.copyQuote = 34
+    s.copyEscape = -1
+    s.copyScanned = 0
+    s.copyInQuote = false
     for opt in ast.items(a, ast.child(a, root, 3)) {
         let on = a.nodes[opt].text
         let val = ast.child(a, opt, 0)
@@ -3821,7 +4956,10 @@ function copyStart(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
         if on == "delimiter" && vt != "" { s.copyDelim = Bytes(vt)[0] }
         if on == "null" { s.copyNull = Bytes(vt) }
         if on == "header" && vt != "false" && vt != "off" && vt != "0" { s.copyHeader = true }
+        if on == "quote" && vt != "" { s.copyQuote = Bytes(vt)[0] }
+        if on == "escape" && vt != "" { s.copyEscape = Bytes(vt)[0] }
     }
+    if s.copyEscape < 0 { s.copyEscape = s.copyQuote }
     // parse registers: one node per target column
     let p = ex.newPlan(e.env)
     let i = 0
@@ -3857,6 +4995,37 @@ public function copyData(e: Engine, s: Session, data: Bytes) {
     }
     let start = 0
     let n = buf.length
+    if s.copyCsv {
+        // CSV: a record ends at a newline outside quotes; quoted fields may hold newlines (RFC 4180), and the quote
+        // state carries over CopyData messages (the scan resumes where the previous message's scan stopped)
+        let q = s.copyQuote
+        let esc = s.copyEscape
+        let inq = s.copyInQuote
+        let i = s.copyScanned
+        while i < n {
+            let c = buf[i]
+            if inq {
+                if c == esc && esc != q && i + 1 < n && (buf[i + 1] == q || buf[i + 1] == esc) {
+                    i += 2
+                    continue
+                }
+                if c == esc && esc != q && i + 1 >= n { break }   // the escaped character is in the next message
+                if c == q { inq = false }
+            } else if c == q {
+                inq = true
+            } else if c == 10 {
+                copyLine(e, s, buf, start, i)
+                if s.copyErr.status == STATUS_ERROR { return }
+                start = i + 1
+            }
+            i += 1
+        }
+        s.copyInQuote = inq
+        s.copyScanned = i - start
+        if start > 0 { s.copyBuf = buf.slice(start, n) }
+        maybeSpill(e, s, e.tm.txns[s.txSlot])   // large COPYs stream their redo to the WAL as they go
+        return
+    }
     let i = 0
     while i < n {
         if buf[i] == 10 {
@@ -4009,18 +5178,40 @@ function copyStoreRow(e: Engine, s: Session, t: tb.Table, p: ex.Plan) {
         ex.storeCell(p, i, t.cols[i], r)
         i += 1
     }
+    if s.copyGen.length > 0 {
+        // expression index keys, computed from the row just stored
+        let g = s.copyGen[0]
+        g.p.slotTable[g.slot] = t
+        g.p.slotRow[g.slot] = r
+        let k = 0
+        while k < g.cols.length {
+            ex.ev(g.p, g.nodes[k])
+            if g.p.err {
+                s.copyErr = errOut(s, g.p.errCode, g.p.errMsg + ", COPY " + t.name + ", line " + Text(s.copyRows + 1), 0)
+                ex.clearError(g.p)
+                t.state[r] = tb.ST_DEAD
+                return
+            }
+            ex.storeCell(g.p, g.nodes[k], t.cols[g.cols[k]], r)
+            k += 1
+        }
+    }
     if s.copyBulk < 0 {
         s.copyBulk = tx.uCount
         txn.addBulkUndo(tx, t, r, r + 1)
     } else {
         txn.extendBulkUndo(tx, s.copyBulk, r + 1)
     }
-    if t.hashIds.length > 0 || t.ordIds.length > 0 || t.searchIds.length > 0 { cat.indexInsertRow(e.c, t, r) }
+    if t.hashIds.length > 0 || t.ordIds.length > 0 || t.searchIds.length > 0 || t.annIds.length > 0 { cat.indexInsertRow(e.c, t, r) }
     tx.redo.add(dml.R_INSERT)
     tb.putVarint(tx.redo, t.id)
     tb.putVarint(tx.redo, r)
     tb.encodeRow(t, r, tx.redo)
     s.copyRows += 1
+    if e.c.annFailure.failed {
+        let f = cat.takeAnnFailure(e.c)
+        s.copyErr = errOut(s, f.code, f.message + ", COPY " + t.name + ", line " + Text(s.copyRows), 0)
+    }
 }
 
 function copyLine(e: Engine, s: Session, b: Bytes, start: Integer, end: Integer) {
@@ -4051,21 +5242,34 @@ function copyLine(e: Engine, s: Session, b: Bytes, start: Integer, end: Integer)
         let fe = pos
         let unq = s.copyNull
         let simple = true
-        if s.copyCsv && fe < e0 && b[fe] == 34 {
+        if s.copyCsv && fe < e0 && b[fe] == s.copyQuote {
+            // quoted CSV field (may span lines); QUOTE ends it, ESCAPE before QUOTE or ESCAPE takes that character
             simple = false
             unq = Bytes()
+            let q = s.copyQuote
+            let esc = s.copyEscape
             fe += 1
             while fe < e0 {
-                if b[fe] == 34 {
-                    if fe + 1 < e0 && b[fe + 1] == 34 {
-                        unq.add(34)
-                        fe += 2
+                let c = b[fe]
+                if c == esc && fe + 1 < e0 && (b[fe + 1] == q || b[fe + 1] == esc) && (esc != q || b[fe + 1] == q) {
+                    unq.add(b[fe + 1])
+                    fe += 2
+                    continue
+                }
+                if c == q {
+                    fe += 1
+                    // a field may continue after its closing quote ("ab"c): Postgres keeps reading, quoted again or not
+                    while fe < e0 && b[fe] != delim && b[fe] != q {
+                        unq.add(b[fe])
+                        fe += 1
+                    }
+                    if fe < e0 && b[fe] == q {
+                        fe += 1
                         continue
                     }
-                    fe += 1
                     break
                 }
-                unq.add(b[fe])
+                unq.add(c)
                 fe += 1
             }
             while fe < e0 && b[fe] != delim { fe += 1 }
@@ -4149,6 +5353,8 @@ public function copyDone(e: Engine, s: Session): Outcome {
     if s.copyTable >= 0 && s.copyErr.status != STATUS_ERROR && s.copyBuf.length > 0 {
         if s.copyBinary {
             s.copyErr = errOut(s, "22P04", "unexpected EOF in COPY data", 0)
+        } else if s.copyCsv && s.copyInQuote {
+            s.copyErr = errOut(s, "22P04", "unterminated CSV quoted field, COPY " + e.c.tables[s.copyTable].name + ", line " + Text(s.copyRows + 1), 0)
         } else {
             copyLine(e, s, s.copyBuf, 0, s.copyBuf.length)
         }
@@ -4198,6 +5404,7 @@ public function copyFail(e: Engine, s: Session, message: Text): Outcome {
 // (empty for dropped tables), so a table not yet decoded is copied byte for byte from the old snapshot.
 // A transaction that spilled 'P' records before the snapshot LSN would lose them on recovery: wait for it.
 function checkpointBlocked(e: Engine): Boolean {
+    if e.replPending > 0 { return true }
     for t in e.tm.txns {
         if t.state == txn.TX_ACTIVE && t.redo.length > 0 && t.redo[0] == 80 { return true }
     }
@@ -4355,9 +5562,10 @@ function finishCheckpoint(e: Engine) {
 }
 
 // The server keeps polling (no epoll sleep) while this is true, so slices run back to back when idle.
-public function backgroundPending(e: Engine): Boolean { return e.ck.active || e.pubPhase > 0 }
+public function backgroundPending(e: Engine): Boolean { return e.ck.active || e.pubPhase > 0 || e.ld.active }
 
-// Chunk 0 (format 3): [3][ddl count][ddl...][ntables][per table: serial, has image][hash fingerprint i64].
+// Chunk 0 (format 3): [3][ddl count][ddl...][ntables][per table: serial, has image][hash fingerprint i64]
+// [replica: primary LSN of the last record applied, i64 — absent in older manifests].
 function catalogChunk(e: Engine): Bytes {
     let b = Bytes()
     b.add(3)
@@ -4373,6 +5581,7 @@ function catalogChunk(e: Engine): Bytes {
         if cat.isDropped(t) { b.add(0) } else { b.add(1) }
     }
     b.addInt64(persist.fingerprint())
+    b.addInt64(e.replPrimary)
     return b
 }
 
@@ -4430,4 +5639,5 @@ function loadCatalog(e: Engine, b: Bytes) {
         i += 1
     }
     if e.snapVersion == 3 { e.st.fingerprintOk = cur.pos + 8 <= b.length && b.getInt64(cur.pos) == persist.fingerprint() }
+    if cur.pos + 16 <= b.length { e.replPrimary = b.getInt64(cur.pos + 8) }
 }

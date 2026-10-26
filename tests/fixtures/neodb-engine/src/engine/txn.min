@@ -42,11 +42,12 @@ public record TxnMgr {
     serialOwner: Integer
     waitsFor: List<Integer>
     lockEpoch: Integer
+    retain: Retain        // row versions for a statement suspended at a yield point (C2)
     catalog: List<cat.Catalog>   // the catalog whose search indexes see every row a transaction touches
 }
 
 public function newTxnMgr(): TxnMgr {
-    return TxnMgr { txns: []; freeSlots: Bytes(); locks: hm.newIntMap(1024); serialOwner: -1; waitsFor: []; lockEpoch: 0; catalog: [] }
+    return TxnMgr { txns: []; freeSlots: Bytes(); locks: hm.newIntMap(1024); serialOwner: -1; waitsFor: []; lockEpoch: 0; catalog: []; retain: newRetain() }
 }
 
 public function begin(m: TxnMgr, session: Integer): Txn {
@@ -153,8 +154,93 @@ public function blocker(m: TxnMgr, t: tb.Table, r: Integer, me: Integer): Intege
     return owner
 }
 
+// ---- row versions for a preempted statement (C2, docs/r2/search.md "Preemptible searches")
+// While a long read-only search statement is suspended at a yield point, short statements of other sessions run and may
+// commit. The suspended statement must still read every row as of its own start: the first change of a row during the
+// window keeps a copy of the row as it was (state byte + tb.encodeRow image), and that statement reads the copy.
+
+public record Retain {
+    on: Boolean
+    rows: hm.IntMap        // (table id << 36) | row -> index into imgs
+    imgs: List<Bytes>      // state byte, then the encoded row
+    limit: Bytes           // int64 per table id: rows at or beyond it did not exist when the window opened (0 = no table)
+}
+
+function newRetain(): Retain { return Retain { on: false; rows: hm.newIntMap(16); imgs: []; limit: Bytes() } }
+
+public function retainOn(m: TxnMgr, c: cat.Catalog) {
+    let rt = m.retain
+    rt.on = true
+    rt.rows = hm.newIntMap(64)
+    rt.imgs = []
+    rt.limit = Bytes(c.tables.length * 8)
+    let i = 0
+    while i < c.tables.length {
+        rt.limit.setInt64(i * 8, c.tables[i].nrows)
+        i += 1
+    }
+}
+
+public function retainOff(m: TxnMgr) { m.retain = newRetain() }
+
+public function retaining(m: TxnMgr): Boolean { return m.retain.on }
+
+// Keep row r of t as the window's statement sees it, if this is its first change since the window opened: the row as it
+// is, or for a row locked by a transaction that is still open, its committed version (that transaction's before-image).
+public function retainRow(m: TxnMgr, t: tb.Table, r: Integer) {
+    let rt = m.retain
+    if !rt.on || t.id * 8 >= rt.limit.length || r >= rt.limit.getInt64(t.id * 8) { return }
+    let key = (t.id << 36) | r
+    if hm.contains(rt.rows, key) { return }
+    let b = Bytes()
+    let st = t.state[r]
+    if (st & tb.ST_LOCKED) != 0 {
+        let x = hm.get(m.locks, lockKey(t.id, r), -1)
+        if (st & tb.ST_NEW) != 0 {
+            b.add(tb.ST_NEW)                     // inserted by an open transaction: not visible
+        } else if x >= 0 && (m.txns[x >> 32].uKind.getInt64((x & 4294967295) * 8) & 15) == U_UPDATE {
+            let ow = m.txns[x >> 32]
+            let off = ow.uImgOff.getInt64((x & 4294967295) * 8)
+            b.add(0)
+            let tmp = tb.cloneSchema(t, -3)
+            tb.reserveRow(tmp, 0)
+            let cur = tb.Cursor { pos: off }
+            tb.decodeRow(tmp, 0, ow.uImg, cur)
+            tb.encodeRow(tmp, 0, b)
+        } else {
+            b.add(0)                             // deleted (or locked) by an open transaction: the data is unchanged
+            tb.encodeRow(t, r, b)
+        }
+    } else {
+        b.add(st)
+        tb.encodeRow(t, r, b)
+    }
+    hm.put(rt.rows, key, rt.imgs.length)
+    rt.imgs.add(b)
+}
+
+// Image of row r of t as of the window's start: -1 when unchanged since, else 0 (dead or invisible: no image) or 1 (the
+// image is decoded into row 0 of scratch).
+public function retainedRow(m: TxnMgr, t: tb.Table, r: Integer, scratch: tb.Table): Integer {
+    let rt = m.retain
+    if !rt.on { return -1 }
+    if t.id * 8 < rt.limit.length && r >= rt.limit.getInt64(t.id * 8) { return 0 }
+    let i = hm.get(rt.rows, (t.id << 36) | r, -1)
+    if i < 0 { return -1 }
+    let b = rt.imgs[i]
+    let st = b[0]
+    // the state at the window's start, seen by a statement outside every transaction then: live unless dead or new
+    if (st & tb.ST_DEAD) != 0 && (st & tb.ST_LOCKED) == 0 { return 0 }
+    if (st & tb.ST_NEW) != 0 { return 0 }
+    if scratch.nrows == 0 { tb.reserveRow(scratch, 0) }
+    let cur = tb.Cursor { pos: 1 }
+    tb.decodeRow(scratch, 0, b, cur)
+    return 1
+}
+
 // Record an undo entry; takes the lock on first touch. Returns the undo index.
 public function addUndo(m: TxnMgr, tx: Txn, t: tb.Table, r: Integer, kind: Integer, withImage: Boolean): Integer {
+    retainRow(m, t, r)
     if t.searchIds.length > 0 && m.catalog.length > 0 {
         let c = m.catalog[0]
         for sid in t.searchIds { si.touchRow(c.searchIdx[sid], t, r) }
@@ -274,6 +360,9 @@ public function finishCommit(m: TxnMgr, c: cat.Catalog, tx: Txn) {
             let t = c.tables[tx.uTable.getInt64(i * 8)]
             let r = tx.uRow.getInt64(i * 8)
             if !cat.isDropped(t) && r < t.nrows {
+                // a statement suspended at a yield point started while this transaction was not yet visible: it keeps
+                // reading the row as it was before (retainRow takes the before-image while the row is still locked)
+                retainRow(m, t, r)
                 hm.remove(m.locks, lockKey(t.id, r))
                 t.state[r] = t.state[r] & (255 - tb.ST_LOCKED - tb.ST_NEW)
                 t.lockedCount -= 1

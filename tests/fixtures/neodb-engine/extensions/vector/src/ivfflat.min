@@ -1,0 +1,654 @@
+// In-memory IVFFlat index following pgvector 0.8's ivfflat access method: `lists` centres from k-means on a
+// sample of the rows (max(50 * lists, 10000) rows by reservoir sampling, k-means++ initialization, Elkan's
+// accelerated k-means for at most 500 iterations, stopping when no assignment changes), each row stored in the
+// list of its nearest centre, and searches that scan the `probes` nearest lists.
+//
+// Rows inserted before train() are kept in one unclustered list and searched exactly; train() clusters every
+// row present and later inserts go straight to their nearest centre. remove(id) erases the row at once (the
+// list's last row moves into its slot), so there is nothing to vacuum.
+//
+// Metrics: l2 (squared L2 inside, Euclidean k-means), cosine (rows normalized, spherical k-means, negative inner
+// product), inner product (rows as given, centres normalized, spherical k-means on normalized samples, negative
+// inner product) and l1 (Euclidean k-means, L1 assignment; pgvector itself has no ivfflat l1 class). Bit
+// metrics are not supported.
+use "math" as math
+use "./ann.min" as ann
+
+public constant DEFAULT_LISTS = 100
+public constant DEFAULT_PROBES = 1
+constant MAX_ITERATIONS = 500
+constant MIN_SAMPLES = 10000
+constant SAMPLES_PER_LIST = 50
+constant LOW_BITS = 4294967295
+constant MAX_PRUNED_LISTS = 2048
+
+public record IvfFlat {
+    dimensions: Integer
+    metric: Integer
+    rowBytes: Integer
+    lists: Integer
+    seed: Integer
+    rng: ann.Rng
+    trained: Boolean
+    nlists: Integer             // 1 (the unclustered list) until trained
+    centers: Bytes              // nlists * dimensions float32 once trained
+    gaps: Bytes                 // nlists * nlists float32, half the distance between two centres, when pruning
+    listIds: List<Bytes>        // int64 id per row
+    listRows: List<Bytes>       // rowBytes per row
+    listCount: List<Integer>
+    live: Integer
+    where: ann.IntMap           // id -> list * 2^32 + position
+    iterations: Integer         // k-means iterations of the last train()
+    samples: Integer            // rows sampled by the last train()
+    query: Bytes                // the search query in index form
+    row: Bytes                  // the row being placed
+    probes: ann.Heap
+    found: ann.Heap
+}
+
+// A new untrained index; metric is ann.L2, ann.INNER_PRODUCT, ann.COSINE, ann.L1 or ann.HAMMING. pgvector allows
+// 1 <= lists <= 32768.
+public function newIvfFlat(dimensions: Integer, metric: Integer, lists: Integer, seed: Integer): IvfFlat {
+    if dimensions < 1 { fail("ivfflat: dimensions must be positive") }
+    if metric < ann.L2 || metric > ann.HAMMING { fail("ivfflat: unsupported metric " + ann.metricName(metric)) }
+    if lists < 1 || lists > 32768 { fail("ivfflat: lists must be between 1 and 32768") }
+    let rb = ann.rowBytes(metric, dimensions)
+    let x = IvfFlat {
+        dimensions: dimensions; metric: metric; rowBytes: rb; lists: lists; seed: seed; rng: ann.newRng(seed)
+        trained: false; nlists: 1; centers: Bytes(); gaps: Bytes(); listIds: [Bytes()]; listRows: [Bytes()]; listCount: [0]
+        live: 0; where: ann.newIntMap(16); iterations: 0; samples: 0; query: Bytes(rb); row: Bytes(rb); probes: ann.newHeap()
+        found: ann.newHeap()
+    }
+    return x
+}
+
+public function IvfFlat.count(): Integer { return self.live }
+
+public function IvfFlat.isTrained(): Boolean { return self.trained }
+
+public function IvfFlat.contains(id: Integer): Boolean { return self.where.get(id, -1) >= 0 }
+
+// Rows in list l (0 <= l < listTotal()).
+public function IvfFlat.listSize(l: Integer): Integer { return self.listCount[l] }
+
+public function IvfFlat.listTotal(): Integer { return self.nlists }
+
+// Bytes per centre: float32 values, or bits like the rows for hamming (pgvector's BitUpdateCenter).
+function IvfFlat.centreBytes(): Integer {
+    if self.metric == ann.HAMMING { return self.rowBytes }
+    return self.dimensions * 4
+}
+
+// A NULL query: every distance is zero (pgvector), so the scan returns all rows of `probes` lists in no
+// particular order; these are the first lists. Returns the count.
+public deterministic function IvfFlat.anyRows(probes: Integer, outIds: List<Integer>): Integer {
+    outIds.clear()
+    let l = 0
+    while l < self.nlists && l < probes {
+        let ids = self.listIds[l]
+        let i = 0
+        while i < self.listCount[l] {
+            outIds.add(ids.getInt64(i * 8))
+            i += 1
+        }
+        l += 1
+    }
+    return outIds.length
+}
+
+public function IvfFlat.memoryBytes(): Integer {
+    let total = self.centers.length + self.gaps.length + self.where.memoryBytes()
+    let l = 0
+    while l < self.nlists {
+        total += self.listIds[l].length + self.listRows[l].length
+        l += 1
+    }
+    return total
+}
+
+// ---------------------------------------------------------------- insert and remove
+
+// The list for the row at q[qo..] (in index form): the nearest centre by the index distance.
+deterministic function IvfFlat.nearestList(q: Bytes, qo: Integer): Integer {
+    if !self.trained { return 0 }
+    if self.gaps.length > 0 { return self.nearestPruned(q, qo) }
+    let best = 0
+    let bestDist = ann.infinity()
+    let c = 0
+    let rb = self.centreBytes()
+    while c < self.nlists {
+        let d = ann.distance(self.metric, q, qo, self.centers, c * rb, self.dimensions, bestDist)
+        if d < bestDist {
+            best = c
+            bestDist = d
+        }
+        c += 1
+    }
+    return best
+}
+
+// For L2 and cosine (where the index distance orders centres like Euclidean distance; cosine rows and centres
+// are normalized) with at most MAX_PRUNED_LISTS lists: half the Euclidean distance between every two centres,
+// slightly lowered so rounding can only make pruning more cautious. Otherwise empty.
+deterministic function IvfFlat.centreGaps(): Bytes {
+    let k = self.nlists
+    if (self.metric != ann.L2 && self.metric != ann.COSINE) || k > MAX_PRUNED_LISTS { return Bytes() }
+    let rb = self.dimensions * 4
+    let gaps = Bytes(k * k * 4)
+    let a = 0
+    while a < k {
+        let b = a + 1
+        while b < k {
+            let g = lowered(0.5 * math.sqrt(ann.l2Squared(self.centers, a * rb, self.centers, b * rb, self.dimensions)))
+            gaps.setFloat32((a * k + b) * 4, g)
+            gaps.setFloat32((b * k + a) * 4, g)
+            b += 1
+        }
+        a += 1
+    }
+    return gaps
+}
+
+// nearestList with Elkan's first lemma: a centre at least twice as far from the best centre so far as the row is
+// cannot be nearer, so it needs no distance. Picks the same list as the full scan up to rounding ties.
+deterministic function IvfFlat.nearestPruned(q: Bytes, qo: Integer): Integer {
+    let k = self.nlists
+    let rb = self.dimensions * 4
+    let best = 0
+    let bestSquared = ann.l2Squared(q, qo, self.centers, 0, self.dimensions)
+    let bestDist = math.sqrt(bestSquared)
+    let c = 1
+    while c < k {
+        if self.gaps.getFloat32((best * k + c) * 4) < bestDist {
+            let d = ann.l2SquaredBounded(q, qo, self.centers, c * rb, self.dimensions, bestSquared)
+            if d < bestSquared {
+                best = c
+                bestSquared = d
+                bestDist = math.sqrt(d)
+            }
+        }
+        c += 1
+    }
+    return best
+}
+
+// Add a row (dimensions float32 values at v[offset..]; the index keeps its own copy). An id already present is
+// replaced. Returns false, storing nothing, for a cosine row with zero norm or a row with NaN or an infinity.
+public deterministic function IvfFlat.insert(id: Integer, v: Bytes, offset: Integer): Boolean {
+    if self.where.get(id, -1) >= 0 { self.remove(id) }
+    if !ann.storeRow(self.metric, v, offset, self.row, 0, self.dimensions) { return false }
+    self.place(id, self.nearestList(self.row, 0))
+    return true
+}
+
+// Append the row in self.row to list l.
+deterministic function IvfFlat.place(id: Integer, l: Integer) {
+    let pos = self.listCount[l]
+    self.listRows[l].addBytes(self.row)
+    self.listIds[l].addInt64(id)
+    self.listCount[l] = pos + 1
+    self.where.put(id, l * 4294967296 + pos)
+    self.live += 1
+}
+
+// Erase a row; false when the id is not in the index.
+public deterministic function IvfFlat.remove(id: Integer): Boolean {
+    let at = self.where.get(id, -1)
+    if at < 0 { return false }
+    self.where.remove(id)
+    let l = (at >> 32) & LOW_BITS
+    let pos = at & LOW_BITS
+    let last = self.listCount[l] - 1
+    let ids = self.listIds[l]
+    let rows = self.listRows[l]
+    let rb = self.rowBytes
+    if pos != last {
+        let moved = ids.getInt64(last * 8)
+        ids.setInt64(pos * 8, moved)
+        let i = 0
+        while i < rb {
+            rows[pos * rb + i] = rows[last * rb + i]
+            i += 1
+        }
+        self.where.put(moved, l * 4294967296 + pos)
+    }
+    ids.resize(last * 8)
+    rows.resize(last * rb)
+    self.listCount[l] = last
+    self.live -= 1
+    return true
+}
+
+// ---------------------------------------------------------------- training
+
+// Cluster every row present into `lists` lists (pgvector's ivfflat build). Training again re-clusters.
+public deterministic function IvfFlat.train() {
+    let rb = self.rowBytes
+    let dims = self.dimensions
+    let n = self.live
+    // gather the rows
+    let allIds = Bytes()
+    let allRows = Bytes()
+    let l = 0
+    while l < self.nlists {
+        allIds.addBytes(self.listIds[l])
+        allRows.addBytes(self.listRows[l])
+        l += 1
+    }
+    // reservoir sample (Algorithm R) of max(50 * lists, 10000) rows, kept in row order
+    let want = self.lists * SAMPLES_PER_LIST
+    if want < MIN_SAMPLES { want = MIN_SAMPLES }
+    let picks: List<Integer> = []
+    let i = 0
+    while i < n {
+        if picks.length < want {
+            picks.add(i)
+        } else {
+            let j = self.rng.below(i + 1)
+            if j < want { picks[j] = i }
+        }
+        i += 1
+    }
+    picks.sort()
+    // spherical k-means works on normalized samples; bit rows are clustered as 0/1 floats (pgvector's BitSumCenter)
+    let spherical = self.metric == ann.INNER_PRODUCT || self.metric == ann.COSINE
+    let bits = self.metric == ann.HAMMING
+    let fb = dims * 4
+    let sample = Bytes(picks.length * fb)
+    let ns = 0
+    let norm = ann.COSINE
+    if !spherical { norm = ann.L2 }
+    for p in picks {
+        if bits {
+            let d = 0
+            while d < dims {
+                let bit = (allRows[p * rb + d / 8] >> (7 - d % 8)) & 1
+                sample.setFloat32(ns * fb + d * 4, Float(bit))
+                d += 1
+            }
+            ns += 1
+        } else if ann.storeRow(norm, allRows, p * rb, sample, ns * fb, dims) {
+            ns += 1
+        }
+    }
+    sample.resize(ns * fb)
+    self.samples = ns
+    let centers = self.kmeans(sample, ns, self.lists, spherical)
+    if bits { centers = bitCentres(centers, self.lists, dims, rb) }
+    self.centers = centers
+    // redistribute
+    self.trained = true
+    self.nlists = self.lists
+    self.gaps = self.centreGaps()
+    let ids: List<Bytes> = []
+    let rows: List<Bytes> = []
+    let counts: List<Integer> = []
+    l = 0
+    while l < self.nlists {
+        ids.add(Bytes())
+        rows.add(Bytes())
+        counts.add(0)
+        l += 1
+    }
+    self.listIds = ids
+    self.listRows = rows
+    self.listCount = counts
+    self.where = ann.newIntMap(n)
+    self.live = 0
+    i = 0
+    while i < n {
+        ann.copyRow(allRows, i * rb, self.row, rb)
+        self.place(allIds.getInt64(i * 8), self.nearestList(self.row, 0))
+        i += 1
+    }
+}
+
+function lowered(d: Float): Float { return d * 0.9999998 }
+
+// float32 centres -> bit rows: a bit is set when its mean is above one half (pgvector's BitUpdateCenter).
+deterministic function bitCentres(centers: Bytes, k: Integer, dims: Integer, rb: Integer): Bytes {
+    let out = Bytes(k * rb)
+    let c = 0
+    while c < k {
+        let d = 0
+        while d < dims {
+            if centers.getFloat32((c * dims + d) * 4) > 0.5 { out[c * rb + d / 8] = out[c * rb + d / 8] | (1 << (7 - d % 8)) }
+            d += 1
+        }
+        c += 1
+    }
+    return out
+}
+
+// k centres for the n samples (float32 rows in x), Elkan's k-means with k-means++ initialization; centres are
+// normalized after every update when spherical.
+deterministic function IvfFlat.kmeans(x: Bytes, n: Integer, k: Integer, spherical: Boolean): Bytes {
+    let dims = self.dimensions
+    let rb = dims * 4
+    let centers = Bytes(k * rb)
+    self.iterations = 0
+    if n <= k {
+        // pgvector's QuickCenters: every sample is a centre, the rest are random
+        let i = 0
+        while i < n * rb {
+            centers[i] = x[i]
+            i += 1
+        }
+        let c = n
+        while c < k {
+            let d = 0
+            while d < dims {
+                centers.setFloat32(c * rb + d * 4, self.rng.nextFloat() * 2.0 - 1.0)
+                d += 1
+            }
+            if spherical { normalizeRow(centers, c * rb, dims) }
+            c += 1
+        }
+        return centers
+    }
+    let inf = ann.infinity()
+    let lower = Bytes(n * k * 4)
+    let upper: List<Float> = []
+    let assign: List<Integer> = []
+    let weight: List<Float> = []
+    let j = 0
+    while j < n {
+        upper.add(inf)
+        assign.add(0)
+        weight.add(inf)
+        j += 1
+    }
+    // k-means++: each next centre is a sample drawn with probability proportional to its squared distance
+    let pick = self.rng.below(n)
+    let c = 0
+    while c < k {
+        let b = 0
+        while b < rb {
+            centers[c * rb + b] = x[pick * rb + b]
+            b += 1
+        }
+        j = 0
+        while j < n {
+            let d = math.sqrt(ann.l2Squared(centers, c * rb, x, j * rb, dims))
+            lower.setFloat32((j * k + c) * 4, lowered(d))
+            if d < upper[j] {
+                upper[j] = d
+                assign[j] = c
+            }
+            if d * d < weight[j] { weight[j] = d * d }
+            j += 1
+        }
+        c += 1
+        if c == k { break }
+        let sum = 0.0
+        j = 0
+        while j < n {
+            sum += weight[j]
+            j += 1
+        }
+        let choice = sum * self.rng.nextFloat()
+        pick = 0
+        while pick < n - 1 {
+            choice -= weight[pick]
+            if choice <= 0.0 { break }
+            pick += 1
+        }
+    }
+    let cc = Bytes(k * k * 4)
+    let half: List<Float> = []
+    let shift: List<Float> = []
+    let counts: List<Integer> = []
+    let sums: List<Float> = []
+    c = 0
+    while c < k {
+        half.add(0.0)
+        shift.add(0.0)
+        counts.add(0)
+        c += 1
+    }
+    let s = 0
+    while s < k * dims {
+        sums.add(0.0)
+        s += 1
+    }
+    let next = Bytes(k * rb)
+    let iteration = 0
+    while iteration < MAX_ITERATIONS {
+        // half the distance from each centre to its nearest other centre
+        let a = 0
+        while a < k {
+            half[a] = inf
+            a += 1
+        }
+        a = 0
+        while a < k {
+            let b = a + 1
+            while b < k {
+                let d = 0.5 * math.sqrt(ann.l2Squared(centers, a * rb, centers, b * rb, dims))
+                cc.setFloat32((a * k + b) * 4, lowered(d))
+                cc.setFloat32((b * k + a) * 4, lowered(d))
+                if d < half[a] { half[a] = d }
+                if d < half[b] { half[b] = d }
+                b += 1
+            }
+            a += 1
+        }
+        // reassign, skipping centres the bounds rule out
+        let changes = 0
+        j = 0
+        while j < n {
+            let cur = assign[j]
+            let u = upper[j]
+            if u > half[cur] {
+                let stale = true
+                let row = j * k * 4
+                let t = 0
+                while t < k {
+                    if t != cur && u > lower.getFloat32(row + t * 4) && u > cc.getFloat32((cur * k + t) * 4) {
+                        let skip = false
+                        if stale {
+                            u = math.sqrt(ann.l2Squared(x, j * rb, centers, cur * rb, dims))
+                            lower.setFloat32(row + cur * 4, lowered(u))
+                            stale = false
+                            skip = u <= lower.getFloat32(row + t * 4) || u <= cc.getFloat32((cur * k + t) * 4)
+                        }
+                        if !skip {
+                            let d = math.sqrt(ann.l2Squared(x, j * rb, centers, t * rb, dims))
+                            lower.setFloat32(row + t * 4, lowered(d))
+                            if d < u {
+                                cur = t
+                                u = d
+                                changes += 1
+                            }
+                        }
+                    }
+                    t += 1
+                }
+                assign[j] = cur
+                upper[j] = u
+            }
+            j += 1
+        }
+        if iteration > 0 && changes == 0 { break }
+        // move each centre to the mean of its samples (an empty centre stays where it is)
+        c = 0
+        while c < k {
+            counts[c] = 0
+            c += 1
+        }
+        s = 0
+        while s < k * dims {
+            sums[s] = 0.0
+            s += 1
+        }
+        j = 0
+        while j < n {
+            let to = assign[j]
+            counts[to] += 1
+            let d = 0
+            while d < dims {
+                sums[to * dims + d] += x.getFloat32(j * rb + d * 4)
+                d += 1
+            }
+            j += 1
+        }
+        c = 0
+        while c < k {
+            let d = 0
+            if counts[c] == 0 {
+                while d < rb {
+                    next[c * rb + d] = centers[c * rb + d]
+                    d += 1
+                }
+            } else {
+                let scale = 1.0 / Float(counts[c])
+                while d < dims {
+                    next.setFloat32(c * rb + d * 4, sums[c * dims + d] * scale)
+                    d += 1
+                }
+                if spherical { normalizeRow(next, c * rb, dims) }
+            }
+            shift[c] = math.sqrt(ann.l2Squared(centers, c * rb, next, c * rb, dims))
+            c += 1
+        }
+        // loosen the bounds by how far the centres moved
+        j = 0
+        while j < n {
+            let row = j * k * 4
+            let t = 0
+            while t < k {
+                let lb = lower.getFloat32(row + t * 4) - shift[t]
+                if lb < 0.0 { lb = 0.0 }
+                lower.setFloat32(row + t * 4, lowered(lb))
+                t += 1
+            }
+            upper[j] = upper[j] + shift[assign[j]]
+            j += 1
+        }
+        let swap = centers
+        centers = next
+        next = swap
+        iteration += 1
+    }
+    self.iterations = iteration
+    return centers
+}
+
+deterministic function normalizeRow(b: Bytes, offset: Integer, dims: Integer) {
+    let sum = 0.0
+    let d = 0
+    while d < dims {
+        let f = b.getFloat32(offset + d * 4)
+        sum += f * f
+        d += 1
+    }
+    let norm = math.sqrt(sum)
+    if !(norm > 0.0) { return }
+    d = 0
+    while d < dims {
+        b.setFloat32(offset + d * 4, b.getFloat32(offset + d * 4) / norm)
+        d += 1
+    }
+}
+
+// ---------------------------------------------------------------- search
+
+// Up to k rows nearest the query (dimensions float32 values at q[offset..]) from the `probes` nearest lists
+// (pgvector's ivfflat.probes, default 1; probes >= lists, or an untrained index, is an exact scan). Writes ids
+// and operator distances nearest-first into outIds[0..] and outDistances[0..], growing the Lists when needed,
+// and returns the number written.
+public deterministic function IvfFlat.search(q: Bytes, offset: Integer, k: Integer, probes: Integer,
+        outIds: List<Integer>, outDistances: List<Float>): Integer {
+    if self.live == 0 || k <= 0 { return 0 }
+    if !ann.storeRow(self.metric, q, offset, self.query, 0, self.dimensions) {
+        let i = 0
+        while i < self.rowBytes {
+            self.query[i] = 0
+            i += 1
+        }
+    }
+    let found = self.found
+    found.clear()
+    if !self.trained {
+        self.scan(0, k)
+    } else {
+        let p = probes
+        if p < 1 { p = 1 }
+        if p > self.nlists { p = self.nlists }
+        let heap = self.probes
+        heap.clear()
+        let inf = ann.infinity()
+        let rb = self.centreBytes()
+        let c = 0
+        while c < self.nlists {
+            let bound = inf
+            if heap.length >= p { bound = heap.dist[0] }
+            let d = ann.distance(self.metric, self.query, 0, self.centers, c * rb, self.dimensions, bound)
+            if heap.length < p {
+                heap.pushMax(d, c)
+            } else if d < bound {
+                heap.popMax()
+                heap.pushMax(d, c)
+            }
+            c += 1
+        }
+        let i = 0
+        while i < heap.length {
+            self.scan(heap.item[i], k)
+            i += 1
+        }
+    }
+    let n = found.drainAscending(outIds, outDistances, 0)
+    let i = 0
+    while i < n {
+        outDistances[i] = ann.reported(self.metric, outDistances[i])
+        i += 1
+    }
+    return n
+}
+
+// Offer every row of list l to the k-best heap.
+deterministic function IvfFlat.scan(l: Integer, k: Integer) {
+    let found = self.found
+    let ids = self.listIds[l]
+    let rows = self.listRows[l]
+    let n = self.listCount[l]
+    let rb = self.rowBytes
+    let inf = ann.infinity()
+    let r = 0
+    while r < n {
+        let full = found.length >= k
+        let bound = inf
+        if full { bound = found.dist[0] }
+        let d = ann.distance(self.metric, self.query, 0, rows, r * rb, self.dimensions, bound)
+        if !full {
+            found.pushMax(d, ids.getInt64(r * 8))
+        } else if d < bound {
+            found.popMax()
+            found.pushMax(d, ids.getInt64(r * 8))
+        }
+        r += 1
+    }
+}
+
+// A hash of the centres and every list's ids in order, for determinism checks.
+public function IvfFlat.checksum(): Integer {
+    let h = self.nlists
+    let i = 0
+    while i + 4 <= self.centers.length {
+        h = wrappingAdd(wrappingMultiply(h, 1099511628211), self.centers.getInt32(i))
+        i += 4
+    }
+    let l = 0
+    while l < self.nlists {
+        let ids = self.listIds[l]
+        let r = 0
+        while r < self.listCount[l] {
+            h = wrappingAdd(wrappingMultiply(h, 31), ids.getInt64(r * 8))
+            r += 1
+        }
+        h = wrappingAdd(wrappingMultiply(h, 7), l)
+        l += 1
+    }
+    return h
+}

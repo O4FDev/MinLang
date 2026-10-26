@@ -18,6 +18,7 @@ use "./table.min" as tb
 use "./index.min" as ix
 use "./catalog.min" as cat
 use "./txn.min" as txn
+use "../search/index.min" as si
 
 public constant FORMAT = 3
 
@@ -29,6 +30,8 @@ public constant K_HEAP = 5
 public constant K_SLOTS = 6
 public constant K_OMAIN = 7
 public constant K_ODELTA = 8
+public constant K_SEARCH = 9     // search index buffers: obj = position in t.searchIds * SEARCH_STRIDE + buffer index
+public constant SEARCH_STRIDE = 1048576
 
 constant ENC_RAW = 0
 constant ENC_CONST = 1
@@ -543,12 +546,31 @@ public function writeTable(st: Store, c: cat.Catalog, tm: txn.TxnMgr, committing
     let oi = 0
     for oid in t.ordIds {
         let o = c.ordIdx[oid]
-        if o.segs.length == 0 { o.segs = [tb.newSeg(), tb.newSeg()] }
+        ix.ordJoin(o)
         img.segs.add(writeTracked(st, K_OMAIN, oi, o.main, o.segs[0], findSeg(old, K_OMAIN, oi)))
         img.segs.add(writeTracked(st, K_ODELTA, oi, o.delta, o.segs[1], findSeg(old, K_ODELTA, oi)))
+        ix.ordReleaseJoin(o)
         oi += 1
     }
     img.nord = t.ordIds.length
+    let k = 0
+    for sid in t.searchIds {
+        let x = c.searchIdx[sid]
+        let meta = si.imageMeta(x)
+        if meta.length > 0 {
+            let o = k * SEARCH_STRIDE
+            img.segs.add(writeHashed(st, K_SEARCH, o + si.IMG_META, meta, findSeg(old, K_SEARCH, o + si.IMG_META)))
+            let bufs = si.imageBuffers(x)
+            let segs = si.imageSegs(x)
+            for i in 0..bufs.length { img.segs.add(writeTracked(st, K_SEARCH, o + i, bufs[i], segs[i], findSeg(old, K_SEARCH, o + i))) }
+            let ci = 0
+            for a in si.imageArenas(x) {
+                img.segs.add(writeTracked(st, K_SEARCH, o + si.IMG_ARENA + ci, a, x.arenaSegs[ci], findSeg(old, K_SEARCH, o + si.IMG_ARENA + ci)))
+                ci += 1
+            }
+        }
+        k += 1
+    }
     overlayFor(tm, t, img)
     setImage(st, t.id, img)
     return img
@@ -648,51 +670,16 @@ public function markAllDirty(c: cat.Catalog, t: tb.Table) {
     for oid in t.ordIds {
         for s in c.ordIdx[oid].segs { s.all = true }
     }
+    for sid in t.searchIds {
+        let x = c.searchIdx[sid]
+        for s in si.imageSegs(x) { s.all = true }
+        for s in x.arenaSegs { s.all = true }
+    }
 }
 
 // ---------------------------------------------------------------- loading
 
 // pread every piece of a persisted buffer into one Bytes (adjacent pieces in one read) and check piece CRCs.
-function readSeg(st: Store, s: SegImage): Bytes {
-    let out = Bytes()
-    let np = pieceCount(s.length)
-    let p = 0
-    while p < np {
-        let o = s.offs.getInt64(p * 8)
-        if o < 0 {
-            let n = pieceLen(s.length, p)
-            let w = s.words.getInt64(p * 8)
-            let k = 0
-            while k + 8 <= n {
-                out.addInt64(w)
-                k += 8
-            }
-            p += 1
-        } else {
-            // run of raw pieces that are contiguous in the file
-            let q = p + 1
-            let total = pieceLen(s.length, p)
-            while q < np && s.offs.getInt64(q * 8) == o + total && pieceLen(s.length, q - 1) == tb.PIECE {
-                total += pieceLen(s.length, q)
-                q += 1
-            }
-            let base = out.length
-            df.readAppend(st.data, o, out, total)
-            let at = base
-            while p < q {
-                let n = pieceLen(s.length, p)
-                if crc.update(st.table, 0, out, at, n) != s.crcs.getInt64(p * 8) {
-                    fail("storage: data.db piece at " + Text(s.offs.getInt64(p * 8)) + " fails its CRC (table image " +
-                         "kind " + Text(s.kind) + "); the data file is corrupt")
-                }
-                at += n
-                p += 1
-            }
-        }
-    }
-    return out
-}
-
 function cleanSeg(): tb.Seg {
     let s = tb.newSeg()
     s.all = false
@@ -701,7 +688,171 @@ function cleanSeg(): tb.Seg {
 
 // Load table t from its image: buffers by pread, indexes included (rebuilt instead if the image was written with
 // different hash functions), then the overlay. Replaces any paged stand-in.
+// Load table t from its image in one step (recovery, DDL, small tables): the same work as a sliced load.
 public function loadTable(st: Store, c: cat.Catalog, t: tb.Table, img: TableImage) {
+    let ld = loadStart(st, c, t, img)
+    loadStep(st, ld, -1)
+    loadFinish(st, c, t, ld)
+}
+
+// A table load in progress (sliced first-touch loads, ADR-014): the table's buffers are read piece by piece into
+// outs (one per job, in the order loadStart lists them) over several loop iterations; the table stays not loaded,
+// answering paged point lookups, until loadFinish installs everything in one short step.
+public record Loader {
+    active: Boolean
+    tableId: Integer
+    img: TableImage
+    jobs: List<SegImage>
+    outs: List<Bytes>
+    job: Integer                 // next job to read
+    piece: Integer               // next piece of that job
+    useImages: Boolean           // index images are read (else indexes are rebuilt at the end)
+    bytes: Integer               // read so far / in total (diagnostics)
+    total: Integer
+    steps: Integer
+    longestNs: Integer           // diagnostics: longest single read (+ check) and the job / bytes it was
+    longestJob: Integer
+    longestBytes: Integer
+    longestCrcNs: Integer
+}
+
+public function idleLoader(): Loader {
+    return Loader { active: false; tableId: -1; img: emptyImage(); jobs: []; outs: []; job: 0; piece: 0
+                    useImages: false; bytes: 0; total: 0; steps: 0
+                    longestNs: 0; longestJob: -1; longestBytes: 0; longestCrcNs: 0 }
+}
+
+public function loadStart(st: Store, c: cat.Catalog, t: tb.Table, img: TableImage): Loader {
+    let ld = idleLoader()
+    ld.active = true
+    ld.tableId = t.id
+    ld.img = img
+    if !img.present { return ld }
+    ld.jobs.add(findSeg(img, K_STATE, 0))
+    let ci = 0
+    for col in t.cols {
+        ld.jobs.add(findSeg(img, K_DATA, ci))
+        ld.jobs.add(findSeg(img, K_NULLS, ci))
+        if col.perRowScale { ld.jobs.add(findSeg(img, K_SCALES, ci)) }
+        if v.isTextType(col.type) { ld.jobs.add(findSeg(img, K_HEAP, ci)) }
+        ci += 1
+    }
+    ld.useImages = st.fingerprintOk && img.hashMeta.length / 24 == t.hashIds.length && img.nord == t.ordIds.length
+    if ld.useImages {
+        let hi = 0
+        for hid in t.hashIds {
+            ld.jobs.add(findSeg(img, K_SLOTS, hi))
+            hi += 1
+        }
+        let oi = 0
+        for oid in t.ordIds {
+            ld.jobs.add(findSeg(img, K_OMAIN, oi))
+            ld.jobs.add(findSeg(img, K_ODELTA, oi))
+            oi += 1
+        }
+        let k = 0
+        for sid in t.searchIds {
+            for s in searchSegs(img, k * SEARCH_STRIDE) { ld.jobs.add(s) }
+            k += 1
+        }
+    }
+    for j in ld.jobs {
+        ld.outs.add(Bytes())
+        ld.total += j.length
+    }
+    return ld
+}
+
+constant SEARCH_BUFFERS = 13       // image buffers of a search index besides its state and arenas (si.imageBuffers)
+
+// The image buffers of the search index at obj base o, in load order: state (IMG_META), the SEARCH_BUFFERS buffers,
+// then every chunk arena. None when the image holds no search index there (it is built from the loaded rows instead).
+function searchSegs(img: TableImage, o: Integer): List<SegImage> {
+    let out: List<SegImage> = []
+    let ms = findSeg(img, K_SEARCH, o + si.IMG_META)
+    if ms.length == 0 { return out }
+    out.add(ms)
+    for i in 0..SEARCH_BUFFERS { out.add(findSeg(img, K_SEARCH, o + i)) }
+    // arenas are written for chunks 0 .. n-1 (empty ones too); loadImage checks the count against the state buffer
+    let narenas = 0
+    for s in img.segs {
+        let ci = s.obj - o - si.IMG_ARENA
+        if s.kind == K_SEARCH && ci >= 0 && s.obj < o + SEARCH_STRIDE && ci + 1 > narenas { narenas = ci + 1 }
+    }
+    for ci in 0..narenas { out.add(findSeg(img, K_SEARCH, o + si.IMG_ARENA + ci)) }
+    return out
+}
+
+constant LOAD_READ_MAX = 262144    // one pread per contiguous run, at most this long, so a slice can stop between
+
+// Read pieces until the work is done or budgetNs has passed (budgetNs < 0: no limit). True when done.
+public function loadStep(st: Store, ld: Loader, budgetNs: Integer): Boolean {
+    let t0 = 0
+    if budgetNs >= 0 { t0 = dbio.monotonicNanos() }
+    ld.steps += 1
+    while ld.job < ld.jobs.length {
+        let s = ld.jobs[ld.job]
+        let out = ld.outs[ld.job]
+        let np = pieceCount(s.length)
+        while ld.piece < np {
+            let p = ld.piece
+            let o = s.offs.getInt64(p * 8)
+            if o < 0 {
+                let n = pieceLen(s.length, p)
+                let w = s.words.getInt64(p * 8)
+                let k = 0
+                while k + 8 <= n {
+                    out.addInt64(w)
+                    k += 8
+                }
+                ld.bytes += n
+                ld.piece = p + 1
+            } else {
+                // run of raw pieces that are contiguous in the file
+                let q = p + 1
+                let total = pieceLen(s.length, p)
+                while q < np && s.offs.getInt64(q * 8) == o + total && pieceLen(s.length, q - 1) == tb.PIECE &&
+                      total + pieceLen(s.length, q) <= LOAD_READ_MAX {
+                    total += pieceLen(s.length, q)
+                    q += 1
+                }
+                let r0 = dbio.monotonicNanos()
+                let base = out.length
+                df.readAppend(st.data, o, out, total)
+                let r1 = dbio.monotonicNanos()
+                let at = base
+                while p < q {
+                    let n = pieceLen(s.length, p)
+                    if crc.update(st.table, 0, out, at, n) != s.crcs.getInt64(p * 8) {
+                        fail("storage: data.db piece at " + Text(s.offs.getInt64(p * 8)) + " fails its CRC (table image " +
+                             "kind " + Text(s.kind) + "); the data file is corrupt")
+                    }
+                    at += n
+                    p += 1
+                }
+                ld.bytes += total
+                ld.piece = q
+                let r2 = dbio.monotonicNanos()
+                if r2 - r1 > ld.longestCrcNs { ld.longestCrcNs = r2 - r1 }
+                let rn = r1 - r0
+                if rn > ld.longestNs {
+                    ld.longestNs = rn
+                    ld.longestJob = ld.job
+                    ld.longestBytes = out.length
+                }
+            }
+            if budgetNs >= 0 && dbio.monotonicNanos() - t0 >= budgetNs { return false }
+        }
+        ld.job += 1
+        ld.piece = 0
+    }
+    return true
+}
+
+// Install what loadStep read into t (every job must be done).
+public function loadFinish(st: Store, c: cat.Catalog, t: tb.Table, ld: Loader) {
+    ld.active = false
+    let img = ld.img
     st.loads += 1
     t.paged = []
     for hid in t.hashIds { c.hashIdx[hid].paged = [] }
@@ -710,16 +861,25 @@ public function loadTable(st: Store, c: cat.Catalog, t: tb.Table, img: TableImag
         cat.rebuildIndexes(c, t)
         return
     }
-    t.state = readSeg(st, findSeg(img, K_STATE, 0))
+    let j = 0
+    t.state = ld.outs[j]
+    j += 1
     t.nrows = img.nrows
     t.live = img.live
     t.lockedCount = 0
     let ci = 0
     for col in t.cols {
-        col.data = readSeg(st, findSeg(img, K_DATA, ci))
-        col.nulls = readSeg(st, findSeg(img, K_NULLS, ci))
-        if col.perRowScale { col.scales = readSeg(st, findSeg(img, K_SCALES, ci)) } else { col.scales = Bytes() }
-        if v.isTextType(col.type) { col.heap = readSeg(st, findSeg(img, K_HEAP, ci)) } else { col.heap = Bytes() }
+        col.data = ld.outs[j]
+        col.nulls = ld.outs[j + 1]
+        j += 2
+        if col.perRowScale {
+            col.scales = ld.outs[j]
+            j += 1
+        } else { col.scales = Bytes() }
+        if v.isTextType(col.type) {
+            col.heap = ld.outs[j]
+            j += 1
+        } else { col.heap = Bytes() }
         if ci * 8 < img.heapShared.length {
             col.heapShared = img.heapShared.getInt64(ci * 8)
             col.heapDead = img.heapDead.getInt64(ci * 8)
@@ -729,12 +889,12 @@ public function loadTable(st: Store, c: cat.Catalog, t: tb.Table, img: TableImag
         ci += 1
     }
     if t.state.length != t.nrows { fail("storage: table image of " + t.name + " has a bad row state length") }
-    let useImages = st.fingerprintOk && img.hashMeta.length / 24 == t.hashIds.length && img.nord == t.ordIds.length
-    if useImages {
+    if ld.useImages {
         let hi = 0
         for hid in t.hashIds {
             let h = c.hashIdx[hid]
-            h.slots = readSeg(st, findSeg(img, K_SLOTS, hi))
+            h.slots = ld.outs[j]
+            j += 1
             h.mask = img.hashMeta.getInt64(hi * 24)
             h.used = img.hashMeta.getInt64(hi * 24 + 8)
             h.live = img.hashMeta.getInt64(hi * 24 + 16)
@@ -742,17 +902,36 @@ public function loadTable(st: Store, c: cat.Catalog, t: tb.Table, img: TableImag
             if h.slots.length != (h.mask + 1) * 8 { fail("storage: hash index image of " + t.name + " has a bad length") }
             hi += 1
         }
-        let oi = 0
         for oid in t.ordIds {
             let o = c.ordIdx[oid]
-            o.main = readSeg(st, findSeg(img, K_OMAIN, oi))
-            o.delta = readSeg(st, findSeg(img, K_ODELTA, oi))
+            o.main = ld.outs[j]
+            o.delta = ld.outs[j + 1]
+            j += 2
             o.segs = [cleanSeg(), cleanSeg()]
-            oi += 1
+            ix.ordFromImage(o, t)
         }
-        // search indexes are not part of the image (derived state): the one saved at a clean shutdown with this
-        // checkpoint, or a rebuild from the loaded rows
-        cat.loadSearchIndexes(c, t)
+        // search indexes: from their buffers in the image, or built from the loaded rows (none in the image, other
+        // version or shape)
+        let k = 0
+        for sid in t.searchIds {
+            let x = c.searchIdx[sid]
+            let n = searchSegs(img, k * SEARCH_STRIDE).length
+            let ok = false
+            if n > 0 {
+                let meta = ld.outs[j]
+                let bufs: List<Bytes> = []
+                for i in 0..SEARCH_BUFFERS { bufs.add(ld.outs[j + 1 + i]) }
+                let arenas: List<Bytes> = []
+                let first = 1 + SEARCH_BUFFERS
+                for ci in first..n { arenas.add(ld.outs[j + ci]) }
+                ok = si.loadImage(x, t, meta, bufs, arenas)
+            }
+            j += n
+            if !ok { si.build(x, t) }
+            k += 1
+        }
+        // extension (hnsw, ivfflat) indexes have no image: rebuilt from the rows
+        cat.rebuildAnnIndexes(c, t)
     } else {
         cat.rebuildIndexes(c, t)
     }
@@ -977,12 +1156,31 @@ function captureTable(st: Store, c: cat.Catalog, tm: txn.TxnMgr, committing: Byt
     let oi = 0
     for oid in t.ordIds {
         let o = c.ordIdx[oid]
-        if o.segs.length == 0 { o.segs = [tb.newSeg(), tb.newSeg()] }
+        ix.ordJoin(o)     // a fresh run: inserts after this never touch what the checkpoint holds
         ct.bufs.add(capTracked(st, K_OMAIN, oi, o.main, o.segs[0], findSeg(old, K_OMAIN, oi)))
         ct.bufs.add(capTracked(st, K_ODELTA, oi, o.delta, o.segs[1], findSeg(old, K_ODELTA, oi)))
+        ix.ordReleaseJoin(o)
         oi += 1
     }
     img.nord = t.ordIds.length
+    let k = 0
+    for sid in t.searchIds {
+        let x = c.searchIdx[sid]
+        let meta = si.imageMeta(x)
+        if meta.length > 0 {
+            let o = k * SEARCH_STRIDE
+            ct.bufs.add(capHashed(K_SEARCH, o + si.IMG_META, meta, meta.length, findSeg(old, K_SEARCH, o + si.IMG_META)))
+            let bufs = si.imageBuffers(x)
+            let segs = si.imageSegs(x)
+            for i in 0..bufs.length { ct.bufs.add(capTracked(st, K_SEARCH, o + i, bufs[i], segs[i], findSeg(old, K_SEARCH, o + i))) }
+            let ci = 0
+            for a in si.imageArenas(x) {
+                ct.bufs.add(capTracked(st, K_SEARCH, o + si.IMG_ARENA + ci, a, x.arenaSegs[ci], findSeg(old, K_SEARCH, o + si.IMG_ARENA + ci)))
+                ci += 1
+            }
+        }
+        k += 1
+    }
     overlayFor(tm, t, img)
     return ct
 }

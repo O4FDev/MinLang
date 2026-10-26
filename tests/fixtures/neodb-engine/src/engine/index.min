@@ -4,6 +4,7 @@
 // checkpoint). A hash index of a table that is not loaded can be probed from its image (paged mode).
 use "./values.min" as v
 use "./table.min" as tb
+use "./array.min" as arr
 
 // Probe key values supplied by the executor (one entry per key column).
 public record Key {
@@ -57,13 +58,17 @@ public record PagedSlots {
     pages: List<Bytes>
 }
 
+// Ordered index: row ids sorted by key, then row id, in chunks of at most CHUNK_MAX entries (docs/r2/chunked-ordered-
+// index.md). An insert or delete shifts one chunk; a full chunk splits in two. Images store the chunks joined as one
+// run (main) plus an always-empty delta (the format older builds wrote, with unmerged inserts in delta).
 public record OrdIndex {
     id: Integer
     tableId: Integer
     name: Text
     cols: List<Integer>
     unique: Boolean
-    main: Bytes
+    chunks: List<Bytes>
+    main: Bytes         // the chunks joined, only while a checkpoint takes it (ordJoin); empty otherwise
     delta: Bytes
     segs: List<tb.Seg>  // [main, delta] trackers for catalog tables
 }
@@ -83,12 +88,14 @@ public function normNumeric(x: Integer, s: Integer): Integer {
 public function hashCell(c: tb.Column, r: Integer): Integer {
     if tb.isNull(c, r) { return 7 }
     let t = c.type
-    if t == v.T_NUMTEXT { return v.hashNumText(c.heap, tb.textOff(c, r), tb.textLen(c, r)) }
+    if t == v.T_NUMTEXT { return v.hashNumText(tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r)) }
     if v.isTextType(t) {
-        let off = tb.textOff(c, r)
+        let hb = tb.textBuf(c, r)
+        let off = tb.textAt(c, r)
         let len = tb.textLen(c, r)
-        if t == v.T_BPCHAR { len = v.trimmedLen(c.heap, off, len) }
-        return v.hashBytes(c.heap, off, len)
+        if v.isGeneralArray(t) { return arr.hash(v.arrayElemType(t), hb, off, len) }
+        if t == v.T_BPCHAR { len = v.trimmedLen(hb, off, len) }
+        return v.hashBytes(hb, off, len)
     }
     if t == v.T_FLOAT8 || t == v.T_FLOAT4 { return v.hashFloat(tb.getFloat(c, r)) }
     if t == v.T_NUMERIC { return normNumeric(tb.getInt(c, r), tb.getScale(c, r)) }
@@ -108,6 +115,7 @@ public function hashKeyPart(type: Integer, k: Key, i: Integer): Integer {
     if type == v.T_NUMTEXT { return v.hashNumText(k.bufs[i], k.offs[i], k.lens[i]) }
     if v.isTextType(type) {
         let len = k.lens[i]
+        if v.isGeneralArray(type) { return arr.hash(v.arrayElemType(type), k.bufs[i], k.offs[i], len) }
         if type == v.T_BPCHAR { len = v.trimmedLen(k.bufs[i], k.offs[i], len) }
         return v.hashBytes(k.bufs[i], k.offs[i], len)
     }
@@ -163,6 +171,7 @@ public function cmpNumeric(a: Integer, sa: Integer, b: Integer, sb: Integer): In
 }
 
 public function cmpText(type: Integer, a: Bytes, ao: Integer, al: Integer, b: Bytes, bo: Integer, bl: Integer): Integer {
+    if v.isGeneralArray(type) { return arr.compare(v.arrayElemType(type), a, ao, al, b, bo, bl) }
     if type == v.T_BPCHAR {
         return v.compareBytes(a, ao, v.trimmedLen(a, ao, al), b, bo, v.trimmedLen(b, bo, bl))
     }
@@ -173,10 +182,10 @@ public function cmpText(type: Integer, a: Bytes, ao: Integer, al: Integer, b: By
 public function cmpCells(ca: tb.Column, ra: Integer, cb: tb.Column, rb: Integer): Integer {
     let t = ca.type
     if t == v.T_NUMTEXT {
-        return v.cmpNumText(ca.heap, tb.textOff(ca, ra), tb.textLen(ca, ra), cb.heap, tb.textOff(cb, rb), tb.textLen(cb, rb))
+        return v.cmpNumText(tb.textBuf(ca, ra), tb.textAt(ca, ra), tb.textLen(ca, ra), tb.textBuf(cb, rb), tb.textAt(cb, rb), tb.textLen(cb, rb))
     }
     if v.isTextType(t) {
-        return cmpText(t, ca.heap, tb.textOff(ca, ra), tb.textLen(ca, ra), cb.heap, tb.textOff(cb, rb), tb.textLen(cb, rb))
+        return cmpText(t, tb.textBuf(ca, ra), tb.textAt(ca, ra), tb.textLen(ca, ra), tb.textBuf(cb, rb), tb.textAt(cb, rb), tb.textLen(cb, rb))
     }
     if t == v.T_FLOAT8 || t == v.T_FLOAT4 { return cmpFloat(tb.getFloat(ca, ra), tb.getFloat(cb, rb)) }
     if t == v.T_NUMERIC { return cmpNumeric(tb.getInt(ca, ra), tb.getScale(ca, ra), tb.getInt(cb, rb), tb.getScale(cb, rb)) }
@@ -227,9 +236,9 @@ public function cmpRowKey(t: tb.Table, cols: List<Integer>, r: Integer, k: Key):
         let res = 0
         let ty = c.type
         if ty == v.T_NUMTEXT {
-            res = v.cmpNumText(c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i])
+            res = v.cmpNumText(tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i])
         } else if v.isTextType(ty) {
-            res = cmpText(ty, c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i])
+            res = cmpText(ty, tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i])
         } else if ty == v.T_FLOAT8 || ty == v.T_FLOAT4 {
             res = cmpFloat(tb.getFloat(c, r), k.flts[i])
         } else if ty == v.T_NUMERIC {
@@ -252,11 +261,11 @@ public function rowMatchesKey(t: tb.Table, cols: List<Integer>, r: Integer, k: K
         if k.nulls[i] || tb.isNull(c, r) { return false }
         let ty = c.type
         if ty == v.T_NUMTEXT {
-            if v.cmpNumText(c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i]) != 0 { return false }
+            if v.cmpNumText(tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i]) != 0 { return false }
         } else if v.isTextType(ty) {
             if ty == v.T_BPCHAR {
-                if cmpText(ty, c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i]) != 0 { return false }
-            } else if !v.equalBytes(c.heap, tb.textOff(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i]) {
+                if cmpText(ty, tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i]) != 0 { return false }
+            } else if !v.equalBytes(tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r), k.bufs[i], k.offs[i], k.lens[i]) {
                 return false
             }
         } else if ty == v.T_FLOAT8 || ty == v.T_FLOAT4 {
@@ -474,15 +483,12 @@ function hashBuildGeneric(ix: HashIndex, t: tb.Table) {
 public function newOrdIndex(id: Integer, tableId: Integer, name: Text, cols: List<Integer>, unique: Boolean): OrdIndex {
     let segs: List<tb.Seg> = []
     if tableId >= 0 { segs = [tb.newSeg(), tb.newSeg()] }
-    return OrdIndex { id: id; tableId: tableId; name: name; cols: cols; unique: unique; main: Bytes(); delta: Bytes()
+    return OrdIndex { id: id; tableId: tableId; name: name; cols: cols; unique: unique; chunks: []; main: Bytes(); delta: Bytes()
                       segs: segs }
 }
 
-function freshOrdSegs(ix: OrdIndex) {
-    if ix.segs.length > 0 { ix.segs = [tb.newSeg(), tb.newSeg()] }
-}
-
-public constant DELTA_MAX = 4096
+public constant CHUNK = 512          // entries per chunk after a build (half of CHUNK_MAX, so inserts rarely split)
+public constant CHUNK_MAX = 1024     // a chunk this full splits in two
 
 // First position in run (Bytes of Int64 row ids) whose row is >= row `r` (by key, then row id).
 function lowerBoundRow(t: tb.Table, cols: List<Integer>, run: Bytes, r: Integer): Integer {
@@ -536,88 +542,154 @@ function removeAt(run: Bytes, pos: Integer) {
     run.resize((n - 1) * 8)
 }
 
+// The chunk that holds (or would hold) row r: the last one whose first row is <= r, else the first.
+function chunkOfRow(ix: OrdIndex, t: tb.Table, r: Integer): Integer {
+    let lo = 0
+    let hi = ix.chunks.length
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if cmpRows(t, ix.cols, ix.chunks[mid].getInt64(0), r) <= 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    if lo > 0 { return lo - 1 }
+    return 0
+}
+
 public function ordInsert(ix: OrdIndex, t: tb.Table, r: Integer) {
-    let pos = lowerBoundRow(t, ix.cols, ix.delta, r)
-    if ix.segs.length > 0 { tb.touchRange(ix.segs[1], ix.delta, pos * 8, ix.delta.length) }
-    insertAt(ix.delta, pos, r)
-    if ix.delta.length / 8 >= DELTA_MAX { ordMerge(ix, t) }
+    if ix.chunks.length == 0 {
+        let first = Bytes()
+        first.addInt64(r)
+        ix.chunks.add(first)
+        return
+    }
+    let ci = chunkOfRow(ix, t, r)
+    let c = ix.chunks[ci]
+    insertAt(c, lowerBoundRow(t, ix.cols, c, r), r)
+    let n = c.length / 8
+    if n >= CHUNK_MAX {
+        // split: the upper half becomes a new chunk after this one
+        let half = n / 2
+        let upper = c.slice(half * 8, n * 8)
+        c.resize(half * 8)
+        ix.chunks.add(upper)
+        let k = ix.chunks.length - 1
+        while k > ci + 1 {
+            ix.chunks[k] = ix.chunks[k - 1]
+            k -= 1
+        }
+        ix.chunks[ci + 1] = upper
+    }
 }
 
 // Remove row r (its key must still be the one it was inserted with).
 public function ordRemove(ix: OrdIndex, t: tb.Table, r: Integer): Boolean {
-    let pos = lowerBoundRow(t, ix.cols, ix.delta, r)
-    if pos < ix.delta.length / 8 && ix.delta.getInt64(pos * 8) == r {
-        if ix.segs.length > 0 { tb.touchRange(ix.segs[1], ix.delta, pos * 8, ix.delta.length) }
-        removeAt(ix.delta, pos)
-        return true
+    if ix.chunks.length == 0 { return false }
+    let ci = chunkOfRow(ix, t, r)
+    let c = ix.chunks[ci]
+    let pos = lowerBoundRow(t, ix.cols, c, r)
+    if pos >= c.length / 8 || c.getInt64(pos * 8) != r { return false }
+    removeAt(c, pos)
+    if c.length == 0 {
+        let kept: List<Bytes> = []
+        let k = 0
+        while k < ix.chunks.length {
+            if k != ci { kept.add(ix.chunks[k]) }
+            k += 1
+        }
+        ix.chunks = kept
     }
-    pos = lowerBoundRow(t, ix.cols, ix.main, r)
-    if pos < ix.main.length / 8 && ix.main.getInt64(pos * 8) == r {
-        if ix.segs.length > 0 { tb.touchRange(ix.segs[0], ix.main, pos * 8, ix.main.length) }
-        removeAt(ix.main, pos)
-        return true
-    }
-    return false
+    return true
 }
 
-// Merge the delta into the main run. Each delta row finds its place by galloping from the previous place, and the
-// main rows in between are copied without comparing them: about nb * log(na / nb) key comparisons instead of
-// na + nb, which matters because a comparison decodes key columns and main runs reach millions of rows
-// (TPC-C order_line: an every-4096-inserts full compare cost ~600 comparisons per insert and 100+ ms stalls).
-public function ordMerge(ix: OrdIndex, t: tb.Table) {
-    let a = ix.main
-    let b = ix.delta
-    let na = a.length / 8
-    let nb = b.length / 8
+// Number of entries.
+public function ordCount(ix: OrdIndex): Integer {
+    let n = 0
+    for c in ix.chunks { n += c.length / 8 }
+    return n
+}
+
+// The entries in order as one run (images, checks).
+public function ordRun(ix: OrdIndex): Bytes {
     let out = Bytes()
+    for c in ix.chunks { out.addBytes(c) }
+    return out
+}
+
+// Cut a sorted run into chunks of CHUNK entries.
+function setChunks(ix: OrdIndex, run: Bytes) {
+    let chunks: List<Bytes> = []
+    let n = run.length / 8
     let i = 0
-    let j = 0
-    while j < nb {
-        let y = b.getInt64(j * 8)
-        let p = gallop(t, ix.cols, a, i, na, y)
-        copyRun(out, a, i, p)
-        out.addInt64(y)
-        i = p
-        j += 1
+    while i < n {
+        let e = min(i + CHUNK, n)
+        chunks.add(run.slice(i * 8, e * 8))
+        i = e
     }
-    copyRun(out, a, i, na)
-    ix.main = out
+    ix.chunks = chunks
+}
+
+// A checkpoint takes the index as one run: join the chunks into main (a fresh buffer, so later inserts never touch
+// what the checkpoint holds; it is written in full) with an empty delta. ordReleaseJoin drops the reference after.
+public function ordJoin(ix: OrdIndex) {
+    ix.main = ordRun(ix)
     ix.delta = Bytes()
-    freshOrdSegs(ix)
+    ix.segs = [tb.newSeg(), tb.newSeg()]
 }
 
-// First position p in [from, n) with run[p] > r (rows are totally ordered by key, then row id), searching
-// 1, 2, 4, ... positions ahead of from and then bisecting the last step.
-function gallop(t: tb.Table, cols: List<Integer>, run: Bytes, from: Integer, n: Integer, r: Integer): Integer {
-    if from >= n || cmpRows(t, cols, run.getInt64(from * 8), r) > 0 { return from }
-    let lo = from
-    let step = 1
-    let hi = from + 1
-    while hi < n && cmpRows(t, cols, run.getInt64(hi * 8), r) <= 0 {
-        lo = hi
-        step = step * 2
-        hi = lo + step
-    }
-    if hi > n { hi = n }
-    let x = lo + 1
-    let y = hi
-    while x < y {
-        let mid = (x + y) / 2
-        if cmpRows(t, cols, run.getInt64(mid * 8), r) <= 0 { x = mid + 1 } else { y = mid }
-    }
-    return x
+public function ordReleaseJoin(ix: OrdIndex) {
+    ix.main = Bytes()
 }
 
-function copyRun(out: Bytes, run: Bytes, from: Integer, to: Integer) {
-    if to - from >= 32 {
-        out.addBytes(run.slice(from * 8, to * 8))
-        return
+// After an image load put main (and an older image's unmerged delta) into chunks.
+public function ordFromImage(ix: OrdIndex, t: tb.Table) {
+    let run = ix.main
+    let d = ix.delta
+    if d.length > 0 {
+        let merged = Bytes()
+        let na = run.length / 8
+        let nb = d.length / 8
+        let i = 0
+        let j = 0
+        while i < na || j < nb {
+            if j >= nb || (i < na && cmpRows(t, ix.cols, run.getInt64(i * 8), d.getInt64(j * 8)) <= 0) {
+                merged.addInt64(run.getInt64(i * 8))
+                i += 1
+            } else {
+                merged.addInt64(d.getInt64(j * 8))
+                j += 1
+            }
+        }
+        run = merged
     }
-    let k = from
-    while k < to {
-        out.addInt64(run.getInt64(k * 8))
-        k += 1
+    setChunks(ix, run)
+    ix.main = Bytes()
+    ix.delta = Bytes()
+}
+
+// Range cursor: (chunk, position). The first entry whose key prefix is >= k (strict: > k), as chunk index and position.
+public function ordSeekChunk(ix: OrdIndex, t: tb.Table, k: Key, strict: Boolean): Integer {
+    // the first chunk whose last entry is at or past the bound
+    let lo = 0
+    let hi = ix.chunks.length
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        let c = ix.chunks[mid]
+        let cmp = cmpRowKey(t, ix.cols, c.getInt64(c.length - 8), k)
+        if cmp < 0 || (strict && cmp == 0) {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
     }
+    return lo
+}
+
+public function ordSeekPos(ix: OrdIndex, t: tb.Table, chunk: Integer, k: Key, strict: Boolean): Integer {
+    if chunk >= ix.chunks.length { return 0 }
+    return lowerBoundKey(t, ix.cols, ix.chunks[chunk], k, strict)
 }
 
 public function ordBuild(ix: OrdIndex, t: tb.Table) {
@@ -629,9 +701,10 @@ public function ordBuild(ix: OrdIndex, t: tb.Table) {
         r += 1
     }
     sortRowIds(t, ix.cols, ids)
-    ix.main = ids
+    setChunks(ix, ids)
+    ix.main = Bytes()
     ix.delta = Bytes()
-    freshOrdSegs(ix)
+    if ix.segs.length > 0 { ix.segs = [tb.newSeg(), tb.newSeg()] }
 }
 
 // Merge sort of row ids by cmpRows (stable, O(n log n)).
@@ -711,7 +784,6 @@ public function sortRowIds(t: tb.Table, cols: List<Integer>, ids: Bytes) {
     }
 }
 
-// Range cursor over main + delta: positions are kept by the caller (two Integers).
 public function runLength(run: Bytes): Integer {
     return run.length / 8
 }

@@ -1,26 +1,121 @@
-// The Postgres bit(n) type, written as a built-in extension: neo-db's own core types use the same SDK as
+// The Postgres bit(n) and bit varying(n) types, written as a built-in extension: neo-db's own core types use the same SDK as
 // third-party extensions. Stored as int32 bit count (little-endian) followed by the bits, most significant first.
 use "neodb-sdk" as sdk
 use "text" as utf8
 
 public function extension(): sdk.Extension {
-    let x = sdk.builtin("bit", "fixed-length bit strings")
-    let bit = x.type("bit", function(call) { bitIn(call) }, function(call) { bitOut(call) })
+    let x = sdk.builtin("bit", "fixed-length and varying bit strings")
+    let bit = x.type("bit", function(call) { bitIn(call, false) }, bitOut)
     bit.postgresOids(1560, 1561, "V")
-    bit.binary(function(call) { bitRecv(call) }, function(call) { bitSend(call) })
-    bit.modifier(function(call) { bitCheck(call) })
+    bit.binary(function(call) { bitRecv(call, false) }, bitSend)
+    bit.modifier(function(call) { bitCheck(call, false) })
+    bit.explicitResize(function(call) { bitResize(call, false) })
+    // bit varying(n): the same stored form; n is a maximum length instead of the exact one
+    let varbit = x.type("varbit", function(call) { bitIn(call, true) }, bitOut)
+    varbit.postgresOids(1562, 1563, "V")
+    varbit.binary(function(call) { bitRecv(call, true) }, bitSend)
+    varbit.modifier(function(call) { bitCheck(call, true) })
+    varbit.explicitResize(function(call) { bitResize(call, true) })
+    x.implicitCast("varbit", "bit", function(call) { convert(call, false) })
+    x.implicitCast("bit", "varbit", function(call) { convert(call, true) })
+    x.cast("int4", "bit", function(call) { bitFromInteger(call, 32) })
+    x.cast("int8", "bit", function(call) { bitFromInteger(call, 64) })
+    x.define("length", ["bit"], "int4", bitLength)
+    x.define("length", ["varbit"], "int4", bitLength)
     return x
+}
+
+// length(bit): the number of bits.
+deterministic function bitLength(call: sdk.Call) { call.returnInteger(bits(call)) }
+
+// integer::bit(n) (bitfromint4/bitfromint8): the n rightmost bits of the two's complement value, the sign
+// repeated to the left of its width; plain bit is bit(1).
+deterministic function bitFromInteger(call: sdk.Call, width: Integer) {
+    let n = call.modifier
+    if n < 1 { n = 1 }
+    let x = call.integers[0]
+    let out = call.output
+    out.addInt32(n)
+    let acc = 0
+    let i = 0
+    while i < n {
+        let at = n - 1 - i
+        let bit = 0
+        if at >= width {
+            if x < 0 { bit = 1 }
+        } else {
+            bit = (x >> at) & 1
+        }
+        acc = acc * 2 + bit
+        if i % 8 == 7 {
+            out.add(acc)
+            acc = 0
+        }
+        i += 1
+    }
+    if n % 8 != 0 {
+        let pad = 8 - n % 8
+        while pad > 0 {
+            acc = acc * 2
+            pad -= 1
+        }
+        out.add(acc)
+    }
 }
 
 function bits(call: sdk.Call): Integer { return call.int32(0, 0) }
 
-function checkLength(call: sdk.Call, n: Integer) {
-    if call.modifier >= 0 && n != call.modifier {
+function checkLength(call: sdk.Call, n: Integer, varying: Boolean) {
+    if call.modifier < 0 { return }
+    if varying {
+        if n > call.modifier {
+            call.fail("22001", "bit string too long for type bit varying(" + Text(call.modifier) + ")")
+        }
+        return
+    }
+    if n != call.modifier {
         call.fail("22026", "bit string length " + Text(n) + " does not match type bit(" + Text(call.modifier) + ")")
     }
 }
 
-deterministic function bitIn(call: sdk.Call) {
+// bit <-> bit varying: the bytes stay; the target's length rule applies (an explicit cast fits the length).
+deterministic function convert(call: sdk.Call, varying: Boolean) {
+    if call.explicit && call.modifier >= 0 {
+        bitResize(call, varying)
+        return
+    }
+    call.output.addBytes(call.bytes(0))
+    checkLength(call, bits(call), varying)
+}
+
+// Explicit cast to bit(n) / bit varying(n) (Postgres bit() / varbit() with isExplicit): bit(n) pads with zero bits
+// on the right or truncates; bit varying(n) only truncates.
+deterministic function bitResize(call: sdk.Call, varying: Boolean) {
+    let have = bits(call)
+    let n = call.modifier
+    if varying && have <= n { n = have }
+    let out = call.output
+    out.addInt32(n)
+    let nbytes = (n + 7) / 8
+    let i = 0
+    while i < nbytes {
+        let byte = 0
+        if 4 + i < call.length(0) && i * 8 < have { byte = call.byte(0, 4 + i) }
+        out.add(byte)
+        i += 1
+    }
+    // clear the bits past n in the last byte, and past the source's own length
+    let keep = n
+    if have < keep { keep = have }
+    let bit = keep
+    while bit < nbytes * 8 {
+        let at = out.length - nbytes + bit / 8
+        out[at] = out[at] & (255 - (1 << (7 - bit % 8)))
+        bit += 1
+    }
+}
+
+deterministic function bitIn(call: sdk.Call, varying: Boolean) {
     let n = call.length(0)
     let out = call.output
     out.addInt32(n)
@@ -47,7 +142,7 @@ deterministic function bitIn(call: sdk.Call) {
         }
         out.add(acc)
     }
-    checkLength(call, n)
+    checkLength(call, n, varying)
 }
 
 deterministic function bitOut(call: sdk.Call) {
@@ -68,7 +163,7 @@ deterministic function bitOut(call: sdk.Call) {
 }
 
 // Wire format: int32 bit count (big-endian), then the bit bytes.
-deterministic function bitRecv(call: sdk.Call) {
+deterministic function bitRecv(call: sdk.Call, varying: Boolean) {
     let len = call.length(0)
     if len < 4 {
         call.fail("22P03", "insufficient data left in message")
@@ -86,7 +181,7 @@ deterministic function bitRecv(call: sdk.Call) {
         out.add(call.byte(0, i))
         i += 1
     }
-    checkLength(call, n)
+    checkLength(call, n, varying)
 }
 
 deterministic function bitSend(call: sdk.Call) {
@@ -103,4 +198,4 @@ deterministic function bitSend(call: sdk.Call) {
     }
 }
 
-deterministic function bitCheck(call: sdk.Call) { checkLength(call, bits(call)) }
+deterministic function bitCheck(call: sdk.Call, varying: Boolean) { checkLength(call, bits(call), varying) }

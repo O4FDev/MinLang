@@ -25,6 +25,9 @@ constant PROMOTE_AT = 4096
 constant BM_MIN = 64
 constant BM_BLOCKS = 128
 constant BM_SHIFT = 9
+// after the factors: per block the largest term frequency's TIN bucket (tfRep), a nibble each (block b in byte b >> 1,
+// low nibble for even b); with a row's own length it bounds the term's score in that row without reading its tf
+constant BM_TF = 64
 
 // ---------------------------------------------------------------- dictionary
 
@@ -35,10 +38,13 @@ public record Dict {
     slots: Bytes       // int32 per slot: term id + 1, 0 = empty
     mask: Integer
     count: Integer
+    slotsSeg: tb.Seg   // checkpoint change tracking of slots
+    growSegs: List<tb.Seg>   // of text, ends, hashes: they only grow (new pieces), all-dirty when the dictionary is new
 }
 
 function newDict(): Dict {
-    return Dict { text: Bytes(); ends: Bytes(); hashes: Bytes(); slots: Bytes(65536 * 4); mask: 65535; count: 0 }
+    return Dict { text: Bytes(); ends: Bytes(); hashes: Bytes(); slots: Bytes(65536 * 4); mask: 65535; count: 0; slotsSeg: tb.newSeg()
+                  growSegs: [tb.newSeg(), tb.newSeg(), tb.newSeg()] }
 }
 
 public function termStart(d: Dict, id: Integer): Integer {
@@ -90,6 +96,7 @@ public function intern(d: Dict, buf: Bytes, off: Integer, len: Integer): Integer
     }
     d.ends.addInt32(d.text.length)
     d.hashes.addInt64(h)
+    tb.touch(d.slotsSeg, d.slots, i * 4)
     d.slots.setInt32(i * 4, id + 1)
     d.count = id + 1
     if d.count * 2 > d.mask { growDict(d) }
@@ -99,6 +106,7 @@ public function intern(d: Dict, buf: Bytes, off: Integer, len: Integer): Integer
 function growDict(d: Dict) {
     let n = (d.mask + 1) * 2
     d.slots = Bytes(n * 4)
+    d.slotsSeg = tb.newSeg()
     d.mask = n - 1
     let id = 0
     while id < d.count {
@@ -156,6 +164,47 @@ public record Index {
     facets: List<Facet>   // per-value row bitmaps of low-cardinality columns (GROUP BY over a search)
     generation: Integer   // bumped by every full build (term ids change)
     normAvgdl: Float      // average document length the block-max factors were computed with
+    segs: List<tb.Seg>    // checkpoint change tracking of the persisted buffers (SG_*), see imageBuffers
+    arenaSegs: List<tb.Seg>
+    // a statement searching this index is suspended at a yield point (C2): the index does not settle, and rows whose
+    // main postings a write invalidates before the statement scanned their chunk are evaluated by it at the end
+    pinned: Boolean
+    pinScanned: Bytes     // the suspended search's chunks done (order code chunk * 2 + delta)
+    pinRows: Bytes        // int64 rows to evaluate at the end of the suspended search
+    pinSeen: hm.IntMap
+    version: Integer      // bumped by every change to rows, statistics or segments (prefetched results check it)
+}
+
+// persisted buffers whose in-place writes are tracked (tb.touch before every write)
+constant SG_DF = 0
+constant SG_DL = 1
+constant SG_VALID = 2
+constant SG_INDELTA = 3
+constant SG_COUNTED = 4
+constant SG_SUSPECT = 5
+constant SG_DIR = 6
+constant SG_DIRSTART = 7
+constant SG_DIRCOUNT = 8
+constant SG_COUNT = 9
+
+function newSegs(): List<tb.Seg> {
+    let out: List<tb.Seg> = []
+    let i = 0
+    while i < SG_COUNT {
+        out.add(tb.newSeg())
+        i += 1
+    }
+    return out
+}
+
+function setBitT(ix: Index, k: Integer, b: Bytes, r: Integer) {
+    tb.touch(ix.segs[k], b, (r >> 6) * 8)
+    setBit(b, r)
+}
+
+function clearBitT(ix: Index, k: Integer, b: Bytes, r: Integer) {
+    tb.touch(ix.segs[k], b, (r >> 6) * 8)
+    clearBit(b, r)
 }
 
 public function newIndex(id: Integer, tableId: Integer, column: Integer, name: Text, stemmer: Integer): Index {
@@ -167,6 +216,7 @@ public function newIndex(id: Integer, tableId: Integer, column: Integer, name: T
         deltas: []; deltaDirty: Bytes(); deltaCount: Bytes(); n: 0; sumDl: 0; capRows: 0
         tk: tx.newTokens(stemmer); tk2: tx.newTokens(stemmer); sorted: Bytes(); sortedCount: -1
         cnt: Bytes(); start: Bytes(); built: false; oldPrint: hm.newIntMap(16); facets: []; generation: 0; normAvgdl: 1.0
+        segs: newSegs(); arenaSegs: []; pinned: false; pinScanned: Bytes(); pinRows: Bytes(); pinSeen: hm.newIntMap(16); version: 0
     }
 }
 
@@ -220,6 +270,7 @@ public function ensureRows(ix: Index, rows: Integer) {
     while ix.deltas.length < chunks {
         ix.deltas.add(Delta { terms: hm.newIntMap(16); arena: Bytes(); member: Bytes(); count: 0 })
         ix.arenas.add(Bytes())
+        ix.arenaSegs.add(tb.newSeg())
     }
     ix.deltaDirty.resize(chunks)
     ix.deltaCount.resize(chunks * 4)
@@ -233,6 +284,7 @@ public function docLength(ix: Index, r: Integer): Integer {
 }
 
 function setDocLength(ix: Index, r: Integer, n: Integer) {
+    tb.touch(ix.segs[SG_DL], ix.dl, r * 2)
     if n >= 65535 {
         ix.dl.setUInt16(r * 2, 65535)
         hm.put(ix.dlBig, r, n)
@@ -265,7 +317,7 @@ function tokenizeRow(ix: Index, t: tb.Table, r: Integer, tk: tx.Tokens): Boolean
     tx.clear(tk)
     let c = t.cols[ix.column]
     if tb.isNull(c, r) { return false }
-    tx.tokenize(tk, c.heap, tb.textOff(c, r), tb.textLen(c, r))
+    tx.tokenize(tk, tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r))
     return true
 }
 
@@ -296,6 +348,7 @@ function countRow(ix: Index, t: tb.Table, r: Integer, sign: Integer) {
     while i < ids.length / 4 {
         let id = ids.getInt32(i * 4)
         ix.cnt.setInt32(id * 4, 0)
+        tb.touch(ix.segs[SG_DF], ix.df, id * 4)
         ix.df.setInt32(id * 4, ix.df.getInt32(id * 4) + sign)
         i += 1
     }
@@ -314,16 +367,25 @@ function tokenPrint(tk: tx.Tokens): Integer {
 // The row is about to change (or its state is): take it out of the statistics and the valid set.
 public function touchRow(ix: Index, t: tb.Table, r: Integer) {
     if !ix.built { return }
+    ix.version += 1
     ensureRows(ix, r + 1)
     if getBit(ix.counted, r) {
         countRow(ix, t, r, -1)
-        clearBit(ix.counted, r)
+        clearBitT(ix, SG_COUNTED, ix.counted, r)
         if !getBit(ix.inDelta, r) { hm.put(ix.oldPrint, r, tokenPrint(ix.tk2)) }
     }
-    clearBit(ix.mainValid, r)
+    if getBit(ix.mainValid, r) {
+        // a suspended search that has not scanned this row's chunk yet reads it at its end (as of its start)
+        if ix.pinned && ix.pinScanned.length > (r >> CHUNK_SHIFT) * 2 && ix.pinScanned[(r >> CHUNK_SHIFT) * 2] == 0 &&
+           !hm.contains(ix.pinSeen, r) {
+            hm.put(ix.pinSeen, r, 1)
+            ix.pinRows.addInt64(r)
+        }
+        clearBitT(ix, SG_VALID, ix.mainValid, r)
+    }
     if getBit(ix.inDelta, r) { ix.deltaDirty[r >> CHUNK_SHIFT] = 1 }
     if !getBit(ix.suspect, r) {
-        setBit(ix.suspect, r)
+        setBitT(ix, SG_SUSPECT, ix.suspect, r)
         ix.suspects.addInt64(r)
     }
 }
@@ -350,7 +412,7 @@ public function insertRow(ix: Index, t: tb.Table, r: Integer) {
         ensureTerms(ix)
     }
     if !getBit(ix.inDelta, r) {
-        setBit(ix.inDelta, r)
+        setBitT(ix, SG_INDELTA, ix.inDelta, r)
         let c = r >> CHUNK_SHIFT
         ix.deltaCount.setInt32(c * 4, ix.deltaCount.getInt32(c * 4) + 1)
     }
@@ -370,6 +432,12 @@ public function touchRange(ix: Index, t: tb.Table, from: Integer, to: Integer) {
 // transactions) stay suspect and are returned in `locked`.
 public function settle(ix: Index, t: tb.Table, locked: Bytes) {
     locked.clear()
+    if ix.pinned {
+        // a suspended statement reads this index as it was: nothing settles; every suspect row is read like a locked
+        // one, through the statement's own row versions (nested searches wait for the statement instead)
+        locked.addBytes(ix.suspects)
+        return
+    }
     // an index whose table was empty or not loaded when it was created / recovered is built on first use
     if !ix.built { build(ix, t) }
     if ix.suspects.length > 0 {
@@ -380,27 +448,29 @@ public function settle(ix: Index, t: tb.Table, locked: Bytes) {
             let r = ix.suspects.getInt64(i * 8)
             i += 1
             if r >= t.nrows {
-                clearBit(ix.suspect, r)
+                clearBitT(ix, SG_SUSPECT, ix.suspect, r)
                 continue
             }
             let st = t.state[r]
             if st == 0 {
                 countRow(ix, t, r, 1)
-                setBit(ix.counted, r)
+                setBitT(ix, SG_COUNTED, ix.counted, r)
                 for f in ix.facets { facetRow(f, t, r) }
                 if getBit(ix.inDelta, r) {
                     ix.deltaDirty[r >> CHUNK_SHIFT] = 1
                 } else {
-                    setBit(ix.mainValid, r)
+                    setBitT(ix, SG_VALID, ix.mainValid, r)
                 }
-                clearBit(ix.suspect, r)
+                clearBitT(ix, SG_SUSPECT, ix.suspect, r)
             } else if (st & tb.ST_LOCKED) == 0 {
-                clearBit(ix.suspect, r)
+                clearBitT(ix, SG_SUSPECT, ix.suspect, r)
             } else {
                 keep.addInt64(r)
                 locked.addInt64(r)
             }
         }
+        // rows still locked change nothing; any settled row changes the valid set and the statistics
+        if keep.length != ix.suspects.length { ix.version += 1 }
         ix.suspects = keep
     }
     // promote chunks with large deltas, then rebuild dirty delta mini-segments
@@ -411,10 +481,16 @@ public function settle(ix: Index, t: tb.Table, locked: Bytes) {
         if ix.deltaCount.getInt32(c * 4) > PROMOTE_AT { promote.add(c) }
         c += 1
     }
-    if promote.length > 0 { promoteChunks(ix, t, promote) }
+    if promote.length > 0 {
+        ix.version += 1
+        promoteChunks(ix, t, promote)
+    }
     c = 0
     while c < chunks {
-        if ix.deltaDirty[c] != 0 { rebuildDelta(ix, t, c) }
+        if ix.deltaDirty[c] != 0 {
+            ix.version += 1
+            rebuildDelta(ix, t, c)
+        }
         c += 1
     }
 }
@@ -458,6 +534,8 @@ public function build(ix: Index, t: tb.Table) {
     ix.capRows = 0
     ix.sortedCount = -1
     ix.facets = []
+    ix.segs = newSegs()
+    ix.arenaSegs = []
     ensureRows(ix, max(t.nrows, CHUNK))
     ix.normAvgdl = sampleAvgdl(ix, t)
     let pending = Bytes()
@@ -474,6 +552,7 @@ public function build(ix: Index, t: tb.Table) {
     INV.sorted = Bytes()
     dbio.releaseFreeMemory()
     ix.built = true
+    ix.version += 1
     ix.generation += 1
 }
 
@@ -526,10 +605,10 @@ function buildChunk(ix: Index, t: tb.Table, c: Integer, pending: Bytes, initial:
         while i < nr {
             let r = rows.getInt64(i * 8)
             if t.state[r] == 0 {
-                setBit(ix.counted, r)
-                setBit(ix.mainValid, r)
+                setBitT(ix, SG_COUNTED, ix.counted, r)
+                setBitT(ix, SG_VALID, ix.mainValid, r)
             } else {
-                setBit(ix.suspect, r)
+                setBitT(ix, SG_SUSPECT, ix.suspect, r)
                 ix.suspects.addInt64(r)
             }
             i += 1
@@ -538,6 +617,7 @@ function buildChunk(ix: Index, t: tb.Table, c: Integer, pending: Bytes, initial:
     let arena = Bytes()
     invert(ix, t, rows, lo, arena, pending, c, initial, Delta { terms: hm.newIntMap(16); arena: Bytes(); member: Bytes(); count: 0 })
     ix.arenas[c] = arena.slice(0, arena.length)   // exact size: growth leaves up to half the capacity unused
+    ix.arenaSegs[c] = tb.newSeg()                  // a new buffer: written whole by the next checkpoint
     if initial {
         let i = 0
         while i < nr {
@@ -772,11 +852,14 @@ function emitContainer(ix: Index, id: Integer, s: Bytes, from: Integer, end: Int
         tf += 1
         k += 1
     }
-    if counted > 0 { ix.df.setInt32(id * 4, ix.df.getInt32(id * 4) + counted) }
-    // block-max factors
+    if counted > 0 {
+        tb.touch(ix.segs[SG_DF], ix.df, id * 4)
+        ix.df.setInt32(id * 4, ix.df.getInt32(id * 4) + counted)
+    }
+    // block-max factors and term-frequency buckets
     if np >= BM_MIN {
         let bmAt = arena.length
-        arena.resize(bmAt + BM_BLOCKS)
+        arena.resize(bmAt + BM_BLOCKS + BM_TF)
         k = from
         prevRow = -1
         tf = 0
@@ -790,6 +873,11 @@ function emitContainer(ix: Index, id: Integer, s: Bytes, from: Integer, end: Int
                     if qf > 255 { qf = 255 }
                     let bi = bmAt + (prevRow >> BM_SHIFT)
                     if qf > arena[bi] { arena[bi] = qf }
+                    let blkNo = prevRow >> BM_SHIFT
+                    let ni = bmAt + BM_BLOCKS + (blkNo >> 1)
+                    let sh = (blkNo & 1) * 4
+                    let bucket = tfBucket(tf)
+                    if bucket > ((arena[ni] >> sh) & 15) { arena[ni] = (arena[ni] & (240 >> sh)) | (bucket << sh) }
                 }
                 prevRow = row
                 tf = 0
@@ -915,6 +1003,9 @@ function mergeDirectory(ix: Index, pending: Bytes, drop: List<Integer>) {
     ix.dir = nd
     ix.dirStart = starts
     ix.dirCount = cnt
+    ix.segs[SG_DIR] = tb.newSeg()
+    ix.segs[SG_DIRSTART] = tb.newSeg()
+    ix.segs[SG_DIRCOUNT] = tb.newSeg()
     ensureTermsAfterDir(ix)
 }
 
@@ -954,7 +1045,9 @@ function promoteChunks(ix: Index, t: tb.Table, chunks: List<Integer>) {
         let w = lo >> 6
         while w < (hi + 63) >> 6 {
             let cw = ix.counted.getInt64(w * 8)
+            tb.touch(ix.segs[SG_VALID], ix.mainValid, w * 8)
             ix.mainValid.setInt64(w * 8, cw)
+            tb.touch(ix.segs[SG_INDELTA], ix.inDelta, w * 8)
             ix.inDelta.setInt64(w * 8, 0)
             w += 1
         }
@@ -1053,8 +1146,24 @@ function container(ix: Index, term: Integer, c: Integer, delta: Boolean, ref: Cr
 }
 
 function bmBytes(count: Integer): Integer {
-    if count >= BM_MIN { return BM_BLOCKS }
+    if count >= BM_MIN { return BM_BLOCKS + BM_TF }
     return 0
+}
+
+// Index of tf's TIN bucket (TF_REPS[i] <= tf < TF_REPS[i + 1]).
+function tfBucket(tf: Integer): Integer {
+    if tf <= 3 { return max(tf, 1) - 1 }
+    let i = 15
+    while TF_REPS[i] > tf { i -= 1 }
+    return i
+}
+
+// The largest term frequency representative of a container in block blk (TIN's bucket value), or -1 when the
+// container keeps no block metadata (fewer than BM_MIN postings: the caller uses the container's maxTf).
+function blockTfRep(ref: Cref, blk: Integer): Integer {
+    if ref.count < BM_MIN { return -1 }
+    let b = ref.arena[ref.tfOff + ref.count + BM_BLOCKS + (blk >> 1)]
+    return TF_REPS[(b >> ((blk & 1) * 4)) & 15]
 }
 
 function docsBytes(count: Integer): Integer {
@@ -1265,6 +1374,17 @@ public record Compiled {
     wf: List<Float>            // per distinct term: weight * idf * (k1 + 1) (f64 pruning scores)
     normA: Float               // k1 (1 - b)
     normB: Float               // k1 b / avgdl
+    utScoreQ: Bytes            // per distinct term: scores by the query (utScore = this minus dense-elided terms)
+    utPinned: Bytes            // per distinct term: under an explicit boost (never elided)
+    scoreOrderQ: List<Integer> // scoreOrder before dense elision
+    denseRatio: Float          // > 0: TIN's default tin.score, terms in >= ratio of the documents do not score
+    // main-chunk top k computed ahead with other queries (prefetchTopK); valid while the index version matches
+    pkVersion: Integer
+    pkK: Integer
+    pkBuilt: Integer
+    pkFound: List<Integer>
+    pkScores: List<Float>
+    pkRows: List<Integer>
 }
 
 function emptyBitmap(): Bytes { return Bytes(WORDS * 8) }
@@ -1277,6 +1397,7 @@ public function compile(ix: Index, text: Text): Compiled {
         positional: false; err: q.err; errPos: q.errPos; avgdl: 1.0; docs: 0; tmp: Bytes(); counters: Bytes(CHUNK)
         generation: ix.generation; dictCount: ix.dict.count
         leafScore: []; scoreOrder: []; mult32: []; dlf32: 0.0; tfs: Bytes(); stamp: Bytes(); fastPhrase: false; fpUts: Bytes(); fpOffs: Bytes(); fpPtr: Bytes(); fpLeft: Bytes(); fpCur: Bytes(); phraseLists: []; phraseGaps: []; phraseScratch: []; wf: []; normA: 0.0; normB: 0.0
+        utScoreQ: Bytes(); utPinned: Bytes(); scoreOrderQ: []; denseRatio: 0.0; pkVersion: -1; pkK: 0; pkBuilt: 0; pkFound: []; pkScores: []; pkRows: []
     }
     if q.err != "" { return cp }
     // resolve terms first (may add nodes), then size the per-node arrays
@@ -1296,7 +1417,7 @@ public function compile(ix: Index, text: Text): Compiled {
     markExact(cp, q.root)
     cp.positional = cp.exact[q.root] == 0
     detectFastPhrase(cp)
-    markScoring(cp, q.root, false, 1.0)
+    markScoring(cp, q.root, false, 1.0, false)
     i = 0
     while i < cp.uts.length / 4 {
         cp.refs.add(newCref())
@@ -1315,8 +1436,19 @@ public function compile(ix: Index, text: Text): Compiled {
     }
     let ut = cp.uts
     cp.scoreOrder.sortBy(function(a: Integer, b: Integer): Integer { return compareTerms(d, ut.getInt32(a * 4), ut.getInt32(b * 4)) })
+    cp.utScoreQ = cp.utScore.slice(0, cp.utScore.length)
+    for u in cp.scoreOrder { cp.scoreOrderQ.add(u) }
     refreshStats(ix, cp)
     return cp
+}
+
+// TIN's default tin.score: terms in at least `ratio` of the documents (and not under an explicit boost) still match
+// but do not score. 0 = exact BM25 (tin.full_score). The ratio is a float4 in TIN; compared as f64 like Lead does.
+public function setDenseRatio(ix: Index, cp: Compiled, ratio: Float) {
+    let before = cp.denseRatio
+    if ratio > 0.0 { cp.denseRatio = f32(ratio) } else { cp.denseRatio = 0.0 }
+    if cp.denseRatio != before { cp.pkVersion = -1 }   // a top k computed ahead scored with the old elision
+    refreshStats(ix, cp)
 }
 
 // N, avgdl and idf from the current statistics (call after settle).
@@ -1347,6 +1479,29 @@ public function refreshStats(ix: Index, cp: Compiled) {
     }
     cp.normA = K1 * (1.0 - BM25_B)
     cp.normB = K1 * BM25_B / cp.avgdl
+    // dense elision (Lead: !pinned && df > 0 && df >= ratio * N, with the ratio a float4)
+    if cp.utScoreQ.length == cp.utScore.length {
+        let changed = false
+        i = 0
+        while i < cp.uts.length / 4 {
+            let want = cp.utScoreQ[i]
+            if want != 0 && cp.denseRatio > 0.0 && cp.utPinned[i] == 0 {
+                let df = documentFrequency(ix, cp.uts.getInt32(i * 4))
+                if df > 0 && Float(df) >= cp.denseRatio * Float(ix.n) { want = 0 }
+            }
+            if cp.utScore[i] != want {
+                cp.utScore[i] = want
+                changed = true
+            }
+            i += 1
+        }
+        if changed {
+            cp.scoreOrder = []
+            for u in cp.scoreOrderQ {
+                if cp.utScore[u] != 0 { cp.scoreOrder.add(u) }
+            }
+        }
+    }
 }
 
 // Phrases drop words that fold to nothing and leading/trailing gaps; * is not valid where spans are needed.
@@ -1405,6 +1560,7 @@ function setLeaf(cp: Compiled, n: Integer, terms: Bytes) {
             u = cp.uts.length / 4
             cp.uts.addInt32(id)
             cp.utScore.add(0)
+            cp.utPinned.add(0)
             cp.utBoost.add(0.0)
             cp.utLeaves.add(Bytes())
             hm.put(cp.utOf, id, u)
@@ -1860,8 +2016,8 @@ function markExact(cp: Compiled, n: Integer) {
     cp.exact[n] = e
 }
 
-// Terms outside negations contribute to the score (boosts multiply).
-function markScoring(cp: Compiled, n: Integer, negated: Boolean, boost: Float) {
+// Terms outside negations contribute to the score (boosts multiply). pinned: under an explicit boost.
+function markScoring(cp: Compiled, n: Integer, negated: Boolean, boost: Float, pinned: Boolean) {
     let q = cp.q
     let k = q.kind[n]
     let leaf = -1
@@ -1876,6 +2032,7 @@ function markScoring(cp: Compiled, n: Integer, negated: Boolean, boost: Float) {
                 if mode == -2 || (mode >= 0 && cp.uts.getInt32(u * 4) == mode) {
                     cp.utScore[u] = 1
                     cp.utBoost[u] = cp.utBoost[u] + boost
+                    if pinned { cp.utPinned[u] = 1 }
                 }
                 i += 1
             }
@@ -1883,22 +2040,22 @@ function markScoring(cp: Compiled, n: Integer, negated: Boolean, boost: Float) {
         return
     }
     if k == qy.Q_ANDNOT {
-        markScoring(cp, q.a[n], negated, boost)
-        markScoring(cp, q.b[n], true, boost)
+        markScoring(cp, q.a[n], negated, boost, pinned)
+        markScoring(cp, q.b[n], true, boost, pinned)
     } else if k == qy.Q_REL {
-        markScoring(cp, q.a[n], negated, boost)
-        markScoring(cp, q.b[n], negated || (q.flags[n] & qy.QF_NOT) != 0, boost)
+        markScoring(cp, q.a[n], negated, boost, pinned)
+        markScoring(cp, q.b[n], negated || (q.flags[n] & qy.QF_NOT) != 0, boost, pinned)
     } else if k == qy.Q_THEN || k == qy.Q_NEAR {
-        markScoring(cp, q.a[n], negated, boost)
-        markScoring(cp, q.b[n], negated, boost)
+        markScoring(cp, q.a[n], negated, boost, pinned)
+        markScoring(cp, q.b[n], negated, boost, pinned)
     } else if k == qy.Q_WITHIN || k == qy.Q_INPOS {
-        markScoring(cp, q.a[n], negated, boost)
+        markScoring(cp, q.a[n], negated, boost, pinned)
     } else if k == qy.Q_BOOST {
-        markScoring(cp, q.a[n], negated, boost * q.f[n])
+        markScoring(cp, q.a[n], negated, boost * q.f[n], true)
     } else if k == qy.Q_ATLEAST && q.a[n] == 0 {
         // AT LEAST 0 OF matches every row and scores nothing
     } else {
-        for x in q.kids[n] { markScoring(cp, x, negated, boost) }
+        for x in q.kids[n] { markScoring(cp, x, negated, boost, pinned) }
     }
 }
 
@@ -2916,13 +3073,19 @@ public function count(ix: Index, t: tb.Table, cp: Compiled, rd: Reader): Integer
     let total = 0
     let chunks = nChunks(t.nrows)
     // Plain-term AND/OR: the immutable main chunks are counted on every core; deltas and locked rows stay here.
-    let plan = flatPlan(cp)
+    let plan = flatPlan(cp)   // sim-serial-zero: tests/search/sim.sh builds use plan = 0 (deterministic scenarios)
     let built = 0
     if plan != 0 {
         built = min(chunks, ix.arenas.length)
-        total += flatCountChunks(ix, cp, plan, built)
+        total += flatCountChunks(ix, cp, plan, built)   // sim-serial-delete
     }
+    let scanned = Bytes(chunks * 2)
     let c = 0
+    while c < built {
+        scanned[c * 2] = 1
+        c += 1
+    }
+    c = 0
     while c < chunks {
         let pass = 0
         if c < built { pass = 1 }
@@ -2950,8 +3113,12 @@ public function count(ix: Index, t: tb.Table, cp: Compiled, rd: Reader): Integer
             }
             pass += 1
         }
+        scanned[c * 2] = 1
+        scanned[c * 2 + 1] = 1
+        maybeYield(ix, scanned)
         c += 1
     }
+    addPinned(ix, locked)
     let buf = Bytes()
     let i = 0
     while i < locked.length / 8 {
@@ -3058,189 +3225,15 @@ function flatRefs(ix: Index, terms: List<Integer>, built: Integer): List<Integer
     return refs
 }
 
-// Exact top k of a plain-term conjunction over the main chunks, pushed into h. Every core computes, per 64-row
-// word, the best f64 approximation of its rows' scores (the f32 TIN score is within 1e-6 of it); only words within
-// 1e-4 of the k-th best word, and words with tf >= 255 or very long documents, can hold a top-k row, and those are
-// scored exactly here. Returns the main chunks covered, or 0 (heap untouched) when the serial plan must run.
-function flatTopK(ix: Index, cp: Compiled, t: tb.Table, h: Heap, rd: Reader): Integer {
-    let built = min(nChunks(t.nrows), ix.arenas.length)
-    if built == 0 { return 0 }
-    let kids = cp.q.kids[cp.q.root]
-    let terms: List<Integer> = []
-    let weights: List<Float> = []
-    let i = 0
-    while i < kids.length {
-        let u = cp.leafUts[leafOfNode(cp, kids[i])].getInt32(0)
-        let id = cp.uts.getInt32(u * 4)
-        let wgt = 0.0
-        if cp.utScore[u] != 0 { wgt = cp.wf[u] }
-        let j = 0
-        while j < terms.length {
-            if terms[j] == id { wgt = 0.0 }
-            j += 1
-        }
-        terms.add(id)
-        weights.add(wgt)
-        i += 1
-    }
-    let n = terms.length
-    let refs = flatRefs(ix, terms, built)
-    let words = built * WORDS
-    let best: List<Float> = []
-    i = 0
-    while i < words {
-        best.add(0.0)
-        i += 1
-    }
-    let arenas = ix.arenas
-    let valid = ix.mainValid
-    let dls = ix.dl
-    let reps = TF_REPS
-    let normA = cp.normA
-    let normB = cp.normB
-    parallel for gw in 0..words {
-        let c = gw >> 10
-        best[gw] = flatBest(arenas[c], refs, c * n * 2, n, valid, dls, c, gw & 1023, weights, reps, normA, normB)
-    }
-    // the k-th best word among the exactly approximated ones (FLAT_ANY marks words that must be rescored anyway)
-    let k = h.k
-    let top: List<Float> = []
-    i = 0
-    while i < words {
-        let b = best[i]
-        if b >= 0.0 && b < FLAT_ANY && (top.length < k || b > top[top.length - 1]) {
-            if top.length < k { top.add(b) } else { top[top.length - 1] = b }
-            let j = top.length - 1
-            while j > 0 && top[j - 1] < top[j] {
-                let x = top[j - 1]
-                top[j - 1] = top[j]
-                top[j] = x
-                j -= 1
-            }
-        }
-        i += 1
-    }
-    let cut = 0.0
-    if top.length >= k { cut = top[k - 1] * 0.9999 }
-    let picked: List<Integer> = []
-    i = 0
-    while i < words {
-        if best[i] >= 0.0 && best[i] >= cut {
-            picked.add(i)
-            if picked.length > 4096 { return 0 }
-        }
-        i += 1
-    }
-    let res = emptyBitmap()
-    let loaded = -1
-    let found: List<Integer> = []
-    let scores: List<Float> = []
-    for gw in picked {
-        let c = gw >> 10
-        if c != loaded {
-            loaded = c
-            if !chunkCandidates(ix, cp, c, false, res) { zero(res) }
-        }
-        let wl = gw & 1023
-        let x = res.getInt64(wl * 8)
-        while x != 0 {
-            let o = wl * 64 + lowestBit(x)
-            x = x & wrappingSubtract(x, 1)
-            let r = (c << CHUNK_SHIFT) + o
-            if !rd.accept(r) { return 0 }
-            found.add(r)
-            scores.add(rowScore(ix, cp, o, r))
-        }
-    }
-    i = 0
-    while i < found.length {
-        if qualifies(h, scores[i], found[i]) { heapPush(h, scores[i], found[i]) }
-        i += 1
-    }
-    return built
-}
 
-constant FLAT_ANY = 1.0e300
 
-// Best approximate score among the conjunction's rows in word wl of chunk c (-1 = none, FLAT_ANY = rescore exactly).
-parallel function flatBest(a: Bytes, refs: List<Integer>, base: Integer, n: Integer, valid: Bytes, dls: Bytes, c: Integer,
-                           wl: Integer, weights: List<Float>, reps: List<Integer>, normA: Float, normB: Float): Float {
-    let x = flatValidWord(valid, c, wl)
-    let u = 0
-    while u < n && x != 0 {
-        let k = refs[base + u * 2 + 1]
-        if k == 0 { x = 0 } else { x = x & flatWordBits(a, refs[base + u * 2], k, wl) }
-        u += 1
-    }
-    let best = -1.0
-    while x != 0 {
-        let o = wl * 64 + flatOnes(wrappingSubtract(x & wrappingSubtract(0, x), 1))
-        x = x & wrappingSubtract(x, 1)
-        let r = c * CHUNK + o
-        if r * 2 + 2 > dls.length { return FLAT_ANY }
-        let dl = dls.getUInt16(r * 2)
-        if dl == 65535 { return FLAT_ANY }
-        let norm = normA + normB * Float(dl)
-        let s = 0.0
-        let v = 0
-        while v < n {
-            if weights[v] > 0.0 {
-                let tf = flatTf(a, refs[base + v * 2], refs[base + v * 2 + 1], o)
-                if tf == 255 { return FLAT_ANY }
-                let rep = tf
-                if tf > 3 {
-                    let ri = 15
-                    while reps[ri] > tf { ri -= 1 }
-                    rep = reps[ri]
-                }
-                let ftf = Float(rep)
-                s += weights[v] * ftf / (ftf + norm)
-            }
-            v += 1
-        }
-        if s > best { best = s }
-    }
-    return best
-}
 
 parallel function flatBit(b: Integer): Integer {
     if b == 63 { return -9223372036854775807 - 1 }
     return 1 << b
 }
 
-// Word wl (64 chunk offsets) of a container as a bit mask.
-parallel function flatWordBits(a: Bytes, off: Integer, count: Integer, wl: Integer): Integer {
-    if count >= ARRAY_MAX { return a.getInt64(off + wl * 8) }
-    let first = wl * 64
-    let lo = 0
-    let hi = count
-    while lo < hi {
-        let m = (lo + hi) >> 1
-        if a.getUInt16(off + m * 2) < first { lo = m + 1 } else { hi = m }
-    }
-    let x = 0
-    while lo < count && a.getUInt16(off + lo * 2) < first + 64 {
-        x = x | flatBit(a.getUInt16(off + lo * 2) & 63)
-        lo += 1
-    }
-    return x
-}
 
-// Term frequency byte of chunk offset o, which the container holds (255 = see tfBig).
-parallel function flatTf(a: Bytes, off: Integer, count: Integer, o: Integer): Integer {
-    if count >= ARRAY_MAX {
-        let w = o >> 6
-        let rank = a.getInt32(off + 8192 + w * 4) + flatOnes(a.getInt64(off + w * 8) & wrappingSubtract(flatBit(o & 63), 1))
-        return a[off + BITMAP_BYTES + rank]
-    }
-    let lo = 0
-    let hi = count
-    while lo < hi {
-        let m = (lo + hi) >> 1
-        if a.getUInt16(off + m * 2) < o { lo = m + 1 } else { hi = m }
-    }
-    return a[off + count * 2 + lo]
-}
 
 parallel function flatOnes(x: Integer): Integer {
     let a = wrappingSubtract(x, (x >> 1) & 0x5555555555555555)
@@ -3371,6 +3364,7 @@ public function rows(ix: Index, t: tb.Table, cp: Compiled, rd: Reader, out: Byte
     let res = emptyBitmap()
     let both = emptyBitmap()
     let chunks = nChunks(t.nrows)
+    let scanned = Bytes(chunks * 2)
     let c = 0
     while c < chunks {
         // main and delta rows are disjoint; verify each pass with its own containers, then merge in order
@@ -3406,8 +3400,12 @@ public function rows(ix: Index, t: tb.Table, cp: Compiled, rd: Reader, out: Byte
             }
             w += 1
         }
+        scanned[c * 2] = 1
+        scanned[c * 2 + 1] = 1
+        maybeYield(ix, scanned)
         c += 1
     }
+    addPinned(ix, locked)
     if locked.length > 0 {
         let buf = Bytes()
         let any = false
@@ -3458,6 +3456,92 @@ public function scoreOf(ix: Index, t: tb.Table, cp: Compiled, r: Integer, rd: Re
     let dl = lockedMatch(ix, cp, r, rd, buf)
     if dl < 0 { return 0.0 }
     return docScore(cp, dl)
+}
+
+// ---- preemptible searches (C2): yield points between chunks
+
+// The server installs `hook` (runs a nested pass over other sessions' short statements); the engine says per statement
+// whether it may yield (a read-only single-table search outside a transaction block). A search yields at a chunk
+// boundary once `budgetNs` passed since its statement started or last yielded. Its index is then pinned until the
+// statement ends: it does not settle, and the rows writes take out of the main segment before the search scanned their
+// chunk are evaluated at the end, as of the statement's start (Reader.visible serves those row versions).
+public record Yield {
+    hook: List<() -> Boolean>
+    budgetNs: Integer
+    sinceNs: Integer
+    allowed: Boolean
+    nested: Boolean
+    pinned: List<Index>
+    yields: Integer
+}
+
+global YIELD: Yield = Yield { hook: []; budgetNs: 1000000; sinceNs: 0; allowed: false; nested: false; pinned: []; yields: 0 }
+
+public function setYieldHook(hook: () -> Boolean, budgetNs: Integer) {
+    YIELD.hook = [hook]
+    YIELD.budgetNs = budgetNs
+}
+
+// A statement starts (on the loop, not nested): may it yield?
+public function statementStart(allowed: Boolean) {
+    YIELD.allowed = allowed && YIELD.hook.length > 0 && !YIELD.nested
+    YIELD.sinceNs = dbio.monotonicNanos()
+}
+
+public function yieldState(): Yield { return YIELD }
+public function yieldCount(): Integer { return YIELD.yields }
+
+// The statement that yielded has ended: unpin its indexes.
+public function statementEnd() {
+    for ix in YIELD.pinned {
+        ix.pinned = false
+        ix.pinScanned = Bytes()
+        ix.pinRows = Bytes()
+        ix.pinSeen = hm.newIntMap(16)
+    }
+    YIELD.pinned = []
+    YIELD.allowed = false
+}
+
+public function anyPinned(): Boolean { return YIELD.pinned.length > 0 }
+
+// Between chunks: yield if this statement may and its budget is spent. scanned: the search's finished chunks.
+function maybeYield(ix: Index, scanned: Bytes) {
+    if !YIELD.allowed || YIELD.nested || YIELD.hook.length == 0 { return }
+    if dbio.monotonicNanos() - YIELD.sinceNs < YIELD.budgetNs { return }
+    if !ix.pinned {
+        ix.pinned = true
+        ix.pinRows = Bytes()
+        ix.pinSeen = hm.newIntMap(16)
+        YIELD.pinned.add(ix)
+    }
+    ix.pinScanned = scanned
+    YIELD.nested = true
+    YIELD.yields += 1
+    YIELD.hook[0]()
+    YIELD.nested = false
+    YIELD.sinceNs = dbio.monotonicNanos()
+}
+
+// Rows to evaluate like locked ones at the end of a search: those taken out of the main segment while it was suspended.
+function addPinned(ix: Index, locked: Bytes) {
+    if !ix.pinned || ix.pinRows.length == 0 { return }
+    let seen = hm.newIntMap(16)
+    let i = 0
+    while i < locked.length / 8 {
+        hm.put(seen, locked.getInt64(i * 8), 1)
+        i += 1
+    }
+    i = 0
+    while i < ix.pinRows.length / 8 {
+        let r = ix.pinRows.getInt64(i * 8)
+        if !hm.contains(seen, r) {
+            hm.put(seen, r, 1)
+            locked.addInt64(r)
+        }
+        i += 1
+    }
+    ix.pinRows = Bytes()
 }
 
 // ---- top-k (block-max MaxScore over chunks)
@@ -3563,7 +3647,7 @@ public function topK(ix: Index, t: tb.Table, cp: Compiled, k: Integer, rd: Reade
     let h = Heap { scores: []; rows: []; k: max(k, 1) }
     // plain-term conjunctions: the main chunks' top k comes from every core; deltas and locked rows below
     let mainDone = 0
-    if flatPlan(cp) == 1 { mainDone = flatTopK(ix, cp, t, h, rd) }
+    if PK_ENABLED[0] { mainDone = pkTopK(ix, cp, t, h, rd) }   // sim-serial-delete
     let nu = cp.uts.length / 4
     // order chunks (main and delta) by their bound, best first
     let chunks = nChunks(t.nrows)
@@ -3618,21 +3702,46 @@ public function topK(ix: Index, t: tb.Table, cp: Compiled, k: Integer, rd: Reade
     // the per-block score filter pays off only when candidate rows may lack some query terms
     let rk = cp.q.kind[cp.q.root]
     let disjunctive = rk == qy.Q_OR || rk == qy.Q_ATLEAST
+    // OR of term leaves (or one leaf): once the threshold is positive, a candidate is any valid row holding a scoring
+    // term, so chunks skip the set evaluation and blocks take their candidates from the terms' presence words
+    let plainOr = flatPlan(cp) == 2
+    let ws = newWand(nu)
     let terms: List<Integer> = []      // scoring terms present in the chunk, by bound descending
     let rest: List<Float> = []         // bound sum of terms[i + 1 ..]
     // seed the heap from the best chunk's rows that hold its strongest term: a good threshold early
     if mainDone == 0 && idx.length > 0 && heapSeed(ix, cp, order[idx[0]], res, ess, h, rd, ubs, terms) {
         // rows already in the heap are skipped below
     }
+    let scanned = Bytes(chunks * 2)
+    c = 0
+    while c < mainDone {
+        scanned[c * 2] = 1
+        c += 1
+    }
+    let lastCode = -1
     for j in idx {
+        if lastCode >= 0 {
+            scanned[lastCode] = 1
+            maybeYield(ix, scanned)
+        }
+        lastCode = order[j]
         let th = threshold(h)
         if heapFull(h) && bounds[j] < th { break }
         let cc = order[j] >> 1
         let delta = (order[j] & 1) == 1
         if !delta && cc < mainDone { continue }
+        // equal bounds: a row can only tie the threshold and needs a lower id than the heap's worst
+        if heapFull(h) && bounds[j] <= th && (cc << CHUNK_SHIFT) > h.rows[0] { continue }
         WORK[0] = WORK[0] + 1
-        if !chunkCandidates(ix, cp, cc, delta, res) { continue }
+        let plainNow = plainOr && heapFull(h) && th > 0.0
+        if plainNow {
+            loadChunk(ix, cp, cc, delta)
+        } else if !chunkCandidates(ix, cp, cc, delta, res) {
+            continue
+        }
         chunkTerms(cp, ubs, terms, rest)
+        wandReset(ws, nu)
+        if plainNow && terms.length == 0 { continue }
         // MaxScore: terms whose bounds together stay below the threshold cannot make a row qualify alone
         if heapFull(h) && terms.length > 0 {
             let cut = terms.length
@@ -3642,7 +3751,7 @@ public function topK(ix: Index, t: tb.Table, cp: Compiled, k: Integer, rd: Reade
                 cut -= 1
             }
             if cut == 0 { continue }
-            if cut < terms.length {
+            if cut < terms.length && !plainNow {
                 zero(ess)
                 let e = 0
                 while e < cut {
@@ -3658,6 +3767,11 @@ public function topK(ix: Index, t: tb.Table, cp: Compiled, k: Integer, rd: Reade
         for u in terms { bmul[u] = (K1 + 1.0) / 255.0 * cp.utIdf[u] * cp.utBoost[u] * scale }
         let blk = 0
         while blk < BM_BLOCKS {
+            if (disjunctive || plainOr) && heapFull(h) && terms.length > 0 && (plainNow || threshold(h) > 0.0) {
+                wandBlock(ix, cp, cc, delta, blk, res, plainNow, terms, ubs, bmul, h, rd, ws)
+                blk += 1
+                continue
+            }
             let w0 = blk * 8
             let anyc = 0
             let w = w0
@@ -3831,6 +3945,7 @@ public function topK(ix: Index, t: tb.Table, cp: Compiled, k: Integer, rd: Reade
             blk += 1
         }
     }
+    addPinned(ix, locked)
     let buf = Bytes()
     i = 0
     while i < locked.length / 8 {
@@ -3838,7 +3953,8 @@ public function topK(ix: Index, t: tb.Table, cp: Compiled, k: Integer, rd: Reade
         let dl = lockedMatch(ix, cp, r, rd, buf)
         if dl >= 0 {
             let s = docScore(cp, dl)
-            if qualifies(h, s, r) && rd.accept(r) { heapPush(h, s, r) }
+            // (a row the heap seed scored before a yield may also come back as a pinned row)
+            if qualifies(h, s, r) && !inHeap(h, r) && rd.accept(r) { heapPush(h, s, r) }
         }
         i += 1
     }
@@ -3858,7 +3974,7 @@ public function topK(ix: Index, t: tb.Table, cp: Compiled, k: Integer, rd: Reade
 }
 
 // Work counters (benchmarks): [chunks visited, candidate rows, rows fully scored]
-global WORK: List<Integer> = [0, 0, 0, 0, 0, 0]
+global WORK: List<Integer> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 public function work(i: Integer): Integer { return WORK[i] }
 
@@ -4024,6 +4140,455 @@ function scoreBounded(ix: Index, cp: Compiled, o: Integer, r: Integer, terms: Li
     return s
 }
 
+// ---- disjunctive blocks: block-max WAND with per-row presence bounds
+
+// Per-query scratch of wandBlock. Terms holding postings in the current 512-row block get slots in bound order: per
+// slot the term, its block bound, its presence (8 words) and the rank of its first posting in each word (8 int32s).
+// Array containers keep a cursor per term (postings are visited in increasing row order within a chunk).
+record Wand {
+    pres: Bytes        // slot * 64 + word * 8
+    rk: Bytes          // slot * 32 + word * 4
+    slotU: Bytes       // int32 per slot
+    slotB: Bytes       // f64 per slot
+    slotRep: Bytes     // f64 per slot: the term's largest tf representative in the block (0 = unknown)
+    rowB: Bytes        // f64 per slot: the term's bound for the current row (its own document length)
+    cur: Bytes         // int64 per distinct term
+    bbs: List<Float>   // per distinct term: bound in the current block
+    order: List<Integer>
+    cand: Bytes
+    acc: Bytes         // f64 per row of the current word: bound sum of the terms the row holds
+}
+
+function newWand(nu: Integer): Wand {
+    let bbs: List<Float> = []
+    let i = 0
+    while i < nu {
+        bbs.add(0.0)
+        i += 1
+    }
+    return Wand { pres: Bytes(nu * 64); rk: Bytes(nu * 32); slotU: Bytes(nu * 4); slotB: Bytes(nu * 8); slotRep: Bytes(nu * 8)
+                  rowB: Bytes(nu * 8); cur: Bytes(nu * 8)
+                  bbs: bbs; order: []; cand: Bytes(64); acc: Bytes(512) }
+}
+
+// A new chunk: array cursors start at the first posting.
+function wandReset(ws: Wand, nu: Integer) {
+    let i = 0
+    while i < nu {
+        ws.cur.setInt64(i * 8, 0)
+        i += 1
+    }
+}
+
+// Presence words and per-word first ranks of distinct term u, into slot `slot`, for the block starting at word w0;
+// false when the term has no posting there.
+function wandPresence(ref: Cref, u: Integer, slot: Integer, w0: Integer, ws: Wand): Boolean {
+    let a = ref.arena
+    let o = ref.off
+    let pa = slot * 64
+    let ra = slot * 32
+    if ref.count >= ARRAY_MAX {
+        let any = 0
+        let w = 0
+        while w < 8 {
+            let x = a.getInt64(o + (w0 + w) * 8)
+            ws.pres.setInt64(pa + w * 8, x)
+            ws.rk.setInt32(ra + w * 4, a.getInt32(o + 8192 + (w0 + w) * 4))
+            any = any | x
+            w += 1
+        }
+        return any != 0
+    }
+    let first = w0 * 64
+    let limit = first + 512
+    let n = ref.count
+    let c = ws.cur.getInt64(u * 8)
+    if c < n && a.getUInt16(o + c * 2) < first {
+        // gallop forward, then binary search the last step
+        let step = 1
+        while c + step < n && a.getUInt16(o + (c + step) * 2) < first {
+            c += step
+            step = step * 2
+        }
+        let lo = c + 1
+        let hi = min(c + step, n)
+        while lo < hi {
+            let m = (lo + hi) >> 1
+            if a.getUInt16(o + m * 2) < first { lo = m + 1 } else { hi = m }
+        }
+        c = lo
+    }
+    if c >= n || a.getUInt16(o + c * 2) >= limit {
+        ws.cur.setInt64(u * 8, c)
+        return false
+    }
+    let p0 = 0
+    let p1 = 0
+    let p2 = 0
+    let p3 = 0
+    let p4 = 0
+    let p5 = 0
+    let p6 = 0
+    let p7 = 0
+    let j = c
+    while j < n {
+        let row = a.getUInt16(o + j * 2)
+        if row >= limit { break }
+        let k = (row - first) >> 6
+        let bit = lowBit(row & 63)
+        if k < 4 {
+            if k == 0 { p0 = p0 | bit } else if k == 1 { p1 = p1 | bit } else if k == 2 { p2 = p2 | bit } else { p3 = p3 | bit }
+        } else {
+            if k == 4 { p4 = p4 | bit } else if k == 5 { p5 = p5 | bit } else if k == 6 { p6 = p6 | bit } else { p7 = p7 | bit }
+        }
+        j += 1
+    }
+    ws.cur.setInt64(u * 8, j)
+    WORK[8] = WORK[8] + j - c
+    let pr = ws.pres
+    pr.setInt64(pa, p0)
+    pr.setInt64(pa + 8, p1)
+    pr.setInt64(pa + 16, p2)
+    pr.setInt64(pa + 24, p3)
+    pr.setInt64(pa + 32, p4)
+    pr.setInt64(pa + 40, p5)
+    pr.setInt64(pa + 48, p6)
+    pr.setInt64(pa + 56, p7)
+    let rk = ws.rk
+    let acc = c
+    rk.setInt32(ra, acc)
+    acc += popcount(p0)
+    rk.setInt32(ra + 4, acc)
+    acc += popcount(p1)
+    rk.setInt32(ra + 8, acc)
+    acc += popcount(p2)
+    rk.setInt32(ra + 12, acc)
+    acc += popcount(p3)
+    rk.setInt32(ra + 16, acc)
+    acc += popcount(p4)
+    rk.setInt32(ra + 20, acc)
+    acc += popcount(p5)
+    rk.setInt32(ra + 24, acc)
+    acc += popcount(p6)
+    rk.setInt32(ra + 28, acc)
+    return true
+}
+
+// A container's largest tf representative in block blk as a Float (0 = unbounded: maxTf 255 overflows).
+function slotTfRep(ref: Cref, blk: Integer): Float {
+    let r = blockTfRep(ref, blk)
+    if r >= 0 { return Float(r) }
+    if ref.maxTf >= 255 { return 0.0 }
+    return Float(tfRep(max(ref.maxTf, 1)))
+}
+
+// Rows (bits of mask) present in at least m of the slots' words `w` (slots 0 .. n): bit-sliced counters.
+function atLeast(pres: Bytes, n: Integer, w: Integer, mask: Integer, m: Integer): Integer {
+    let c0 = 0
+    let c1 = 0
+    let c2 = 0
+    let c3 = 0
+    let c4 = 0
+    let i = 0
+    while i < n {
+        let carry = pres.getInt64(i * 64 + w * 8) & mask
+        let t = c0 & carry
+        c0 = c0 ^ carry
+        carry = t
+        if carry != 0 {
+            t = c1 & carry
+            c1 = c1 ^ carry
+            carry = t
+            if carry != 0 {
+                t = c2 & carry
+                c2 = c2 ^ carry
+                carry = t
+                if carry != 0 {
+                    t = c3 & carry
+                    c3 = c3 ^ carry
+                    carry = t
+                    c4 = c4 | carry   // 16 or more terms: saturate
+                }
+            }
+        }
+        i += 1
+    }
+    if m >= 16 { return c4 }
+    // count >= m, comparing the 4-bit counters from the top bit down (c4 means >= 16)
+    let gt = c4
+    let eq = ~c4
+    if ((m >> 3) & 1) != 0 { eq = eq & c3 } else {
+        gt = gt | (eq & c3)
+        eq = eq & ~c3
+    }
+    if ((m >> 2) & 1) != 0 { eq = eq & c2 } else {
+        gt = gt | (eq & c2)
+        eq = eq & ~c2
+    }
+    if ((m >> 1) & 1) != 0 { eq = eq & c1 } else {
+        gt = gt | (eq & c1)
+        eq = eq & ~c1
+    }
+    if (m & 1) != 0 { eq = eq & c0 } else {
+        gt = gt | (eq & c0)
+        eq = eq & ~c0
+    }
+    return gt | eq
+}
+
+// One 512-row block of a disjunctive top-k with a full heap. Rows are dropped, in this order, when: the block's bounds
+// sum below the threshold; they hold no essential term (only tail terms whose bounds sum below it); they hold fewer
+// terms than the fewest largest bounds that reach it (bit-sliced counts); the bounds of the terms they hold sum below
+// it (presence, WAND); their partial exact score plus the bounds of their remaining terms falls below it. Survivors get
+// TIN's exact f32 score. Ranks come from the presence words (no searches).
+// plain: candidates are valid rows holding an essential term (OR of leaves); otherwise the chunk's matches in res.
+function wandBlock(ix: Index, cp: Compiled, cc: Integer, delta: Boolean, blk: Integer, res: Bytes, plain: Boolean,
+                   terms: List<Integer>, ubs: List<Float>, bmul: List<Float>, h: Heap, rd: Reader, ws: Wand) {
+    let w0 = blk * 8
+    let base = cc << CHUNK_SHIFT
+    let th = threshold(h)
+    let thp = th / 1.00001
+    let sum = 0.0
+    for u in terms {
+        let ref = cp.refs[u]
+        let b = ubs[u]
+        if ref.count >= BM_MIN {
+            b = Float(ref.arena[ref.tfOff + ref.count + blk]) * bmul[u]
+            if b > ubs[u] { b = ubs[u] }
+        }
+        ws.bbs[u] = b
+        sum += b
+    }
+    WORK[3] = WORK[3] + 1
+    if sum < thp { return }
+    if sum * 1.00001 <= th && base + w0 * 64 > h.rows[0] { return }
+    WORK[6] = WORK[6] + 1
+    let order = ws.order
+    order.clear()
+    for u in terms {
+        if ws.bbs[u] > 0.0 {
+            order.add(u)
+            let i = order.length - 1
+            while i > 0 && ws.bbs[order[i - 1]] < ws.bbs[u] {
+                order[i] = order[i - 1]
+                i -= 1
+            }
+            order[i] = u
+        }
+    }
+    // essential prefix (rows holding only tail terms cannot reach the threshold) and the fewest terms a row needs,
+    // from the block bounds (a term without postings here only makes both weaker, never wrong)
+    let nb = order.length
+    let cutB = nb
+    let tail = 0.0
+    while cutB > 0 && tail + ws.bbs[order[cutB - 1]] < thp {
+        tail += ws.bbs[order[cutB - 1]]
+        cutB -= 1
+    }
+    if cutB == 0 { return }
+    let m = 0
+    let pre = 0.0
+    while m < nb && pre < thp {
+        pre += ws.bbs[order[m]]
+        m += 1
+    }
+    if pre < thp { return }
+    // presence of the essential terms first: blocks where none of them holds a valid candidate stop here
+    let pres = ws.pres
+    let slotB = ws.slotB
+    let n = 0
+    let oi = 0
+    while oi < cutB {
+        let u = order[oi]
+        WORK[7] = WORK[7] + 1
+        if wandPresence(cp.refs[u], u, n, w0, ws) {
+            ws.slotU.setInt32(n * 4, u)
+            slotB.setFloat64(n * 8, ws.bbs[u])
+            ws.slotRep.setFloat64(n * 8, slotTfRep(cp.refs[u], blk))
+            n += 1
+        }
+        oi += 1
+    }
+    let cut = n
+    if cut == 0 { return }
+    let any = 0
+    let w = 0
+    while w < 8 {
+        let e = 0
+        let i = 0
+        while i < cut {
+            e = e | pres.getInt64(i * 64 + w * 8)
+            i += 1
+        }
+        if plain {
+            if delta {
+                e = e & ix.deltas[cc].member.getInt64((w0 + w) * 8)
+            } else {
+                let gi = (cc * WORDS + w0 + w) * 8
+                if gi < ix.mainValid.length { e = e & ix.mainValid.getInt64(gi) } else { e = 0 }
+            }
+        } else {
+            e = e & res.getInt64((w0 + w) * 8)
+        }
+        ws.cand.setInt64(w * 8, e)
+        any = any | e
+        w += 1
+    }
+    if any == 0 { return }
+    while oi < nb {
+        let u = order[oi]
+        WORK[7] = WORK[7] + 1
+        if wandPresence(cp.refs[u], u, n, w0, ws) {
+            ws.slotU.setInt32(n * 4, u)
+            slotB.setFloat64(n * 8, ws.bbs[u])
+            ws.slotRep.setFloat64(n * 8, slotTfRep(cp.refs[u], blk))
+            n += 1
+        }
+        oi += 1
+    }
+    if m >= 2 {
+        any = 0
+        w = 0
+        while w < 8 {
+            let e = ws.cand.getInt64(w * 8)
+            if e != 0 {
+                e = e & atLeast(pres, n, w, e, m)
+                ws.cand.setInt64(w * 8, e)
+                any = any | e
+            }
+            w += 1
+        }
+    }
+    if any == 0 { return }
+    WORK[4] = WORK[4] + 1
+    let tfs = cp.tfs
+    let stamp = cp.stamp
+    let acc = ws.acc
+    let rk = ws.rk
+    w = 0
+    while w < 8 {
+        let x = ws.cand.getInt64(w * 8)
+        if x == 0 {
+            w += 1
+            continue
+        }
+        WORK[1] = WORK[1] + popcount(x)
+        // the same count over the terms present among this word's candidates only
+        let m2 = 0
+        pre = 0.0
+        let i = 0
+        while i < n && pre < thp {
+            if (pres.getInt64(i * 64 + w * 8) & x) != 0 {
+                pre += slotB.getFloat64(i * 8)
+                m2 += 1
+            }
+            i += 1
+        }
+        if pre < thp {
+            w += 1
+            continue
+        }
+        if m2 > m {
+            x = x & atLeast(pres, n, w, x, m2)
+            if x == 0 {
+                w += 1
+                continue
+            }
+        }
+        // bounds of the terms each candidate holds, term at a time over the presence bits
+        let y = x
+        while y != 0 {
+            acc.setFloat64(lowestBit(y) * 8, 0.0)
+            y = y & wrappingSubtract(y, 1)
+        }
+        i = 0
+        while i < n {
+            y = pres.getInt64(i * 64 + w * 8) & x
+            if y != 0 {
+                let bb = slotB.getFloat64(i * 8)
+                while y != 0 {
+                    let at = lowestBit(y) * 8
+                    acc.setFloat64(at, acc.getFloat64(at) + bb)
+                    y = y & wrappingSubtract(y, 1)
+                }
+            }
+            i += 1
+        }
+        while x != 0 {
+            let b = lowestBit(x)
+            x = x & wrappingSubtract(x, 1)
+            let ubr = acc.getFloat64(b * 8)
+            if ubr < thp { continue }
+            WORK[5] = WORK[5] + 1
+            let bit = lowBit(b)
+            let below = wrappingSubtract(bit, 1)
+            let o = (w0 + w) * 64 + b
+            let r = base + o
+            let dl = ix.dl.getUInt16(r * 2)
+            if dl == 65535 { dl = docLength(ix, r) }
+            let norm = cp.normA + cp.normB * Float(dl)
+            // tighter bounds with the row's own length: a present term adds at most wf * rep / (rep + norm), rep its
+            // largest tf representative in the block
+            let ubd = 0.0
+            let rowB = ws.rowB
+            i = 0
+            while i < n {
+                if (pres.getInt64(i * 64 + w * 8) & bit) != 0 {
+                    let b2 = slotB.getFloat64(i * 8)
+                    let rp = ws.slotRep.getFloat64(i * 8)
+                    if rp > 0.0 {
+                        let d = cp.wf[ws.slotU.getInt32(i * 4)] * rp / (rp + norm) * 1.000001
+                        if d < b2 { b2 = d }
+                    }
+                    rowB.setFloat64(i * 8, b2)
+                    ubd += b2
+                }
+                i += 1
+            }
+            if ubd < thp { continue }
+            let partial = 0.0
+            let rest = ubd
+            let ok = true
+            i = 0
+            while i < n {
+                let pw = pres.getInt64(i * 64 + w * 8)
+                if (pw & bit) != 0 {
+                    rest -= rowB.getFloat64(i * 8)
+                    let u = ws.slotU.getInt32(i * 4)
+                    let ref = cp.refs[u]
+                    let rank = rk.getInt32(i * 32 + w * 4) + popcount(pw & below)
+                    let tf = ref.arena[ref.tfOff + rank]
+                    if tf == 255 { tf = hm.get(ix.tfBig, (ref.term << 32) | r, 255) }
+                    tfs.setInt32(u * 4, tf)
+                    stamp.setInt64(u * 8, r + 1)
+                    let ftf = Float(tf)
+                    if tf > 3 { ftf = Float(tfRep(tf)) }
+                    partial += cp.wf[u] * ftf / (ftf + norm)
+                    if partial + rest < thp {
+                        ok = false
+                        break
+                    }
+                }
+                i += 1
+            }
+            if !ok { continue }
+            WORK[2] = WORK[2] + 1
+            let sc = 0.0
+            for u in cp.scoreOrder {
+                if stamp.getInt64(u * 8) == r + 1 { sc = f32(sc + termScore32(cp, u, tfs.getInt32(u * 4), dl)) }
+            }
+            if qualifies(h, sc, r) && !inHeap(h, r) {
+                if verify(ix, cp, o, r) && rd.accept(r) {
+                    heapPush(h, sc, r)
+                    th = threshold(h)
+                    thp = th / 1.00001
+                }
+            }
+        }
+        w += 1
+    }
+}
+
 // Fill the heap from chunk entry `oc` (order code): rows holding its strongest scoring term.
 function heapSeed(ix: Index, cp: Compiled, oc: Integer, res: Bytes, tmp: Bytes, h: Heap, rd: Reader, ubs: List<Float>,
                   terms: List<Integer>): Boolean {
@@ -4042,25 +4607,69 @@ function heapSeed(ix: Index, cp: Compiled, oc: Integer, res: Bytes, tmp: Bytes, 
         contrib.add(0.0)
         u += 1
     }
-    let none = Heap { scores: []; rows: []; k: 1000000000 }
-    let base = cc << CHUNK_SHIFT
-    let w = 0
-    while w < WORDS {
-        let x = res.getInt64(w * 8)
-        while x != 0 {
-            let o = w * 64 + lowestBit(x)
-            x = x & wrappingSubtract(x, 1)
-            let r = base + o
-            let s = scoreBounded(ix, cp, o, r, terms, rest, contrib, none)
-            if qualifies(h, s, r) {
-                let ok = verify(ix, cp, o, r)
-                if ok && rd.accept(r) { heapPush(h, s, r) }
+    // only the SEED_BLOCKS blocks with the largest block bounds: a good first threshold without scoring every row of
+    // a common term (rows outside them are scored, or skipped by their bounds, in the main pass)
+    let scale = cp.avgdl / ix.normAvgdl
+    if scale < 1.0 { scale = 1.0 }
+    let blockSum: List<Float> = []
+    let blk = 0
+    while blk < BM_BLOCKS {
+        let any = 0
+        let w = blk * 8
+        while w < blk * 8 + 8 {
+            any = any | res.getInt64(w * 8)
+            w += 1
+        }
+        let sum = -1.0
+        if any != 0 {
+            sum = 0.0
+            for t in terms {
+                let ref = cp.refs[t]
+                let b = ubs[t]
+                if ref.count >= BM_MIN {
+                    b = Float(ref.arena[ref.tfOff + ref.count + blk]) * (K1 + 1.0) / 255.0 * cp.utIdf[t] * cp.utBoost[t] * scale
+                    if b > ubs[t] { b = ubs[t] }
+                }
+                sum += b
             }
         }
-        w += 1
+        blockSum.add(sum)
+        blk += 1
+    }
+    let picked: List<Integer> = []
+    while picked.length < SEED_BLOCKS {
+        let best = -1
+        blk = 0
+        while blk < BM_BLOCKS {
+            if blockSum[blk] >= 0.0 && (best < 0 || blockSum[blk] > blockSum[best]) { best = blk }
+            blk += 1
+        }
+        if best < 0 { break }
+        picked.add(best)
+        blockSum[best] = -1.0
+    }
+    let base = cc << CHUNK_SHIFT
+    for pb in picked {
+        let w = pb * 8
+        while w < pb * 8 + 8 {
+            let x = res.getInt64(w * 8)
+            while x != 0 {
+                let o = w * 64 + lowestBit(x)
+                x = x & wrappingSubtract(x, 1)
+                let r = base + o
+                let s = scoreBounded(ix, cp, o, r, terms, rest, contrib, h)
+                if s >= 0.0 && qualifies(h, s, r) && !inHeap(h, r) {
+                    let ok = verify(ix, cp, o, r)
+                    if ok && rd.accept(r) { heapPush(h, s, r) }
+                }
+            }
+            w += 1
+        }
     }
     return true
 }
+
+constant SEED_BLOCKS = 8
 
 // Reference evaluation of one document text, independent of the containers (tests and EXPLAIN checks):
 // -1.0 when it does not match, else its BM25 score under the current statistics.
@@ -4116,124 +4725,230 @@ public function settleIndex(ix: Index, t: tb.Table) {
 }
 
 // ---------------------------------------------------------------- facets
-// A facet keeps, for one low-cardinality column of the indexed table, a bitmap of the rows holding each value.
-// GROUP BY col over a search is then, per chunk, popcount(search result AND value bitmap). Rows whose value
-// changes are suspect rows of the index (every write goes through txn.addUndo) and are re-read when settled.
+// A facet keeps, for one grouping key of the indexed table (a column, or an integer expression over one row such as
+// time / 31557600 + 1970), a value code per row and, while the key has at most FACET_BITMAPS distinct values, a bitmap
+// of the rows holding each value. GROUP BY key over a search is then, per chunk, popcount(search result AND value
+// bitmap); keys with more values count the result's rows by their codes. Rows whose value changes are suspect rows of
+// the index (every write goes through txn.addUndo) and are re-read when settled; expression keys are re-evaluated on
+// the facet's next use with the caller's evaluator. At most FACET_VALUES distinct values (4 bytes per row and one
+// dictionary entry per value), and FACET_KEEP facets per index (the least recently used one is dropped).
 
-constant FACET_MAX = 64
+constant FACET_BITMAPS = 64
+constant FACET_VALUES = 1048576
+constant FACET_KEEP = 8
+
+// How a facet reads its key. Column keys read the column; expression keys call value(r) (and isNull(r)), which
+// return ok = false through failed(r) when the expression cannot be evaluated for a row (the facet then gives up).
+public record FacetKey {
+    column: Integer            // column key: column index; expression key: -1
+    expr: Text                 // expression key: canonical text identifying the expression
+    value: (Integer) -> Integer
+    isNull: (Integer) -> Boolean
+    failed: () -> Boolean
+}
 
 record Facet {
     column: Integer
+    expr: Text
     disabled: Boolean
-    keys: hm.IntMap        // integer value or text hash -> value index
-    reps: List<Integer>    // per value: a row that held it when the value was first seen
-    bits: List<Bytes>      // per value: bitmap over rows
-    nulls: Bytes           // rows whose value is NULL
-    rowValue: Bytes        // int16 per row: value index, -1 none, -2 NULL
+    keys: hm.IntMap        // key (integer value, or hash of a text value) -> value index
+    reps: List<Integer>    // per value: a row that held it when it was first seen (text keys compare against it)
+    bits: List<Bytes>      // per value: bitmap over rows, while there are at most FACET_BITMAPS values
+    nulls: Bytes           // bitmap of rows whose key is NULL (bitmap mode)
+    code: Bytes            // int32 per row: value index, -1 none, -2 NULL
     cap: Integer
+    stale: Bytes           // expression keys: int64 rows to evaluate again
+    used: Integer          // last use (LRU)
 }
+
+global FACET_CLOCK: List<Integer> = [0]
+
+function bitmapMode(f: Facet): Boolean { return f.reps.length <= FACET_BITMAPS }
 
 function facetGrow(f: Facet, rows: Integer) {
     if rows <= f.cap { return }
     let cap = max(rows, f.cap * 2)
     let words = nChunks(cap) * WORDS
-    for b in f.bits { b.resize(words * 8) }
-    f.nulls.resize(words * 8)
-    let old = f.rowValue.length / 2
-    f.rowValue.resize(cap * 2)
+    if bitmapMode(f) {
+        for b in f.bits { b.resize(words * 8) }
+        f.nulls.resize(words * 8)
+    }
+    let old = f.code.length / 4
+    f.code.resize(cap * 4)
     let r = old
     while r < cap {
-        f.rowValue.setInt16(r * 2, -1)
+        f.code.setInt32(r * 4, -1)
         r += 1
     }
     f.cap = cap
 }
 
-// Value index of row r's column value (creating it), -2 for NULL, -3 when the facet must be disabled.
-function facetValue(f: Facet, t: tb.Table, r: Integer): Integer {
-    let c = t.cols[f.column]
-    if tb.isNull(c, r) { return -2 }
-    let key = 0
-    let isText = v.isTextType(c.type)
-    if isText {
-        key = v.hashBytes(c.heap, tb.textOff(c, r), tb.textLen(c, r))
-    } else if c.type == v.T_FLOAT8 || c.type == v.T_FLOAT4 || c.width == 16 || c.perRowScale || c.type == v.T_NUMERIC {
-        return -3
+// Value index of row r's key (creating it), -2 for NULL, -3 when the facet must be disabled.
+function facetValue(f: Facet, t: tb.Table, r: Integer, key: FacetKey): Integer {
+    let k = 0
+    let isText = false
+    let c = t.cols[0]
+    if f.expr != "" {
+        if key.isNull(r) {
+            if key.failed() { return -3 }
+            return -2
+        }
+        k = key.value(r)
+        if key.failed() { return -3 }
     } else {
-        key = tb.getInt(c, r)
+        c = t.cols[f.column]
+        if tb.isNull(c, r) { return -2 }
+        isText = v.isTextType(c.type)
+        if isText {
+            k = v.hashBytes(tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r))
+        } else if c.type == v.T_FLOAT8 || c.type == v.T_FLOAT4 || c.width == 16 || c.perRowScale || c.type == v.T_NUMERIC {
+            return -3
+        } else {
+            k = tb.getInt(c, r)
+        }
     }
-    let vi = hm.get(f.keys, key, -1)
+    let vi = hm.get(f.keys, k, -1)
     if vi >= 0 {
         if isText {
             let q = f.reps[vi]
-            if !v.equalBytes(c.heap, tb.textOff(c, q), tb.textLen(c, q), c.heap, tb.textOff(c, r), tb.textLen(c, r)) { return -3 }
+            if !v.equalBytes(tb.textBuf(c, q), tb.textAt(c, q), tb.textLen(c, q), tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r)) { return -3 }
         }
         return vi
     }
-    if f.reps.length >= FACET_MAX { return -3 }
+    if f.reps.length >= FACET_VALUES { return -3 }
     vi = f.reps.length
-    hm.put(f.keys, key, vi)
+    hm.put(f.keys, k, vi)
     f.reps.add(r)
-    f.bits.add(Bytes(nChunks(f.cap) * WORDS * 8))
+    if f.reps.length <= FACET_BITMAPS {
+        f.bits.add(Bytes(nChunks(f.cap) * WORDS * 8))
+    } else if f.bits.length > 0 {
+        // too many values for bitmaps: count by code from now on
+        f.bits = []
+        f.nulls = Bytes()
+    }
     return vi
 }
 
-// Re-read row r's value into the facet's bitmaps.
-function facetRow(f: Facet, t: tb.Table, r: Integer) {
-    if f.disabled { return }
-    facetGrow(f, r + 1)
-    let old = f.rowValue.getInt16(r * 2)
-    if old >= 0 { clearBit(f.bits[old], r) }
-    if old == -2 { clearBit(f.nulls, r) }
-    let vi = facetValue(f, t, r)
+// Store row r's value code (and bit).
+function facetSet(f: Facet, t: tb.Table, r: Integer, key: FacetKey) {
+    let old = f.code.getInt32(r * 4)
+    if bitmapMode(f) {
+        if old >= 0 { clearBit(f.bits[old], r) }
+        if old == -2 { clearBit(f.nulls, r) }
+    }
+    let vi = facetValue(f, t, r, key)
     if vi == -3 {
         f.disabled = true
         return
     }
-    if vi == -2 { setBit(f.nulls, r) } else { setBit(f.bits[vi], r) }
-    f.rowValue.setInt16(r * 2, vi)
+    if bitmapMode(f) {
+        if vi == -2 { setBit(f.nulls, r) } else { setBit(f.bits[vi], r) }
+    }
+    f.code.setInt32(r * 4, vi)
 }
 
-function facetFor(ix: Index, t: tb.Table, column: Integer): Facet {
+global NO_KEY: FacetKey = FacetKey { column: -1; expr: ""; value: function(r: Integer): Integer { return 0 }
+                                     isNull: function(r: Integer): Boolean { return false }; failed: function(): Boolean { return false } }
+
+// Row r was settled (its key may have changed): re-read column keys now; expression keys on the next use.
+function facetRow(f: Facet, t: tb.Table, r: Integer) {
+    if f.disabled { return }
+    facetGrow(f, r + 1)
+    if f.expr == "" {
+        facetSet(f, t, r, NO_KEY)
+        return
+    }
+    let old = f.code.getInt32(r * 4)
+    if bitmapMode(f) {
+        if old >= 0 { clearBit(f.bits[old], r) }
+        if old == -2 { clearBit(f.nulls, r) }
+    }
+    f.code.setInt32(r * 4, -1)
+    f.stale.addInt64(r)
+}
+
+// Evaluate the expression key of rows settled since the facet's last use (live rows only; others are read when they
+// settle again).
+function facetRefresh(f: Facet, t: tb.Table, key: FacetKey) {
+    if f.expr == "" || f.stale.length == 0 { return }
+    let n = f.stale.length / 8
+    let i = 0
+    while i < n && !f.disabled {
+        let r = f.stale.getInt64(i * 8)
+        if r < t.nrows && t.state[r] == 0 && f.code.getInt32(r * 4) == -1 { facetSet(f, t, r, key) }
+        i += 1
+    }
+    f.stale = Bytes()
+}
+
+function facetFor(ix: Index, t: tb.Table, key: FacetKey): Facet {
+    FACET_CLOCK[0] = FACET_CLOCK[0] + 1
     for f in ix.facets {
-        if f.column == column {
+        if f.column == key.column && f.expr == key.expr {
+            f.used = FACET_CLOCK[0]
             facetGrow(f, t.nrows)
+            facetRefresh(f, t, key)
             return f
         }
     }
-    let f = Facet { column: column; disabled: false; keys: hm.newIntMap(16); reps: []; bits: []; nulls: Bytes()
-                    rowValue: Bytes(); cap: 0 }
+    if ix.facets.length >= FACET_KEEP {
+        let keep: List<Facet> = []
+        let oldest = 0
+        let i = 1
+        while i < ix.facets.length {
+            if ix.facets[i].used < ix.facets[oldest].used { oldest = i }
+            i += 1
+        }
+        i = 0
+        while i < ix.facets.length {
+            if i != oldest { keep.add(ix.facets[i]) }
+            i += 1
+        }
+        ix.facets = keep
+    }
+    let f = Facet { column: key.column; expr: key.expr; disabled: false; keys: hm.newIntMap(16); reps: []; bits: []
+                    nulls: Bytes(); code: Bytes(); cap: 0; stale: Bytes(); used: FACET_CLOCK[0] }
     facetGrow(f, max(t.nrows, 1))
     let r = 0
     while r < t.nrows && !f.disabled {
         let st = t.state[r]
-        if (st & tb.ST_DEAD) == 0 || (st & tb.ST_LOCKED) != 0 { facetRow(f, t, r) }
+        // expression keys read live rows only (a locked row's current values may be uncommitted); the others wait
+        // until they settle
+        if f.expr != "" {
+            if st == 0 { facetSet(f, t, r, key) }
+        } else if (st & tb.ST_DEAD) == 0 || (st & tb.ST_LOCKED) != 0 {
+            facetSet(f, t, r, key)
+        }
         r += 1
     }
     ix.facets.add(f)
     return f
 }
 
-// Counts of the search result per value of `column` from bitmaps. False when the facet cannot answer (too many
-// values, unsupported type, positional query, or matching rows locked by open transactions): use the row path.
-// reps / counts: one entry per value with a non-zero count (rep = a row holding the value); NULL as rep of a NULL row.
-public function facetCounts(ix: Index, t: tb.Table, cp: Compiled, column: Integer, rd: Reader, reps: List<Integer>,
-                            counts: List<Integer>): Boolean {
+// Rows of the search result per value of the key. False when the facet cannot answer (unsupported type, more than
+// FACET_VALUES values, positional query, an expression that fails, or matching rows locked by open transactions): use
+// the row path. reps / counts: one entry per value with a non-zero count (rep = a row of the result holding the value,
+// NULL last as a NULL row); groups (when wantRows): per entry the int64 rows of the result holding the value.
+public function facetCounts(ix: Index, t: tb.Table, cp: Compiled, key: FacetKey, rd: Reader, reps: List<Integer>,
+                            counts: List<Integer>, wantRows: Boolean, groups: List<Bytes>): Boolean {
     let locked = Bytes()
     settle(ix, t, locked)
     refreshStats(ix, cp)
     if cp.positional || locked.length > 0 { return false }
-    let f = facetFor(ix, t, column)
+    let f = facetFor(ix, t, key)
     if f.disabled { return false }
     let nv = f.reps.length
     let tot: List<Integer> = []
-    let rep: List<Integer> = []      // per value: a row of the search result holding it
+    let rep: List<Integer> = []      // per value (index nv = NULL): a row of the search result holding it
+    let rows: List<Bytes> = []
     let i = 0
     while i <= nv {
         tot.add(0)
         rep.add(-1)
+        if wantRows { rows.add(Bytes()) }
         i += 1
     }
+    let bitmaps = bitmapMode(f)
     let res = emptyBitmap()
     let chunks = nChunks(t.nrows)
     let c = 0
@@ -4242,23 +4957,49 @@ public function facetCounts(ix: Index, t: tb.Table, cp: Compiled, column: Intege
         while pass < 2 {
             let delta = pass == 1
             if (!delta || ix.deltas[c].count > 0) && chunkCandidates(ix, cp, c, delta, res) {
-                let base = c * WORDS * 8
-                let vi = 0
-                while vi <= nv {
-                    let b = f.nulls
-                    if vi < nv { b = f.bits[vi] }
-                    let n = 0
+                let rowBase = c << CHUNK_SHIFT
+                if bitmaps {
+                    let base = c * WORDS * 8
+                    let vi = 0
+                    while vi <= nv {
+                        let b = f.nulls
+                        if vi < nv { b = f.bits[vi] }
+                        let n = 0
+                        let w = 0
+                        while w < WORDS {
+                            let x = res.getInt64(w * 8) & b.getInt64(base + w * 8)
+                            if x != 0 {
+                                n += popcount(x)
+                                if rep[vi] < 0 { rep[vi] = rowBase + w * 64 + lowestBit(x) }
+                                if wantRows {
+                                    let y = x
+                                    while y != 0 {
+                                        rows[vi].addInt64(rowBase + w * 64 + lowestBit(y))
+                                        y = y & wrappingSubtract(y, 1)
+                                    }
+                                }
+                            }
+                            w += 1
+                        }
+                        tot[vi] = tot[vi] + n
+                        vi += 1
+                    }
+                } else {
                     let w = 0
                     while w < WORDS {
-                        let x = res.getInt64(w * 8) & b.getInt64(base + w * 8)
-                        if x != 0 {
-                            n += popcount(x)
-                            if rep[vi] < 0 { rep[vi] = (c << CHUNK_SHIFT) + w * 64 + lowestBit(x) }
+                        let x = res.getInt64(w * 8)
+                        while x != 0 {
+                            let r = rowBase + w * 64 + lowestBit(x)
+                            x = x & wrappingSubtract(x, 1)
+                            let vi = f.code.getInt32(r * 4)
+                            if vi == -1 { return false }   // a result row without a code (cannot happen; be safe)
+                            if vi == -2 { vi = nv }
+                            tot[vi] = tot[vi] + 1
+                            if rep[vi] < 0 { rep[vi] = r }
+                            if wantRows { rows[vi].addInt64(r) }
                         }
                         w += 1
                     }
-                    tot[vi] = tot[vi] + n
-                    vi += 1
                 }
             }
             pass += 1
@@ -4270,162 +5011,171 @@ public function facetCounts(ix: Index, t: tb.Table, cp: Compiled, column: Intege
         if tot[i] > 0 {
             reps.add(rep[i])
             counts.add(tot[i])
+            if wantRows { groups.add(rows[i]) }
         }
         i += 1
     }
     return true
 }
 
+// ---------------------------------------------------------------- persistence in checkpoint images (ADR-010)
+// The index is persisted with its table at every checkpoint, as buffers of the table image (persist.min): the
+// per-chunk arenas (replaced, never changed in place, by builds and promotions), the term directory, the dictionary,
+// the per-row arrays and bitmaps, and a small state buffer. In-place writes go through tb.touch, so a checkpoint writes
+// only the 128 KiB pieces that changed (a new arena or directory is written whole). Deltas and facets are not persisted
+// (rebuilt from the rows on first use), nor are the fingerprints of rows in the middle of an update (such a row then
+// goes to its chunk's delta). WAL replay after the checkpoint goes through the write hooks, so recovery loads the
+// index instead of rebuilding it. Images of another IMAGE_VERSION (tokenizer or container format) are rebuilt.
 
-// ---------------------------------------------------------------- persistence at clean shutdown
-// After close's final checkpoint the index is written next to the snapshot, tagged with the checkpoint LSN. A later
-// open loads it instead of rebuilding only when the snapshot has that LSN and no WAL was replayed after it (the
-// table is then exactly the checkpointed one); any other case (crash, newer checkpoint, a short or foreign file)
-// rebuilds from the table. The file is derived state: deleting it only costs a rebuild.
+public constant IMAGE_VERSION = 5   // 5: block tf buckets in containers; 4: English stems are rust-stemmers' (TIN's); 3: this
+                                    // image format; FILE_VERSION 2 tokenizer rules
+public constant IMG_META = 15       // buffer index of the state buffer
+public constant IMG_ARENA = 16      // buffer index of chunk 0's arena (chunk c: IMG_ARENA + c)
 
-constant FILE_MAGIC = 0x4E454F5352434831   // "NEOSRCH1"
-constant FILE_VERSION = 2       // 2: words need a letter or digit; superscript digits are words of their own
-constant HEADER_WORDS = 20
-
-function blobs(ix: Index): List<Bytes> {
+// Tracked buffers in image order, with their change tracking (imageSegs).
+public function imageBuffers(ix: Index): List<Bytes> {
     return [ix.dict.text, ix.dict.ends, ix.dict.hashes, ix.dict.slots, ix.df, ix.dirStart, ix.dirCount, ix.dir, ix.dl,
-            ix.dlBig.keys, ix.dlBig.vals, ix.tfBig.keys, ix.tfBig.vals, ix.mainValid, ix.inDelta, ix.counted, ix.suspect,
-            ix.suspects, ix.deltaCount]
+            ix.mainValid, ix.inDelta, ix.counted, ix.suspect]
 }
 
-function writeAll(fd: Integer, b: Bytes, at: Integer): Boolean {
-    let done = 0
-    while done < b.length {
-        let n = dbio.pwrite(fd, b, done, min(b.length - done, 1 << 26), at + done)
-        if n <= 0 { return false }
-        done += n
-    }
-    return true
+public function imageSegs(ix: Index): List<tb.Seg> {
+    let g = ix.dict.growSegs
+    return [g[0], g[1], g[2], ix.dict.slotsSeg, ix.segs[SG_DF], ix.segs[SG_DIRSTART], ix.segs[SG_DIRCOUNT],
+            ix.segs[SG_DIR], ix.segs[SG_DL], ix.segs[SG_VALID], ix.segs[SG_INDELTA], ix.segs[SG_COUNTED], ix.segs[SG_SUSPECT]]
 }
 
-function readAll(fd: Integer, at: Integer, len: Integer, out: Bytes): Boolean {
-    let done = 0
-    while done < len {
-        let n = dbio.preadAppend(fd, at + done, out, min(len - done, 1 << 26))
-        if n <= 0 { return false }
-        done += n
+function putMap(b: Bytes, m: hm.IntMap) {
+    b.addInt64(m.count)
+    let s = hm.nextSlot(m, 0)
+    while s >= 0 {
+        b.addInt64(hm.slotKey(m, s))
+        b.addInt64(hm.slotValue(m, s))
+        s = hm.nextSlot(m, s + 1)
     }
-    return true
 }
 
-// Write the index to path (atomically: temporary file, sync, rename, directory sync). False on any I/O error.
-public function save(ix: Index, t: tb.Table, dir: Text, path: Text, lsn: Integer): Boolean {
-    if !ix.built { return false }
-    let tmp = path + ".tmp"
-    let fd = dbio.open(tmp, dbio.OPEN_WRITE | dbio.OPEN_CREATE | dbio.OPEN_TRUNCATE)
-    if fd < 0 { return false }
-    let h = Bytes()
-    let fields = [FILE_MAGIC, FILE_VERSION, lsn, t.nrows, t.id, ix.column, ix.stemmer, ix.dict.count, ix.dict.mask, ix.n,
-                  ix.sumDl, ix.capRows, ix.dlBig.mask, ix.dlBig.count, ix.tfBig.mask, ix.tfBig.count, ix.arenas.length, 0, 0, 0]
-    for x in fields { h.addInt64(x) }
-    h.setFloat64(17 * 8, ix.normAvgdl)
-    let ok = writeAll(fd, h, 0)
-    let at = h.length
-    let lens = Bytes()
-    for b in blobs(ix) { lens.addInt64(b.length) }
-    for b in ix.arenas { lens.addInt64(b.length) }
-    ok = ok && writeAll(fd, lens, at)
-    at += lens.length
-    for b in blobs(ix) {
-        ok = ok && writeAll(fd, b, at)
-        at += b.length
-    }
-    for b in ix.arenas {
-        ok = ok && writeAll(fd, b, at)
-        at += b.length
-    }
-    ok = ok && dbio.fsync(fd) == 0
-    dbio.close(fd)
-    if !ok {
-        dbio.unlink(tmp)
-        return false
-    }
-    if dbio.rename(tmp, path) != 0 { return false }
-    dbio.fsyncDir(dir)
-    return true
-}
-
-// Load the index from path if it was written for this checkpoint LSN and table; false = build it instead.
-public function load(ix: Index, t: tb.Table, path: Text, lsn: Integer): Boolean {
-    if lsn < 0 || dbio.pathSize(path) < HEADER_WORDS * 8 { return false }
-    let fd = dbio.open(path, dbio.OPEN_READ)
-    if fd < 0 { return false }
-    let ok = loadFrom(ix, t, fd, lsn)
-    dbio.close(fd)
-    return ok
-}
-
-function loadFrom(ix: Index, t: tb.Table, fd: Integer, lsn: Integer): Boolean {
-    let h = Bytes()
-    if !readAll(fd, 0, HEADER_WORDS * 8, h) { return false }
-    let w = function(i: Integer): Integer { return h.getInt64(i * 8) }
-    if w(0) != FILE_MAGIC || w(1) != FILE_VERSION || w(2) != lsn || w(3) != t.nrows || w(4) != t.id || w(5) != ix.column ||
-       w(6) != ix.stemmer {
-        return false
-    }
-    let nblobs = blobs(ix).length
-    let narenas = w(16)
-    if narenas < 0 || narenas > 1000000 { return false }
-    let lens = Bytes()
-    if !readAll(fd, HEADER_WORDS * 8, (nblobs + narenas) * 8, lens) { return false }
-    let at = HEADER_WORDS * 8 + lens.length
-    let parts: List<Bytes> = []
+function getMap(b: Bytes, at: Integer, m: hm.IntMap): Integer {
+    let n = b.getInt64(at)
+    let p = at + 8
     let i = 0
-    while i < nblobs + narenas {
-        let len = lens.getInt64(i * 8)
-        let b = Bytes()
-        if len < 0 || (len > 0 && !readAll(fd, at, len, b)) { return false }
-        parts.add(b)
-        at += len
+    while i < n {
+        hm.put(m, b.getInt64(p), b.getInt64(p + 8))
+        p += 16
         i += 1
     }
-    // install
-    ix.dict = Dict { text: parts[0]; ends: parts[1]; hashes: parts[2]; slots: parts[3]; mask: w(8); count: w(7) }
-    ix.df = parts[4]
-    ix.dirStart = parts[5]
-    ix.dirCount = parts[6]
-    ix.dir = parts[7]
-    ix.dl = parts[8]
-    ix.dlBig = hm.IntMap { keys: parts[9]; vals: parts[10]; mask: w(12); count: w(13) }
-    ix.tfBig = hm.IntMap { keys: parts[11]; vals: parts[12]; mask: w(14); count: w(15) }
-    ix.mainValid = parts[13]
-    ix.inDelta = parts[14]
-    ix.counted = parts[15]
-    ix.suspect = parts[16]
-    ix.suspects = parts[17]
-    ix.deltaCount = parts[18]
+    return p
+}
+
+// The state buffer (a fresh copy, so a checkpoint may keep it): version, shape, statistics, the overflow maps of
+// document lengths and term frequencies, and the rows still to settle. Empty when the index is not built.
+public function imageMeta(ix: Index): Bytes {
+    let b = Bytes()
+    if !ix.built { return b }
+    b.addInt64(IMAGE_VERSION)
+    b.addInt64(ix.column)
+    b.addInt64(ix.stemmer)
+    b.addInt64(ix.dict.count)
+    b.addInt64(ix.dict.mask)
+    b.addInt64(ix.n)
+    b.addInt64(ix.sumDl)
+    b.addInt64(ix.capRows)
+    b.addFloat64(ix.normAvgdl)
+    b.addInt64(ix.arenas.length)
+    putMap(b, ix.dlBig)
+    putMap(b, ix.tfBig)
+    b.addInt64(ix.suspects.length / 8)
+    b.addBytes(ix.suspects)
+    return b
+}
+
+// Arenas to persist (chunk order).
+public function imageArenas(ix: Index): List<Bytes> { return ix.arenas }
+
+// Install an index from a checkpoint image: meta from imageMeta, bufs in imageBuffers order, arenas by chunk. The
+// tracking starts clean (the next checkpoint reuses every piece). False when the image is of another version or shape.
+public function loadImage(ix: Index, t: tb.Table, meta: Bytes, bufs: List<Bytes>, arenas: List<Bytes>): Boolean {
+    if meta.length < 88 || bufs.length != 13 { return false }
+    if meta.getInt64(0) != IMAGE_VERSION || meta.getInt64(8) != ix.column || meta.getInt64(16) != ix.stemmer { return false }
+    let narenas = meta.getInt64(72)
+    if narenas != arenas.length { return false }
+    let clean = function(): tb.Seg {
+        let s = tb.newSeg()
+        s.all = false
+        return s
+    }
+    ix.dict = Dict { text: bufs[0]; ends: bufs[1]; hashes: bufs[2]; slots: bufs[3]; mask: meta.getInt64(32); count: meta.getInt64(24)
+                     slotsSeg: clean(); growSegs: [clean(), clean(), clean()] }
+    ix.df = bufs[4]
+    ix.dirStart = bufs[5]
+    ix.dirCount = bufs[6]
+    ix.dir = bufs[7]
+    ix.dl = bufs[8]
+    ix.mainValid = bufs[9]
+    ix.inDelta = bufs[10]
+    ix.counted = bufs[11]
+    ix.suspect = bufs[12]
+    ix.n = meta.getInt64(40)
+    ix.sumDl = meta.getInt64(48)
+    ix.capRows = meta.getInt64(56)
+    ix.normAvgdl = meta.getFloat64(64)
+    ix.dlBig = hm.newIntMap(16)
+    ix.tfBig = hm.newIntMap(16)
+    let at = getMap(meta, 80, ix.dlBig)
+    at = getMap(meta, at, ix.tfBig)
+    let ns = meta.getInt64(at)
+    ix.suspects = meta.slice(at + 8, at + 8 + ns * 8)
     ix.arenas = []
-    i = 0
-    while i < narenas {
-        ix.arenas.add(parts[nblobs + i])
+    ix.arenaSegs = []
+    for a in arenas {
+        ix.arenas.add(a)
+        ix.arenaSegs.add(clean())
+    }
+    ix.segs = []
+    let i = 0
+    while i < SG_COUNT {
+        ix.segs.add(clean())
         i += 1
     }
-    ix.n = w(9)
-    ix.sumDl = w(10)
-    ix.capRows = w(11)
-    ix.normAvgdl = h.getFloat64(17 * 8)
+    let chunks = nChunks(ix.capRows)
+    if ix.dl.length < ix.capRows * 2 || ix.mainValid.length < chunks * WORDS * 8 || ix.inDelta.length < chunks * WORDS * 8 ||
+       ix.counted.length < chunks * WORDS * 8 || ix.suspect.length < chunks * WORDS * 8 || narenas > chunks {
+        return false
+    }
+    while ix.arenas.length < chunks {
+        ix.arenas.add(Bytes())
+        ix.arenaSegs.add(tb.newSeg())
+    }
     ix.cnt = Bytes(ix.df.length)
     ix.start = Bytes(ix.df.length)
     ix.deltas = []
-    ix.deltaDirty = Bytes(narenas)
-    i = 0
-    while i < narenas {
+    ix.deltaDirty = Bytes(chunks)
+    ix.deltaCount = Bytes(chunks * 4)
+    let c = 0
+    while c < chunks {
         ix.deltas.add(Delta { terms: hm.newIntMap(16); arena: Bytes(); member: Bytes(); count: 0 })
-        if i * 4 < ix.deltaCount.length && ix.deltaCount.getInt32(i * 4) > 0 { ix.deltaDirty[i] = 1 }
-        i += 1
+        let k = 0
+        let w = c * WORDS
+        while w < (c + 1) * WORDS {
+            k += popcount(ix.inDelta.getInt64(w * 8))
+            w += 1
+        }
+        ix.deltaCount.setInt32(c * 4, k)
+        if k > 0 { ix.deltaDirty[c] = 1 }
+        c += 1
     }
     ix.oldPrint = hm.newIntMap(16)
     ix.facets = []
     ix.sorted = Bytes()
     ix.sortedCount = -1
     ix.built = true
+    ix.version += 1
     ix.generation += 1
     return true
+}
+
+// The table was truncated or rebuilt behind the index's back (WAL replay of TRUNCATE): build again on first use.
+public function invalidate(ix: Index) {
+    ix.built = false
 }
 
 // ---------------------------------------------------------------- streaming phrase check
@@ -4525,4 +5275,884 @@ function phraseStream(ix: Index, cp: Compiled, o: Integer, r: Integer): Boolean 
         }
     }
     return false
+}
+
+// ---------------------------------------------------------------- per-chunk top k on every core (lane parranges)
+// Each main chunk runs the block-max loop of topK on a worker: candidates from the plan (plain-term AND, plain-term
+// OR, or a fast phrase verified on positions), MaxScore and per-block bounds against the chunk's own k-th score,
+// exact f32 scores, and its best k rows written into its windows of the result Lists. The loop merges the chunks'
+// rows into the heap, then deltas and locked rows run as before. Exact: a row the chunk drops scores below k rows of
+// the same chunk, so it cannot be in the global top k.
+
+// Scratch bytes per chunk: candidate bitmap (1,024 words), essential and block masks (8 words each), partial
+// scores of one block (512 f64), an f32 rounding slot, and the fast phrase streams (3 int64 per word).
+constant PK_RES = 0
+constant PK_ESS = 8192
+constant PK_BLOCK = 8256
+constant PK_ACC = 8320
+constant PK_F32 = 12416
+constant PK_FP = 12424
+// Per-term scratch slots: Floats ubs, bbs, bmul, rest, bRest; Integers terms, bTerms, tfs, stamp, cursor.
+constant PK_SLOTS = 5
+
+global PK_SCRATCH: Bytes = Bytes()
+// setParallelTopK(false) keeps every top-k query on the serial engine (differential tests, paired benchmarks).
+global PK_ENABLED: List<Boolean> = [true]
+
+public function setParallelTopK(on: Boolean) { PK_ENABLED[0] = on }
+
+// Top-k searches that found their main chunks computed ahead (prefetchTopK), since start.
+global PK_AHEAD: List<Integer> = [0]
+
+public function searchesAhead(): Integer { return PK_AHEAD[0] }
+global PK_FLOATS: List<Float> = []
+global PK_INTS: List<Integer> = []
+global PK_SCORES: List<Float> = []
+global PK_ROWS: List<Integer> = []
+global PK_FOUND: List<Integer> = []
+
+// Plans the per-chunk kernel runs: 1 plain-term AND, 2 plain-term OR, 3 fast phrase; 0 = serial engine.
+function pkPlan(cp: Compiled): Integer {
+    if cp.fastPhrase { return 3 }
+    return flatPlan(cp)
+}
+
+parallel function pkBit(b: Integer): Integer {
+    if b == 63 { return -9223372036854775807 - 1 }
+    return 1 << b
+}
+
+parallel function pkLowest(x: Integer): Integer { return flatOnes(wrappingSubtract(x & wrappingSubtract(0, x), 1)) }
+
+parallel function pkF32(scratch: Bytes, x: Float): Float {
+    scratch.setFloat32(PK_F32, x)
+    return scratch.getFloat32(PK_F32)
+}
+
+parallel function pkHash(v: Integer): Integer {
+    let h = wrappingAdd(v, -7046029254386353131)
+    h = h ^ ((h >> 33) & 2147483647)
+    h = wrappingMultiply(h, -49064778989728563)
+    h = h ^ ((h >> 33) & 2147483647)
+    h = wrappingMultiply(h, -4265267296055464877)
+    h = h ^ ((h >> 33) & 2147483647)
+    return h
+}
+
+// hm.get over the map's slots, read-only.
+parallel function pkGet(m: hm.IntMap, key: Integer, missing: Integer): Integer {
+    let k = key + 1
+    let i = pkHash(key) & m.mask
+    while true {
+        let s = m.keys.getInt64(i * 8)
+        if s == 0 { return missing }
+        if s == k { return m.vals.getInt64(i * 8) }
+        i = (i + 1) & m.mask
+    }
+    return missing
+}
+
+parallel function pkDocLength(ix: Index, r: Integer): Integer {
+    let x = ix.dl.getUInt16(r * 2)
+    if x == 65535 { return pkGet(ix.dlBig, r, 65535) }
+    return x
+}
+
+parallel function pkTfRep(tf: Integer, reps: List<Integer>): Integer {
+    if tf <= 3 {
+        if tf < 1 { return 1 }
+        return tf
+    }
+    let i = 15
+    while reps[i] > tf { i -= 1 }
+    return reps[i]
+}
+
+// Rank of chunk offset o in term u's container, or -1; array containers keep a forward cursor in ints[4n + u].
+parallel function pkRank(a: Bytes, off: Integer, count: Integer, o: Integer, ints: List<Integer>, slot: Integer): Integer {
+    if count >= ARRAY_MAX {
+        let w = o >> 6
+        let x = a.getInt64(off + w * 8)
+        if (x & pkBit(o & 63)) == 0 { return -1 }
+        return a.getInt32(off + 8192 + w * 4) + flatOnes(x & wrappingSubtract(pkBit(o & 63), 1))
+    }
+    let i = ints[slot]
+    if i > 0 && a.getUInt16(off + (i - 1) * 2) >= o { i = 0 }
+    let step = 1
+    while i + step < count && a.getUInt16(off + (i + step) * 2) < o {
+        i += step
+        step = step * 2
+    }
+    while i < count && a.getUInt16(off + i * 2) < o { i += 1 }
+    ints[slot] = i
+    if i < count && a.getUInt16(off + i * 2) == o { return i }
+    return -1
+}
+
+// Term frequency of the posting at rank (tf >= 255 is kept in ix.tfBig).
+parallel function pkTf(ix: Index, a: Bytes, off: Integer, count: Integer, rank: Integer, term: Integer, r: Integer): Integer {
+    let x = a[off + flatDocs(count) + rank]
+    if x == 255 { return pkGet(ix.tfBig, (term << 32) | r, 255) }
+    return x
+}
+
+parallel function flatDocs(count: Integer): Integer {
+    if count >= ARRAY_MAX { return BITMAP_BYTES }
+    return count * 2
+}
+
+// Chunk offset of the posting at rank (only for tf overflow lookups).
+parallel function pkRowAtRank(a: Bytes, off: Integer, count: Integer, rank: Integer): Integer {
+    if count < ARRAY_MAX { return a.getUInt16(off + rank * 2) }
+    let w = 0
+    while w + 1 < WORDS && a.getInt32(off + 8192 + (w + 1) * 4) <= rank { w += 1 }
+    let x = a.getInt64(off + w * 8)
+    let seen = a.getInt32(off + 8192 + w * 4)
+    while x != 0 {
+        let b = pkLowest(x)
+        if seen == rank { return w * 64 + b }
+        seen += 1
+        x = x & wrappingSubtract(x, 1)
+    }
+    return -1
+}
+
+// Byte offset of the positions of the posting at rank.
+parallel function pkPositions(ix: Index, a: Bytes, off: Integer, count: Integer, rank: Integer, term: Integer, base: Integer): Integer {
+    let tfo = off + flatDocs(count)
+    let skipAt = tfo + count
+    if count >= BM_MIN { skipAt += BM_BLOCKS + BM_TF }   // block-max factors and tf buckets (bmBytes)
+    let posStart = skipAt + (count + 15) / 16 * 4
+    let p = posStart + a.getInt32(skipAt + (rank >> 4) * 4)
+    let k = rank & 0x7FFFFFFFFFFFFFF0
+    while k < rank {
+        let tf = a[tfo + k]
+        if tf == 255 { tf = pkGet(ix.tfBig, (term << 32) | (base + pkRowAtRank(a, off, count, k)), 255) }
+        let j = 0
+        while j < tf {
+            while a[p] >= 128 { p += 1 }
+            p += 1
+            j += 1
+        }
+        k += 1
+    }
+    return p
+}
+
+// Next position of phrase word i (stream state at PK_FP + i * 24: byte offset, positions left, current).
+parallel function pkStreamNext(a: Bytes, scratch: Bytes, i: Integer): Boolean {
+    let at = PK_FP + i * 24
+    let left = scratch.getInt64(at + 8)
+    if left == 0 { return false }
+    let p = scratch.getInt64(at)
+    let u = 0
+    let shift = 0
+    while true {
+        let b = a[p]
+        p += 1
+        u = u | ((b & 127) << shift)
+        if b < 128 { break }
+        shift += 7
+    }
+    let cur = scratch.getInt64(at + 16)
+    if cur < 0 { cur = 0 }
+    scratch.setInt64(at + 16, cur + u)
+    scratch.setInt64(at, p)
+    scratch.setInt64(at + 8, left - 1)
+    return true
+}
+
+// phraseStream: does row r (chunk offset o) hold the phrase?
+parallel function pkPhrase(ix: Index, cp: Compiled, a: Bytes, refs: List<Integer>, rb: Integer, o: Integer, r: Integer,
+                           ints: List<Integer>, n: Integer, scratch: Bytes): Boolean {
+    let words = cp.fpUts.length / 4
+    let driver = -1
+    let best = 0
+    let i = 0
+    while i < words {
+        let u = cp.fpUts.getInt32(i * 4)
+        let off = refs[rb + u * 4]
+        let count = refs[rb + u * 4 + 1]
+        if count == 0 { return false }
+        let rank = pkRank(a, off, count, o, ints, 4 * n + u)
+        if rank < 0 { return false }
+        let term = cp.uts.getInt32(u * 4)
+        let tf = pkTf(ix, a, off, count, rank, term, r)
+        scratch.setInt64(PK_FP + i * 24, pkPositions(ix, a, off, count, rank, term, r - o))
+        scratch.setInt64(PK_FP + i * 24 + 8, tf)
+        scratch.setInt64(PK_FP + i * 24 + 16, -1)
+        if driver < 0 || tf < best {
+            driver = i
+            best = tf
+        }
+        i += 1
+    }
+    let doff = cp.fpOffs.getInt32(driver * 4)
+    while pkStreamNext(a, scratch, driver) {
+        let start = scratch.getInt64(PK_FP + driver * 24 + 16) - doff
+        if start >= 0 {
+            let ok = true
+            let k = 0
+            while k < words && ok {
+                if k != driver {
+                    let target = start + cp.fpOffs.getInt32(k * 4)
+                    while scratch.getInt64(PK_FP + k * 24 + 16) < target {
+                        if !pkStreamNext(a, scratch, k) { return false }
+                    }
+                    if scratch.getInt64(PK_FP + k * 24 + 16) != target { ok = false }
+                }
+                k += 1
+            }
+            if ok { return true }
+        }
+    }
+    return false
+}
+
+// termScore32: TIN's per-term score in f32, in the production order.
+parallel function pkTermScore(cp: Compiled, u: Integer, tf: Integer, dl: Integer, reps: List<Integer>, scratch: Bytes): Float {
+    let rep = pkF32(scratch, Float(pkTfRep(tf, reps)))
+    let num = pkF32(scratch, pkF32(scratch, cp.mult32[u] * rep) * pkF32(scratch, K1 + 1.0))
+    let dconst = pkF32(scratch, rep + pkF32(scratch, pkF32(scratch, K1) * pkF32(scratch, 1.0 - BM25_B)))
+    let den = pkF32(scratch, dconst + pkF32(scratch, cp.dlf32 * Float(dl)))
+    return pkF32(scratch, num / den)
+}
+
+// scoreBounded: exact score of row r, or -1.0 once it cannot reach th. Terms come from ints[order ..] with their
+// rest sums at floats[restAt ..].
+parallel function pkScore(ix: Index, cp: Compiled, a: Bytes, refs: List<Integer>, rb: Integer, o: Integer, r: Integer,
+                          order: Integer, count: Integer, restAt: Integer, th: Float, full: Boolean, reps: List<Integer>,
+                          fs: List<Float>, ints: List<Integer>, n: Integer, scratch: Bytes): Float {
+    let dl = pkDocLength(ix, r)
+    let norm = cp.normA + cp.normB * Float(dl)
+    let partial = 0.0
+    let i = 0
+    while i < count {
+        let u = ints[order + i]
+        let off = refs[rb + u * 4]
+        let rank = pkRank(a, off, refs[rb + u * 4 + 1], o, ints, 4 * n + u)
+        if rank >= 0 {
+            let tf = pkTf(ix, a, off, refs[rb + u * 4 + 1], rank, cp.uts.getInt32(u * 4), r)
+            ints[2 * n + u] = tf
+            ints[3 * n + u] = r + 1
+            let ftf = Float(tf)
+            if tf > 3 { ftf = Float(pkTfRep(tf, reps)) }
+            partial += cp.wf[u] * ftf / (ftf + norm)
+        }
+        if full && (partial + fs[restAt + i]) * 1.00001 < th { return -1.0 }
+        i += 1
+    }
+    let s = 0.0
+    let j = 0
+    while j < cp.scoreOrder.length {
+        let u = cp.scoreOrder[j]
+        if ints[3 * n + u] == r + 1 { s = pkF32(scratch, s + pkTermScore(cp, u, ints[2 * n + u], dl, reps, scratch)) }
+        j += 1
+    }
+    return s
+}
+
+// Keep (s, r) among the chunk's best rows (score descending; rows arrive in increasing order, so ties keep the
+// earlier row). Returns the new count.
+parallel function pkOffer(scores: List<Float>, rows: List<Integer>, k: Integer, have: Integer, s: Float, r: Integer): Integer {
+    let slot = have
+    if have == k {
+        if s <= scores[k - 1] { return have }
+        slot = k - 1
+    }
+    while slot > 0 && s > scores[slot - 1] {
+        scores[slot] = scores[slot - 1]
+        rows[slot] = rows[slot - 1]
+        slot -= 1
+    }
+    scores[slot] = s
+    rows[slot] = r
+    if have < k { return have + 1 }
+    return have
+}
+
+// OR a container's rows in words [w0, w0 + 8) into the 8-word mask at scratch[at].
+parallel function pkOrBlock(a: Bytes, off: Integer, count: Integer, w0: Integer, scratch: Bytes, at: Integer) {
+    if count >= ARRAY_MAX {
+        let w = 0
+        while w < 8 {
+            scratch.setInt64(at + w * 8, scratch.getInt64(at + w * 8) | a.getInt64(off + (w0 + w) * 8))
+            w += 1
+        }
+        return
+    }
+    let first = w0 * 64
+    let lo = flatLower(a, off, count, first)
+    while lo < count {
+        let row = a.getUInt16(off + lo * 2)
+        if row >= first + 512 { return }
+        let w = at + ((row - first) >> 6) * 8
+        scratch.setInt64(w, scratch.getInt64(w) | pkBit(row & 63))
+        lo += 1
+    }
+}
+
+// accBlock: partial f64 scores of term u for the rows of block w0 set in the block mask.
+parallel function pkAccBlock(ix: Index, cp: Compiled, a: Bytes, off: Integer, count: Integer, u: Integer, w0: Integer,
+                             base: Integer, reps: List<Integer>, scratch: Bytes) {
+    let first = w0 * 64
+    let wf = cp.wf[u]
+    let term = cp.uts.getInt32(u * 4)
+    let tfOff = off + flatDocs(count)
+    if count >= ARRAY_MAX {
+        let rank = a.getInt32(off + 8192 + w0 * 4)
+        let w = 0
+        while w < 8 {
+            let x = a.getInt64(off + (w0 + w) * 8)
+            let m = scratch.getInt64(PK_BLOCK + w * 8)
+            while x != 0 {
+                let b = pkLowest(x)
+                x = x & wrappingSubtract(x, 1)
+                if (m & pkBit(b)) != 0 {
+                    let o = w * 64 + b
+                    let r = base + first + o
+                    let tf = a[tfOff + rank]
+                    if tf == 255 { tf = pkGet(ix.tfBig, (term << 32) | r, 255) }
+                    let dl = pkDocLength(ix, r)
+                    let ftf = Float(tf)
+                    if tf > 3 { ftf = Float(pkTfRep(tf, reps)) }
+                    scratch.setFloat64(PK_ACC + o * 8, scratch.getFloat64(PK_ACC + o * 8) + wf * ftf / (ftf + cp.normA + cp.normB * Float(dl)))
+                }
+                rank += 1
+            }
+            w += 1
+        }
+        return
+    }
+    let lo = flatLower(a, off, count, first)
+    while lo < count {
+        let row = a.getUInt16(off + lo * 2)
+        if row >= first + 512 { return }
+        let o = row - first
+        if (scratch.getInt64(PK_BLOCK + (o >> 6) * 8) & pkBit(o & 63)) != 0 {
+            let r = base + row
+            let tf = a[tfOff + lo]
+            if tf == 255 { tf = pkGet(ix.tfBig, (term << 32) | r, 255) }
+            let dl = pkDocLength(ix, r)
+            let ftf = Float(tf)
+            if tf > 3 { ftf = Float(pkTfRep(tf, reps)) }
+            scratch.setFloat64(PK_ACC + o * 8, scratch.getFloat64(PK_ACC + o * 8) + wf * ftf / (ftf + cp.normA + cp.normB * Float(dl)))
+        }
+        lo += 1
+    }
+}
+
+// The chunk's best k rows into its windows; returns how many. refs[rb ..]: per distinct term of this query its
+// main container in chunk c: offset, postings, maxTf, minDl (0 postings = absent). seed: a score every top-k row
+// reaches (0.0 = none).
+parallel function pkChunk(ix: Index, cp: Compiled, a: Bytes, c: Integer, plan: Integer, refs: List<Integer>, rb: Integer,
+                          n: Integer, k: Integer, b0: Integer, b1: Integer, reps: List<Integer>, disjunctive: Boolean, seed: Float, scores: List<Float>,
+                          rows: List<Integer>, fs: List<Float>, ints: List<Integer>, scratch: Bytes): Integer {
+    let base = c * CHUNK
+    // this item's blocks [b0, b1): words [wFrom, wTo), chunk offsets [first, after)
+    let wFrom = b0 * 8
+    let wTo = b1 * 8
+    let first = wFrom * 64
+    let after = wTo * 64
+    // candidates: AND (plan 1, and the phrase's words) or OR of the containers, after main validity
+    let driver = -1
+    let least = 0
+    let u = 0
+    while u < n {
+        let count = refs[rb + u * 4 + 1]
+        ints[3 * n + u] = 0
+        ints[4 * n + u] = 0
+        if plan != 2 && count == 0 { return 0 }
+        if count > 0 && (driver < 0 || count < least) {
+            driver = u
+            least = count
+        }
+        u += 1
+    }
+    if driver < 0 { return 0 }
+    let any = 0
+    let w = wFrom
+    while w < wTo {
+        scratch.setInt64(PK_RES + w * 8, 0)
+        w += 1
+    }
+    if plan == 2 {
+        u = 0
+        while u < n {
+            let count = refs[rb + u * 4 + 1]
+            let off = refs[rb + u * 4]
+            if count >= ARRAY_MAX {
+                w = wFrom
+                while w < wTo {
+                    scratch.setInt64(PK_RES + w * 8, scratch.getInt64(PK_RES + w * 8) | a.getInt64(off + w * 8))
+                    w += 1
+                }
+            } else {
+                let i = flatLower(a, off, count, first)
+                while i < count && a.getUInt16(off + i * 2) < after {
+                    let row = a.getUInt16(off + i * 2)
+                    let at = PK_RES + (row >> 6) * 8
+                    scratch.setInt64(at, scratch.getInt64(at) | pkBit(row & 63))
+                    i += 1
+                }
+            }
+            u += 1
+        }
+    } else if least >= ARRAY_MAX {
+        w = wFrom
+        while w < wTo {
+            let x = -1
+            u = 0
+            while u < n && x != 0 {
+                x = x & a.getInt64(refs[rb + u * 4] + w * 8)
+                u += 1
+            }
+            scratch.setInt64(PK_RES + w * 8, x)
+            w += 1
+        }
+    } else {
+        let doff = refs[rb + driver * 4]
+        let i = flatLower(a, doff, least, first)
+        while i < least && a.getUInt16(doff + i * 2) < after {
+            let row = a.getUInt16(doff + i * 2)
+            let all = true
+            u = 0
+            while u < n && all {
+                if u != driver { all = flatHas(a, refs[rb + u * 4], refs[rb + u * 4 + 1], row) }
+                u += 1
+            }
+            if all {
+                let at = PK_RES + (row >> 6) * 8
+                scratch.setInt64(at, scratch.getInt64(at) | pkBit(row & 63))
+            }
+            i += 1
+        }
+    }
+    w = wFrom
+    while w < wTo {
+        let x = scratch.getInt64(PK_RES + w * 8) & flatValidWord(ix.mainValid, c, w)
+        scratch.setInt64(PK_RES + w * 8, x)
+        any = any | x
+        w += 1
+    }
+    if any == 0 { return 0 }
+    // chunkTerms: scoring terms present, by bound descending (ties: lower index first), rest sums after each
+    let scale = cp.avgdl / ix.normAvgdl
+    if scale < 1.0 { scale = 1.0 }
+    let nt = 0
+    u = 0
+    while u < n {
+        let count = refs[rb + u * 4 + 1]
+        if cp.utScore[u] != 0 && count > 0 {
+            let maxTf = refs[rb + u * 4 + 2]
+            let b = cp.wf[u] * 1.00001
+            if maxTf < 255 {
+                let ftf = Float(pkTfRep(maxTf, reps))
+                b = cp.wf[u] * ftf / (ftf + cp.normA + cp.normB * Float(refs[rb + u * 4 + 3])) * 1.00001
+            }
+            fs[u] = b
+            fs[2 * n + u] = (K1 + 1.0) / 255.0 * cp.utIdf[u] * cp.utBoost[u] * scale
+            let at = nt
+            while at > 0 && fs[ints[at - 1]] < b {
+                ints[at] = ints[at - 1]
+                at -= 1
+            }
+            ints[at] = u
+            nt += 1
+        }
+        u += 1
+    }
+    let acc = 0.0
+    let ti = nt - 1
+    while ti >= 0 {
+        fs[3 * n + ti] = acc
+        acc += fs[ints[ti]]
+        ti -= 1
+    }
+    let have = 0
+    // MaxScore against the seed: terms whose bounds together stay below it cannot make a row qualify alone
+    if seed > 0.0 && nt > 0 {
+        let cut = nt
+        let sum = 0.0
+        while cut > 0 && (sum + fs[ints[cut - 1]]) * 1.00001 < seed {
+            sum += fs[ints[cut - 1]]
+            cut -= 1
+        }
+        if cut == 0 { return 0 }
+        if cut < nt {
+            // essential rows, a block at a time into PK_ESS, then AND into the candidates
+            let blk = b0
+            let left = 0
+            while blk < b1 {
+                let e = 0
+                while e < 8 {
+                    scratch.setInt64(PK_ESS + e * 8, 0)
+                    e += 1
+                }
+                e = 0
+                while e < cut {
+                    let eu = ints[e]
+                    pkOrBlock(a, refs[rb + eu * 4], refs[rb + eu * 4 + 1], blk * 8, scratch, PK_ESS)
+                    e += 1
+                }
+                e = 0
+                while e < 8 {
+                    let at = PK_RES + (blk * 8 + e) * 8
+                    let x = scratch.getInt64(at) & scratch.getInt64(PK_ESS + e * 8)
+                    scratch.setInt64(at, x)
+                    left = left | x
+                    e += 1
+                }
+                blk += 1
+            }
+            if left == 0 { return 0 }
+        }
+    }
+    let blk = b0
+    while blk < b1 {
+        let w0 = blk * 8
+        let anyc = 0
+        w = w0
+        while w < w0 + 8 {
+            anyc = anyc | scratch.getInt64(PK_RES + w * 8)
+            w += 1
+        }
+        if anyc != 0 {
+            let full = have == k || seed > 0.0
+            let th = seed
+            if have == k && scores[k - 1] > th { th = scores[k - 1] }
+            let order = 0
+            let count = nt
+            let restAt = 3 * n
+            let skip = false
+            w = 0
+            while w < 8 {
+                scratch.setInt64(PK_BLOCK + w * 8, scratch.getInt64(PK_RES + (w0 + w) * 8))
+                w += 1
+            }
+            if full && nt > 0 {
+                // block-max: bounds of every scoring term within this 512-row block
+                let sum = 0.0
+                ti = 0
+                while ti < nt {
+                    let tu = ints[ti]
+                    let b = fs[tu]
+                    let tc = refs[rb + tu * 4 + 1]
+                    if tc >= BM_MIN {
+                        b = Float(a[refs[rb + tu * 4] + flatDocs(tc) + tc + blk]) * fs[2 * n + tu]
+                        if b > fs[tu] { b = fs[tu] }
+                    }
+                    fs[n + tu] = b
+                    sum += b
+                    ti += 1
+                }
+                if sum * 1.00001 < th {
+                    skip = true
+                } else {
+                    // bTerms at ints[n ..]: terms with a positive block bound, by block bound descending
+                    let nb = 0
+                    ti = 0
+                    while ti < nt {
+                        let tu = ints[ti]
+                        if fs[n + tu] > 0.0 {
+                            let at = nb
+                            while at > 0 && fs[n + ints[n + at - 1]] < fs[n + tu] {
+                                ints[n + at] = ints[n + at - 1]
+                                at -= 1
+                            }
+                            ints[n + at] = tu
+                            nb += 1
+                        }
+                        ti += 1
+                    }
+                    let bacc = 0.0
+                    ti = nb - 1
+                    while ti >= 0 {
+                        fs[4 * n + ti] = bacc
+                        bacc += fs[n + ints[n + ti]]
+                        ti -= 1
+                    }
+                    // non-essential tail: rows holding only those terms cannot reach the threshold
+                    let cut = nb
+                    let tail = 0.0
+                    while cut > 0 && (tail + fs[n + ints[n + cut - 1]]) * 1.00001 < th {
+                        tail += fs[n + ints[n + cut - 1]]
+                        cut -= 1
+                    }
+                    if cut == 0 {
+                        skip = true
+                    } else {
+                        if cut < nb {
+                            let e = 0
+                            while e < 8 {
+                                scratch.setInt64(PK_ESS + e * 8, 0)
+                                e += 1
+                            }
+                            e = 0
+                            while e < cut {
+                                let eu = ints[n + e]
+                                pkOrBlock(a, refs[rb + eu * 4], refs[rb + eu * 4 + 1], w0, scratch, PK_ESS)
+                                e += 1
+                            }
+                            let nc = 0
+                            w = 0
+                            while w < 8 {
+                                let bw = scratch.getInt64(PK_BLOCK + w * 8) & scratch.getInt64(PK_ESS + w * 8)
+                                scratch.setInt64(PK_BLOCK + w * 8, bw)
+                                nc += flatOnes(bw)
+                                w += 1
+                            }
+                            // many candidates: add up the essential terms' scores term at a time and keep rows whose
+                            // partial score plus the non-essential terms' block bounds where they occur can qualify
+                            if nc >= 16 && disjunctive {
+                                w = 0
+                                while w < 512 {
+                                    scratch.setFloat64(PK_ACC + w * 8, 0.0)
+                                    w += 1
+                                }
+                                e = 0
+                                while e < cut {
+                                    let eu = ints[n + e]
+                                    pkAccBlock(ix, cp, a, refs[rb + eu * 4], refs[rb + eu * 4 + 1], eu, w0, base, reps, scratch)
+                                    e += 1
+                                }
+                                e = cut
+                                while e < nb {
+                                    let ne = ints[n + e]
+                                    let z = 0
+                                    while z < 8 {
+                                        scratch.setInt64(PK_ESS + z * 8, 0)
+                                        z += 1
+                                    }
+                                    pkOrBlock(a, refs[rb + ne * 4], refs[rb + ne * 4 + 1], w0, scratch, PK_ESS)
+                                    let bb = fs[n + ne]
+                                    z = 0
+                                    while z < 8 {
+                                        let x = scratch.getInt64(PK_ESS + z * 8) & scratch.getInt64(PK_BLOCK + z * 8)
+                                        while x != 0 {
+                                            let at = PK_ACC + (z * 64 + pkLowest(x)) * 8
+                                            scratch.setFloat64(at, scratch.getFloat64(at) + bb)
+                                            x = x & wrappingSubtract(x, 1)
+                                        }
+                                        z += 1
+                                    }
+                                    e += 1
+                                }
+                                w = 0
+                                while w < 8 {
+                                    let bw = scratch.getInt64(PK_BLOCK + w * 8)
+                                    let keep = bw
+                                    while bw != 0 {
+                                        let b = pkLowest(bw)
+                                        bw = bw & wrappingSubtract(bw, 1)
+                                        if scratch.getFloat64(PK_ACC + (w * 64 + b) * 8) * 1.00001 < th { keep = keep & ~pkBit(b) }
+                                    }
+                                    scratch.setInt64(PK_BLOCK + w * 8, keep)
+                                    w += 1
+                                }
+                            }
+                        }
+                        order = n
+                        count = nb
+                        restAt = 4 * n
+                    }
+                }
+            }
+            if !skip {
+                w = 0
+                while w < 8 {
+                    let x = scratch.getInt64(PK_BLOCK + w * 8)
+                    while x != 0 {
+                        let o = (w0 + w) * 64 + pkLowest(x)
+                        x = x & wrappingSubtract(x, 1)
+                        let r = base + o
+                        let full2 = have == k || seed > 0.0
+                        let th2 = seed
+                        if have == k && scores[k - 1] > th2 { th2 = scores[k - 1] }
+                        let s = pkScore(ix, cp, a, refs, rb, o, r, order, count, restAt, th2, full2, reps, fs, ints, n, scratch)
+                        if s >= 0.0 && s >= seed && (have < k || s > scores[k - 1]) {
+                            if plan != 3 || pkPhrase(ix, cp, a, refs, rb, o, r, ints, n, scratch) {
+                                have = pkOffer(scores, rows, k, have, s, r)
+                            }
+                        }
+                    }
+                    w += 1
+                }
+            }
+        }
+        blk += 1
+    }
+    return have
+}
+
+// Top k of the main chunks 0..built, pushed into h: computed ahead by prefetchTopK, or now on every core. Returns the
+// chunks covered, or 0 (heap untouched) when the serial engine must run (other plans, or the residual filter
+// rejects a returned row).
+function pkTopK(ix: Index, cp: Compiled, t: tb.Table, h: Heap, rd: Reader): Integer {
+    if pkPlan(cp) == 0 { return 0 }
+    let built = min(nChunks(t.nrows), ix.arenas.length)
+    if built == 0 || cp.uts.length == 0 { return 0 }
+    if cp.pkVersion == ix.version && cp.pkK == h.k && cp.pkBuilt == built {
+        PK_AHEAD[0] = PK_AHEAD[0] + 1
+    } else {
+        let one: List<Compiled> = [cp]
+        let ks = [h.k]
+        pkRun(ix, t, one, ks)
+    }
+    cp.pkVersion = -1
+    // one entry per (chunk, slice), k slots each
+    let k = cp.pkK
+    let c = 0
+    while c < cp.pkFound.length {
+        let i = 0
+        while i < cp.pkFound[c] {
+            if !rd.accept(cp.pkRows[c * k + i]) { return 0 }
+            i += 1
+        }
+        c += 1
+    }
+    c = 0
+    while c < cp.pkFound.length {
+        let i = 0
+        while i < cp.pkFound[c] {
+            let s = cp.pkScores[c * k + i]
+            let r = cp.pkRows[c * k + i]
+            if qualifies(h, s, r) { heapPush(h, s, r) }
+            i += 1
+        }
+        c += 1
+    }
+    return built
+}
+
+// Several queries over one index (connections waiting in the same loop pass): their main-chunk top k in one
+// dispatch, kept in each Compiled until its own topK call uses it. Queries other plans cannot serve are skipped.
+public function prefetchTopK(ix: Index, t: tb.Table, cps: List<Compiled>, ks: List<Integer>) {
+    let locked = Bytes()
+    settle(ix, t, locked)
+    let use: List<Compiled> = []
+    let useK: List<Integer> = []
+    let i = 0
+    while i < cps.length {
+        if PK_ENABLED[0] && pkPlan(cps[i]) != 0 && cps[i].uts.length > 0 {
+            refreshStats(ix, cps[i])
+            use.add(cps[i])
+            useK.add(max(ks[i], 1))
+        }
+        i += 1
+    }
+    // Measured (lane parranges, reports/parranges.md): sharing a dispatch paid on wiki4 (19 chunks, 8 workers) and
+    // cost 8-35% on wiki 8 GB (37 chunks) and hn_sub (153): only while one query has fewer than four chunks per
+    // worker does it improve their use enough to pay for the longer pass and the larger cache footprint.
+    let built = min(nChunks(t.nrows), ix.arenas.length)
+    if use.length > 0 && built < 4 * pkWorkers() { pkRun(ix, t, use, useK) }
+}
+
+global PK_WORKERS: List<Integer> = [0]
+
+// Tests: plan work items as if `n` workers ran them (0 = ask the runtime again).
+public function setSearchWorkers(n: Integer) { PK_WORKERS[0] = n }
+
+function pkWorkers(): Integer {
+    if PK_WORKERS[0] == 0 { PK_WORKERS[0] = max(dbio.parallelWorkers(), 1) }
+    return PK_WORKERS[0]
+}
+
+
+// The per-chunk kernel for every (query, chunk) pair in one parallel for; results into each query's pk* fields.
+function pkRun(ix: Index, t: tb.Table, cps: List<Compiled>, ks: List<Integer>) {
+    let built = min(nChunks(t.nrows), ix.arenas.length)
+    let nq = cps.length
+    let plans: List<Integer> = []
+    let ns: List<Integer> = []
+    let bases: List<Integer> = []
+    let disjunctive: List<Boolean> = []
+    let refs: List<Integer> = []
+    let kmax = 1
+    let nmax = 1
+    let words = 1
+    let ref = newCref()
+    let q = 0
+    while q < nq {
+        let cp = cps[q]
+        let n = cp.uts.length / 4
+        plans.add(pkPlan(cp))
+        ns.add(n)
+        bases.add(refs.length)
+        let rk = cp.q.kind[cp.q.root]
+        disjunctive.add(rk == qy.Q_OR || rk == qy.Q_ATLEAST)
+        if ks[q] > kmax { kmax = ks[q] }
+        if n > nmax { nmax = n }
+        if cp.fpUts.length / 4 > words { words = cp.fpUts.length / 4 }
+        let c = 0
+        while c < built {
+            let u = 0
+            while u < n {
+                if mainContainer(ix, cp.uts.getInt32(u * 4), c, ref) {
+                    refs.add(ref.off); refs.add(ref.count); refs.add(ref.maxTf); refs.add(ref.minDl)
+                } else { refs.add(0); refs.add(0); refs.add(0); refs.add(0) }
+                u += 1
+            }
+            c += 1
+        }
+        q += 1
+    }
+    // One item per (query, chunk). Splitting chunks into block ranges balanced the workers better but cost 15-25%
+    // on wiki4 (each slice must find its own k rows before it can prune); pkChunk keeps the [b0, b1) parameters.
+    let slices = 1
+    let span = (BM_BLOCKS + slices - 1) / slices
+    let total = nq * built * slices
+    let slots = PK_SLOTS * nmax
+    let width = PK_FP + 24 * words
+    let scores = PK_SCORES
+    let rows = PK_ROWS
+    let found = PK_FOUND
+    let floats = PK_FLOATS
+    let ints = PK_INTS
+    let scratch = PK_SCRATCH
+    while scores.length < total * kmax { scores.add(0.0); rows.add(0) }
+    while found.length < total { found.add(0) }
+    while floats.length < total * slots { floats.add(0.0); ints.add(0) }
+    if scratch.length < total * width { scratch.resize(total * width) }
+    let arenas = ix.arenas
+    let reps = TF_REPS
+    let seed = 0.0
+    parallel for item in 0..total {
+        let part = item / slices
+        let qi = part / built
+        let c = part - qi * built
+        let b0 = (item - part * slices) * span
+        let b1 = min(b0 + span, BM_BLOCKS)
+        let n = ns[qi]
+        found[item] = pkChunk(ix, cps[qi], arenas[c], c, plans[qi], refs, bases[qi] + c * n * 4, n, ks[qi], b0, b1, reps,
+                              disjunctive[qi], seed, scores.window(item, kmax), rows.window(item, kmax),
+                              floats.window(item, slots), ints.window(item, slots), scratch.window(item, width))
+    }
+    q = 0
+    while q < nq {
+        let cp = cps[q]
+        let k = ks[q]
+        let f: List<Integer> = []
+        let sc: List<Float> = []
+        let rw: List<Integer> = []
+        let c = 0
+        while c < built * slices {
+            let item = q * built * slices + c
+            f.add(found[item])
+            let i = 0
+            while i < k {
+                sc.add(scores[item * kmax + i])
+                rw.add(rows[item * kmax + i])
+                i += 1
+            }
+            c += 1
+        }
+        cp.pkFound = f
+        cp.pkScores = sc
+        cp.pkRows = rw
+        cp.pkK = k
+        cp.pkBuilt = built
+        cp.pkVersion = ix.version
+        q += 1
+    }
 }

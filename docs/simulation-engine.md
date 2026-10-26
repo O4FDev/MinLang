@@ -2,9 +2,9 @@
 
 `make check-simulation-engine` runs the unmodified neo-db engine, SQL parser,
 transactions, table images, checkpoint publisher and recovery through explicit
-deterministic I/O. The fixture pins all 44 production modules (engine, SQL, storage, search, the
-SDK and three extension packages) and the package manifests to revision
-`f4a90a1f527e8b2f5d700251cc06ae8bf24e8071`; hashes are checked before compilation.
+deterministic I/O. The fixture pins all 71 modules (engine, SQL, storage, search, the
+SDK and three extension packages; the zstd value codec is neo-db's deterministic stand-in) and the package manifests to revision
+`8df7c7a1edc8537ab1a91cc3693e652034e5a278`; hashes are checked before compilation.
 This opt-in target is larger than the WAL and manifest unit integrations.
 `make check-simulation-engine-compile` isolates source compilation first.
 

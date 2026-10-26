@@ -14,6 +14,7 @@
 // Every callback has the same shape, (Call) -> Nothing: it reads its arguments from the Call and sets one result.
 // neo-db owns one Call per expression and reuses it, so calling an extension function allocates nothing.
 use "text" as utf8
+use "boundary" as boundary
 
 // ---------------------------------------------------------------- a call
 
@@ -26,6 +27,7 @@ public record Call {
     offsets: List<Integer>
     lengths: List<Integer>
     modifier: Integer          // type modifier for input and modifier callbacks (vector(3) -> 3), else -1
+    explicit: Boolean          // casts: an explicit CAST / :: (bit(n) pads or truncates) rather than an assignment
     output: Bytes              // append the result bytes of text, bytea and extension-type results here
     resultNull: Boolean
     resultInteger: Integer
@@ -39,7 +41,7 @@ public record Call {
 public function newCall(arguments: Integer, host: Host): Call {
     let c = Call {
         count: arguments; nulls: []; integers: []; floats: []; buffers: []; offsets: []; lengths: []
-        modifier: -1; output: Bytes(); resultNull: false; resultInteger: 0; resultFloat: 0.0
+        modifier: -1; explicit: false; output: Bytes(); resultNull: false; resultInteger: 0; resultFloat: 0.0
         failed: false; failCode: ""; failMessage: ""; host: host
     }
     let empty = Bytes()
@@ -92,6 +94,25 @@ public function Call.returnText(t: Text) { self.output.addBytes(Bytes(t)) }
 // For byte results, append to call.output; never read or shorten it (it may already hold earlier output).
 
 // Stop the statement with a Postgres error: sqlstate (e.g. "22P02") and message.
+// The host runs every extension callback through this. A program error inside the callback (a position
+// outside a List, unwrap of None, fail(...), Integer overflow, ...) becomes this call's failure, SQLSTATE 38000
+// (external routine exception), instead of stopping neo-db. What the callback already appended to the
+// output stays there; the host discards the output of a failed call.
+public function Call.invoke(body: deterministic (Call) -> Nothing) {
+    match boundary.runWith(self, body) {
+        Ok() { }
+        Err(problem) { self.fail("38000", "extension function stopped: " + problem.message()) }
+    }
+}
+
+// The same for a body that may read the clock, random numbers or other host state (defineVolatile, feed transforms).
+public function Call.invokeVolatile(body: (Call) -> Nothing) {
+    match boundary.runWith(self, body) {
+        Ok() { }
+        Err(problem) { self.fail("38000", "extension function stopped: " + problem.message()) }
+    }
+}
+
 public function Call.fail(code: Text, message: Text) {
     if self.failed { return }
     self.failed = true
@@ -103,18 +124,20 @@ public function Call.fail(code: Text, message: Text) {
 
 public record TypeDef {
     name: Text
-    input: (Call) -> Nothing       // text (argument 0, modifier in call.modifier) -> stored bytes
-    output: (Call) -> Nothing      // stored bytes -> text
-    receive: (Call) -> Nothing     // binary wire format -> stored bytes
-    send: (Call) -> Nothing        // stored bytes -> binary wire format
-    check: (Call) -> Nothing       // enforce a type modifier on a stored value (vector(3)); call.modifier >= 0
+    input: deterministic (Call) -> Nothing       // text (argument 0, modifier in call.modifier) -> stored bytes
+    output: deterministic (Call) -> Nothing      // stored bytes -> text
+    receive: deterministic (Call) -> Nothing     // binary wire format -> stored bytes
+    send: deterministic (Call) -> Nothing        // stored bytes -> binary wire format
+    check: deterministic (Call) -> Nothing       // enforce a type modifier on a stored value (vector(3)); call.modifier >= 0
     hasBinary: Boolean
     hasCheck: Boolean
     category: Text                 // pg_type.typcategory ("U" user-defined)
     oid: Integer                   // a fixed pg_type oid (core Postgres types), or 0: neo-db assigns one
     arrayOid: Integer
-    compare: (Call) -> Nothing     // ORDER BY: arguments 0 and 1, result -1, 0 or 1 (returnInteger)
+    compare: deterministic (Call) -> Nothing     // ORDER BY: arguments 0 and 1, result -1, 0 or 1 (returnInteger)
     hasCompare: Boolean
+    resize: deterministic (Call) -> Nothing      // explicit cast to a modified type: write the value fitted to it
+    hasResize: Boolean
     modifierMin: Integer           // accepted type modifier range, e.g. vector(1) .. vector(16000)
     modifierMax: Integer
     modifierWhat: Text             // what the modifier counts, for errors ("dimensions")
@@ -125,14 +148,16 @@ public record TypeDef {
 public record CastDef {
     from: Text
     to: Text
-    body: (Call) -> Nothing
+    body: deterministic (Call) -> Nothing
+    implicit: Boolean              // also applied to function and operator arguments (bit varying -> bit)
 }
 
 public record FunctionDef {
     name: Text
     arguments: List<Text>
     result: Text
-    body: (Call) -> Nothing
+    body: deterministic (Call) -> Nothing  // IMMUTABLE functions (define): proved never to reach the host
+    volatileBody: (Call) -> Nothing        // VOLATILE functions (defineVolatile)
     volatile: Boolean
 }
 
@@ -148,8 +173,8 @@ public record AggregateDef {
     name: Text
     argument: Text
     result: Text
-    step: (Call) -> Nothing        // argument 0: state so far (null on the first row), argument 1: input; result: new state
-    finish: (Call) -> Nothing      // argument 0: final state, argument 1: number of rows stepped (int8); result: value
+    step: deterministic (Call) -> Nothing        // argument 0: state so far (null on the first row), argument 1: input; result: new state
+    finish: deterministic (Call) -> Nothing      // argument 0: final state, argument 1: number of rows stepped (int8); result: value
 }
 
 // Change-feed transform: argument 0 is the table name, argument 1 the change as JSON text
@@ -170,11 +195,12 @@ public record Extension {
     casts: List<CastDef>
     aggregates: List<AggregateDef>
     feedTransforms: List<FeedTransformDef>
+    indexMethods: List<IndexMethodDef>
 }
 
 public function extension(name: Text, version: Text, comment: Text): Extension {
     return Extension { name: name; version: version; comment: comment; builtin: false; types: []; functions: []
-                       operators: []; casts: []; aggregates: []; feedTransforms: [] }
+                       operators: []; casts: []; aggregates: []; feedTransforms: []; indexMethods: [] }
 }
 
 // neo-db's own core types and functions use the same SDK: a built-in is always installed in every database.
@@ -184,28 +210,28 @@ public function builtin(name: Text, comment: Text): Extension {
     return x
 }
 
-function nothing(call: Call) {}
+deterministic function nothing(call: Call) {}
 
 // A base type stored as bytes. input parses text, output formats it.
-public function Extension.type(name: Text, input: (Call) -> Nothing, output: (Call) -> Nothing): TypeDef {
-    let t = TypeDef { name: name; input: input; output: output; receive: function(call) { nothing(call) }
-                      send: function(call) { nothing(call) }; check: function(call) { nothing(call) }
+public function Extension.type(name: Text, input: deterministic (Call) -> Nothing, output: deterministic (Call) -> Nothing): TypeDef {
+    let t = TypeDef { name: name; input: input; output: output; receive: nothing
+                      send: nothing; check: nothing
                       hasBinary: false; hasCheck: false; category: "U"; oid: 0; arrayOid: 0
-                      compare: function(call) { nothing(call) }; hasCompare: false; modifierMin: 0; modifierMax: 2147483647
+                      compare: nothing; hasCompare: false; resize: nothing; hasResize: false; modifierMin: 0; modifierMax: 2147483647
                       modifierWhat: "" }
     self.types.add(t)
     return t
 }
 
 // Binary wire format (COPY BINARY, binary parameters and results).
-public function TypeDef.binary(receive: (Call) -> Nothing, send: (Call) -> Nothing) {
+public function TypeDef.binary(receive: deterministic (Call) -> Nothing, send: deterministic (Call) -> Nothing) {
     self.receive = receive
     self.send = send
     self.hasBinary = true
 }
 
 // Sort order for ORDER BY (otherwise values sort by their stored bytes).
-public function TypeDef.ordering(compare: (Call) -> Nothing) {
+public function TypeDef.ordering(compare: deterministic (Call) -> Nothing) {
     self.compare = compare
     self.hasCompare = true
 }
@@ -224,32 +250,46 @@ public function TypeDef.postgresOids(oid: Integer, arrayOid: Integer, category: 
     self.category = category
 }
 
+// An explicit cast to a modified type (B'101'::bit(8), CAST(x AS bit varying(2))) calls resize instead of the
+// modifier check: write argument 0 fitted to call.modifier (Postgres's length coercion with isExplicit).
+public function TypeDef.explicitResize(resize: deterministic (Call) -> Nothing) {
+    self.resize = resize
+    self.hasResize = true
+}
+
 // Type modifier check, e.g. vector(3): called when a value is stored into a column with a modifier.
-public function TypeDef.modifier(check: (Call) -> Nothing) {
+public function TypeDef.modifier(check: deterministic (Call) -> Nothing) {
     self.check = check
     self.hasCheck = true
 }
 
-// A function whose result depends only on its arguments (IMMUTABLE, PARALLEL SAFE). Mark the body
-// `deterministic function` so the compiler proves it never reaches the host.
-public function Extension.define(name: Text, arguments: List<Text>, result: Text, body: (Call) -> Nothing) {
-    self.functions.add(FunctionDef { name: name; arguments: arguments; result: result; body: body; volatile: false })
+// A function whose result depends only on its arguments (IMMUTABLE, PARALLEL SAFE). The body's type is
+// deterministic (Call) -> Nothing: the compiler proves, where it is passed, that it never reaches the host
+// (clock, random numbers, files); pass the function by name or an anonymous function.
+public function Extension.define(name: Text, arguments: List<Text>, result: Text, body: deterministic (Call) -> Nothing) {
+    self.functions.add(FunctionDef { name: name; arguments: arguments; result: result; body: body; volatileBody: nothing; volatile: false })
 }
 
 // A function that may read the clock, random numbers or other host state (VOLATILE).
 public function Extension.defineVolatile(name: Text, arguments: List<Text>, result: Text, body: (Call) -> Nothing) {
-    self.functions.add(FunctionDef { name: name; arguments: arguments; result: result; body: body; volatile: true })
+    self.functions.add(FunctionDef { name: name; arguments: arguments; result: result; body: nothing; volatileBody: body; volatile: true })
 }
 
 public function Extension.operator(symbol: Text, left: Text, right: Text, implementation: Text) {
     self.operators.add(OperatorDef { symbol: symbol; left: left; right: right; implementation: implementation })
 }
 
-public function Extension.cast(from: Text, to: Text, body: (Call) -> Nothing) {
-    self.casts.add(CastDef { from: from; to: to; body: body })
+public function Extension.cast(from: Text, to: Text, body: deterministic (Call) -> Nothing) {
+    self.casts.add(CastDef { from: from; to: to; body: body; implicit: false })
 }
 
-public function Extension.aggregate(name: Text, argument: Text, result: Text, step: (Call) -> Nothing, finish: (Call) -> Nothing) {
+// A cast that also applies implicitly, when a value of `from` is passed where `to` is expected (Postgres's
+// AS IMPLICIT, e.g. between bit and bit varying, whose stored forms are the same).
+public function Extension.implicitCast(from: Text, to: Text, body: deterministic (Call) -> Nothing) {
+    self.casts.add(CastDef { from: from; to: to; body: body; implicit: true })
+}
+
+public function Extension.aggregate(name: Text, argument: Text, result: Text, step: deterministic (Call) -> Nothing, finish: deterministic (Call) -> Nothing) {
     self.aggregates.add(AggregateDef { name: name; argument: argument; result: result; step: step; finish: finish })
 }
 
@@ -257,13 +297,105 @@ public function Extension.feedTransform(name: Text, body: (Call) -> Nothing) {
     self.feedTransforms.add(FeedTransformDef { name: name; body: body })
 }
 
+// ---------------------------------------------------------------- index access methods
+
+// An index access method (CREATE INDEX ... USING name (column opclass) WITH (option = value, ...)). neo-db's
+// indexes live in memory and are rebuilt when a table loads (the table's WAL covers them), so a method is an
+// in-memory structure the extension keeps behind Integer handles. Index scans serve ORDER BY column <op> value
+// [LIMIT n]: the method returns its nearest rows and neo-db sorts them by the operator's own value.
+public record IndexMethodDef {
+    name: Text
+    opclasses: List<OpClassDef>
+    create: deterministic (IndexOptions) -> Integer                                 // a new empty index; returns its handle
+    insert: deterministic (Integer, Integer, Bytes, Integer, Integer, IndexFailure) -> Boolean
+                                                                      // handle, row, value bytes, offset, length;
+                                                                      // false: not indexed; refuse with failure.fail
+    remove: deterministic (Integer, Integer) -> Nothing                             // handle, row
+    built: deterministic (Integer) -> Nothing                                       // the table's rows are in (ivfflat trains)
+    search: deterministic (Integer, Bytes, Integer, Integer, Integer, Integer, List<Integer>) -> Integer
+                                                                      // handle, query bytes, offset, length
+                                                                      // (-1: NULL query, every distance zero),
+                                                                      // effort, want (rows the query needs, or
+                                                                      // -1 for all the method would give: a WHERE
+                                                                      // filter runs above it); rows nearest
+                                                                      // first; returns count
+    drop: deterministic (Integer) -> Nothing
+    effortSetting: Text                                               // session setting for search effort
+    effortDefault: Integer
+    effortMin: Integer
+    effortMax: Integer
+}
+
+// An operator class: the values of `type` ordered by `operator` (e.g. vector_l2_ops: vector, <->).
+public record OpClassDef {
+    name: Text
+    type: Text
+    operator: Text
+    isDefault: Boolean       // used when CREATE INDEX names no operator class for a column of `type`
+}
+
+// What create sees: the operator class (position in the method's list), the column's type modifier (vector(3):
+// 3, or -1) and the WITH options as written. Refuse with fail(code, message).
+public record IndexOptions {
+    opclass: Integer
+    modifier: Integer
+    names: List<Text>
+    values: List<Text>
+    failed: Boolean
+    failCode: Text
+    failMessage: Text
+    failDetail: Text
+}
+
+// A row an index refuses (sparsevec with more than 1000 non-zero elements in hnsw): the statement fails with it.
+public record IndexFailure {
+    failed: Boolean
+    code: Text
+    message: Text
+}
+
+public function newIndexFailure(): IndexFailure { return IndexFailure { failed: false; code: ""; message: "" } }
+
+public function IndexFailure.fail(code: Text, message: Text) {
+    if self.failed { return }
+    self.failed = true
+    self.code = code
+    self.message = message
+}
+
+public function IndexOptions.fail(code: Text, message: Text) {
+    if self.failed { return }
+    self.failed = true
+    self.failCode = code
+    self.failMessage = message
+}
+
+// fail with a DETAIL line as well (pgvector's option range errors: Valid values are between "2" and "100".)
+public function IndexOptions.failWithDetail(code: Text, message: Text, detail: Text) {
+    if self.failed { return }
+    self.fail(code, message)
+    self.failDetail = detail
+}
+
+// The option `name` as written, or "" when absent.
+public function IndexOptions.option(name: Text): Text {
+    let i = 0
+    while i < self.names.length {
+        if self.names[i] == name { return self.values[i] }
+        i += 1
+    }
+    return ""
+}
+
+public function Extension.indexMethod(m: IndexMethodDef) { self.indexMethods.add(m) }
+
 // ---------------------------------------------------------------- number text, the Postgres way
 
 // Float parsing and printing that match Postgres exactly (float4in/float8in, float4out/float8out), supplied
 // by the host so extensions and core types print the same digits.
 public record Host {
-    addFloat: (Bytes, Float, Boolean) -> Nothing                          // out, value, isFloat4
-    parseFloat: (Bytes, Integer, Integer, Boolean, ParsedFloat) -> Nothing // bytes, offset, length, isFloat4, result
+    addFloat: deterministic (Bytes, Float, Boolean) -> Nothing                          // out, value, isFloat4
+    parseFloat: deterministic (Bytes, Integer, Integer, Boolean, ParsedFloat) -> Nothing // bytes, offset, length, isFloat4, result
     clock: () -> Integer                                                  // wall clock, microseconds since 1970
     random: (Integer) -> Bytes                                            // that many unpredictable bytes
 }
@@ -291,6 +423,79 @@ public function Call.parseFloat4(b: Bytes, offset: Integer, length: Integer, res
 }
 public function Call.parseFloat8(b: Bytes, offset: Integer, length: Integer, result: ParsedFloat) {
     self.host.parseFloat(b, offset, length, false, result)
+}
+
+// ---------------------------------------------------------------- arrays of numbers
+
+// Array arguments and results (types such as "float8[]", "float4[]", "int4[]", "numeric[]" in a signature).
+// neo-db passes an array in PostgreSQL's text form ({1,2,3}); read it with Call.numbers and return one with
+// Call.returnNumbers rather than parsing or printing that form yourself.
+public record Numbers {
+    values: List<Float>
+    dimensions: Integer      // 0 for an empty array, 2 or more for nested arrays (values are then all elements)
+    hasNull: Boolean         // a NULL element (it has no entry in values)
+    ok: Boolean              // false: an element is not a number
+}
+
+public function newNumbers(): Numbers { return Numbers { values: []; dimensions: 0; hasNull: false; ok: true } }
+
+// Read array argument i into `into`, each element as Postgres reads a real (float4 = true; right for int4,
+// float4 and numeric arrays, which Postgres converts to real through their text) or a double precision.
+public function Call.numbers(i: Integer, float4: Boolean, into: Numbers) {
+    into.values.clear()
+    into.dimensions = 0
+    into.hasNull = false
+    into.ok = true
+    let b = self.buffers[i]
+    let e = self.offsets[i] + self.lengths[i]
+    let k = self.offsets[i]
+    // skip a "[lo:hi]=" dimension decoration
+    if k < e && b[k] == 91 {
+        while k < e && b[k] != 61 { k += 1 }
+        k += 1
+    }
+    let depth = 0
+    let parsed = newParsedFloat()
+    while k < e {
+        let c = b[k]
+        if c == 123 {
+            depth += 1
+            if depth > into.dimensions { into.dimensions = depth }
+            k += 1
+        } else if c == 125 {
+            depth -= 1
+            k += 1
+        } else if c == 44 || c == 32 {
+            k += 1
+        } else {
+            let start = k
+            while k < e && b[k] != 44 && b[k] != 125 { k += 1 }
+            let len = k - start
+            if len == 4 && (b[start] == 78 || b[start] == 110) {
+                into.hasNull = true
+            } else {
+                self.host.parseFloat(b, start, len, float4, parsed)
+                if !parsed.ok { into.ok = false }
+                into.values.add(parsed.value)
+            }
+        }
+    }
+    // "{}" is empty: no dimensions
+    if into.values.length == 0 && !into.hasNull { into.dimensions = 0 }
+}
+
+// Return a one-dimensional array of the first `count` values, printed as reals (float4 = true) or as double
+// precision values; declare the result type to match ("float4[]" or "float8[]").
+public function Call.returnNumbers(values: List<Float>, count: Integer, float4: Boolean) {
+    let out = self.output
+    out.add(123)
+    let i = 0
+    while i < count {
+        if i > 0 { out.add(44) }
+        self.host.addFloat(out, values[i], float4)
+        i += 1
+    }
+    out.add(125)
 }
 
 // ---------------------------------------------------------------- change feeds

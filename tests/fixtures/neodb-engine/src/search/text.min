@@ -2,8 +2,12 @@
 // digits and `_`; `'`, `.` and `:` join letters (don't, e.g, a:b), `.` `,` `;` and `'` join digits (3.14, 1,000);
 // combining marks stay inside a word; hyphens and other punctuation split. Han/Hiragana characters and emoji are
 // one-character terms. Terms are case- and accent-folded (Latin-1, Latin Extended-A, Greek, Cyrillic, fullwidth
-// ASCII) and optionally stemmed (Snowball English). Positions are 0-based token indexes.
-use "./stem.min" as stem
+// ASCII) and optionally stemmed (stemmers.min: Snowball English and the 17 other TIN languages). Positions are 0-based
+// token indexes. As in TIN/Lead, the Snowball languages stem the lower-cased NFC word and fold accents afterwards
+// (suffix rules see the accents); English keeps its fold-then-stem order (ASCII words stem the same either way).
+use "./stemmers.min" as st
+use "./snowball/runtime.min" as sb
+use "./snowball/compose.min" as uc
 
 constant C_SEP = 0
 constant C_AL = 1       // letter
@@ -16,7 +20,7 @@ constant C_EXT = 7      // Extend / Format: combining marks, ZWJ, variation sele
 constant C_ONE = 8      // a term on its own (ideograph, emoji)
 
 public constant STEM_NONE = 0
-public constant STEM_EN = 1
+public constant STEM_EN = 1       // this and higher ids are the Snowball languages of stemmers.min
 
 global ASCII_CLASS: Bytes = asciiClasses()
 global LATIN_A: Bytes = Bytes("AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIiJjJjKkkLlLlLlLlLlNnNnNnnNnOoOoOoOoRrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs")
@@ -53,11 +57,17 @@ public record Tokens {
     stemmer: Integer
     withSource: Boolean
     word: Bytes        // scratch: the current word, folded
+    lower: Boolean     // a Snowball language: also keep the word lower-cased only (raw), stem it, then fold
+    raw: Bytes         // scratch: the current word lower-cased, accents and combining marks kept
+    nfc: Bytes         // scratch: raw composed (NFC)
+    stemmed: Bytes     // scratch: the stem of nfc
+    env: sb.Env        // stemmer state
 }
 
 public function newTokens(stemmer: Integer): Tokens {
     return Tokens { terms: Bytes(); ends: Bytes(); srcFrom: Bytes(); srcTo: Bytes(); count: 0; stemmer: stemmer
-                    withSource: false; word: Bytes() }
+                    withSource: false; word: Bytes(); lower: stemmer >= STEM_EN; raw: Bytes(); nfc: Bytes()
+                    stemmed: Bytes(); env: sb.newEnv() }
 }
 
 public function clear(tk: Tokens) {
@@ -82,11 +92,22 @@ function emit(tk: Tokens, from: Integer, to: Integer) {
     while k < w.length && w[k] == 95 { k += 1 }
     if k == w.length {
         w.clear()
+        tk.raw.clear()
         return
     }
 
-    if tk.stemmer == STEM_EN {
-        stem.stemEnglish(w, 0, w.length, tk.terms)
+    if tk.lower {
+        composeNfc(tk.raw, tk.nfc)
+        tk.raw.clear()
+        tk.stemmed.clear()
+        st.stem(tk.env, tk.stemmer, tk.nfc, 0, tk.nfc.length, tk.stemmed)
+        let before = tk.terms.length
+        foldWord(tk.stemmed, 0, tk.stemmed.length, tk.terms)
+        if tk.terms.length == before {
+            // Lead drops a token whose stem folds to nothing
+            w.clear()
+            return
+        }
     } else {
         tk.terms.addBytes(w)
     }
@@ -300,6 +321,108 @@ function foldAppend(out: Bytes, cp: Integer) {
     addUtf8(out, cp)
 }
 
+// Append the lower-cased form of a word character, keeping its accents: char::to_lowercase (as Lead does before
+// stemming) over the ranges foldAppend case-folds; fullwidth ASCII becomes ASCII as in foldAppend.
+function lowerAppend(out: Bytes, cp: Integer) {
+    if cp < 0x80 {
+        if cp >= 65 && cp <= 90 { out.add(cp + 32) } else { out.add(cp) }
+        return
+    }
+    let c = cp
+    if cp >= 0xC0 && cp <= 0xDE && cp != 0xD7 {
+        c = cp + 32
+    } else if cp >= 0x100 && cp <= 0x17F {
+        if cp == 0x130 {                      // İ -> i + combining dot above
+            out.add(105)
+            addUtf8(out, 0x307)
+            return
+        }
+        if cp == 0x178 {
+            c = 0xFF
+        } else if (cp <= 0x137 || (cp >= 0x14A && cp <= 0x177)) && (cp & 1) == 0 {
+            c = cp + 1
+        } else if ((cp >= 0x139 && cp <= 0x148) || (cp >= 0x179 && cp <= 0x17E)) && (cp & 1) == 1 {
+            c = cp + 1
+        }
+    } else if cp >= 0x370 && cp <= 0x3FF {
+        if (cp >= 0x391 && cp <= 0x3AB && cp != 0x3A2) { c = cp + 32 }
+        if cp == 0x386 { c = 0x3AC }
+        if cp >= 0x388 && cp <= 0x38A { c = cp + 37 }
+        if cp == 0x38C { c = 0x3CC }
+        if cp == 0x38E || cp == 0x38F { c = cp + 63 }
+    } else if cp >= 0x400 && cp <= 0x42F {
+        if cp >= 0x410 { c = cp + 32 } else { c = cp + 80 }
+    } else if cp >= 0x1E00 && cp <= 0x1EFF {
+        if cp == 0x1E9E {
+            c = 0xDF
+        } else if (cp < 0x1E96 || cp > 0x1E9F) && (cp & 1) == 0 {
+            c = cp + 1
+        }
+    } else if cp >= 0xFF01 && cp <= 0xFF5E {
+        lowerAppend(out, cp - 0xFEE0)
+        return
+    }
+    addUtf8(out, c)
+}
+
+// Length of the UTF-8 character with lead byte b.
+function utf8Len(b: Integer): Integer {
+    if b < 0x80 { return 1 }
+    if b < 0xE0 { return 2 }
+    if b < 0xF0 { return 3 }
+    return 4
+}
+
+// Code point of the n-byte UTF-8 character at s[i] (valid UTF-8, as built by addUtf8).
+function utf8At(s: Bytes, i: Integer, n: Integer): Integer {
+    let b = s[i]
+    if n == 1 { return b }
+    if n == 2 { return ((b & 31) << 6) | (s[i + 1] & 63) }
+    if n == 3 { return ((b & 15) << 12) | ((s[i + 1] & 63) << 6) | (s[i + 2] & 63) }
+    return ((b & 7) << 18) | ((s[i + 1] & 63) << 12) | ((s[i + 2] & 63) << 6) | (s[i + 3] & 63)
+}
+
+// dst = src with each character composed with the one before it where Unicode has a primary composite (NFC for
+// the base-plus-marks sequences of real text; a pure-ASCII word is copied).
+function composeNfc(src: Bytes, dst: Bytes) {
+    dst.clear()
+    let lastStart = -1
+    let last = -1
+    let i = 0
+    while i < src.length {
+        let n = utf8Len(src[i])
+        if n > src.length - i { n = src.length - i }
+        let cp = utf8At(src, i, n)
+        i += n
+        if cp >= 0x300 && last >= 0 {
+            let c = uc.compose(last, cp)
+            if c >= 0 {
+                dst.resize(lastStart)
+                addUtf8(dst, c)
+                last = c
+                continue
+            }
+        }
+        lastStart = dst.length
+        addUtf8(dst, cp)
+        last = cp
+    }
+}
+
+// Append the case- and accent-folded form of the UTF-8 word s[off .. off + len): foldAppend per character,
+// combining marks dropped. Applied to stems, it is the fold tokenize gives an unstemmed word.
+public function foldWord(s: Bytes, off: Integer, len: Integer, out: Bytes) {
+    let i = off
+    let end = off + len
+    while i < end {
+        let n = utf8Len(s[i])
+        if n > end - i { n = end - i }
+        let cp = utf8At(s, i, n)
+        i += n
+        if cp < 0x80 || classify(cp) != C_EXT { foldAppend(out, cp) }
+    }
+}
+
 // Tokenize src[off, off + len) and append the tokens to tk (call clear first for a fresh list).
 public function tokenize(tk: Tokens, src: Bytes, off: Integer, len: Integer) {
     let end = off + len
@@ -311,6 +434,7 @@ public function tokenize(tk: Tokens, src: Bytes, off: Integer, len: Integer) {
     let last = C_SEP          // class of the last letter/digit/_ in the current word
     let w = tk.word
     w.clear()
+    tk.raw.clear()
     while i < end {
         let b = src[i]
         let cls = 0
@@ -324,7 +448,10 @@ public function tokenize(tk: Tokens, src: Bytes, off: Integer, len: Integer) {
                     inWord = true
                     wordFrom = i
                 }
-                if b >= 65 && b <= 90 { w.add(b + 32) } else { w.add(b) }
+                let lc = b
+                if b >= 65 && b <= 90 { lc = b + 32 }
+                w.add(lc)
+                if tk.lower { tk.raw.add(lc) }
                 last = cls
                 i += 1
                 continue
@@ -341,16 +468,24 @@ public function tokenize(tk: Tokens, src: Bytes, off: Integer, len: Integer) {
                 wordFrom = i
             }
             foldAppend(w, cp)
+            if tk.lower { lowerAppend(tk.raw, cp) }
             last = cls
         } else if cls == C_EXT {
-            // combining marks and joiners stay in the word and are folded away
+            // combining marks and joiners stay in the word and are folded away (after stemming, for raw)
+            if tk.lower && inWord { addUtf8(tk.raw, cp) }
         } else if (cls == C_ML || cls == C_MNL || cls == C_MN) && inWord && i + n < end {
             decode(src, i + n, end, nx)
             let joins = false
             if (last == C_AL) && nx.cls == C_AL && (cls == C_ML || cls == C_MNL) { joins = true }
             if (last == C_NU) && nx.cls == C_NU && (cls == C_MN || cls == C_MNL) { joins = true }
             if joins {
-                if cp == 0x2019 || cp == 0x2018 || cp == 0xFF07 { w.add(39) } else { foldAppend(w, cp) }
+                if cp == 0x2019 || cp == 0x2018 || cp == 0xFF07 {
+                    w.add(39)
+                    if tk.lower { tk.raw.add(39) }
+                } else {
+                    foldAppend(w, cp)
+                    if tk.lower { lowerAppend(tk.raw, cp) }
+                }
             } else {
                 emit(tk, wordFrom, i)
                 inWord = false
@@ -364,6 +499,7 @@ public function tokenize(tk: Tokens, src: Bytes, off: Integer, len: Integer) {
             }
             if cls == C_ONE {
                 addUtf8(w, cp)
+                if tk.lower { addUtf8(tk.raw, cp) }
                 emit(tk, i, i + n)
             }
         }

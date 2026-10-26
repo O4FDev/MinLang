@@ -3,6 +3,7 @@
 use "neodb-sdk" as sdk
 use "math" as math
 use "./dense.min" as dense
+use "./float4.min" as f4
 use "./half.min" as fp16
 use "text" as utf8
 
@@ -10,9 +11,9 @@ constant MAX_DIM = 1000000000
 constant MAX_NNZ = 16000
 
 public function register(x: sdk.Extension) {
-    let s = x.type("sparsevec", function(call) { sparseIn(call) }, function(call) { sparseOut(call) })
-    s.binary(function(call) { sparseRecv(call) }, function(call) { sparseSend(call) })
-    s.modifier(function(call) { sparseCheck(call) })
+    let s = x.type("sparsevec", sparseIn, sparseOut)
+    s.binary(sparseRecv, sparseSend)
+    s.modifier(sparseCheck)
     s.modifierRange(1, MAX_DIM, "dimensions")
     s.ordering(function(call) { call.returnInteger(compare(call)) })
     let v2 = ["sparsevec", "sparsevec"]
@@ -29,14 +30,14 @@ public function register(x: sdk.Extension) {
     x.operator("<>", "sparsevec", "sparsevec", "sparsevec_ne")
     x.operator(">=", "sparsevec", "sparsevec", "sparsevec_ge")
     x.operator(">", "sparsevec", "sparsevec", "sparsevec_gt")
-    x.define("l2_normalize", ["sparsevec"], "sparsevec", function(call) { l2Normalize(call) })
-    x.define("sparsevec_l2_squared_distance", v2, "float8", function(call) { l2Squared(call) })
-    x.define("l2_distance", ["sparsevec", "sparsevec"], "float8", function(call) { l2Distance(call) })
-    x.define("inner_product", ["sparsevec", "sparsevec"], "float8", function(call) { innerProduct(call) })
-    x.define("sparsevec_negative_inner_product", ["sparsevec", "sparsevec"], "float8", function(call) { negativeInnerProduct(call) })
-    x.define("cosine_distance", ["sparsevec", "sparsevec"], "float8", function(call) { cosineDistance(call) })
-    x.define("l1_distance", ["sparsevec", "sparsevec"], "float8", function(call) { l1Distance(call) })
-    x.define("l2_norm", ["sparsevec"], "float8", function(call) { norm(call) })
+    x.define("l2_normalize", ["sparsevec"], "sparsevec", l2Normalize)
+    x.define("sparsevec_l2_squared_distance", v2, "float8", l2Squared)
+    x.define("l2_distance", ["sparsevec", "sparsevec"], "float8", l2Distance)
+    x.define("inner_product", ["sparsevec", "sparsevec"], "float8", innerProduct)
+    x.define("sparsevec_negative_inner_product", ["sparsevec", "sparsevec"], "float8", negativeInnerProduct)
+    x.define("cosine_distance", ["sparsevec", "sparsevec"], "float8", cosineDistance)
+    x.define("l1_distance", ["sparsevec", "sparsevec"], "float8", l1Distance)
+    x.define("l2_norm", ["sparsevec"], "float8", norm)
     x.operator("<->", "sparsevec", "sparsevec", "l2_distance")
     x.operator("<#>", "sparsevec", "sparsevec", "sparsevec_negative_inner_product")
     x.operator("<=>", "sparsevec", "sparsevec", "cosine_distance")
@@ -332,63 +333,80 @@ function sameDims(call: sdk.Call): Boolean {
     return true
 }
 
-// mode 0: squared l2, 1: dot product, 2: l1
+// mode 0: squared l2, 1: dot product, 2: l1, as pgvector's sparse loops compute them: in float4 (they are
+// compiled for baseline x86-64, so no FMA), walking a and advancing through b; the elements of b left after a's
+// last index are added four lanes at a time when there are four or more (GCC vectorises that loop).
 function merge(call: sdk.Call, mode: Integer): Float {
     let na = nnz(call, 0)
     let nb = nnz(call, 1)
+    let distance = 0.0
+    let bpos = 0
     let i = 0
-    let j = 0
-    let sum = 0.0
-    while i < na || j < nb {
-        let ia = 2147483647
-        let ib = 2147483647
-        if i < na { ia = index(call, 0, i) }
-        if j < nb { ib = index(call, 1, j) }
-        let x = 0.0
-        let y = 0.0
-        if ia <= ib {
-            x = value(call, 0, i)
-            i += 1
-        }
-        if ib <= ia {
-            y = value(call, 1, j)
+    while i < na {
+        let ai = index(call, 0, i)
+        let bi = -1
+        let j = bpos
+        while j < nb {
+            bi = index(call, 1, j)
+            if ai == bi {
+                if mode == 1 {
+                    distance = f4.f32(distance + f4.f32(value(call, 0, i) * value(call, 1, j)))
+                } else {
+                    distance = f4.f32(distance + term(f4.f32(value(call, 0, i) - value(call, 1, j)), mode))
+                }
+            } else if ai > bi && mode != 1 {
+                distance = f4.f32(distance + term(value(call, 1, j), mode))
+            }
+            if ai >= bi { bpos = j + 1 }
+            if bi >= ai { break }
             j += 1
         }
-        if mode == 0 { sum += (x - y) * (x - y) }
-        if mode == 1 { sum += x * y }
-        if mode == 2 {
-            let d = x - y
-            if d < 0.0 { d = -d }
-            sum += d
-        }
+        if ai != bi && mode != 1 { distance = f4.f32(distance + term(value(call, 0, i), mode)) }
+        i += 1
     }
-    return sum
-}
-
-function squaredNorm(call: sdk.Call, i: Integer): Float {
-    let n = nnz(call, i)
-    let sum = 0.0
-    let k = 0
-    while k < n {
-        let x = value(call, i, k)
-        sum += x * x
+    if mode == 1 { return distance }
+    let k = bpos
+    if nb - bpos >= 4 {
+        let l0 = 0.0
+        let l1 = 0.0
+        let l2 = 0.0
+        let l3 = 0.0
+        while k + 4 <= nb {
+            l0 = f4.f32(l0 + term(value(call, 1, k), mode))
+            l1 = f4.f32(l1 + term(value(call, 1, k + 1), mode))
+            l2 = f4.f32(l2 + term(value(call, 1, k + 2), mode))
+            l3 = f4.f32(l3 + term(value(call, 1, k + 3), mode))
+            k += 4
+        }
+        distance = f4.f32(distance + f4.f32(f4.f32(l1 + l3) + f4.f32(l0 + l2)))
+    }
+    while k < nb {
+        distance = f4.f32(distance + term(value(call, 1, k), mode))
         k += 1
     }
-    return sum
+    return distance
 }
 
-function overflowed(f: Float): Float {
-    if f > 3.4028234663852886e38 { return 1.0 / 0.0 }
-    if f < -3.4028234663852886e38 { return -1.0 / 0.0 }
-    return f
+// One element's float4 contribution: d^2 (mode 0) or |d| (mode 2).
+function term(d: Float, mode: Integer): Float {
+    if mode == 2 {
+        if d < 0.0 { return -d }
+        return d
+    }
+    return f4.f32(d * d)
+}
+
+// sparsevec_l2_norm / l2_normalize: double sum of squares (SSE2 pattern, see float4.min)
+function squaredNorm(call: sdk.Call, i: Integer): Float {
+    return f4.vectorSumSquares(call.buffer(i), call.offset(i) + 8 + nnz(call, i) * 4, nnz(call, i))
 }
 
 deterministic function l2Distance(call: sdk.Call) {
-    if sameDims(call) { call.returnFloat(math.sqrt(overflowed(merge(call, 0)))) }
+    if sameDims(call) { call.returnFloat(math.sqrt(merge(call, 0))) }
 }
 
 deterministic function l2Squared(call: sdk.Call) {
-    if sameDims(call) { call.returnFloat(overflowed(merge(call, 0))) }
+    if sameDims(call) { call.returnFloat(merge(call, 0)) }
 }
 
 deterministic function l2Normalize(call: sdk.Call) {
@@ -519,16 +537,21 @@ deterministic function toDense(call: sdk.Call, half: Boolean) {
 }
 
 deterministic function innerProduct(call: sdk.Call) {
-    if sameDims(call) { call.returnFloat(overflowed(merge(call, 1))) }
+    if sameDims(call) { call.returnFloat(merge(call, 1)) }
 }
 
 deterministic function negativeInnerProduct(call: sdk.Call) {
-    if sameDims(call) { call.returnFloat(-overflowed(merge(call, 1))) }
+    if sameDims(call) { call.returnFloat(-merge(call, 1)) }
+}
+
+// norms in float4, four lanes (sparsevec_cosine_distance)
+function floatNorm(call: sdk.Call, i: Integer): Float {
+    return f4.floatSumSquares4(call.buffer(i), call.offset(i) + 8 + nnz(call, i) * 4, nnz(call, i))
 }
 
 deterministic function cosineDistance(call: sdk.Call) {
     if !sameDims(call) { return }
-    let s = overflowed(merge(call, 1)) / math.sqrt(overflowed(squaredNorm(call, 0)) * overflowed(squaredNorm(call, 1)))
+    let s = merge(call, 1) / math.sqrt(floatNorm(call, 0) * floatNorm(call, 1))
     if s != s {
         call.returnFloat(s)
         return
@@ -539,7 +562,69 @@ deterministic function cosineDistance(call: sdk.Call) {
 }
 
 deterministic function l1Distance(call: sdk.Call) {
-    if sameDims(call) { call.returnFloat(overflowed(merge(call, 2))) }
+    if sameDims(call) { call.returnFloat(merge(call, 2)) }
 }
 
 deterministic function norm(call: sdk.Call) { call.returnFloat(math.sqrt(squaredNorm(call, 0))) }
+
+// ---------------------------------------------------------------- arrays: int4[], float4[], float8[], numeric[]
+
+public function registerArrays(x: sdk.Extension) {
+    x.cast("int4[]", "sparsevec", function(call) { fromArray(call, true, call.modifier) })
+    x.cast("float4[]", "sparsevec", function(call) { fromArray(call, true, call.modifier) })
+    x.cast("float8[]", "sparsevec", function(call) { fromArray(call, false, call.modifier) })
+    x.cast("numeric[]", "sparsevec", function(call) { fromArray(call, true, call.modifier) })
+    x.define("array_to_sparsevec", ["int4[]", "int4", "bool"], "sparsevec", function(call) { fromArray(call, true, call.integer(1)) })
+    x.define("array_to_sparsevec", ["float4[]", "int4", "bool"], "sparsevec", function(call) { fromArray(call, true, call.integer(1)) })
+    x.define("array_to_sparsevec", ["float8[]", "int4", "bool"], "sparsevec", function(call) { fromArray(call, false, call.integer(1)) })
+    x.define("array_to_sparsevec", ["numeric[]", "int4", "bool"], "sparsevec", function(call) { fromArray(call, true, call.integer(1)) })
+}
+
+deterministic function fromArray(call: sdk.Call, float4: Boolean, typmod: Integer) {
+    let a = sdk.newNumbers()
+    call.numbers(0, float4, a)
+    if a.dimensions > 1 {
+        call.fail("22000", "array must be 1-D")
+        return
+    }
+    if a.hasNull {
+        call.fail("22004", "array must not contain nulls")
+        return
+    }
+    let n = a.values.length
+    if n < 1 {
+        call.fail("22000", "sparsevec must have at least 1 dimension")
+        return
+    }
+    if typmod >= 0 && n != typmod {
+        call.fail("22000", "expected " + Text(typmod) + " dimensions, not " + Text(n))
+        return
+    }
+    let indices: List<Integer> = []
+    let values: List<Float> = []
+    let i = 0
+    while i < n {
+        let f = dense.f32(a.values[i])
+        // NaN and infinities count as non-zero (and are refused below, as in pgvector)
+        if f != 0.0 {
+            indices.add(i)
+            values.add(f)
+        }
+        i += 1
+    }
+    if indices.length > MAX_NNZ {
+        call.fail("54000", "sparsevec cannot have more than " + Text(MAX_NNZ) + " non-zero elements")
+        return
+    }
+    for f in values {
+        if f != f {
+            call.fail("22000", "NaN not allowed in sparsevec")
+            return
+        }
+        if f > 3.4028234663852886e38 || f < -3.4028234663852886e38 {
+            call.fail("22000", "infinite value not allowed in sparsevec")
+            return
+        }
+    }
+    store(call, n, indices, values)
+}

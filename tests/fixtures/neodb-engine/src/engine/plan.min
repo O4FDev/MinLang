@@ -8,6 +8,7 @@ use "./catalog.min" as cat
 use "./exec.min" as ex
 use "./pgcatalog.min" as pgc
 use "./ext.min" as ext
+use "../sql/parser.min" as parser
 use "../search/index.min" as si
 
 public constant SK_SELECT = 1
@@ -69,6 +70,13 @@ public record Stmt {
     exclTemp: Integer
     exclSlot: Integer
     conflictWhere: Integer
+    // generated columns (expression index keys, ADR-015): a one-row buffer holding the new row, and per generated
+    // column the node computing it from that buffer; UPDATE appends them to setCols/setExprs after the user's SETs
+    genTemp: Integer
+    genSlot: Integer
+    genCols: List<Integer>
+    genNodes: List<Integer>
+    nUserSet: Integer
 }
 
 record Range {
@@ -128,10 +136,15 @@ record PC {
     srfAst: Integer
     srfSlot: Integer
     srfKind: Integer
+    srfAsts: List<Integer>      // several set-returning functions zipped (kind 4): call i reads column i of srfSlot
     winSlot: Integer
     winTable: tb.Table
     winEval: List<Integer>      // (expr, column) pairs evaluated per row after capture
     winSpec: List<Integer>      // per call: nPart, nOrd, kind, resultCol, (col, desc, nullsFirst) * (nPart + nOrd)
+    // generated columns in scope: compileExpr turns an expression equal to one into a read of that column
+    anyGenerated: Boolean
+    genKeys: List<Integer>      // table id * 65536 + column, parsed below
+    genParsed: List<GenExpr>
 }
 
 public function newStmt(tree: ast.Ast, root: Integer, p: ex.Plan, sql: Text): Stmt {
@@ -142,6 +155,7 @@ public function newStmt(tree: ast.Ast, root: Integer, p: ex.Plan, sql: Text): St
         tree: tree; astRoot: root; catVersion: 0; err: false; errCode: ""; errMsg: ""; errPos: 0; sql: sql; sqlBytes: Bytes(); serialNodes: []; tableIds: []; constChecks: []
         route: []; routeIdx: -1; fromBuf: -1; mtTid: []; mtSlot: []; mtRoot: []; mtSetCols: []; mtSetExprs: []; mtOut: []; mtRoute: []; mtFromBuf: []
         conflictHid: -1; exclTemp: -1; exclSlot: -1; conflictWhere: -1
+        genTemp: -1; genSlot: -1; genCols: []; genNodes: []; nUserSet: -1
     }
 }
 
@@ -178,7 +192,8 @@ function planStatementOver(c: cat.Catalog, views: ViewCache, env: ex.Env, tree: 
         cteName: []; cteAst: []; cteRec: []; cteCount: 0; workName: []; workTi: []; workTable: []; workCount: 0; err: false; errCode: ""; errMsg: ""; errPos: -1
         tgtNames: []; tgtAst: []; slotLevel: []; views: views; noTrack: false; suppressConst: 0
         targetOverride: override; targetAlias: alias; routeRoot: routeRoot
-        srfAst: -1; srfSlot: -1; srfKind: 0; winSlot: -1; winTable: tb.newTable(-1, ""); winEval: []; winSpec: []
+        srfAst: -1; srfSlot: -1; srfKind: 0; srfAsts: []; winSlot: -1; winTable: tb.newTable(-1, ""); winEval: []; winSpec: []
+        anyGenerated: false; genKeys: []; genParsed: []
     }
     let k = ast.kind(tree, root)
     if ast.isQuery(tree, root) {
@@ -295,6 +310,14 @@ function typeOfTypename(pc: PC, tn: Integer): Integer {
         perr(pc, "42704", "type \"" + name + "\" does not exist", posOf(pc, tn))
         return v.T_TEXT
     }
+    if pc.a.nodes[tn].intValue > 0 {
+        let at = v.arrayOf(t)
+        if at == v.T_UNKNOWN {
+            perr(pc, "42704", "type \"" + name + "[]\" does not exist", posOf(pc, tn))
+            return v.T_TEXT
+        }
+        return at
+    }
     return t
 }
 
@@ -370,6 +393,13 @@ public function commonType(a: Integer, b: Integer): Integer {
     if a == b { return a }
     if a == v.T_UNKNOWN { return b }
     if b == v.T_UNKNOWN { return a }
+    // arrays: the array of the elements' common type (int4[] and int8[] meet at int8[]); never with a scalar
+    if v.isGeneralArray(a) || v.isGeneralArray(b) {
+        if !v.isGeneralArray(a) || !v.isGeneralArray(b) { return -1 }
+        let ce = commonType(v.arrayElemType(a), v.arrayElemType(b))
+        if ce < 0 { return -1 }
+        return v.arrayOf(ce)
+    }
     let ra = numRank(a)
     let rb = numRank(b)
     if ra > 0 && rb > 0 {
@@ -425,6 +455,15 @@ function coerce(pc: PC, n: Integer, to: Integer, typmod: Integer, explicit: Bool
         if explicit { x = 1 }
         return ex.addExpr(p, ex.EX_CAST, to, n, x, typmod, 0)
     }
+    if v.isGeneralArray(from) || v.isGeneralArray(to) {
+        if from != to && !(v.isGeneralArray(to) && v.isTextType(from)) && !(v.isGeneralArray(from) && v.isTextType(to)) {
+            perr(pc, "42846", "cannot cast type " + v.typeName(from) + " to " + v.typeName(to), -1)
+            return n
+        }
+        let x = 0
+        if explicit { x = 1 }
+        return ex.addExpr(p, ex.EX_CAST, to, n, x, typmod, 0)
+    }
     // same class without typmod: no cast needed for ints/text family
     let fc = ex.classOf(from)
     let tc = ex.classOf(to)
@@ -444,10 +483,7 @@ function paramIndexOf(pc: PC, n: Integer): Integer {
     return -1
 }
 
-function cmpClass(t: Integer): Integer {
-    if t == v.T_BPCHAR { return ex.CL_BPCHAR }
-    return ex.classOf(t)
-}
+function cmpClass(t: Integer): Integer { return ex.cmpClassOfType(t) }
 
 // ---------------------------------------------------------------- ranges / name resolution
 
@@ -669,6 +705,11 @@ function compileLiteral(pc: PC, id: Integer): Integer {
         let b = Bytes(nd.text)
         ex.setTextReg(p, n, b, 0, b.length)
         trackLit(pc, n, id)
+        if nd.intValue == 2 {
+            // B'101' is a bit constant (not an untyped literal): B'1'::bit(4) pads like Postgres
+            let bt = typeInCatalog(pc.c, "bit")
+            if bt >= 0 { return coerce(pc, n, bt, -1, false) }
+        }
         return n
     }
     if k == ast.K_BOOL_LIT {
@@ -697,7 +738,7 @@ function compileParam(pc: PC, id: Integer): Integer {
 
 function isAggName(name: Text): Boolean {
     return name == "count" || name == "sum" || name == "avg" || name == "min" || name == "max" ||
-        name == "bool_and" || name == "bool_or" || name == "every" || name == "string_agg" ||
+        name == "bool_and" || name == "bool_or" || name == "every" || name == "string_agg" || name == "array_agg" ||
         name == "stddev" || name == "stddev_samp" || name == "variance" || name == "var_samp" ||
         name == "stddev_pop" || name == "var_pop" || name == "any_value" || twoArgAggKind(name) > 0
 }
@@ -779,6 +820,10 @@ function compileExpr(pc: PC, id: Integer): Integer {
     }
     if k == ast.K_PARAM { return compileParam(pc, id) }
     if k == ast.K_COLUMN_REF { return resolveColumn(pc, id) }
+    if pc.anyGenerated {
+        let g = matchGenerated(pc, id)
+        if g >= 0 { return g }
+    }
     if k == ast.K_BINARY_OP { return compileBinary(pc, id) }
     if k == ast.K_UNARY_OP {
         let op = nd.op
@@ -842,7 +887,17 @@ function compileExpr(pc: PC, id: Integer): Integer {
         return -1
     }
     if k == ast.K_FUNC_CALL {
-        if pc.srfSlot >= 0 && astEqual(pc, pc.srfAst, id) {
+        if pc.srfSlot >= 0 && pc.srfKind == 4 {
+            let si = 0
+            while si < pc.srfAsts.length {
+                if astEqual(pc, pc.srfAsts[si], id) {
+                    let st1 = p.slotTable[pc.srfSlot]
+                    return ex.addExpr(p, ex.EX_COL, st1.cols[si].type, pc.srfSlot, si, 0, -1)
+                }
+                si += 1
+            }
+        }
+        if pc.srfSlot >= 0 && pc.srfKind != 4 && astEqual(pc, pc.srfAst, id) {
             let col = 0
             if pc.srfKind == 1 { col = 2 }
             let st0 = p.slotTable[pc.srfSlot]
@@ -855,7 +910,12 @@ function compileExpr(pc: PC, id: Integer): Integer {
         let t = typeOfTypename(pc, tn)
         let tm = typmodOfTypename(pc, tn)
         let inner = nd.children[0]
-        let arg = compileExpr(pc, inner)
+        let arg = -1
+        if ast.kind(pc.a, inner) == ast.K_ARRAY_EXPR && v.isGeneralArray(t) {
+            arg = compileArrayExpr(pc, inner, v.arrayElemType(t))
+        } else {
+            arg = compileExpr(pc, inner)
+        }
         if arg < 0 { return -1 }
         let n = coerce(pc, arg, t, tm, true)
         if n == arg && p.et[n] != t {
@@ -965,10 +1025,7 @@ function compileExpr(pc: PC, id: Integer): Integer {
         return compileSubqueryExpr(pc, nd.children[1], 3, e, f, id)
     }
     if k == ast.K_QUANTIFIED {
-        if (nd.flags & ast.F_SUBQUERY) == 0 {
-            perr(pc, "0A000", "ANY/ALL over arrays is not supported", nd.position)
-            return -1
-        }
+        if (nd.flags & ast.F_SUBQUERY) == 0 { return compileQuantArray(pc, id) }
         let e = compileExpr(pc, nd.children[0])
         if e < 0 { return -1 }
         let f = nd.op
@@ -979,10 +1036,13 @@ function compileExpr(pc: PC, id: Integer): Integer {
         return compileExpr(pc, nd.children[0])
     }
     if k == ast.K_SUBSCRIPT { return compileSubscript(pc, id) }
+    if k == ast.K_ARRAY_EXPR { return compileArrayExpr(pc, id, v.T_UNKNOWN) }
+    if k == ast.K_ARRAY_SUBQUERY { return compileArraySubquery(pc, id) }
     if k == ast.K_FIELD_SELECT { return compileFieldSelect(pc, id) }
     if k == ast.K_ROW_EXPR {
         let items = ast.items(a, nd.children[0])
-        if items.length == 1 { return compileExpr(pc, items[0]) }
+        // (x) is x; ROW(x) is a one-column record, which has no type here
+        if items.length == 1 && (nd.flags & ast.F_EXPLICIT_ROW) == 0 { return compileExpr(pc, items[0]) }
         perr(pc, "0A000", "row expressions are not supported", nd.position)
         return -1
     }
@@ -996,7 +1056,7 @@ function compileExpr(pc: PC, id: Integer): Integer {
 
 function cmpClassMixed(t: Integer, et: Integer): Integer {
     if t == v.T_BPCHAR || et == v.T_BPCHAR { return ex.CL_BPCHAR }
-    return ex.classOf(t)
+    return ex.cmpClassOfType(t)
 }
 
 function coerceText(pc: PC, n: Integer): Integer {
@@ -1033,6 +1093,8 @@ function makeCmpCore(pc: PC, op: Integer, l: Integer, r: Integer, pos: Integer):
     let lt = p.et[l]
     let rt = p.et[r]
     let ct = commonType(lt, rt)
+    // array comparisons take two arrays of one type (anyarray); only an unknown literal adapts
+    if v.isGeneralArray(lt) && v.isGeneralArray(rt) && lt != rt { ct = -1 }
     if ct < 0 {
         perr(pc, "42883", "operator does not exist: " + v.typeName(lt) + " " + opSymbol(op) + " " + v.typeName(rt), pos)
         return -1
@@ -1062,6 +1124,7 @@ function makeCmpCore(pc: PC, op: Integer, l: Integer, r: Integer, pos: Integer):
 function sameRepresentation(a: Integer, b: Integer): Boolean {
     if a == v.T_UNKNOWN { return false }
     if a == b { return true }
+    if v.isGeneralArray(a) || v.isGeneralArray(b) { return false }
     if v.isIntType(a) && v.isIntType(b) { return true }
     if ex.classOf(a) == ex.CL_TEXT && ex.classOf(b) == ex.CL_TEXT { return true }
     return false
@@ -1138,6 +1201,7 @@ function compileBinary(pc: PC, id: Integer): Integer {
     if op == ast.OP_CONCAT {
         let lt0 = p.et[l]
         let rt0 = p.et[r]
+        if v.isGeneralArray(lt0) || v.isGeneralArray(rt0) { return compileArrayConcat(pc, l, r, nd.position) }
         if (lt0 == v.T_BYTEA && (rt0 == v.T_BYTEA || rt0 == v.T_UNKNOWN)) || (rt0 == v.T_BYTEA && lt0 == v.T_UNKNOWN) {
             if isNullConst(pc, l) || isNullConst(pc, r) { return nullConst(pc, v.T_BYTEA) }
             l = coerce(pc, l, v.T_BYTEA, -1, false)
@@ -1511,6 +1575,7 @@ function compileFunc(pc: PC, id: Integer): Integer {
     if schemaNode >= 0 && (pc.a.nodes[schemaNode].text == "tin" || pc.a.nodes[schemaNode].text == "search") {
         return compileSearchFunc(pc, id, name)
     }
+    if (nd.flags & ast.F_FUNC_VARIADIC) != 0 { return compileVariadicCall(pc, id, name) }
     let catf = compileCatFunc(pc, id, name)
     if catf != -2 { return catf }
     let rawArgs = ast.items(pc.a, ast.child(pc.a, id, 1))
@@ -1577,11 +1642,18 @@ function compileFunc(pc: PC, id: Integer): Integer {
         return textConst(pc, "")
     }
     if name == "set_config" {
+        // settings are not kept per session; set_config(name, value, is_local) returns the value it was given
         if nargs >= 2 && ast.kind(pc.a, rawArgs[1]) == ast.K_STR_LIT {
             pin(pc, rawArgs[1])
             return textConst(pc, pc.a.nodes[rawArgs[1]].text)
         }
-        return textConst(pc, "")
+        let args = fnArgs(pc, id)
+        if pc.err { return -1 }
+        if args.length != 3 { return badArgs(pc, name, id) }
+        args[0] = coerceText(pc, args[0])
+        args[2] = coerceBool(pc, args[2], name, id)
+        if pc.err { return -1 }
+        return coerceText(pc, args[1])
     }
     if name == "pg_advisory_unlock_all" {
         // advisory locks are not implemented, so there is never one to release (asyncpg's pool reset calls this)
@@ -1719,6 +1791,11 @@ function compileFunc(pc: PC, id: Integer): Integer {
     if name == "random" { return mkFunc(pc, ex.FN_RANDOM, v.T_FLOAT8, args) }
     if name == "length" || name == "char_length" || name == "character_length" || name == "octet_length" {
         if args.length != 1 { return badArgs(pc, name, id) }
+        if v.isExtType(p.et[args[0]]) {
+            // the type's own length (length(bit) counts bits), when its extension defines one
+            let own = compileExtFunc(pc, name, args, nd.position)
+            if own != -2 { return own }
+        }
         if p.et[args[0]] == v.T_UNKNOWN { args[0] = coerce(pc, args[0], v.T_TEXT, -1, false) }
         if !v.isTextType(p.et[args[0]]) {
             perr(pc, "42883", "function " + name + "(" + v.typeName(p.et[args[0]]) + ") does not exist", nd.position)
@@ -1814,7 +1891,15 @@ public function extTypmodError(t: Integer, count: Integer, value: Integer): Text
 
 // Engine type id of an SDK signature type name ("float8", "int4", "vector", ...), or -1.
 function extSignatureType(pc: PC, name: Text): Integer {
+    if name.length > 2 && name.endsWith("[]") {
+        let et = extSignatureType(pc, name.slice(0, name.length - 2))
+        if et < 0 { return -1 }
+        let at = v.arrayOf(et)
+        if at == v.T_UNKNOWN { return -1 }
+        return at
+    }
     if name == "float8" { return v.T_FLOAT8 }
+    if name == "numeric" { return v.T_NUMERIC }
     if name == "float4" { return v.T_FLOAT4 }
     if name == "int4" { return v.T_INT4 }
     if name == "int8" { return v.T_INT8 }
@@ -1837,11 +1922,22 @@ function resolveExtFn(pc: PC, f: ext.Fn) {
 // or by implicit numeric widening)?
 function extArgFits(have: Integer, want: Integer): Boolean {
     if have == want || have == v.T_UNKNOWN { return true }
+    // arrays convert element by element along the elements' implicit casts (int4[] -> float8[])
+    if v.isGeneralArray(have) && v.isGeneralArray(want) { return extArgFits(v.arrayElemType(have), v.arrayElemType(want)) }
+    if v.isGeneralArray(have) || v.isGeneralArray(want) { return false }
     if v.isExtType(have) || v.isExtType(want) { return false }
     if v.isIntType(have) && (v.isIntType(want) || want == v.T_FLOAT8 || want == v.T_FLOAT4) { return numRank(have) <= numRank(want) || want == v.T_FLOAT8 || want == v.T_FLOAT4 }
     if have == v.T_FLOAT4 && want == v.T_FLOAT8 { return true }
     if v.isTextType(have) && v.isTextType(want) && !v.isExtType(have) { return want == v.T_TEXT }
     return false
+}
+
+// extArgFits, plus the implicit casts installed extensions declare (bit varying -> bit).
+function extArgFitsPc(pc: PC, have: Integer, want: Integer): Boolean {
+    if extArgFits(have, want) { return true }
+    if !v.isExtType(have) || !v.isExtType(want) { return false }
+    let ci = findExtCast(pc, have, want)
+    return ci >= 0 && ext.castAt(ci).def.implicit
 }
 
 // Call of installed extension function fi on compiled args (already checked to fit).
@@ -1859,6 +1955,33 @@ function extCall(pc: PC, fi: Integer, args: List<Integer>): Integer {
     }
     let start = ex.addArgs(p, args)
     return ex.addExpr(p, ex.EX_EXTFN, f.result, start, args.length, fi, ex.addCall(p, args.length))
+}
+
+// Another installed function `name` fits args and differs from candidate `best` only at untyped arguments.
+function extFnAmbiguous(pc: PC, name: Text, args: List<Integer>, best: Integer): Boolean {
+    let p = pc.p
+    let b = ext.fn(best)
+    let i = 0
+    while i < ext.fnCount() {
+        let f = ext.fn(i)
+        if i != best && f.def.name == name && ext.isInstalled(pc.c.extensions, f.ext) && f.argTypes.length == args.length {
+            let fits = true
+            let differsTyped = false
+            let differs = false
+            let j = 0
+            while j < args.length {
+                if !extArgFitsPc(pc, p.et[args[j]], f.argTypes[j]) { fits = false }
+                if f.argTypes[j] != b.argTypes[j] {
+                    differs = true
+                    if p.et[args[j]] != v.T_UNKNOWN { differsTyped = true }
+                }
+                j += 1
+            }
+            if fits && differs && !differsTyped { return true }
+        }
+        i += 1
+    }
+    return false
 }
 
 function extFnText(name: Text, types: List<Integer>): Text {
@@ -1889,7 +2012,7 @@ function compileExtFunc(pc: PC, name: Text, args: List<Integer>, pos: Integer): 
                 let same = true
                 let j = 0
                 while j < args.length {
-                    if !extArgFits(p.et[args[j]], f.argTypes[j]) { fits = false }
+                    if !extArgFitsPc(pc, p.et[args[j]], f.argTypes[j]) { fits = false }
                     if p.et[args[j]] != f.argTypes[j] { same = false }
                     j += 1
                 }
@@ -1905,6 +2028,14 @@ function compileExtFunc(pc: PC, name: Text, args: List<Integer>, pos: Integer): 
         let types: List<Integer> = []
         for a in args { types.add(p.et[a]) }
         perr(pc, "42883", "function " + extFnText(name, types) + " does not exist", pos)
+        return -1
+    }
+    // candidates that differ only where the arguments are untyped literals cannot be told apart (Postgres:
+    // l2_distance('[0,0]', '[3,4]') matches vector, halfvec and sparsevec)
+    if exact < 0 && extFnAmbiguous(pc, name, args, best) {
+        let types: List<Integer> = []
+        for a in args { types.add(p.et[a]) }
+        perr(pc, "42725", "function " + extFnText(name, types) + " is not unique", pos)
         return -1
     }
     return extCall(pc, best, args)
@@ -1923,7 +2054,7 @@ function compileExtOp(pc: PC, sym: Text, l: Integer, r: Integer, pos: Integer): 
         if o.def.symbol == sym && ext.isInstalled(pc.c.extensions, o.ext) {
             let f = ext.fn(o.fn)
             resolveExtFn(pc, f)
-            if extArgFits(lt, f.argTypes[0]) && extArgFits(rt, f.argTypes[1]) {
+            if extArgFitsPc(pc, lt, f.argTypes[0]) && extArgFitsPc(pc, rt, f.argTypes[1]) {
                 if best < 0 { best = i }
                 if lt == f.argTypes[0] && rt == f.argTypes[1] && exact < 0 { exact = i }
             }
@@ -2580,7 +2711,7 @@ function exprMask(pc: PC, leaves: List<Leaf>, n: Integer): Integer {
     let k = p.ek[n]
     if k == ex.EX_COL { return slotBit(leaves, p.ea[n]) }
     if k == ex.EX_CONST || k == ex.EX_PARAM || k == ex.EX_NOW { return 0 }
-    if k == ex.EX_SUBQ || k == ex.EX_EXISTS {
+    if k == ex.EX_SUBQ || k == ex.EX_EXISTS || k == ex.EX_ARRSUB {
         if p.ec[n] == 1 { return allMask(leaves) }
         return 0
     }
@@ -2590,7 +2721,8 @@ function exprMask(pc: PC, leaves: List<Leaf>, n: Integer): Integer {
         return m
     }
     if k == ex.EX_QUANT { return allMask(leaves) }
-    if k == ex.EX_FUNC || k == ex.EX_COALESCE || k == ex.EX_GREATEST {
+    // nodes whose a/b are an argument list (start in eargs, count), not two operands
+    if k == ex.EX_FUNC || k == ex.EX_COALESCE || k == ex.EX_GREATEST || k == ex.EX_EXTFN || k == ex.EX_ARRAY {
         let m = 0
         let i = 0
         while i < p.eb[n] {
@@ -2620,8 +2752,20 @@ function exprMask(pc: PC, leaves: List<Leaf>, n: Integer): Integer {
     if k == ex.EX_LIKE {
         return exprMask(pc, leaves, p.ea[n]) | exprMask(pc, leaves, p.eb[n]) | exprMask(pc, leaves, p.ed[n])
     }
-    if k == ex.EX_CAST || k == ex.EX_LITCAST || k == ex.EX_NOT || k == ex.EX_NEG || k == ex.EX_ISNULL || k == ex.EX_ISBOOL {
+    if k == ex.EX_CAST || k == ex.EX_LITCAST || k == ex.EX_NOT || k == ex.EX_NEG || k == ex.EX_ISNULL || k == ex.EX_ISBOOL || k == ex.EX_FIELD {
         return exprMask(pc, leaves, p.ea[n])
+    }
+    if k == ex.EX_SUBSCRIPT {
+        // a = the array, b = subscripts start in eargs, c = count (two per subscript when d = 1: slices)
+        let m = exprMask(pc, leaves, p.ea[n])
+        let nargs = p.ec[n]
+        if p.ed[n] == 1 { nargs = nargs * 2 }
+        let i = 0
+        while i < nargs {
+            m = m | exprMask(pc, leaves, p.eargs[p.eb[n] + i])
+            i += 1
+        }
+        return m
     }
     return exprMask(pc, leaves, p.ea[n]) | exprMask(pc, leaves, p.eb[n])
 }
@@ -2632,6 +2776,7 @@ function addRangeForTable(pc: PC, alias: Text, slot: Integer, t: tb.Table, colAl
         return
     }
     let r = Range { name: alias; slot: slot; level: pc.level; tableId: t.id; cols: []; types: []; mods: []; hidden: [] }
+    if t.id >= 0 && tb.hasGenerated(t) { pc.anyGenerated = true }
     let i = 0
     for c in t.cols {
         let nm = c.name
@@ -2826,13 +2971,17 @@ function compileFromItem(pc: PC, id: Integer, leaves: List<Leaf>, conjAst: List<
         let aliasNode = ast.child(a, id, 1)
         let alias = fname
         if aliasNode >= 0 { alias = a.nodes[aliasNode].text }
-        if fname != "generate_series" {
+        if fname == "unnest" {
+            compileUnnestFrom(pc, id, leaves)
+            return
+        }
+        if fname != "generate_series" && fname != "generate_subscripts" {
             perr(pc, "0A000", "function " + fname + " in FROM is not supported", a.nodes[id].position)
             return
         }
         let args = ast.items(a, ast.child(a, fc, 1))
         if args.length < 2 {
-            perr(pc, "42883", "function generate_series needs 2 or 3 arguments", a.nodes[id].position)
+            perr(pc, "42883", "function " + fname + " needs 2 or 3 arguments", a.nodes[id].position)
             return
         }
         let e1 = compileExpr(pc, args[0])
@@ -2840,6 +2989,15 @@ function compileFromItem(pc: PC, id: Integer, leaves: List<Leaf>, conjAst: List<
         let e3 = -1
         if args.length > 2 { e3 = compileExpr(pc, args[2]) }
         if pc.err { return }
+        if fname == "generate_subscripts" {
+            let raw: List<Integer> = [e1, e2]
+            if e3 >= 0 { raw.add(e3) }
+            let series = subscriptSeries(pc, raw, a.nodes[id].position)
+            if pc.err { return }
+            e1 = series[0]
+            e2 = series[1]
+            e3 = series[2]
+        }
         let ty = v.T_INT4
         if p.et[e1] == v.T_INT8 || p.et[e2] == v.T_INT8 { ty = v.T_INT8 }
         e1 = coerce(pc, e1, v.T_INT8, -1, false)
@@ -3758,6 +3916,71 @@ function leafHasIndexedConst(pc: PC, leaves: List<Leaf>, li: Integer, conjs: Lis
     return false
 }
 
+// ORDER BY column <op> value LIMIT n over one table with an extension index (hnsw, ivfflat) ordering by <op>:
+// the table's leaf becomes an index scan returning the index's nearest rows; WHERE filters and the ORDER BY /
+// LIMIT still run above it, so the result is the LIMIT rows nearest by the operator's value among them (as in
+// pgvector, rows the index does not return are not considered). Not used when grouping, DISTINCT, set-returning
+// or window functions would sit between the scan and the ORDER BY, or when an equality on an indexed column
+// already gives an index path.
+function annLeaf(pc: PC, q: Integer, leaves: List<Leaf>, conjs: List<Integer>) {
+    let a = pc.a
+    let p = pc.p
+    if leaves.length != 1 || leaves[0].op >= 0 || leaves[0].tableId < 0 { return }
+    if ast.child(a, q, ast.Q_LIMIT) < 0 || ast.child(a, q, ast.Q_GROUP_BY) >= 0 || ast.child(a, q, ast.Q_HAVING) >= 0 { return }
+    if (a.nodes[q].flags & ast.F_DISTINCT) != 0 { return }
+    let t = pc.c.tables[leaves[0].tableId]
+    if t.annIds.length == 0 { return }
+    let items = ast.items(a, ast.child(a, q, ast.Q_ORDER_BY))
+    if items.length == 0 || a.nodes[items[0]].op == ast.SORT_DESC { return }
+    let targets = ast.items(a, ast.child(a, q, ast.Q_TARGETS))
+    let aggs: List<Integer> = []
+    for tg in targets {
+        let e0 = ast.child(a, tg, 0)
+        collectAggs(pc, e0, aggs)
+        if findSrf(pc, e0) >= 0 || hasWindowCall(pc, e0) { return }
+    }
+    if aggs.length > 0 { return }
+    let key = ast.child(a, items[0], 0)
+    // ORDER BY an output column name: use its expression
+    if ast.kind(a, key) == ast.K_COLUMN_REF && ast.qualifier(a, key) == "" {
+        for tg in targets {
+            if a.nodes[tg].text == a.nodes[key].text && ast.kind(a, ast.child(a, tg, 0)) == ast.K_BINARY_OP { key = ast.child(a, tg, 0) }
+        }
+    }
+    if ast.kind(a, key) != ast.K_BINARY_OP || a.nodes[key].op != ast.OP_OTHER { return }
+    let sym = a.nodes[key].text
+    let lhs = compileExpr(pc, a.nodes[key].children[0])
+    if pc.err || lhs < 0 { return }
+    let slot = leaves[0].slot
+    if p.ek[lhs] != ex.EX_COL || p.ea[lhs] != slot { return }
+    let aid = cat.findAnnIndexOn(pc.c, t, p.eb[lhs], sym)
+    if aid < 0 { return }
+    let masks: List<Integer> = []
+    for cj in conjs { masks.add(exprMask(pc, leaves, cj)) }
+    if leafHasIndexedConst(pc, leaves, 0, conjs, masks) { return }
+    let rhs = compileExpr(pc, a.nodes[key].children[1])
+    if pc.err || rhs < 0 { return }
+    if exprMask(pc, leaves, rhs) != 0 { return }
+    let ct = t.cols[p.eb[lhs]].type
+    let qv = rhs
+    if p.et[rhs] != ct {
+        if p.et[rhs] != v.T_UNKNOWN && findExtCast(pc, p.et[rhs], ct) < 0 { return }
+        qv = coerce(pc, rhs, ct, -1, false)
+        if pc.err { return }
+    }
+    // without a WHERE filter or a second sort key, the scan only needs LIMIT + OFFSET rows (pgvector's Limit
+    // stops reading there too)
+    let want = -1
+    let lim = ast.child(a, q, ast.Q_LIMIT)
+    let off = ast.child(a, q, ast.Q_OFFSET)
+    if conjs.length == 0 && items.length == 1 && ast.kind(a, lim) == ast.K_INT_LIT && (off < 0 || ast.kind(a, off) == ast.K_INT_LIT) {
+        want = a.nodes[lim].intValue
+        if off >= 0 { want += a.nodes[off].intValue }
+    }
+    let op = ex.addOp(p, ex.O_ANN, slot, aid, qv, -1, ex.addAnnRows(p), want)
+    leaves[0] = Leaf { op: op; slot: -1; tableId: -1; slots: [slot]; outer: false }
+}
+
 function leafSize(pc: PC, leaf: Leaf): Integer {
     if leaf.op >= 0 { return 1000 }
     return pc.c.tables[leaf.tableId].nrows
@@ -3969,6 +4192,7 @@ function aggKind(name: Text, star: Boolean): Integer {
     if name == "bool_and" || name == "every" { return ex.AG_BOOL_AND }
     if name == "bool_or" { return ex.AG_BOOL_OR }
     if name == "string_agg" { return ex.AG_STRING_AGG }
+    if name == "array_agg" { return ex.AG_ARRAY_AGG }
     if name == "stddev_pop" { return ex.AG_STDDEV_POP }
     if name == "var_pop" { return ex.AG_VAR_POP }
     if name == "stddev" || name == "stddev_samp" { return ex.AG_STDDEV }
@@ -3982,6 +4206,7 @@ function compileSelect(pc: PC, q: Integer): QResult {
     let saveSrfAst = pc.srfAst
     let saveSrfSlot = pc.srfSlot
     let saveSrfKind = pc.srfKind
+    let saveSrfAsts = pc.srfAsts
     let saveWinSlot = pc.winSlot
     let saveWinTable = pc.winTable
     let saveWinEval = pc.winEval
@@ -3992,6 +4217,7 @@ function compileSelect(pc: PC, q: Integer): QResult {
     pc.srfAst = saveSrfAst
     pc.srfSlot = saveSrfSlot
     pc.srfKind = saveSrfKind
+    pc.srfAsts = saveSrfAsts
     pc.winSlot = saveWinSlot
     pc.winTable = saveWinTable
     pc.winEval = saveWinEval
@@ -4020,6 +4246,8 @@ function compileSelectInner(pc: PC, q: Integer): QResult {
     splitAnd(pc, ast.child(a, q, ast.Q_WHERE), conjAst)
     let conjs = compileConjList(pc, conjAst)
     if pc.err { return emptyResult() }
+    annLeaf(pc, q, leaves, conjs)
+    if pc.err { return emptyResult() }
     let root = planJoins(pc, leaves, conjs)
     if pc.err { return emptyResult() }
     // targets (expand stars)
@@ -4042,7 +4270,7 @@ function compileSelectInner(pc: PC, q: Integer): QResult {
                 if r.level == pc.level && (qual == "" || r.name == qual) {
                     let ci = 0
                     while ci < r.cols.length {
-                        if !(qual == "" && r.hidden[ci]) {
+                        if !(qual == "" && r.hidden[ci]) && !rangeColumnGenerated(pc, r, ci) {
                             tgtExprAst.add(-1)
                             tgtNames.add(r.cols[ci])
                             starSlot.add(ri)
@@ -4166,7 +4394,7 @@ function compileSelectInner(pc: PC, q: Integer): QResult {
             let rt = v.T_INT8
             let extAgg = -1
             // an extension aggregate for this name and type wins; count and any_value work on every type
-            if arg >= 0 && !twoArg && (v.isExtType(at) || !isAggName(an.text)) && kind != ex.AG_COUNT && kind != ex.AG_ANY_VALUE {
+            if arg >= 0 && !twoArg && (v.isExtType(at) || !isAggName(an.text)) && kind != ex.AG_COUNT && kind != ex.AG_ANY_VALUE && kind != ex.AG_ARRAY_AGG {
                 extAgg = findExtAgg(pc, an.text, at)
                 if extAgg < 0 {
                     perr(pc, "42883", "function " + an.text + "(" + v.typeName(at) + ") does not exist", an.position)
@@ -4204,6 +4432,16 @@ function compileSelectInner(pc: PC, q: Integer): QResult {
                 rt = v.T_TEXT
             } else if kind == ex.AG_ANY_VALUE {
                 rt = at
+            } else if kind == ex.AG_ARRAY_AGG {
+                if v.isGeneralArray(at) {
+                    perr(pc, "0A000", "array_agg over arrays is not supported", an.position)
+                    return emptyResult()
+                }
+                rt = v.arrayOf(v.sqlType(at))
+                if rt == v.T_UNKNOWN {
+                    perr(pc, "42704", "could not find array type for data type " + v.typeName(at), an.position)
+                    return emptyResult()
+                }
             } else if twoArg {
                 rt = v.T_FLOAT8
                 if kind == ex.AG_REGR_COUNT { rt = v.T_INT8 }
@@ -4224,6 +4462,7 @@ function compileSelectInner(pc: PC, q: Integer): QResult {
             if kind == ex.AG_MIN || kind == ex.AG_MAX {
                 extra = ex.addExpr(p, ex.EX_CONST, rt, 0, 0, 0, 0)
             }
+            if kind == ex.AG_ARRAY_AGG { extra = ex.addAggBufs(p) }
             if kind == ex.AG_STRING_AGG {
                 let sep = textConst(pc, ",")
                 if args.length > 1 { sep = coerceText(pc, compileExpr(pc, args[1])) }
@@ -4291,12 +4530,15 @@ function compileSelectInner(pc: PC, q: Integer): QResult {
         }
     }
     // set-returning function in the select list (runs once per input row, after WHERE / GROUP BY / HAVING)
-    let srf = -1
+    let srfs: List<Integer> = []
     for e in tgtExprAst {
-        if srf < 0 && e >= 0 { srf = findSrf(pc, e) }
+        if e >= 0 { collectSrfs(pc, e, srfs) }
     }
-    if srf >= 0 {
-        root = setupSrf(pc, srf, root)
+    if srfs.length == 1 {
+        root = setupSrf(pc, srfs[0], root)
+        if pc.err { return emptyResult() }
+    } else if srfs.length > 1 {
+        root = setupZippedSrfs(pc, srfs, root)
         if pc.err { return emptyResult() }
     }
     // window functions: their rows are materialised by O_WINDOW; expressions compiled from here on read it
@@ -4356,6 +4598,8 @@ function compileSelectInner(pc: PC, q: Integer): QResult {
             n = compileExpr(pc, e)
             if pc.err { return emptyResult() }
             if p.ek[n] == ex.EX_COL && !pc.aggActive { mod = p.ed[n] }
+            // a cast to a modified extension type reports its modifier (v::halfvec(3) -> 3, as exprTypmod)
+            if (p.ek[n] == ex.EX_CAST || p.ek[n] == ex.EX_LITCAST) && v.isExtType(p.et[n]) { mod = p.ec[n] }
         }
         r.exprs.add(n)
         r.names.add(tgtNames[i])
@@ -4539,6 +4783,10 @@ function compileInsert(pc: PC, id: Integer) {
     let t = pc.c.tables[tid]
     st.tableId = tid
     let ncols = t.cols.length
+    if tb.hasGenerated(t) {
+        prepareGenerated(pc, t)
+        if pc.err { return }
+    }
     // column mapping: target position -> table column
     let colMap: List<Integer> = []
     let colList = ast.child(a, id, 1)
@@ -4547,6 +4795,10 @@ function compileInsert(pc: PC, id: Integer) {
             let ci = tb.columnIndex(t, a.nodes[cn].text)
             if ci < 0 {
                 perr(pc, "42703", "column \"" + a.nodes[cn].text + "\" of relation \"" + t.name + "\" does not exist", a.nodes[cn].position)
+                return
+            }
+            if tb.isGenerated(t.cols[ci]) {
+                perr(pc, "428C9", "cannot insert a non-DEFAULT value into column \"" + a.nodes[cn].text + "\"", a.nodes[cn].position)
                 return
             }
             for x in colMap {
@@ -4560,7 +4812,7 @@ function compileInsert(pc: PC, id: Integer) {
     } else {
         let i = 0
         while i < ncols {
-            colMap.add(i)
+            if !tb.isGenerated(t.cols[i]) { colMap.add(i) }
             i += 1
         }
     }
@@ -4569,7 +4821,7 @@ function compileInsert(pc: PC, id: Integer) {
         // DEFAULT VALUES
         let i = 0
         while i < ncols {
-            st.rowExprs.add(defaultExpr(pc, t, i))
+            st.rowExprs.add(insertDefault(pc, t, i))
             i += 1
         }
         st.nRows = 1
@@ -4600,7 +4852,7 @@ function compileInsert(pc: PC, id: Integer) {
             }
             i = 0
             while i < ncols {
-                if rowNodes[i] == -3 { rowNodes[i] = defaultExpr(pc, t, i) }
+                if rowNodes[i] == -3 { rowNodes[i] = insertDefault(pc, t, i) }
                 st.rowExprs.add(rowNodes[i])
                 i += 1
             }
@@ -4631,7 +4883,7 @@ function compileInsert(pc: PC, id: Integer) {
         }
         i = 0
         while i < ncols {
-            if rowNodes[i] == -3 { rowNodes[i] = defaultExpr(pc, t, i) }
+            if rowNodes[i] == -3 { rowNodes[i] = insertDefault(pc, t, i) }
             st.srcExprs.add(rowNodes[i])
             i += 1
         }
@@ -4741,6 +4993,14 @@ function compileUpdateTarget(pc: PC, id: Integer, tid: Integer, ref: Integer) {
         st.setCols.add(ci)
         st.setExprs.add(n)
     }
+    if tb.hasGenerated(t) {
+        if fromList >= 0 {
+            perr(pc, "0A000", "UPDATE ... FROM is not supported on a table with an expression index (" + displayName(t.name) + ")", posOf(pc, id))
+            return
+        }
+        appendGeneratedSets(pc, t)
+        if pc.err { return }
+    }
     if fromList >= 0 {
         // SET values are computed while the join is positioned (dml.collectTargets) and kept here
         let fb = tb.newTable(-1, "setbuf")
@@ -4826,6 +5086,227 @@ function compileConflictUpdate(pc: PC, id: Integer, oc: Integer, t: tb.Table) {
     }
     let w = ast.child(a, oc, 2)
     if w >= 0 { st.conflictWhere = coerceBool(pc, compileExpr(pc, w), "WHERE", w) }
+    if tb.hasGenerated(t) { appendGeneratedSets(pc, t) }
+}
+
+// ---------------------------------------------------------------- generated columns (expression indexes, ADR-015)
+//
+// CREATE INDEX ... ((expr)) adds a hidden column storing expr for every row (tb.Column.generated holds its SQL) and
+// indexes that column, so hash/ordered indexes, unique checks, images and WAL replay treat it like any column.
+// Writes compute it from the new row: the user's values go into a one-row buffer (st.genTemp, scope st.genSlot)
+// and the compiled expression is evaluated over it. Queries never list it (*), and compileExpr reads it wherever an
+// expression equal to the indexed one appears, so the planner's ordinary index choice applies (EXPLAIN shows it).
+
+public record GenExpr {
+    a: ast.Ast
+    root: Integer
+}
+
+// The expression a generated column stores, parsed (root -1 if it does not parse as one expression).
+public function parseGenerated(text: Text): GenExpr {
+    let r = parser.parse("SELECT " + text)
+    if !r.ok || r.ast.statements.length != 1 { return GenExpr { a: r.ast; root: -1 } }
+    let sel = r.ast.statements[0]
+    let tl = ast.items(r.ast, ast.child(r.ast, sel, ast.Q_TARGETS))
+    if tl.length != 1 { return GenExpr { a: r.ast; root: -1 } }
+    return GenExpr { a: r.ast; root: ast.child(r.ast, tl[0], 0) }
+}
+
+// Generated columns of t compiled over t itself (the caller binds `slot` to a row of t): CREATE INDEX fills a new
+// column for existing rows with it, COPY computes the columns of each row it loads. err is "" when it compiled.
+public record GenPlan {
+    p: ex.Plan
+    slot: Integer
+    cols: List<Integer>
+    nodes: List<Integer>
+    err: Text
+}
+
+public function compileGenerated(c: cat.Catalog, views: ViewCache, env: ex.Env, p: ex.Plan, t: tb.Table): GenPlan {
+    let tree = parser.parse("SELECT 1").ast
+    let st = newStmt(tree, -1, p, "")
+    let pc = PC {
+        p: p; st: st; a: tree; c: c; ranges: []; rCount: 0; level: 0; minRef: 1000000
+        aggActive: false; aggLevel: -1; aggSlot: -1; groupAst: []; groupNodes: []; aggAst: []; collecting: false
+        cteName: []; cteAst: []; cteRec: []; cteCount: 0; workName: []; workTi: []; workTable: []; workCount: 0; err: false; errCode: ""; errMsg: ""; errPos: -1
+        tgtNames: []; tgtAst: []; slotLevel: []; views: views; noTrack: false; suppressConst: 0
+        targetOverride: -1; targetAlias: ""; routeRoot: -1
+        srfAst: -1; srfSlot: -1; srfKind: 0; srfAsts: []; winSlot: -1; winTable: tb.newTable(-1, ""); winEval: []; winSpec: []
+        anyGenerated: false; genKeys: []; genParsed: []
+    }
+    let g = GenPlan { p: p; slot: newSlot(pc, t); cols: []; nodes: []; err: "" }
+    addRangeForTable(pc, displayName(t.name), g.slot, t, [])
+    // the range reads the table's own cells: no expression may be turned into a read of a generated column here
+    pc.ranges[pc.rCount - 1].tableId = -1
+    pc.anyGenerated = false
+    let ci = 0
+    for col in t.cols {
+        if tb.isGenerated(col) && !pc.err {
+            let ge = parseGenerated(col.generated)
+            if ge.root < 0 {
+                perr(pc, "42601", "cannot parse the index expression " + col.generated, -1)
+            } else {
+                pc.a = ge.a
+                let n = compileExpr(pc, ge.root)
+                if n >= 0 && !pc.err { n = coerce(pc, n, v.sqlType(col.type), col.typmod, true) }
+                g.cols.add(ci)
+                g.nodes.add(n)
+            }
+        }
+        ci += 1
+    }
+    if pc.err { g.err = pc.errMsg }
+    return g
+}
+
+function isGenName(name: Text): Boolean {
+    let b = Bytes(name)
+    let pre = Bytes(tb.GENERATED_PREFIX)
+    if b.length < pre.length { return false }
+    let i = 0
+    while i < pre.length {
+        if b[i] != pre[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+function rangeColumnGenerated(pc: PC, r: Range, ci: Integer): Boolean {
+    if r.tableId >= 0 && r.tableId < pc.c.tables.length {
+        let t = pc.c.tables[r.tableId]
+        return ci < t.cols.length && tb.isGenerated(t.cols[ci])
+    }
+    return isGenName(r.cols[ci])
+}
+
+// The value an INSERT stores in column i when it names no value for it: the default, or the generated value.
+function insertDefault(pc: PC, t: tb.Table, i: Integer): Integer {
+    if tb.isGenerated(t.cols[i]) { return generatedNode(pc, i) }
+    return defaultExpr(pc, t, i)
+}
+
+function generatedNode(pc: PC, ci: Integer): Integer {
+    let st = pc.st
+    let k = 0
+    while k < st.genCols.length {
+        if st.genCols[k] == ci { return st.genNodes[k] }
+        k += 1
+    }
+    perr(pc, "XX000", "generated column without its expression", -1)
+    return -1
+}
+
+// Compile every generated column of t over a one-row buffer with t's columns (once per statement).
+function prepareGenerated(pc: PC, t: tb.Table) {
+    let st = pc.st
+    if st.genSlot >= 0 { return }
+    let buf = tb.newTable(-1, "genrow")
+    buf.isTemp = true
+    for col in t.cols { tb.addColumn(buf, tb.newColumn(col.name, col.type, col.typmod, false)) }
+    tb.reserveRow(buf, 0)
+    st.genTemp = ex.addTemp(pc.p, buf)
+    let saveA = pc.a
+    let saveR = pc.rCount
+    pc.level += 1
+    st.genSlot = newSlot(pc, buf)
+    addRangeForTable(pc, displayName(t.name), st.genSlot, buf, [])
+    let ci = 0
+    for col in t.cols {
+        if tb.isGenerated(col) && !pc.err {
+            let g = parseGenerated(col.generated)
+            if g.root < 0 {
+                perr(pc, "XX000", "expression of column \"" + col.name + "\" does not parse: " + col.generated, -1)
+            } else {
+                pc.a = g.a
+                let n = compileExpr(pc, g.root)
+                if n >= 0 && !pc.err { n = coerce(pc, n, v.sqlType(col.type), col.typmod, true) }
+                pc.a = saveA
+                st.genCols.add(ci)
+                st.genNodes.add(n)
+            }
+        }
+        ci += 1
+    }
+    pc.a = saveA
+    pc.level -= 1
+    pc.rCount = saveR
+}
+
+// UPDATE / ON CONFLICT DO UPDATE: the generated columns are recomputed from the updated row after the user's SETs.
+function appendGeneratedSets(pc: PC, t: tb.Table) {
+    let st = pc.st
+    prepareGenerated(pc, t)
+    if pc.err { return }
+    st.nUserSet = st.setCols.length
+    let k = 0
+    while k < st.genCols.length {
+        st.setCols.add(st.genCols[k])
+        st.setExprs.add(st.genNodes[k])
+        k += 1
+    }
+}
+
+function parsedGenerated(pc: PC, t: tb.Table, ci: Integer): GenExpr {
+    let key = t.id * 65536 + ci
+    let i = 0
+    while i < pc.genKeys.length {
+        if pc.genKeys[i] == key { return pc.genParsed[i] }
+        i += 1
+    }
+    let g = parseGenerated(t.cols[ci].generated)
+    pc.genKeys.add(key)
+    pc.genParsed.add(g)
+    return g
+}
+
+// Expression id equal to a generated column of a table in scope at this level: a read of that column, else -1.
+// An unqualified match in more than one range is left to ordinary compilation (which reports the ambiguity).
+function matchGenerated(pc: PC, id: Integer): Integer {
+    let found = -1
+    let i = pc.rCount - 1
+    while i >= 0 {
+        let r = pc.ranges[i]
+        if r.level == pc.level && r.tableId >= 0 && r.tableId < pc.c.tables.length {
+            let t = pc.c.tables[r.tableId]
+            let ci = 0
+            while ci < t.cols.length && ci < r.cols.length {
+                if tb.isGenerated(t.cols[ci]) {
+                    let g = parsedGenerated(pc, t, ci)
+                    // two ranges can match (a self-join): ambiguous; two hidden columns of one table with the same
+                    // expression (a block dropped and re-created its index) hold the same values: the first serves
+                    if g.root >= 0 && sameExpr(pc.a, id, g.a, g.root, r.name) {
+                        if found >= 0 && pc.p.ea[found] != r.slot { return -1 }
+                        if found < 0 { found = ex.addExpr(pc.p, ex.EX_COL, r.types[ci], r.slot, ci, 0, r.mods[ci]) }
+                    }
+                }
+                ci += 1
+            }
+        }
+        i -= 1
+    }
+    return found
+}
+
+// Structural equality of expression x in a and y in b (b's column references are unqualified; x's may be
+// qualified by the range name `qual`).
+function sameExpr(a: ast.Ast, x: Integer, b: ast.Ast, y: Integer, qual: Text): Boolean {
+    if x < 0 || y < 0 { return x == y }
+    let na = a.nodes[x]
+    let nb = b.nodes[y]
+    if na.kind != nb.kind { return false }
+    if na.kind == ast.K_COLUMN_REF {
+        if na.text != nb.text { return false }
+        let q = ast.qualifier(a, x)
+        return q == "" || q == qual
+    }
+    if na.op != nb.op || na.text != nb.text || na.intValue != nb.intValue || na.flags != nb.flags { return false }
+    if na.children.length != nb.children.length { return false }
+    let i = 0
+    while i < na.children.length {
+        if !sameExpr(a, na.children[i], b, nb.children[i], qual) { return false }
+        i += 1
+    }
+    return true
 }
 
 function sameColumnSet(x: List<Integer>, y: List<Integer>): Boolean {
@@ -4862,6 +5343,10 @@ function setColumn(pc: PC, t: tb.Table, name: Text, item: Integer): Integer {
     let ci = tb.columnIndex(t, name)
     if ci < 0 {
         perr(pc, "42703", "column \"" + name + "\" of relation \"" + displayName(t.name) + "\" does not exist", posOf(pc, item))
+        return -1
+    }
+    if tb.isGenerated(t.cols[ci]) {
+        perr(pc, "428C9", "column \"" + name + "\" can only be updated to DEFAULT", posOf(pc, item))
         return -1
     }
     for x in pc.st.setCols {
@@ -4946,7 +5431,9 @@ function starColumns(pc: PC, star: Integer): List<Integer> {
         if r.level == pc.level && (qual == "" || r.name == qual) {
             let ci = 0
             while ci < r.cols.length {
-                if !(qual == "" && r.hidden[ci]) { out.add(ex.addExpr(pc.p, ex.EX_COL, r.types[ci], r.slot, ci, 0, r.mods[ci])) }
+                if !(qual == "" && r.hidden[ci]) && !rangeColumnGenerated(pc, r, ci) {
+                    out.add(ex.addExpr(pc.p, ex.EX_COL, r.types[ci], r.slot, ci, 0, r.mods[ci]))
+                }
                 ci += 1
             }
         }
@@ -5530,28 +6017,6 @@ function compileCatalogRel(pc: PC, code: Integer, alias: Text, colAliases: List<
     leaves.add(Leaf { op: op; slot: -1; tableId: -1; slots: [slot]; outer: false })
 }
 
-function compileSubscript(pc: PC, id: Integer): Integer {
-    let nd = pc.a.nodes[id]
-    let p = pc.p
-    if (nd.flags & ast.F_SLICE) != 0 || nd.children[2] >= 0 {
-        perr(pc, "0A000", "array slices are not supported", nd.position)
-        return -1
-    }
-    let arr = compileExpr(pc, nd.children[0])
-    let idx = compileExpr(pc, nd.children[1])
-    if pc.err { return -1 }
-    let at = p.et[arr]
-    if !v.isArrayType(at) {
-        perr(pc, "42804", "cannot subscript type " + v.typeName(at) + " because it does not support subscripting", nd.position)
-        return -1
-    }
-    let it = p.et[idx]
-    if it == v.T_UNKNOWN || !v.isIntType(it) { idx = coerce(pc, idx, v.T_INT4, -1, false) }
-    let et = v.arrayElemType(at)
-    if isNullConst(pc, arr) || isNullConst(pc, idx) { return nullConst(pc, et) }
-    return ex.addExpr(p, ex.EX_SUBSCRIPT, et, arr, idx, 0, 0)
-}
-
 function compileFieldSelect(pc: PC, id: Integer): Integer {
     let nd = pc.a.nodes[id]
     let p = pc.p
@@ -5580,7 +6045,29 @@ function compileFieldSelect(pc: PC, id: Integer): Integer {
 }
 
 function isSrfName(name: Text): Boolean {
-    return name == "_pg_expandarray" || name == "unnest" || name == "generate_series"
+    return name == "_pg_expandarray" || name == "unnest" || name == "generate_series" || name == "generate_subscripts"
+}
+
+// generate_subscripts(array, dim [, reverse]) as a series: [first, last, step] expressions (step -1 or -1 node
+// for "none"), bounds NULL (no rows) when the array has no such dimension.
+function subscriptSeries(pc: PC, args: List<Integer>, pos: Integer): List<Integer> {
+    let p = pc.p
+    if args.length < 2 || args.length > 3 || !v.isArrayType(p.et[args[0]]) {
+        perr(pc, "42883", "function generate_subscripts needs an array, a dimension and an optional reverse flag", pos)
+        return []
+    }
+    let dim = coerce(pc, args[1], v.T_INT4, -1, false)
+    let lo = mkFunc(pc, ex.FN_ARRAY_LOWER, v.T_INT4, [args[0], dim])
+    let hi = mkFunc(pc, ex.FN_ARRAY_UPPER, v.T_INT4, [args[0], dim])
+    if args.length == 3 {
+        let rev = constBoolNode(pc, coerceBool(pc, args[2], "generate_subscripts", -1))
+        if rev < 0 {
+            perr(pc, "0A000", "generate_subscripts takes a constant reverse flag", pos)
+            return []
+        }
+        if rev == 1 { return [hi, lo, intConst(pc, -1, v.T_INT8)] }
+    }
+    return [lo, hi, -1]
 }
 
 // First set-returning function call in expression id (not inside subqueries or window calls), or -1.
@@ -5597,6 +6084,86 @@ function findSrf(pc: PC, id: Integer): Integer {
     return -1
 }
 
+// Every set-returning call in expression id (outermost ones; the same call text once).
+function collectSrfs(pc: PC, id: Integer, out: List<Integer>) {
+    if id < 0 { return }
+    let nd = pc.a.nodes[id]
+    let k = nd.kind
+    if k == ast.K_SELECT || k == ast.K_SET_OP || k == ast.K_VALUES { return }
+    if k == ast.K_FUNC_CALL && isSrfName(nd.text) && ast.child(pc.a, id, 3) < 0 {
+        for x in out {
+            if astEqual(pc, x, id) { return }
+        }
+        out.add(id)
+        return
+    }
+    for c in nd.children { collectSrfs(pc, c, out) }
+}
+
+// Several set-returning functions in one select list run in lockstep (PostgreSQL 10+): one output row per
+// position, as many rows as the longest, the shorter ones NULL. Each child row's results are materialised.
+// spec: [4, n, per call: kind (2 unnest, 3 series), then [array] or [first, last, step|-1]]
+function setupZippedSrfs(pc: PC, srfs: List<Integer>, root: Integer): Integer {
+    let p = pc.p
+    let t = tb.newTable(-1, "srf")
+    t.isTemp = true
+    let spec: List<Integer> = [4, srfs.length]
+    for srf in srfs {
+        let nd = pc.a.nodes[srf]
+        let args = fnArgs(pc, srf)
+        if pc.err { return root }
+        if nd.text == "_pg_expandarray" {
+            perr(pc, "0A000", "_pg_expandarray cannot be combined with other set-returning functions", nd.position)
+            return root
+        }
+        if nd.text == "unnest" {
+            if args.length != 1 || !v.isArrayType(p.et[args[0]]) {
+                perr(pc, "0A000", "unnest takes one array argument", nd.position)
+                return root
+            }
+            tb.addColumn(t, tb.newColumn(nd.text, v.arrayElemType(p.et[args[0]]), -1, false))
+            spec.add(2)
+            spec.add(args[0])
+        } else {
+            if nd.text == "generate_subscripts" {
+                args = subscriptSeries(pc, args, nd.position)
+                if pc.err { return root }
+            } else if args.length == 2 {
+                args.add(-1)
+            }
+            if args.length != 3 {
+                perr(pc, "42883", "function generate_series needs 2 or 3 arguments", nd.position)
+                return root
+            }
+            let ty = v.T_INT4
+            if p.et[args[0]] == v.T_INT8 || p.et[args[1]] == v.T_INT8 { ty = v.T_INT8 }
+            let i = 0
+            while i < 3 {
+                if args[i] >= 0 {
+                    if !v.isIntType(p.et[args[i]]) && p.et[args[i]] != v.T_UNKNOWN {
+                        perr(pc, "0A000", "generate_series is supported over integers only", nd.position)
+                        return root
+                    }
+                    args[i] = coerce(pc, args[i], v.T_INT8, -1, false)
+                }
+                i += 1
+            }
+            tb.addColumn(t, tb.newColumn(nd.text, ty, -1, false))
+            spec.add(3)
+            spec.add(args[0])
+            spec.add(args[1])
+            spec.add(args[2])
+        }
+    }
+    let ti = ex.addTemp(p, t)
+    let slot = newSlot(pc, t)
+    pc.srfAsts = srfs
+    pc.srfAst = -1
+    pc.srfSlot = slot
+    pc.srfKind = 4
+    return ex.addOp(p, ex.O_SRF, root, ti, slot, ex.listBlock(p, spec), 0, 0)
+}
+
 function setupSrf(pc: PC, srf: Integer, root: Integer): Integer {
     let p = pc.p
     let nd = pc.a.nodes[srf]
@@ -5607,7 +6174,12 @@ function setupSrf(pc: PC, srf: Integer, root: Integer): Integer {
     let spec: List<Integer> = []
     let kind = 2
     if nd.text == "_pg_expandarray" { kind = 1 }
-    if nd.text == "generate_series" { kind = 3 }
+    if nd.text == "generate_series" || nd.text == "generate_subscripts" { kind = 3 }
+    if nd.text == "generate_subscripts" {
+        args = subscriptSeries(pc, args, nd.position)
+        if pc.err { return root }
+        if args[2] < 0 { args.pop() }
+    }
     if kind == 3 {
         if args.length < 2 || args.length > 3 {
             perr(pc, "42883", "function generate_series needs 2 or 3 arguments", nd.position)
@@ -5624,12 +6196,16 @@ function setupSrf(pc: PC, srf: Integer, root: Integer): Integer {
             args[i] = coerce(pc, args[i], v.T_INT8, -1, false)
             i += 1
         }
-        tb.addColumn(t, tb.newColumn("generate_series", ty, -1, false))
+        tb.addColumn(t, tb.newColumn(nd.text, ty, -1, false))
         spec = [3, args[0], args[1], -1]
         if args.length > 2 { spec[3] = args[2] }
     } else {
         if args.length != 1 || !v.isArrayType(p.et[args[0]]) {
-            perr(pc, "0A000", nd.text + " is supported over catalog arrays only", nd.position)
+            if args.length == 1 && p.et[args[0]] == v.T_UNKNOWN {
+                perr(pc, "42725", "function " + nd.text + "(unknown) is not unique", nd.position)
+            } else {
+                perr(pc, "0A000", nd.text + " takes one array argument", nd.position)
+            }
             return root
         }
         let et = v.arrayElemType(p.et[args[0]])
@@ -5839,7 +6415,19 @@ function compileCatFunc(pc: PC, id: Integer, name: Text): Integer {
         if pc.err { return -1 }
         return nullConst(pc, v.T_TEXT)
     }
-    if name == "pg_table_is_visible" || name == "pg_type_is_visible" || name == "pg_function_is_visible" ||
+    if name == "pg_table_is_visible" {
+        let args = fnArgs(pc, id)
+        if pc.err { return -1 }
+        if args.length != 1 { return badArgs(pc, name, id) }
+        return mkFunc(pc, ex.FN_TABLE_VISIBLE, v.T_BOOL, [coerce(pc, args[0], v.T_OID, -1, false)])
+    }
+    if name == "pg_get_serial_sequence" {
+        let args = fnArgs(pc, id)
+        if pc.err { return -1 }
+        if args.length != 2 { return badArgs(pc, name, id) }
+        return mkFunc(pc, ex.FN_SERIAL_SEQ, v.T_TEXT, [coerceText(pc, args[0]), coerceText(pc, args[1])])
+    }
+    if name == "pg_type_is_visible" || name == "pg_function_is_visible" || name == "pg_collation_is_visible" ||
        name == "has_table_privilege" || name == "has_schema_privilege" || name == "has_database_privilege" ||
        name == "has_column_privilege" || name == "has_function_privilege" || name == "has_sequence_privilege" || name == "pg_has_role" {
         let args = fnArgs(pc, id)
@@ -5871,11 +6459,10 @@ function compileCatFunc(pc: PC, id: Integer, name: Text): Integer {
         p.et[n] = v.T_TEXTARRAY
         return n
     }
-    if name == "array_upper" || name == "array_lower" || name == "array_length" || name == "cardinality" {
+    if name == "array_upper" || name == "array_lower" || name == "array_length" {
         let args = fnArgs(pc, id)
         if pc.err { return -1 }
         let want = 2
-        if name == "cardinality" { want = 1 }
         if args.length != want { return badArgs(pc, name, id) }
         if !v.isArrayType(p.et[args[0]]) {
             perr(pc, "42883", "function " + name + "(" + v.typeName(p.et[args[0]]) + ") does not exist", posOf(pc, id))
@@ -5885,9 +6472,11 @@ function compileCatFunc(pc: PC, id: Integer, name: Text): Integer {
         if want == 2 { use.add(coerce(pc, args[1], v.T_INT4, -1, false)) }
         let fn = ex.FN_ARRAY_UPPER
         if name == "array_lower" { fn = ex.FN_ARRAY_LOWER }
-        if name == "array_length" || name == "cardinality" { fn = ex.FN_ARRAY_LENGTH }
+        if name == "array_length" { fn = ex.FN_ARRAY_LENGTH }
         return mkFunc(pc, fn, v.T_INT4, use)
     }
+    let af = compileArrayFunc(pc, id, name)
+    if af != -2 { return af }
     if name == "pg_relation_size" || name == "pg_total_relation_size" || name == "pg_table_size" || name == "pg_indexes_size" {
         let args = fnArgs(pc, id)
         if pc.err { return -1 }
@@ -5895,6 +6484,477 @@ function compileCatFunc(pc: PC, id: Integer, name: Text): Integer {
         return mkFunc(pc, ex.FN_REL_SIZE, v.T_INT8, [coerce(pc, args[0], v.T_REGCLASS, -1, false)])
     }
     return -2
+}
+
+// ---------------------------------------------------------------- arrays
+
+// ARRAY[...]. hint: the element type a surrounding cast to an array type asks for (T_UNKNOWN if none). Items
+// meet at one common type; items that are arrays themselves (ARRAY[[1,2],[3,4]], ARRAY[ARRAY[1], b]) give a
+// result with one more dimension.
+function compileArrayExpr(pc: PC, id: Integer, hint: Integer): Integer {
+    let p = pc.p
+    let nd = pc.a.nodes[id]
+    let items = ast.items(pc.a, nd.children[0])
+    if items.length == 0 {
+        if hint == v.T_UNKNOWN {
+            perr(pc, "42P18", "cannot determine type of empty array", nd.position)
+            return -1
+        }
+        let n = constNode(pc, v.arrayOf(hint))
+        let b = Bytes("{}")
+        ex.setTextReg(p, n, b, 0, b.length)
+        return n
+    }
+    let nodes: List<Integer> = []
+    let arrays = 0
+    for it in items {
+        let x = -1
+        if ast.kind(pc.a, it) == ast.K_ARRAY_EXPR {
+            x = compileArrayExpr(pc, it, hint)
+        } else {
+            x = compileExpr(pc, it)
+        }
+        if pc.err { return -1 }
+        nodes.add(x)
+        if v.isGeneralArray(p.et[x]) { arrays += 1 }
+    }
+    let nested = arrays > 0
+    let et = v.T_UNKNOWN
+    for x in nodes {
+        let xt = p.et[x]
+        if nested && xt != v.T_UNKNOWN {
+            if !v.isGeneralArray(xt) {
+                perr(pc, "42804", "ARRAY elements must all be arrays or all be scalars", nd.position)
+                return -1
+            }
+            xt = v.arrayElemType(xt)
+        }
+        let ct = commonType(et, xt)
+        if ct < 0 {
+            perr(pc, "42804", "ARRAY types " + v.typeName(et) + " and " + v.typeName(xt) + " cannot be matched", posOf(pc, x))
+            return -1
+        }
+        et = ct
+    }
+    if et == v.T_UNKNOWN { et = hint }
+    if et == v.T_UNKNOWN { et = v.T_TEXT }
+    let at = v.arrayOf(et)
+    if at == v.T_UNKNOWN {
+        perr(pc, "42704", "could not find array type for data type " + v.typeName(et), nd.position)
+        return -1
+    }
+    let i = 0
+    while i < nodes.length {
+        if nested {
+            nodes[i] = coerce(pc, nodes[i], at, -1, false)
+        } else {
+            nodes[i] = coerce(pc, nodes[i], et, -1, false)
+        }
+        i += 1
+    }
+    if pc.err { return -1 }
+    let start = ex.addArgs(p, nodes)
+    let c = 0
+    if nested { c = 1 }
+    return ex.addExpr(p, ex.EX_ARRAY, at, start, nodes.length, c, 0)
+}
+
+// x op ANY/ALL (array expression); the elements compare at the common type of x and the element type.
+function compileQuantArray(pc: PC, id: Integer): Integer {
+    let p = pc.p
+    let nd = pc.a.nodes[id]
+    let e = compileExpr(pc, nd.children[0])
+    if e < 0 { return -1 }
+    let lt = p.et[e]
+    let rid = nd.children[1]
+    let ar = -1
+    if ast.kind(pc.a, rid) == ast.K_ARRAY_EXPR {
+        let hint = lt
+        if hint == v.T_UNKNOWN { hint = v.T_TEXT }
+        ar = compileArrayExpr(pc, rid, hint)
+    } else {
+        ar = compileExpr(pc, rid)
+    }
+    if pc.err { return -1 }
+    if p.et[ar] == v.T_UNKNOWN {
+        let want = lt
+        if want == v.T_UNKNOWN { want = v.T_TEXT }
+        ar = coerce(pc, ar, v.arrayOf(v.sqlType(want)), -1, false)
+    }
+    let at = p.et[ar]
+    if !v.isArrayType(at) {
+        perr(pc, "42809", "op ANY/ALL (array) requires array on right side", nd.position)
+        return -1
+    }
+    let et = v.arrayElemType(at)
+    let ct = commonType(lt, et)
+    if ct < 0 {
+        perr(pc, "42883", "operator does not exist: " + v.typeName(lt) + " " + opSymbol(nd.op) + " " + v.typeName(et), nd.position)
+        return -1
+    }
+    if ct == v.T_UNKNOWN { ct = v.T_TEXT }
+    if !sameRepresentation(lt, ct) { e = coerce(pc, e, ct, -1, false) }
+    if pc.err { return -1 }
+    // elements that compare as they are (ints of any width, the text family) need no per-element cast
+    let cmpType = ct
+    if sameRepresentation(et, ct) { cmpType = et }
+    let cl = cmpClassMixed(ct, et)
+    let all = 0
+    if nd.intValue == ast.QUANT_ALL { all = 1 }
+    return ex.addExpr(p, ex.EX_QUANTARR, v.T_BOOL, e, ar, nd.op | (all << 8) | (cl << 16), cmpType)
+}
+
+// ARRAY(subquery): the subquery's single column as a one-dimensional array.
+function compileArraySubquery(pc: PC, id: Integer): Integer {
+    let p = pc.p
+    let q = pc.a.nodes[id].children[0]
+    let sub = compileSubqueryExpr(pc, q, 1, -1, 0, id)
+    if sub < 0 { return -1 }
+    let et = p.et[sub]
+    if v.isGeneralArray(et) {
+        perr(pc, "0A000", "ARRAY(subquery) over arrays is not supported", posOf(pc, id))
+        return -1
+    }
+    let at = v.arrayOf(v.sqlType(et))
+    if at == v.T_UNKNOWN {
+        perr(pc, "42704", "could not find array type for data type " + v.typeName(et), posOf(pc, id))
+        return -1
+    }
+    // reuse the scalar-subquery node's plan: a = root, b = output expression, c = correlated
+    return ex.addExpr(p, ex.EX_ARRSUB, at, p.ea[sub], p.eb[sub], p.ec[sub], 0)
+}
+
+// a[i][j], a[lo:hi] (also mixed: a non-slice subscript i in a slice means 1:i).
+function compileSubscript(pc: PC, id: Integer): Integer {
+    let p = pc.p
+    let chain: List<Integer> = []
+    let base = id
+    while ast.kind(pc.a, base) == ast.K_SUBSCRIPT {
+        chain.add(base)
+        base = pc.a.nodes[base].children[0]
+    }
+    let arrE = compileExpr(pc, base)
+    if pc.err { return -1 }
+    let at = p.et[arrE]
+    let pos = pc.a.nodes[id].position
+    if !v.isArrayType(at) {
+        perr(pc, "42804", "cannot subscript type " + v.typeName(at) + " because it does not support subscripting", pos)
+        return -1
+    }
+    let slice = false
+    for s in chain {
+        let nd = pc.a.nodes[s]
+        if (nd.flags & ast.F_SLICE) != 0 || nd.children[2] >= 0 { slice = true }
+    }
+    if chain.length > arrMaxDim() {
+        perr(pc, "54000", "number of array dimensions (" + Text(chain.length) + ") exceeds the maximum allowed (6)", pos)
+        return -1
+    }
+    let args: List<Integer> = []
+    let k = chain.length - 1
+    while k >= 0 {
+        let nd = pc.a.nodes[chain[k]]
+        let isSlice = (nd.flags & ast.F_SLICE) != 0 || nd.children[2] >= 0
+        if slice {
+            if isSlice {
+                args.add(subscriptArg(pc, nd.children[1]))
+                args.add(subscriptArg(pc, nd.children[2]))
+            } else {
+                args.add(intConst(pc, 1, v.T_INT4))
+                args.add(subscriptArg(pc, nd.children[1]))
+            }
+        } else {
+            args.add(subscriptArg(pc, nd.children[1]))
+        }
+        k -= 1
+    }
+    if pc.err { return -1 }
+    let rt = v.arrayElemType(at)
+    if slice { rt = at }
+    for x in args {
+        if x >= 0 && isNullConst(pc, x) { return nullConst(pc, rt) }
+    }
+    if isNullConst(pc, arrE) { return nullConst(pc, rt) }
+    let d = 0
+    if slice { d = 1 }
+    return ex.addExpr(p, ex.EX_SUBSCRIPT, rt, arrE, ex.addArgs(p, args), chain.length, d)
+}
+
+function arrMaxDim(): Integer { return 6 }
+
+// A subscript expression as int4 (-1 for an omitted slice bound).
+function subscriptArg(pc: PC, id: Integer): Integer {
+    if id < 0 { return -1 }
+    let x = compileExpr(pc, id)
+    if x < 0 { return -1 }
+    let t = pc.p.et[x]
+    if t == v.T_UNKNOWN || !v.isIntType(t) { x = coerce(pc, x, v.T_INT4, -1, false) }
+    return x
+}
+
+// Array functions (ex.evalArrayFunc). -2 when `name` is not one of them.
+function compileArrayFunc(pc: PC, id: Integer, name: Text): Integer {
+    let p = pc.p
+    if name == "json_build_object" || name == "json_build_array" {
+        let jargs = fnArgs(pc, id)
+        if pc.err { return -1 }
+        let obj = name == "json_build_object"
+        if obj && jargs.length % 2 != 0 {
+            perr(pc, "22023", "argument list must have even number of elements", posOf(pc, id))
+            return -1
+        }
+        let i = 0
+        while i < jargs.length {
+            if p.et[jargs[i]] == v.T_UNKNOWN { jargs[i] = coerce(pc, jargs[i], v.T_TEXT, -1, false) }
+            i += 1
+        }
+        let fn = ex.FN_JSON_BUILD_ARRAY
+        if obj { fn = ex.FN_JSON_BUILD_OBJECT }
+        return arrFuncNode(pc, fn, v.T_TEXT, jargs)
+    }
+    let isArr = name == "array_ndims" || name == "array_dims" || name == "cardinality" || name == "array_fill" ||
+        name == "array_to_string" || name == "array_append" || name == "array_prepend" || name == "array_cat" ||
+        name == "array_position" || name == "array_remove" || name == "string_to_array"
+    if !isArr { return -2 }
+    let args = fnArgs(pc, id)
+    if pc.err { return -1 }
+    let pos = posOf(pc, id)
+    let n = args.length
+    if name == "string_to_array" {
+        if n < 2 || n > 3 { return badArgs(pc, name, id) }
+        let i = 0
+        while i < n {
+            args[i] = coerceText(pc, args[i])
+            i += 1
+        }
+        return arrFuncNode(pc, ex.FN_STRING_TO_ARRAY, v.T_TEXTARRAY, args)
+    }
+    if name == "array_fill" {
+        if n < 2 || n > 3 { return badArgs(pc, name, id) }
+        let vt = p.et[args[0]]
+        if vt == v.T_UNKNOWN {
+            perr(pc, "42804", "could not determine polymorphic type because input has type unknown", pos)
+            return -1
+        }
+        let i = 1
+        while i < n {
+            args[i] = coerce(pc, args[i], v.arrayOf(v.T_INT4), -1, false)
+            i += 1
+        }
+        return arrFuncNode(pc, ex.FN_ARRAY_FILL, v.arrayOf(v.sqlType(vt)), args)
+    }
+    if name == "array_append" || name == "array_prepend" {
+        if n != 2 { return badArgs(pc, name, id) }
+        let ai = 0
+        let ei = 1
+        if name == "array_prepend" {
+            ai = 1
+            ei = 0
+        }
+        let at = p.et[args[ai]]
+        let elt = p.et[args[ei]]
+        let et = v.T_UNKNOWN
+        if v.isGeneralArray(at) { et = v.arrayElemType(at) } else if at != v.T_UNKNOWN {
+            perr(pc, "42883", "function " + name + "(" + v.typeName(p.et[args[0]]) + ", " + v.typeName(p.et[args[1]]) + ") does not exist", pos)
+            return -1
+        }
+        let ct = commonType(et, elt)
+        if ct < 0 {
+            perr(pc, "42883", "function " + name + "(" + v.typeName(p.et[args[0]]) + ", " + v.typeName(p.et[args[1]]) + ") does not exist", pos)
+            return -1
+        }
+        if ct == v.T_UNKNOWN { ct = v.T_TEXT }
+        let rt = v.arrayOf(v.sqlType(ct))
+        args[ai] = coerce(pc, args[ai], rt, -1, false)
+        args[ei] = coerce(pc, args[ei], ct, -1, false)
+        return arrFuncNode(pc, ex.FN_ARRAY_APPEND + ai, rt, args)
+    }
+    if name == "array_cat" {
+        if n != 2 { return badArgs(pc, name, id) }
+        let ct = commonType(p.et[args[0]], p.et[args[1]])
+        if ct == v.T_UNKNOWN { ct = v.T_TEXTARRAY }
+        if ct < 0 || !v.isGeneralArray(ct) {
+            perr(pc, "42883", "function array_cat(" + v.typeName(p.et[args[0]]) + ", " + v.typeName(p.et[args[1]]) + ") does not exist", pos)
+            return -1
+        }
+        args[0] = coerce(pc, args[0], ct, -1, false)
+        args[1] = coerce(pc, args[1], ct, -1, false)
+        return arrFuncNode(pc, ex.FN_ARRAY_CAT, ct, args)
+    }
+    if n < 1 { return badArgs(pc, name, id) }
+    let at = p.et[args[0]]
+    if !v.isGeneralArray(at) {
+        let types = ""
+        for a in args {
+            if types != "" { types = types + ", " }
+            types = types + v.typeName(p.et[a])
+        }
+        perr(pc, "42883", "function " + name + "(" + types + ") does not exist", pos)
+        return -1
+    }
+    if name == "cardinality" || name == "array_ndims" || name == "array_dims" {
+        if n != 1 { return badArgs(pc, name, id) }
+        if name == "cardinality" { return arrFuncNode(pc, ex.FN_CARDINALITY, v.T_INT4, args) }
+        if name == "array_ndims" { return arrFuncNode(pc, ex.FN_ARRAY_NDIMS, v.T_INT4, args) }
+        return arrFuncNode(pc, ex.FN_ARRAY_DIMS, v.T_TEXT, args)
+    }
+    if name == "array_to_string" {
+        if n < 2 || n > 3 { return badArgs(pc, name, id) }
+        args[1] = coerceText(pc, args[1])
+        if n > 2 { args[2] = coerceText(pc, args[2]) }
+        return arrFuncNode(pc, ex.FN_ARRAY_TO_STRING, v.T_TEXT, args)
+    }
+    // array_position(array, element [, start]) / array_remove(array, element)
+    if n < 2 || n > 3 || (name == "array_remove" && n != 2) { return badArgs(pc, name, id) }
+    let et = v.arrayElemType(at)
+    let ct = commonType(et, p.et[args[1]])
+    if ct < 0 {
+        perr(pc, "42883", "function " + name + "(" + v.typeName(at) + ", " + v.typeName(p.et[args[1]]) + ") does not exist", pos)
+        return -1
+    }
+    args[1] = coerce(pc, args[1], et, -1, false)
+    if n > 2 { args[2] = coerce(pc, args[2], v.T_INT4, -1, false) }
+    if name == "array_remove" { return arrFuncNode(pc, ex.FN_ARRAY_REMOVE, at, args) }
+    return arrFuncNode(pc, ex.FN_ARRAY_POSITION, v.T_INT4, args)
+}
+
+// An EX_FUNC node for an array function: these handle NULL arguments themselves.
+function arrFuncNode(pc: PC, fn: Integer, type: Integer, args: List<Integer>): Integer {
+    let start = ex.addArgs(pc.p, args)
+    return ex.addExpr(pc.p, ex.EX_FUNC, type, start, args.length, fn, 0)
+}
+
+// a || b with an array on either side: array_cat, array_append or array_prepend (an unknown literal beside an
+// array is an array).
+function compileArrayConcat(pc: PC, l: Integer, r: Integer, pos: Integer): Integer {
+    let p = pc.p
+    let lt = p.et[l]
+    let rt = p.et[r]
+    let la = v.isGeneralArray(lt)
+    let ra = v.isGeneralArray(rt)
+    if la && (ra || rt == v.T_UNKNOWN) || ra && lt == v.T_UNKNOWN {
+        let ct = lt
+        if !la { ct = rt }
+        if la && ra {
+            ct = commonType(lt, rt)
+            if ct < 0 {
+                perr(pc, "42883", "operator does not exist: " + v.typeName(lt) + " || " + v.typeName(rt), pos)
+                return -1
+            }
+        }
+        return arrFuncNode(pc, ex.FN_ARRAY_CAT, ct, [coerce(pc, l, ct, -1, false), coerce(pc, r, ct, -1, false)])
+    }
+    if la {
+        let et = v.arrayElemType(lt)
+        if commonType(et, rt) < 0 {
+            perr(pc, "42883", "operator does not exist: " + v.typeName(lt) + " || " + v.typeName(rt), pos)
+            return -1
+        }
+        return arrFuncNode(pc, ex.FN_ARRAY_APPEND, lt, [l, coerce(pc, r, et, -1, false)])
+    }
+    let et = v.arrayElemType(rt)
+    if commonType(et, lt) < 0 {
+        perr(pc, "42883", "operator does not exist: " + v.typeName(lt) + " || " + v.typeName(rt), pos)
+        return -1
+    }
+    return arrFuncNode(pc, ex.FN_ARRAY_PREPEND, rt, [coerce(pc, l, et, -1, false), r])
+}
+
+// f(..., VARIADIC array): the array's elements are the trailing arguments. concat and concat_ws are the
+// variadic built-ins this accepts; they become array_to_string over the array (NULL elements skipped).
+function compileVariadicCall(pc: PC, id: Integer, name: Text): Integer {
+    let p = pc.p
+    let args = fnArgs(pc, id)
+    if pc.err { return -1 }
+    let pos = posOf(pc, id)
+    let want = 1
+    if name == "concat_ws" { want = 2 }
+    if (name != "concat" && name != "concat_ws") || args.length != want {
+        perr(pc, "0A000", "VARIADIC arguments are supported for concat(VARIADIC array) and concat_ws(separator, VARIADIC array) only", pos)
+        return -1
+    }
+    let arrI = args.length - 1
+    let at = p.et[args[arrI]]
+    if at == v.T_UNKNOWN {
+        args[arrI] = coerce(pc, args[arrI], v.T_TEXTARRAY, -1, false)
+    } else if !v.isGeneralArray(at) {
+        perr(pc, "42804", "VARIADIC argument must be an array", pos)
+        return -1
+    }
+    let sep = textConst(pc, "")
+    if name == "concat_ws" { sep = coerceText(pc, args[0]) }
+    return arrFuncNode(pc, ex.FN_ARRAY_TO_STRING, v.T_TEXT, [args[arrI], sep])
+}
+
+// FROM unnest(array [, array ...]) [WITH ORDINALITY] [AS alias [(columns)]]: one row per element, arrays of
+// different lengths padded with NULLs.
+function compileUnnestFrom(pc: PC, id: Integer, leaves: List<Leaf>) {
+    let p = pc.p
+    let a = pc.a
+    let fc = ast.child(a, id, 0)
+    let aliasNode = ast.child(a, id, 1)
+    let alias = "unnest"
+    if aliasNode >= 0 { alias = a.nodes[aliasNode].text }
+    let argIds = ast.items(a, ast.child(a, fc, 1))
+    if argIds.length == 0 {
+        perr(pc, "42883", "function unnest() does not exist", a.nodes[id].position)
+        return
+    }
+    let exprs: List<Integer> = []
+    for ai in argIds {
+        let e = compileExpr(pc, ai)
+        if pc.err { return }
+        if !v.isArrayType(p.et[e]) {
+            let what = "unknown"
+            if p.et[e] != v.T_UNKNOWN { what = v.typeName(p.et[e]) }
+            if p.et[e] == v.T_UNKNOWN {
+                perr(pc, "42725", "function unnest(unknown) is not unique", a.nodes[id].position)
+            } else {
+                perr(pc, "42883", "function unnest(" + what + ") does not exist", a.nodes[id].position)
+            }
+            return
+        }
+        exprs.add(e)
+    }
+    let ord = (a.nodes[id].flags & ast.F_WITH_ORDINALITY) != 0
+    let colAliases = aliasColumns(pc, aliasNode)
+    let t = tb.newTable(-1, "unnest")
+    t.isTemp = true
+    let names: List<Text> = []
+    let types: List<Integer> = []
+    let mods: List<Integer> = []
+    let hidden: List<Boolean> = []
+    let i = 0
+    while i < exprs.length {
+        let name = "unnest"
+        // a single function with a table alias and no column list names its column after the alias
+        if exprs.length == 1 && aliasNode >= 0 { name = alias }
+        if i < colAliases.length { name = colAliases[i] }
+        let et = v.arrayElemType(p.et[exprs[i]])
+        tb.addColumn(t, tb.newColumn(name, et, -1, false))
+        names.add(name)
+        types.add(v.sqlType(et))
+        mods.add(-1)
+        hidden.add(false)
+        i += 1
+    }
+    if ord {
+        let name = "ordinality"
+        if exprs.length < colAliases.length { name = colAliases[exprs.length] }
+        tb.addColumn(t, tb.newColumn(name, v.T_INT8, -1, false))
+        names.add(name)
+        types.add(v.T_INT8)
+        mods.add(-1)
+        hidden.add(false)
+    }
+    let ti = ex.addTemp(p, t)
+    let slot = newSlot(pc, t)
+    let spec: List<Integer> = [exprs.length]
+    for e in exprs { spec.add(e) }
+    if ord { spec.add(1) } else { spec.add(0) }
+    let op = ex.addOp(p, ex.O_UNNEST, slot, ti, ex.listBlock(p, spec), 0, 0, 0)
+    pushRange(pc, Range { name: alias; slot: slot; level: pc.level; tableId: -1; cols: names; types: types; mods: mods; hidden: hidden })
+    leaves.add(Leaf { op: op; slot: -1; tableId: -1; slots: [slot]; outer: false })
 }
 
 // ---------------------------------------------------------------- EXPLAIN
@@ -5948,6 +7008,10 @@ function explainOp(c: cat.Catalog, p: ex.Plan, o: Integer, depth: Integer, out: 
     let k = p.ok[o]
     if k == ex.O_SCAN {
         explainLine(out, depth, withFilter("Seq Scan on " + slotName(p, p.oa[o]), p.oc[o]))
+    } else if k == ex.O_ANN {
+        let x = c.annIdx[p.ob[o]]
+        explainLine(out, depth, withFilter("Index Scan using " + x.name + " on " + slotName(p, p.oa[o]), p.od[o]))
+        explainLine(out, depth + 1, "Order By: (" + c.tables[x.tableId].cols[x.col].name + " " + x.operator + " $value)")
     } else if k == ex.O_HASHEQ {
         explainLine(out, depth, withFilter("Index Scan using " + c.hashIdx[p.ob[o]].name + " on " + slotName(p, p.oa[o]), p.oc[o]))
     } else if k == ex.O_RANGE {
@@ -6057,6 +7121,39 @@ function compileSearchFunc(pc: PC, id: Integer, name: Text): Integer {
     }
     let st = p.searches.length - 1
     if name == "score" || name == "full_score" || name == "max_score" || name == "bm25" {
+        // tin.score(ctid, dense_ratio): TIN's default scoring elides terms in >= dense_ratio of the documents; neo-db's
+        // tin.score(ctid) without it is exact BM25 like tin.full_score (docs/r2/search.md)
+        let dense = 0.0
+        if name == "score" {
+            let rawArgs = ast.items(pc.a, ast.child(pc.a, id, 1))
+            let names = ast.items(pc.a, ast.child(pc.a, id, 5))
+            let i = 1
+            while i < rawArgs.length {
+                let an = ""
+                if i < names.length { an = pc.a.nodes[names[i]].text }
+                if an == "" && i == 1 { an = "dense_ratio" }
+                if an != "dense_ratio" {
+                    perr(pc, "0A000", "tin.score(): argument " + an + " is not supported (neo-db scores with k1 = 1.2, b = 0.75; only dense_ratio can be given)", pc.a.nodes[rawArgs[i]].position)
+                    return -1
+                }
+                let x = pc.a.nodes[rawArgs[i]]
+                let val = -1.0
+                if x.kind == ast.K_INT_LIT { val = Float(x.intValue) } else if x.kind == ast.K_NUM_LIT { val = x.floatValue }
+                if val < 0.0 {
+                    perr(pc, "22023", "dense_ratio must be a finite, non-negative number literal", x.position)
+                    return -1
+                }
+                dense = val
+                i += 1
+            }
+        }
+        let ss = p.searches[st]
+        if ss.denseSet && ss.dense != dense {
+            perr(pc, "42883", "tin.score() calls on one relation must use identical dense_ratio arguments (tin.full_score is exact)", nd.position)
+            return -1
+        }
+        ss.dense = dense
+        ss.denseSet = true
         return ex.addExpr(p, ex.EX_SEARCH_SCORE, v.T_FLOAT8, -1, -1, st, 0)
     }
     if name == "highlight" || name == "snippet" {

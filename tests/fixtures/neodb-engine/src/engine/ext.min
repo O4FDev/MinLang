@@ -50,7 +50,15 @@ public record Agg {
     oid: Integer
 }
 
+// An index access method (hnsw, ivfflat) of extension `ext`.
+public record Method {
+    ext: Integer
+    def: sdk.IndexMethodDef
+    oid: Integer       // pg_am oid; its operator classes are oid + 1 + position
+}
+
 public record Registry {
+    methods: List<Method>
     fixed: List<Integer>               // engine type ids of types with fixed (core Postgres) oids
     exts: List<sdk.Extension>
     bases: List<Integer>
@@ -73,7 +81,7 @@ function fnv1a(t: Text): Integer {
 }
 
 function build(): Registry {
-    let r = Registry { fixed: []; exts: []; bases: []; types: []; fns: []; ops: []; casts: []; aggs: [] }
+    let r = Registry { methods: []; fixed: []; exts: []; bases: []; types: []; fns: []; ops: []; casts: []; aggs: [] }
     for x in available.available() {
         let e = r.exts.length
         let base = OID_BASE + (fnv1a(x.name) % 20000) * 1024
@@ -105,6 +113,11 @@ function build(): Registry {
             r.aggs.add(Agg { ext: e; def: a; oid: base + 64 + i })
             i += 1
         }
+        for m in x.indexMethods {
+            r.methods.add(Method { ext: e; def: m; oid: base + 64 + i })
+            i += 1 + m.opclasses.length
+        }
+        if i >= 1024 - 64 { fail("extension " + x.name + " needs more than 1024 OIDs") }
         i = 0
         for o in x.operators {
             let fi = -1
@@ -125,6 +138,30 @@ function build(): Registry {
 
 public function registry(): Registry { return REG }
 
+// `minyar patch` can add an extension package to a running server: the patched available() lists it after
+// the ones the server started with. CREATE EXTENSION and the extension catalogs pick it up here. Existing
+// extensions keep their positions, so every index and OID already handed out stays valid; any other change
+// to the list needs a restart and is ignored.
+public function refresh() {
+    let now = available.available()
+    if now.length <= REG.exts.length { return }
+    let i = 0
+    while i < REG.exts.length {
+        if now[i].name != REG.exts[i].name { return }
+        i += 1
+    }
+    // REG is a global binding: replace its contents.
+    let fresh = build()
+    REG.fixed = fresh.fixed
+    REG.exts = fresh.exts
+    REG.bases = fresh.bases
+    REG.types = fresh.types
+    REG.fns = fresh.fns
+    REG.ops = fresh.ops
+    REG.casts = fresh.casts
+    REG.aggs = fresh.aggs
+}
+
 // ---------------------------------------------------------------- extensions
 
 public function extensionCount(): Integer { return REG.exts.length }
@@ -132,6 +169,7 @@ public function extension(i: Integer): sdk.Extension { return REG.exts[i] }
 
 // An extension CREATE EXTENSION can install (built-ins are always installed and not found here).
 public function findExtension(name: Text): Integer {
+    refresh()
     let i = 0
     while i < REG.exts.length {
         if REG.exts[i].name == name && !REG.exts[i].builtin { return i }
@@ -166,11 +204,31 @@ public function isInstalled(installed: List<Integer>, e: Integer): Boolean {
 
 public function isExtType(t: Integer): Boolean {
     if t <= TYPE_BASE { return false }
-    if t >= TYPE_BASE + OID_BASE { return t < TYPE_BASE + OID_BASE + OID_SPAN }
+    if t >= TYPE_BASE + OID_BASE {
+        // an extension's OID block holds its types at even offsets 0..62 and their array types at odd ones
+        let at = (t - TYPE_BASE - OID_BASE) % 1024
+        return t < TYPE_BASE + OID_BASE + OID_SPAN && at < 64 && at % 2 == 0
+    }
     for f in REG.fixed {
         if f == t { return true }
     }
     return false
+}
+
+// Engine type id of the array type of extension type t, or -1.
+public function arrayTypeOf(t: Integer): Integer {
+    let i = typeAt(t)
+    if i < 0 { return -1 }
+    return TYPE_BASE + REG.types[i].arrayOid
+}
+
+// Element type of extension array type t (engine ids), or 0 (values.T_UNKNOWN) when t is not one.
+public function elemTypeOfArray(t: Integer): Integer {
+    let oid = t - TYPE_BASE
+    for ty in REG.types {
+        if ty.arrayOid == oid { return TYPE_BASE + ty.oid }
+    }
+    return 0
 }
 
 public function isBuiltin(e: Integer): Boolean { return REG.exts[e].builtin }
@@ -254,3 +312,21 @@ public function agg(i: Integer): Agg { return REG.aggs[i] }
 
 // Calls to an extension function or type callback: one Call per expression node, reused for every row.
 public function newCall(arguments: Integer, host: sdk.Host): sdk.Call { return sdk.newCall(arguments, host) }
+
+// ---------------------------------------------------------------- index access methods
+
+// The installed index method called `name` (CREATE INDEX ... USING name), or -1.
+public function findMethod(installed: List<Integer>, name: Text): Integer {
+    let i = 0
+    while i < REG.methods.length {
+        if REG.methods[i].def.name == name && isInstalled(installed, REG.methods[i].ext) { return i }
+        i += 1
+    }
+    return -1
+}
+
+public function method(i: Integer): sdk.IndexMethodDef { return REG.methods[i].def }
+
+public function methodCount(): Integer { return REG.methods.length }
+
+public function methodOid(i: Integer): Integer { return REG.methods[i].oid }

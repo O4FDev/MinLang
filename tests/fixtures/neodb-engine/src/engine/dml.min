@@ -10,6 +10,7 @@ use "./exec.min" as ex
 use "./plan.min" as pl
 use "./numeric.min" as nm
 use "text" as utf8
+use "./array.min" as arr
 
 // redo opcodes
 public constant R_INSERT = 1
@@ -29,10 +30,11 @@ public record Run {
     conflictRow: Integer   // row that made the last unique check fail
     conflictHid: Integer   // its hash index
     touched: hm.IntMap     // ON CONFLICT DO UPDATE: rows this statement inserted or updated
+    formats: List<Integer> // result formats of the statement's RETURNING rows (binary for asyncpg)
 }
 
 public function newRun(): Run {
-    return Run { rowData: Bytes(); rowCount: 0; affected: 0; keys: []; rows: Bytes(); seen: hm.newIntMap(16); conflictRow: -1; conflictHid: -1; touched: hm.newIntMap(16) }
+    return Run { rowData: Bytes(); rowCount: 0; affected: 0; keys: []; rows: Bytes(); seen: hm.newIntMap(16); conflictRow: -1; conflictHid: -1; touched: hm.newIntMap(16); formats: [] }
 }
 
 // ---------------------------------------------------------------- binding
@@ -73,6 +75,10 @@ public function bindParams(st: pl.Stmt, params: List<Bytes>, nulls: List<Boolean
 public function bindBinary(p: ex.Plan, n: Integer, t: Integer, b: Bytes) {
     if v.isExtType(t) {
         ex.extReceive(p, b, n, t, -1)
+        return
+    }
+    if v.isGeneralArray(t) {
+        recvArray(p, n, t, b)
         return
     }
     let len = b.length
@@ -325,7 +331,7 @@ function uniqueError(st: pl.Stmt, t: tb.Table, h: ix.HashIndex, r: Integer) {
     let names: List<Text> = []
     let vals: List<Text> = []
     for ci in h.cols {
-        names.add(t.cols[ci].name)
+        if tb.isGenerated(t.cols[ci]) { names.add(t.cols[ci].generated) } else { names.add(t.cols[ci].name) }
         vals.add(cellText(t.cols[ci], r))
     }
     p.errDetail = "Key (" + joinWith(names, ", ") + ")=(" + joinWith(vals, ", ") + ") already exists."
@@ -346,9 +352,9 @@ public function cellText(c: tb.Column, r: Integer): Text {
     if tb.isNull(c, r) { return "null" }
     let b = Bytes()
     let t = c.type
-    if v.isExtType(t) { return ex.extText(t, c.heap, tb.textOff(c, r), tb.textLen(c, r)) }
+    if v.isExtType(t) { return ex.extText(t, tb.textBuf(c, r), tb.textAt(c, r), tb.textLen(c, r)) }
     if v.isTextType(t) {
-        b.addBytes(c.heap.slice(tb.textOff(c, r), tb.textOff(c, r) + tb.textLen(c, r)))
+        b.addBytes(tb.textBytes(c, r))
     } else if t == v.T_FLOAT8 || t == v.T_FLOAT4 {
         v.addFloat(b, tb.getFloat(c, r), t == v.T_FLOAT4)
     } else if t == v.T_NUMERIC {
@@ -406,9 +412,11 @@ function insertOne(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, t: 
     }
     i = 0
     while i < nc {
-        ex.ev(p, nodes[base + i])
+        if !tb.isGenerated(t.cols[i]) { ex.ev(p, nodes[base + i]) }
         i += 1
     }
+    if p.err { return -1 }
+    computeGenerated(st, t, nodes, base)
     if p.err { return -1 }
     if !notNullCheck(st, t, nodes, base) { return -1 }
     let u = uniqueCheck(st, c, tm, tx.slot, t, nodes, base, -1, run)
@@ -441,13 +449,14 @@ function insertOne(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, t: 
     if st.returning {
         p.slotTable[st.slot] = t
         p.slotRow[st.slot] = r
-        encodeRow(st, [], run.rowData)
+        encodeRow(st, run.formats, run.rowData)
         run.rowCount += 1
     }
     return 0
 }
 
 public function runInsert(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, formats: List<Integer>, run: Run) {
+    run.formats = formats
     let p = st.p
     let t = c.tables[st.tableId]
     let nc = t.cols.length
@@ -503,7 +512,7 @@ public function runInsert(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.T
             for sn in st.serialNodes {
                 if sn == n { isSerial = true }
             }
-            if !isSerial {
+            if !isSerial && !tb.isGenerated(t.cols[i]) {
                 ex.ev(p, n)
                 ex.storeCell(p, n, buf.cols[i], br)
             }
@@ -521,9 +530,11 @@ public function runInsert(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.T
             for sn in st.serialNodes {
                 if sn == n { isSerial = true }
             }
-            if !isSerial { ex.loadCell(p, n, buf.cols[i], r) }
+            if !isSerial && !tb.isGenerated(t.cols[i]) { ex.loadCell(p, n, buf.cols[i], r) }
             i += 1
         }
+        computeGenerated(st, t, st.srcExprs, 0)
+        if p.err { return }
         let res = 0
         if st.routeIdx >= 0 {
             assignSerials(st, t, tx, st.srcExprs)
@@ -535,6 +546,46 @@ public function runInsert(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.T
         if res == 0 { run.affected += 1 }
         r += 1
     }
+}
+
+// Generated columns (expression index keys, ADR-015): put the new row's other values (registers nodes[base + i])
+// into the statement's one-row buffer and evaluate each generated column's node over it.
+function computeGenerated(st: pl.Stmt, t: tb.Table, nodes: List<Integer>, base: Integer) {
+    if st.genSlot < 0 { return }
+    let p = st.p
+    let buf = p.temps[st.genTemp]
+    let i = 0
+    while i < t.cols.length {
+        if !tb.isGenerated(t.cols[i]) { ex.storeCell(p, nodes[base + i], buf.cols[i], 0) }
+        i += 1
+    }
+    p.slotTable[st.genSlot] = buf
+    p.slotRow[st.genSlot] = 0
+    for n in st.genNodes { ex.ev(p, n) }
+}
+
+// SET values of row r: the user's SET expressions, then the generated columns recomputed from the updated row
+// (its current cells with the SET values applied).
+function evalSet(st: pl.Stmt, t: tb.Table, r: Integer) {
+    let p = st.p
+    let nu = st.setExprs.length
+    if st.nUserSet >= 0 { nu = st.nUserSet }
+    let j = 0
+    while j < nu {
+        ex.ev(p, st.setExprs[j])
+        j += 1
+    }
+    if st.genSlot < 0 || p.err { return }
+    let buf = p.temps[st.genTemp]
+    tb.copyRow(t, r, buf, 0)
+    j = 0
+    while j < nu {
+        ex.storeCell(p, st.setExprs[j], buf.cols[st.setCols[j]], 0)
+        j += 1
+    }
+    p.slotTable[st.genSlot] = buf
+    p.slotRow[st.genSlot] = 0
+    for n in st.genNodes { ex.ev(p, n) }
 }
 
 // serial / identity defaults among the row registers (target table counter)
@@ -676,7 +727,7 @@ function insertLoaded(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, 
     if st.returning {
         p.slotTable[st.slot] = t
         p.slotRow[st.slot] = r
-        encodeRow(st, [], run.rowData)
+        encodeRow(st, run.formats, run.rowData)
         run.rowCount += 1
     }
     return 0
@@ -706,14 +757,14 @@ function conflictUpdate(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn
         if p.err { return -1 }
         if p.rNull[st.conflictWhere] != 0 || p.rInt[st.conflictWhere] == 0 { return 1 }
     }
-    for n in st.setExprs { ex.ev(p, n) }
+    evalSet(st, t, r)
     if p.err { return -1 }
     hm.put(run.touched, r, 1)
     if !updateRowInPlace(st, c, tm, tx, t, r, run) { return -1 }
     if st.returning {
         p.slotTable[st.slot] = t
         p.slotRow[st.slot] = r
-        encodeRow(st, [], run.rowData)
+        encodeRow(st, run.formats, run.rowData)
         run.rowCount += 1
     }
     return 0
@@ -882,10 +933,7 @@ function runUpdateOne(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, 
                 j += 1
             }
         } else {
-            while j < ns {
-                ex.ev(p, st.setExprs[j])
-                j += 1
-            }
+            evalSet(st, t, r)
         }
         if p.err { return }
         if st.routeIdx >= 0 {
@@ -1042,8 +1090,8 @@ function uniqueCheckUpdate(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, me: Inte
                     } else {
                         k.nulls[i] = false
                         if v.isTextType(col.type) {
-                            k.bufs[i] = col.heap
-                            k.offs[i] = tb.textOff(col, r)
+                            k.bufs[i] = tb.textBuf(col, r)
+                            k.offs[i] = tb.textAt(col, r)
                             k.lens[i] = tb.textLen(col, r)
                         } else if col.type == v.T_FLOAT8 || col.type == v.T_FLOAT4 {
                             k.flts[i] = tb.getFloat(col, r)
@@ -1149,8 +1197,19 @@ function runDeleteOne(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.Txn, 
 // ---------------------------------------------------------------- redo replay (recovery)
 
 // Apply one redo payload (a committed transaction's operations). DDL records are returned to the caller
-// through ddlOut (in order) because replaying them needs the parser.
+// through ddlOut (in order) because replaying them needs the parser. Recovery leaves the indexes alone and rebuilds
+// those of the tables it loaded afterwards; a replica applying records as they arrive maintains them as it goes
+// (replayOpsIndexed), the way live DML does: inserts are added, rows whose indexed columns change are moved, deleted
+// rows stay in the index (readers check the row state).
 public function replayOps(c: cat.Catalog, b: Bytes, start: Integer, end: Integer, ddlOut: List<Text>, ddlAt: List<Integer>, need: List<Integer>): Integer {
+    return replayWith(c, b, start, end, ddlOut, ddlAt, need, false)
+}
+
+public function replayOpsIndexed(c: cat.Catalog, b: Bytes, start: Integer, end: Integer, ddlOut: List<Text>, ddlAt: List<Integer>, need: List<Integer>): Integer {
+    return replayWith(c, b, start, end, ddlOut, ddlAt, need, true)
+}
+
+function replayWith(c: cat.Catalog, b: Bytes, start: Integer, end: Integer, ddlOut: List<Text>, ddlAt: List<Integer>, need: List<Integer>, indexed: Boolean): Integer {
     let cur = tb.Cursor { pos: start }
     let count = 0
     while cur.pos < end {
@@ -1174,29 +1233,52 @@ public function replayOps(c: cat.Catalog, b: Bytes, start: Integer, end: Integer
                 return opStart
             }
         }
+        // search indexes are maintained through replay (cat.searchRow*); hash and ordered ones are rebuilt after it
+        let searched = t.searchIds.length > 0
         if op == R_INSERT {
             let r = tb.getVarint(b, cur)
             tb.ensureRows(t, r + 1)
+            if searched && r < t.nrows { cat.searchRowChanging(c, t, r) }
             tb.decodeRow(t, r, b, cur)
             if t.state[r] != 0 { t.live += 1 }
             t.state[r] = 0
+            if indexed { cat.indexInsertRow(c, t, r) }
+            if searched { cat.searchRowChanged(c, t, r) }
         } else if op == R_UPDATE {
             let r = tb.getVarint(b, cur)
             let n = tb.getVarint(b, cur)
+            let keyChange = false
+            if indexed && (t.hashIds.length > 0 || t.ordIds.length > 0) {
+                let scan = tb.Cursor { pos: cur.pos }
+                let k = 0
+                while k < n {
+                    let ci = tb.getVarint(b, scan)
+                    if cat.columnIndexed(c, t, ci) { keyChange = true }
+                    tb.skipValue(t.cols[ci], b, scan)
+                    k += 1
+                }
+            }
+            if keyChange { cat.indexRemoveRow(c, t, r) }
+            if searched && r < t.nrows { cat.searchRowChanging(c, t, r) }
             let i = 0
             while i < n {
                 let ci = tb.getVarint(b, cur)
                 tb.decodeValue(t.cols[ci], r, b, cur)
                 i += 1
             }
+            if keyChange { cat.indexInsertRow(c, t, r) }
+            if searched && r < t.nrows { cat.searchRowChanged(c, t, r) }
         } else if op == R_DELETE {
             let r = tb.getVarint(b, cur)
             if r < t.nrows {
+                if searched { cat.searchRowChanging(c, t, r) }
                 if t.state[r] == 0 { t.live -= 1 }
                 t.state[r] = tb.ST_DEAD
             }
         } else if op == R_TRUNCATE {
             tb.truncate(t)
+            if indexed { cat.rebuildIndexes(c, t) }
+            cat.searchTruncated(c, t)
         } else if op == R_SERIAL {
             let s = tb.getVarint(b, cur)
             if s > t.serial { t.serial = s }
@@ -1204,4 +1286,86 @@ public function replayOps(c: cat.Catalog, b: Bytes, start: Integer, end: Integer
         count += 1
     }
     return end
+}
+
+// Binary array (array_recv) into register n of array type t: ndim, has-null flag, element oid, (length, lower
+// bound) per dimension, then each element as length + its type's binary form (-1 for NULL). The register gets
+// the canonical text form.
+function recvArray(p: ex.Plan, n: Integer, t: Integer, b: Bytes) {
+    let len = b.length
+    if len < 12 {
+        ex.raise(p, "22P03", "insufficient data left in message")
+        return
+    }
+    let ndim = v.getBE32(b, 0)
+    let flags = v.getBE32(b, 4)
+    let elemOid = v.getBE32(b, 8)
+    if elemOid < 0 { elemOid += 4294967296 }
+    if ndim < 0 || ndim > arr.MAXDIM {
+        ex.raise(p, "22P03", "invalid number of dimensions: " + Text(ndim))
+        return
+    }
+    if flags != 0 && flags != 1 {
+        ex.raise(p, "22P03", "invalid array flags")
+        return
+    }
+    let et = v.arrayElemType(t)
+    let want = v.typeOid(et)
+    if elemOid != want {
+        ex.raise(p, "42804", "binary data has array element type " + Text(elemOid) + " instead of expected " + Text(want) + " (" + v.typeName(et) + ")")
+        return
+    }
+    if len < 12 + ndim * 8 {
+        ex.raise(p, "22P03", "insufficient data left in message")
+        return
+    }
+    let out = arr.newArr()
+    let total = 1
+    let d = 0
+    while d < ndim {
+        let dim = v.getBE32(b, 12 + d * 8)
+        let lb = v.getBE32(b, 16 + d * 8)
+        if dim < 0 || total * dim > 134217727 {
+            ex.raise(p, "54000", "array size exceeds the maximum allowed (134217727)")
+            return
+        }
+        total = total * dim
+        out.dims.add(dim)
+        out.lbs.add(lb)
+        d += 1
+    }
+    out.ndim = ndim
+    if ndim == 0 || total == 0 {
+        out.reset()
+        total = 0
+    }
+    let pos = 12 + ndim * 8
+    let er = ex.elemReg(p, 0, et)
+    let i = 0
+    while i < total {
+        if pos + 4 > len {
+            ex.raise(p, "22P03", "insufficient data left in message")
+            return
+        }
+        let el = v.getBE32(b, pos)
+        pos += 4
+        if el == -1 {
+            out.addNull()
+        } else {
+            if el < 0 || pos + el > len {
+                ex.raise(p, "22P03", "insufficient data left in message")
+                return
+            }
+            bindBinary(p, er, et, b.slice(pos, pos + el))
+            if p.err { return }
+            ex.addElemReg(p, out, er, et)
+            pos += el
+        }
+        i += 1
+    }
+    if pos != len {
+        ex.raise(p, "22P03", "incorrect binary data format in element")
+        return
+    }
+    ex.setArrayResult(p, n, out)
 }

@@ -1,0 +1,268 @@
+// The hnsw and ivfflat index access methods (CREATE INDEX ... USING hnsw (embedding vector_l2_ops)), behind the
+// SDK's index-method interface. The graph and list structures are hnsw.min and ivfflat.min; this file maps
+// pgvector's operator classes and options onto them and converts stored values to their rows (vector: float4
+// values as stored; halfvec: widened to float4; bit: the bits without the length header).
+use "neodb-sdk" as sdk
+use "./ann.min" as ann
+use "./hnsw.min" as hnsw
+use "./ivfflat.min" as ivf
+use "./float4.min" as f4
+
+constant KIND_VECTOR = 0
+constant KIND_HALF = 1
+constant KIND_BIT = 2
+constant KIND_SPARSE = 3
+constant SPARSE_MAX_NNZ = 1000      // pgvector's HNSW_MAX_NNZ
+constant SPARSE_FIRST_CAPACITY = 16
+
+// One open index: which structure, its metric and the stored type it reads.
+record Open {
+    method: Integer          // 0 hnsw, 1 ivfflat
+    slot: Integer            // position in GRAPHS or LISTS
+    metric: Integer
+    kind: Integer
+    dims: Integer
+    row: Bytes               // a converted row or query
+    ids: List<Integer>
+    dists: List<Float>
+    live: Boolean
+}
+
+global OPEN: List<Open> = []
+global GRAPHS: List<hnsw.Hnsw> = []
+global LISTS: List<ivf.IvfFlat> = []
+
+// Operator classes: name, type, operator, metric (ann.*). ivfflat has no l1 or jaccard classes, as in pgvector.
+function classes(ivfflat: Boolean): List<sdk.OpClassDef> {
+    let out: List<sdk.OpClassDef> = []
+    for t in ["vector", "halfvec"] {
+        // pgvector's one default class: vector_l2_ops for ivfflat
+        out.add(sdk.OpClassDef { name: t + "_l2_ops"; type: t; operator: "<->"; isDefault: ivfflat && t == "vector" })
+        out.add(sdk.OpClassDef { name: t + "_ip_ops"; type: t; operator: "<#>"; isDefault: false })
+        out.add(sdk.OpClassDef { name: t + "_cosine_ops"; type: t; operator: "<=>"; isDefault: false })
+        if !ivfflat { out.add(sdk.OpClassDef { name: t + "_l1_ops"; type: t; operator: "<+>"; isDefault: false }) }
+    }
+    if !ivfflat {
+        out.add(sdk.OpClassDef { name: "sparsevec_l2_ops"; type: "sparsevec"; operator: "<->"; isDefault: false })
+        out.add(sdk.OpClassDef { name: "sparsevec_ip_ops"; type: "sparsevec"; operator: "<#>"; isDefault: false })
+        out.add(sdk.OpClassDef { name: "sparsevec_cosine_ops"; type: "sparsevec"; operator: "<=>"; isDefault: false })
+        out.add(sdk.OpClassDef { name: "sparsevec_l1_ops"; type: "sparsevec"; operator: "<+>"; isDefault: false })
+    }
+    out.add(sdk.OpClassDef { name: "bit_hamming_ops"; type: "bit"; operator: "<~>"; isDefault: false })
+    if !ivfflat { out.add(sdk.OpClassDef { name: "bit_jaccard_ops"; type: "bit"; operator: "<%>"; isDefault: false }) }
+    return out
+}
+
+public function register(x: sdk.Extension) {
+    x.indexMethod(method(false))
+    x.indexMethod(method(true))
+}
+
+function method(ivfflat: Boolean): sdk.IndexMethodDef {
+    let name = "hnsw"
+    let setting = "hnsw.ef_search"
+    let effort = hnsw.DEFAULT_EF_SEARCH
+    let most = 1000
+    if ivfflat {
+        name = "ivfflat"
+        setting = "ivfflat.probes"
+        effort = ivf.DEFAULT_PROBES
+        most = 32768
+    }
+    let cls = classes(ivfflat)
+    return sdk.IndexMethodDef {
+        name: name; opclasses: cls
+        create: function(o) { return create(o, ivfflat, cls) }
+        insert: insert
+        remove: function(h, r) { remove(h, r) }
+        built: function(h) { built(h) }
+        search: search
+        drop: function(h) { drop(h) }
+        effortSetting: setting; effortDefault: effort; effortMin: 1; effortMax: most
+    }
+}
+
+// An integer option: its value, the default when absent, or -1 with o failed (pgvector's messages).
+function intOption(o: sdk.IndexOptions, name: Text, fallback: Integer, lo: Integer, hi: Integer): Integer {
+    let txt = o.option(name)
+    if txt == "" { return fallback }
+    let x = 0
+    let ok = true
+    let neg = false
+    let i = 0
+    for c in Bytes(txt) {
+        if i == 0 && c == 45 {
+            neg = true
+        } else if c >= 48 && c <= 57 && x < 100000000 {
+            x = x * 10 + (c - 48)
+        } else {
+            ok = false
+        }
+        i += 1
+    }
+    if neg { x = -x }
+    if !ok {
+        o.fail("22023", "invalid value for integer option \"" + name + "\": " + txt)
+        return -1
+    }
+    if x < lo || x > hi {
+        o.failWithDetail("22023", "value " + txt + " out of bounds for option \"" + name + "\"",
+                         "Valid values are between \"" + Text(lo) + "\" and \"" + Text(hi) + "\".")
+        return -1
+    }
+    return x
+}
+
+function create(o: sdk.IndexOptions, ivfflat: Boolean, cls: List<sdk.OpClassDef>): Integer {
+    let c = cls[o.opclass]
+    let kind = KIND_VECTOR
+    if c.type == "halfvec" { kind = KIND_HALF }
+    if c.type == "bit" { kind = KIND_BIT }
+    if c.type == "sparsevec" { kind = KIND_SPARSE }
+    let am = "hnsw"
+    if ivfflat { am = "ivfflat" }
+    for n in o.names {
+        let known = (!ivfflat && (n == "m" || n == "ef_construction")) || (ivfflat && n == "lists")
+        if !known {
+            o.fail("22023", "unrecognized parameter \"" + n + "\"")
+            return -1
+        }
+    }
+    if o.modifier < 0 {
+        o.fail("22023", "column does not have dimensions")
+        return -1
+    }
+    let most = 2000
+    if kind == KIND_HALF { most = 4000 }
+    if kind == KIND_BIT { most = 64000 }
+    if kind == KIND_SPARSE { most = 1000000000 }
+    if o.modifier > most {
+        o.fail("54000", "column cannot have more than " + Text(most) + " dimensions for " + am + " index")
+        return -1
+    }
+    let metric = ann.metricNamed(c.operator)
+    // sparse rows: the graph's "dimensions" is its row capacity in elements, grown as wider rows arrive
+    let width = o.modifier
+    if kind == KIND_SPARSE {
+        metric = ann.SPARSE_L2 + metric
+        width = SPARSE_FIRST_CAPACITY
+    }
+    let handle = OPEN.length
+    let seed = 1469598103934665603 + handle * 1099511628211
+    let slot = 0
+    if ivfflat {
+        let lists = intOption(o, "lists", ivf.DEFAULT_LISTS, 1, 32768)
+        if o.failed { return -1 }
+        slot = LISTS.length
+        LISTS.add(ivf.newIvfFlat(o.modifier, metric, lists, seed))
+    } else {
+        let m = intOption(o, "m", hnsw.DEFAULT_M, 2, 100)
+        let efc = intOption(o, "ef_construction", hnsw.DEFAULT_EF_CONSTRUCTION, 4, 1000)
+        if o.failed { return -1 }
+        if efc < 2 * m {
+            o.fail("22023", "ef_construction must be greater than or equal to 2 * m")
+            return -1
+        }
+        slot = GRAPHS.length
+        GRAPHS.add(hnsw.newHnsw(width, metric, m, efc, seed))
+    }
+    let method = 0
+    if ivfflat { method = 1 }
+    OPEN.add(Open { method: method; slot: slot; metric: metric; kind: kind; dims: o.modifier; row: Bytes(); ids: []
+                    dists: []; live: true })
+    return handle
+}
+
+// The row form of a stored value: float4 values (halfvec widened), or the bits after bit's length header.
+// Returns the offset of the row in `into` or in b.
+function rowOf(x: Open, b: Bytes, off: Integer): Integer {
+    if x.kind == KIND_BIT { return off + 4 }
+    if x.kind == KIND_VECTOR || x.kind == KIND_SPARSE { return off }
+    let r = x.row
+    r.clear()
+    let i = 0
+    while i < x.dims {
+        r.addFloat32(f4.halfToFloat(b.getUInt16(off + i * 2)))
+        i += 1
+    }
+    return 0
+}
+
+function source(x: Open, b: Bytes): Bytes {
+    if x.kind == KIND_HALF { return x.row }
+    return b
+}
+
+deterministic function insert(h: Integer, r: Integer, b: Bytes, off: Integer, len: Integer, failure: sdk.IndexFailure): Boolean {
+    let x = OPEN[h]
+    if !x.live { return false }
+    if x.kind == KIND_SPARSE {
+        let n = b.getInt32(off + 4)
+        if n > SPARSE_MAX_NNZ {
+            failure.fail("54000", "sparsevec cannot have more than " + Text(SPARSE_MAX_NNZ) + " non-zero elements for hnsw index")
+            return false
+        }
+        let g = GRAPHS[x.slot]
+        if n > g.dimensions {
+            let want = g.dimensions * 2
+            while want < n { want = want * 2 }
+            if want > SPARSE_MAX_NNZ { want = SPARSE_MAX_NNZ }
+            g.growSparse(want)
+        }
+    }
+    let at = rowOf(x, b, off)
+    if x.method == 1 { return LISTS[x.slot].insert(r, source(x, b), at) }
+    return GRAPHS[x.slot].insert(r, source(x, b), at)
+}
+
+deterministic function remove(h: Integer, r: Integer) {
+    let x = OPEN[h]
+    if !x.live { return }
+    if x.method == 1 {
+        LISTS[x.slot].remove(r)
+        return
+    }
+    let g = GRAPHS[x.slot]
+    g.remove(r)
+    // repair and compact once removed rows are a third of the graph (pgvector repairs at VACUUM)
+    if g.deletedCount() > 1000 && g.deletedCount() * 2 > g.count() { g.vacuum() }
+}
+
+deterministic function built(h: Integer) {
+    let x = OPEN[h]
+    if x.live && x.method == 1 { LISTS[x.slot].train() }
+}
+
+deterministic function search(h: Integer, q: Bytes, off: Integer, len: Integer, effort: Integer, want: Integer, rows: List<Integer>): Integer {
+    let x = OPEN[h]
+    if !x.live { return 0 }
+    // a NULL query (length -1): every distance is zero
+    if len < 0 {
+        if x.method == 1 { return LISTS[x.slot].anyRows(effort, rows) }
+        return GRAPHS[x.slot].anyRows(effort, rows)
+    }
+    let at = rowOf(x, q, off)
+    if x.method == 1 {
+        let l = LISTS[x.slot]
+        // every row of the probed lists, nearest first (pgvector scans the whole lists), or the `want` nearest
+        let k = l.count()
+        if want >= 0 && want < k { k = want }
+        return l.search(source(x, q), at, k, effort, rows, x.dists)
+    }
+    // hnsw: ef_search candidates, nearest first (at most `want` of them)
+    let k = effort
+    if want >= 0 && want < k { k = want }
+    return GRAPHS[x.slot].search(source(x, q), at, k, effort, rows, x.dists)
+}
+
+function drop(h: Integer) {
+    let x = OPEN[h]
+    if !x.live { return }
+    x.live = false
+    // release the structure's memory; the slot stays so handles never move
+    if x.method == 1 {
+        LISTS[x.slot] = ivf.newIvfFlat(1, ann.L2, 1, 0)
+    } else {
+        GRAPHS[x.slot] = hnsw.newHnsw(1, ann.L2, 2, 4, 0)
+    }
+}
