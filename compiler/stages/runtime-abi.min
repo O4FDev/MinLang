@@ -239,14 +239,31 @@ good:
 
 }
 
-function literalName(prefix: Text, index: Integer, data: Boolean): Text {
+// String and List constants are named by a digest of their content (see
+// genericInstanceDigest), never by token position: an edit that adds code before
+// them must not rename them, or a live patch would treat every later function
+// as changed. Equal constants share one definition.
+function literalName(prefix: Text, digest: Text, data: Boolean): Text {
     if prefix == "" {
-        if data { return ".text.data." + Text(index) }
-        return ".text." + Text(index)
+        if data { return ".text.data." + digest }
+        return ".text." + digest
     }
     let kind = "value"
     if data { kind = "data" }
-    return "\"minyar.literal|" + prefix + "|" + kind + "|" + Text(index) + "\""
+    return "\"minyar.literal|" + prefix + "|" + kind + "|" + digest + "\""
+}
+
+// Records a content-named constant; true when it still needs its definition.
+// Two different contents with one digest are a compile error.
+function newConstantName(names: GenericIndex, contents: List<Text>, digest: Text, content: Text): Boolean {
+    let seen = genericIndexGet(names, digest)
+    if seen >= 0 {
+        if contents[seen] != content { failCompiler("two constants hash to the same name " + digest + "; change one of them") }
+        return false
+    }
+    genericIndexPut(names, digest, contents.length)
+    contents.add(content)
+    return true
 }
 
 function appendRuntimeDeclarations(output: List<Text>, features: Integer) {
@@ -380,49 +397,37 @@ declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)
 }
 
 function appendLiteralDeclarations(output: List<Text>, tokenKinds: List<Integer>, tokenTexts: List<Text>, prefix: Text, threaded: Boolean) {
-    let dataHead = "@.text.data."
-    let valueHead = "@.text."
-    let tail = ""
-    if prefix != "" {
-        dataHead = "@\"minyar.literal|" + prefix + "|data|"
-        valueHead = "@\"minyar.literal|" + prefix + "|value|"
-        tail = "\""
-    }
+    let names = newGenericIndex()
+    let contents: List<Text> = []
     let position = 0
     while position < tokenKinds.length {
-        if tokenKinds[position] == 3 {
-            let literal = tokenTexts[position]
-            output.add(dataHead)
-            output.add(Text(position))
-            if tail != "" { output.add(tail) }
+        let literal = tokenTexts[position]
+        let digest = ""
+        if tokenKinds[position] == 3 { digest = genericInstanceDigest(literal) }
+        if tokenKinds[position] == 3 && newConstantName(names, contents, digest, literal) {
+            let data = "@" + literalName(prefix, digest, true)
+            let value = "@" + literalName(prefix, digest, false)
+            output.add(data)
             output.add(" = private unnamed_addr constant [")
             output.add(Text(literal.byteLength + 1))
             output.add(" x i8] c\"")
             output.add(escapeLLVMText(literal))
             output.add("\\00\"\n")
             if literal.length == literal.byteLength {
-                output.add(valueHead)
-                output.add(Text(position))
-                if tail != "" { output.add(tail) }
+                output.add(value)
                 output.add(" = private constant { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr ")
-                output.add(dataHead)
-                output.add(Text(position))
-                if tail != "" { output.add(tail) }
+                output.add(data)
                 output.add(", i64 ")
                 output.add(Text(literal.byteLength))
                 output.add(", i64 ")
                 output.add(Text(literal.byteLength))
                 output.add(", ptr null, ptr null }\n")
             } else {
-                output.add(valueHead)
-                output.add(Text(position))
-                if tail != "" { output.add(tail) }
+                output.add(value)
                 let storage = "global"
                 if threaded { storage = "constant" }
                 output.add(" = private " + storage + " { i64, ptr, i64, i64, ptr, ptr } { i64 0, ptr ")
-                output.add(dataHead)
-                output.add(Text(position))
-                if tail != "" { output.add(tail) }
+                output.add(data)
                 output.add(", i64 ")
                 output.add(Text(literal.byteLength))
                 output.add(", i64 -1, ptr null, ptr null }\n")
