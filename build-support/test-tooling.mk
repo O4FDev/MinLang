@@ -22,9 +22,11 @@ build/tooling/%.o: %.c build/.toolchain.json build-support/test-tooling.mk
 # A new scanner rebuilds every harness, so trees built before it gain a list.
 MINYAR_DEPENDENCY_SCANNER = build-support/minyar-dependencies.awk
 
+# `make -s` (the launcher's first-use builds) must print nothing, so the command is echoed only when make is not silent.
+MAKE_SILENT = $(findstring s,$(firstword -$(MAKEFLAGS)))
 build/tooling/%.ll: %.min build/minyarc-modules $(MINYAR_DEPENDENCY_SCANNER)
-	mkdir -p "$(@D)"
-	@echo '$(LIMITED) ./build/minyarc-modules $< $@ --library library'
+	@mkdir -p "$(@D)"
+	@$(if $(MAKE_SILENT),:,echo '$(LIMITED) ./build/minyarc-modules $< $@ --library library')
 	@set -eu; temporary=$$(mktemp "$@.XXXXXXXX"); \
 	dependencies=$$(mktemp "$@.d.XXXXXXXX"); \
 	trap 'rm -f "$$temporary" "$$dependencies"' 0; \
