@@ -12,26 +12,26 @@ build/tooling/tests/thread-ordinary: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/thread-ordinary: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/thread-ordinary: runtime/native/sha256.c
 check-thread-domain: build/tooling/tests/thread-runtime
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-runtime --domain-only
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-runtime --domain-only
 
 check-thread-buffers: build/tooling/tests/thread-runtime
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-runtime --buffers-only
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-runtime --buffers-only
 
 check-thread-ordinary: build/tooling/tests/thread-ordinary
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-ordinary --base-root "$(MINYAR_THREAD_BASE_ROOT)"
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-ordinary --base-root "$(MINYAR_THREAD_BASE_ROOT)"
 
 check-thread-runtime-ir: build/tooling/tests/thread-runtime-ir
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-runtime-ir
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-runtime-ir
 
 check-thread-runtime: check-thread-runtime-ir build/tooling/tests/thread-runtime
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-runtime
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-runtime
 
 check-thread-runtime-sanitize: build/tooling/tests/thread-runtime
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-runtime --sanitize address,undefined
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-runtime --sanitize address,undefined
 
 check-thread-runtime-tsan: build/tooling/tests/thread-runtime-ir build/tooling/tests/thread-runtime
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-runtime-ir --tsan
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-runtime --sanitize thread
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-runtime-ir --tsan
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-runtime --sanitize thread
 
 # The threaded fixtures have no native Windows qualification yet (WS7 owns that run).
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)

@@ -15,7 +15,7 @@ STACK_OWNERSHIP_FALLBACK = $(foreach profile,eager arena,$(foreach mode,native s
 .PHONY: $(STACK_OWNERSHIP_BOUNDED) $(STACK_OWNERSHIP_FALLBACK)
 check-stack-ownership: $(STACK_OWNERSHIP_BOUNDED) $(STACK_OWNERSHIP_FALLBACK)
 $(STACK_OWNERSHIP_BOUNDED) $(STACK_OWNERSHIP_FALLBACK): build/tooling/tests/stack-ownership tests/stack-ownership-runtime.c tests/stack-ownership-fallback.c tests/stack-ownership-runtime-source.h experiments/memory/production-live-oracle.c $(RUNTIME_HEADERS)
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/stack-ownership $(word 4,$(subst -, ,$@)) $(word 5,$(subst -, ,$@)) $(word 6,$(subst -, ,$@))
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/stack-ownership $(word 4,$(subst -, ,$@)) $(word 5,$(subst -, ,$@)) $(word 6,$(subst -, ,$@))
 
 
 check: check-ownership-policy check-stack-ownership
@@ -56,7 +56,7 @@ check-smoke: build/minyarc build/minyar-runtime.o
 .PHONY: check-memory-contracts check-memory-contracts-harness
 .PHONY: check-foundation-baseline
 check-foundation-baseline: build/minyarc build/testing/cycle-runtime.o build/tooling/tests/compiler-behavior
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --compiler build/minyarc --profile errors
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --compiler build/minyarc --profile errors
 
 check check-portable: check-foundation-baseline
 
@@ -89,7 +89,7 @@ build/tooling/tests/regressions build/tooling/tests/native-evidence-harness: TOO
 build/tooling/tests/regressions build/tooling/tests/native-evidence-harness: build/testing/cycle-runtime.o
 check-regressions: build/minyarc build/minyar-runtime.o build/tooling/tests/regressions build/tooling/tests/native-evidence-harness
 	$(LIMITED) ./build/tooling/tests/regressions
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/native-evidence-harness "$(CURDIR)/build/tooling/tests/native-evidence-harness"
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/native-evidence-harness "$(CURDIR)/build/tooling/tests/native-evidence-harness"
 
 check-diagnostics: build/minyarc build/tooling/tests/diagnostics
 	$(LIMITED) ./build/tooling/tests/diagnostics
@@ -97,7 +97,7 @@ check-diagnostics: build/minyarc build/tooling/tests/diagnostics
 check: check-diagnostics
 
 check-conformance: build/minyarc build/minyar-runtime.o build/tooling/tests/conformance
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/conformance
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/conformance
 
 check: check-conformance
 
@@ -108,16 +108,16 @@ check-runtime-unit: build/runtime-unit
 	$(LIMITED) ./build/runtime-unit
 
 check-modules: build/minyarc build/minyar-runtime.o build/tooling/tools/clang-driver
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) sh tests/run-module-tests.sh
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) sh tests/run-module-tests.sh
 
 .PHONY: check-json-parser check-json-parser-sanitize
 build/tooling/tests/json-parser-test: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/json-parser-test: TOOL_LIBS = $(TOOL_CRYPTO)
 check-json-parser: build/minyarc build/tooling/tests/json-parser-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/json-parser-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/json-parser-test
 
 check-json-parser-sanitize: build/minyarc build/tooling/tests/json-parser-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/json-parser-test --sanitize
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/json-parser-test --sanitize
 
 check check-portable: check-json-parser
 check-sanitize: check-json-parser-sanitize
@@ -167,7 +167,7 @@ check-stack-overflow-sanitize: build/minyarc-sanitize build/minyar-runtime-sanit
 # Cross-platform per-commit gate. Heavier memory-profile and performance
 # matrices remain in the Linux evidence runner and the full `make check` gate.
 check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow build/compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/compiler-behavior
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
 
 check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/tests/list-access build/tooling/tests/checked-arithmetic build/tooling/tools/clang-driver build/tooling/tests/mutation
 	$(LIMITED) ./build/tooling/tests/mutation
@@ -239,7 +239,7 @@ check: check-temporary-owner-admission
 # fixed point, including when a retained build artifact has misleading times.
 check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/compiler-behavior
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/minyarc-sanitize build/compiler.min build/compiler-sanitized.ll --library library
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --ir build/compiler-sanitized.ll --ir build/compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --ir build/compiler-sanitized.ll --ir build/compiler-stage3.ll
 
 .PHONY: check-sanitize-core
 check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize check-sanitize-core
@@ -259,7 +259,7 @@ check: doctor check-smoke check-release-build check-recursive-data check-compact
 
 .PHONY: check-examples
 check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello build/language-tour build/records build/compiler-bootstrap build/hello-self-hosted build/integer-overflow build/divide-by-zero build/text-and-files build/lists build/newlines build/top-level build/top-level-exit build/list-out-of-bounds build/text-indexing build/text-slice-out-of-bounds build/minyar-runtime.o build/tooling/tests/compiler-behavior tests/diagnostics/expected/errors/malformed-expression.stderr tests/diagnostics/expected/errors/top-level-malformed-expression.stderr
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
 	test "$$(./build/hello)" = "hello from LLVM-backed Minyar"
 	test "$$(./build/language-tour | tr '\n' ' ')" = "The answer is 42 3 2 1 "
 	test "$$(./build/records | tr '\n' ' ')" = "Minyar Ada is 36 Grace "
@@ -369,8 +369,8 @@ check-compiler-slice-cache: build/tooling/tests/compiler-slice-cache
 	$(LIMITED) ./build/tooling/tests/compiler-slice-cache
 
 check-compact-ownership: build/minyarc build/minyarc-sanitize build/ownership-runtime.o build/minyar-compiler-runtime.ll build/tooling/tests/compact-ownership
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compact-ownership
-	MINYAR_TEST_CLANG="$(LLVM_CC)" ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/compact-ownership
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compact-ownership
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/compact-ownership
 
 .PHONY: check-text-view-budget
 check-text-view-budget: build/tooling/tests/text-view-budget
@@ -476,7 +476,7 @@ build/tooling/tests/incremental-module-mutation: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/incremental-module-mutation: runtime/native/sha256.c
 .PHONY: check-incremental-modules
 check-incremental-modules: build/minyarc-errors-request build/minyarc-modules build/module-compiler-stage2.ll build/module-compiler-stage3.ll build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-release.ll build/minyarc-callbacks build/tooling/tests/recursive-data build/tooling/tools/clang-driver build/tooling/tests/compiler-behavior build/tooling/tests/ownership build/tooling/tests/incremental-modules build/tooling/tests/incremental-module-driver build/tooling/tests/incremental-module-delta build/tooling/tests/incremental-module-artifacts build/tooling/tests/incremental-module-regressions build/tooling/tests/regressions build/tooling/tests/launcher-isolation
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/module-compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/module-compiler-stage3.ll
 	$(LIMITED) ./build/tooling/tests/incremental-modules
 	$(LIMITED) ./build/tooling/tests/incremental-module-driver
 	$(LIMITED) ./build/tooling/tests/incremental-module-delta
@@ -503,7 +503,7 @@ check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-
 
 .PHONY: check-incremental-module-mutation
 check-incremental-module-mutation: build/minyarc-modules build/module-compiler.min build/minyarc build/minyar-compiler-runtime.ll build/tooling/tests/incremental-module-mutation
-	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS="$(COMPILER_LTO_FLAGS)" $(LIMITED) ./build/tooling/tests/incremental-module-mutation
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_LINK_FLAGS="$(COMPILER_LTO_FLAGS)" $(LIMITED) ./build/tooling/tests/incremental-module-mutation
 
 .PHONY: check-toolchain-stamp check-toolchain-portability check-fuzz-harness check-coverage-harness check-runtime-bytes check-runtime-bytes-sanitize check-compiler-hardening check-incremental-language-hardening check-module-driver-options check-native-graphics
 TOOLCHAIN_TEST_TOOLS = build/tooling/tests/toolchain-stamp build/tooling/tests/toolchain-portability build/tooling/tests/native-object-cache
@@ -517,14 +517,14 @@ check-toolchain-stamp: build/tooling/tests/toolchain-stamp
 	./build/tooling/tests/toolchain-stamp
 
 check-toolchain-portability: build/tooling/tools/clang-driver build/tooling/tests/toolchain-portability
-	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/toolchain-portability
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/toolchain-portability
 
 build/tooling/tests/toolchain-bootstrap: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/toolchain-bootstrap: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/toolchain-bootstrap: runtime/native/sha256.c
 .PHONY: check-cold-bootstrap
 check-cold-bootstrap: build/tooling/tests/toolchain-bootstrap
-	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/toolchain-bootstrap
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/toolchain-bootstrap
 
 check-module-driver-options: build/tooling/tests/module-driver-options
 	./build/tooling/tests/module-driver-options
@@ -540,7 +540,7 @@ check-coverage-harness: build/tooling/tests/coverage-harness
 
 .PHONY: check-coverage-inlining
 check-coverage-inlining: build/tooling/tests/coverage-inlining
-	MINYAR_TEST_CLANG="$${MINYAR_TEST_CLANG:-$(LLVM_CC)}" ./build/tooling/tests/coverage-inlining
+	MINYAR_TEST_CLANG="$${MINYAR_TEST_CLANG:-$(TEST_CLANG)}" ./build/tooling/tests/coverage-inlining
 
 check-runtime-bytes: build/tooling/tests/runtime-bytes
 	$(LIMITED) ./build/tooling/tests/runtime-bytes --clang "$(LLVM_CC)"
@@ -584,16 +584,16 @@ check-checked-arithmetic-sanitize: build/minyarc-sanitize build/minyar-runtime-s
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/checked-arithmetic
 
 check-checked-results: build/minyarc build/minyar-runtime.o build/tooling/tests/checked-results
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/checked-results
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/checked-results
 
 check-checked-results-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/checked-results
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/checked-results
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/checked-results
 
 check-checked-results-frontends: build/minyarc-modules build/minyarc-callbacks build/minyarc-errors build/minyar-runtime.o build/tooling/tests/checked-results-frontends
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/checked-results-frontends
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/checked-results-frontends
 
 check-checked-results-frontends-sanitize: build/minyarc-modules-sanitize build/minyarc-callbacks-sanitize build/minyarc-errors-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/checked-results-frontends
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/checked-results-frontends
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/checked-results-frontends
 
 check-portable check: check-checked-arithmetic check-checked-results check-checked-results-frontends
 check-sanitize: check-checked-arithmetic-sanitize check-checked-results-sanitize check-checked-results-frontends-sanitize
@@ -644,14 +644,14 @@ check-fuzz-afl-harness: build/tooling/tests/fuzz-afl-harness build/tooling/tools
 
 .PHONY: check-bootstrap-portability
 check-bootstrap-portability: build/compiler.min build/tooling/tests/bootstrap-portability
-	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/bootstrap-portability
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/bootstrap-portability
 
 check-portable: check-bootstrap-portability
 check: check-bootstrap-portability
 
 .PHONY: check-bootstrap-records
 check-bootstrap-records: build/stage0 build/tooling/tests/bootstrap-records
-	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/bootstrap-records
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/bootstrap-records
 
 check-portable check: check-bootstrap-records
 
@@ -703,7 +703,7 @@ check-portable: check-scalar-study-harness
 
 .PHONY: check-stack-limits
 check-stack-limits: build/tooling/tests/stack-limits tests/stack-limits.c
-	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/stack-limits
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/stack-limits
 
 check-portable check: check-stack-limits
 
@@ -756,10 +756,10 @@ check-sanitize: check-peer-semantics-sanitize check-memory-regressions-sanitize
 # TLS 1.3 against a local OpenSSL server, through the hosted http, tls, crypto and net packages.
 .PHONY: check-tls check-tls-sanitize
 check-tls: build/minyarc build/tooling/tests/tls-local-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-local-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/tls-local-test
 
 check-tls-sanitize: build/minyarc build/tooling/tests/tls-local-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-local-test --sanitize
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-local-test --sanitize
 
 check check-portable: check-tls
 
@@ -772,10 +772,10 @@ build/tooling/tests/quic-wire-test.ll: tests/cpython-random.min
 # ACK scheduling gates retain both native and sanitizer optimizations.
 .PHONY: check-quic-ack check-quic-ack-sanitize
 check-quic-ack: build/minyarc tests/quic-ack.min build/tooling/tests/quic-ack-test | build
-	@set -e; rm -rf -- build/quic-ack-native.*; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-ack-native.*; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --artifacts "$$artifacts"
 
 check-quic-ack-sanitize: build/minyarc tests/quic-ack.min build/tooling/tests/quic-ack-test | build
-	@set -e; rm -rf -- build/quic-ack-sanitize.*; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-sanitize.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --sanitize --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-ack-sanitize.*; artifacts=$$(mktemp -d "$(abspath build)/quic-ack-sanitize.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-ack-test --optimization both --sanitize --artifacts "$$artifacts"
 
 check check-portable check-quic: check-quic-ack
 check-sanitize check-quic-sanitize: check-quic-ack-sanitize
@@ -783,11 +783,11 @@ check-sanitize check-quic-sanitize: check-quic-ack-sanitize
 # Handshake PTO virtual-clock modes use fresh absolute evidence directories.
 .PHONY: check-quic-pto check-quic-pto-sanitize
 check-quic-pto: build/minyarc tests/quic-pto.min build/tooling/tests/quic-pto-test | build
-	@set -e; rm -rf -- build/quic-pto-native-O0.*; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O0.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 0 --artifacts "$$artifacts"
-	@set -e; rm -rf -- build/quic-pto-native-O2.*; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O2.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 2 --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-pto-native-O0.*; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O0.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 0 --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-pto-native-O2.*; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-native-O2.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-pto-test --optimization 2 --artifacts "$$artifacts"
 
 check-quic-pto-sanitize: build/minyarc tests/quic-pto.min build/tooling/tests/quic-pto-test | build
-	@set -e; rm -rf -- build/quic-pto-sanitize-O1.*; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-sanitize-O1.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-pto-test --optimization 1 --sanitize --artifacts "$$artifacts"
+	@set -e; rm -rf -- build/quic-pto-sanitize-O1.*; artifacts=$$(mktemp -d "$(abspath build)/quic-pto-sanitize-O1.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-pto-test --optimization 1 --sanitize --artifacts "$$artifacts"
 
 check check-portable check-quic: check-quic-pto
 check-sanitize check-quic-sanitize: check-quic-pto-sanitize
@@ -817,15 +817,15 @@ QUIC_SUITE_TOOLS = build/tooling/tests/quic-suite-test build/tooling/tests/quic-
     build/tooling/tests/tls-handshake-validity-test build/tooling/tests/transport-go-test
 
 check-quic-native-O0: build/minyarc $(QUIC_SUITE_TOOLS)
-	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-suite-test --artifacts build/quic-native-O0
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-suite-test --artifacts build/quic-native-O0
 
 check-quic-native-O2: build/minyarc $(QUIC_SUITE_TOOLS)
-	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-suite-test --optimization 2 --artifacts build/quic-native-O2
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-suite-test --optimization 2 --artifacts build/quic-native-O2
 
 check-quic: build/minyarc check-quic-native-O0 check-quic-native-O2
 
 check-quic-native-sanitize: build/minyarc $(QUIC_SUITE_TOOLS)
-	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-suite-test --sanitize --artifacts build/quic-sanitize
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-suite-test --sanitize --artifacts build/quic-sanitize
 
 check-quic-sanitize: build/minyarc check-quic-native-sanitize
 
@@ -841,16 +841,16 @@ check-quic-quinn: build/minyarc build/tooling/tests/quic-quinn | build
 
 .PHONY: check-redis-protocol check-redis-protocol-sanitize check-redis-pipeline check-redis-pipeline-sanitize
 check-redis-protocol: build/minyarc build/minyar-runtime.o build/tooling/tests/redis-protocol-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/redis-protocol-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/redis-protocol-test
 
 check-redis-protocol-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/redis-protocol-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/redis-protocol-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/redis-protocol-test
 
 check-redis-pipeline: build/minyarc build/minyar-runtime.o build/tooling/tests/redis-pipeline-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/redis-pipeline-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/redis-pipeline-test
 
 check-redis-pipeline-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/redis-pipeline-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/redis-pipeline-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/redis-pipeline-test
 
 check check-portable: check-redis-protocol check-redis-pipeline
 check-sanitize: check-redis-protocol-sanitize check-redis-pipeline-sanitize
@@ -863,7 +863,7 @@ check-native-cache: build/tooling/tools/clang-driver build/tooling/tests/native-
 
 .PHONY: check-package-native-inputs
 check-package-native-inputs: build/minyarc build/tooling/tests/package-native-inputs
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/package-native-inputs
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/package-native-inputs
 
 check check-portable: check-package-native-inputs
 
@@ -897,7 +897,7 @@ check-sanitize: check-native-bytes-sanitize
 .PHONY: check-module-test-driver check-build-wiring
 build/tooling/tests/module-test-driver: build/tooling/tools/clang-driver
 check-module-test-driver: build/minyarc build/minyar-runtime.o build/tooling/tests/module-test-driver build/tooling/tools/clang-driver
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/module-test-driver
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/module-test-driver
 
 build/tooling/tests/build-wiring.ll: tests/build-wiring-support.min tests/build-wiring-graphs.min tests/build-wiring-quic.min tests/build-wiring-network.min
 build/tooling/tests/build-wiring: TOOL_RUNTIME = build/testing/cycle-runtime.o
@@ -909,34 +909,34 @@ check check-portable: check-module-test-driver check-build-wiring
 
 .PHONY: check-tls-validity check-tls-validity-sanitize check-tls-resumption-expiry check-tls-resumption-expiry-sanitize
 check-tls-validity: build/minyarc build/tooling/tests/tls-validity-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-validity-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/tls-validity-test
 
 check-tls-validity-sanitize: build/minyarc build/tooling/tests/tls-validity-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-validity-test --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-validity-test --sanitize
 
 check-tls-resumption-expiry: build/minyarc build/tooling/tests/tls-resumption-expiry-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-resumption-expiry-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/tls-resumption-expiry-test
 
 check-tls-resumption-expiry-sanitize: build/minyarc build/tooling/tests/tls-resumption-expiry-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-resumption-expiry-test --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-resumption-expiry-test --sanitize
 
 check-tls: check-tls-validity check-tls-resumption-expiry
 check-tls-sanitize: check-tls-validity-sanitize check-tls-resumption-expiry-sanitize
 
 .PHONY: check-tls-keyshare check-tls-keyshare-sanitize check-tls-server check-tls-server-sanitize
 check-tls-keyshare: build/minyarc build/tooling/tests/tls-keyshare-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-keyshare-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/tls-keyshare-test
 
 check-tls-keyshare-sanitize: build/minyarc build/tooling/tests/tls-keyshare-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-keyshare-test --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-keyshare-test --sanitize
 
 check-tls-server: build/minyarc build/tooling/tests/tls-server-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-server-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-server-test --curve prime256v1
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/tls-server-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/tls-server-test --curve prime256v1
 
 check-tls-server-sanitize: build/minyarc build/tooling/tests/tls-server-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-server-test --sanitize
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-server-test --sanitize --curve prime256v1
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-server-test --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-server-test --sanitize --curve prime256v1
 
 check-tls: check-tls-keyshare check-tls-server
 check-tls-sanitize: check-tls-keyshare-sanitize check-tls-server-sanitize
@@ -944,16 +944,16 @@ check-sanitize: check-tls-sanitize
 
 .PHONY: check-yamux-churn check-yamux-churn-sanitize check-transport-cancel check-transport-cancel-sanitize check-transport-go check-transport-go-sanitize
 check-yamux-churn: build/minyarc build/tooling/tests/yamux-churn-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/yamux-churn-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/yamux-churn-test
 
 check-yamux-churn-sanitize: build/minyarc build/tooling/tests/yamux-churn-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/yamux-churn-test --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/yamux-churn-test --sanitize
 
 check-transport-cancel: build/minyarc build/tooling/tests/transport-cancel-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-cancel-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/transport-cancel-test
 
 check-transport-cancel-sanitize: build/minyarc build/tooling/tests/transport-cancel-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-cancel-test --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-cancel-test --sanitize
 
 build/yamux-peer: tests/interop/yamux/main.go tests/interop/yamux/go.mod tests/interop/yamux/go.sum $(lastword $(MAKEFILE_LIST)) | build
 	cd tests/interop/yamux && CGO_ENABLED=0 GOMAXPROCS=2 go build -mod=readonly -o "$(abspath $@)" .
@@ -961,15 +961,15 @@ build/yamux-peer: tests/interop/yamux/main.go tests/interop/yamux/go.mod tests/i
 # The ordinary and FIN-schedule runs share one compiled Minyar peer per recipe.
 check-transport-go: build/minyarc build/yamux-peer build/tooling/tests/transport-go-test | build
 	@set -e; cache=$$(mktemp -d "$(abspath build)/transport-go-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer; \
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --streams 1536; \
-	MINYAR_MAX_MEMORY_MIB=2048 MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer; \
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --streams 1536; \
+	MINYAR_MAX_MEMORY_MIB=2048 MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule
 
 check-transport-go-sanitize: build/minyarc build/yamux-peer build/tooling/tests/transport-go-test | build
 	@set -e; cache=$$(mktemp -d "$(abspath build)/transport-go-sanitize-programs.XXXXXXXX"); trap 'rm -rf "$$cache"' EXIT; export MINYAR_TEST_PROGRAM_CACHE="$$cache"; \
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --sanitize; \
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --streams 1536 --sanitize; \
-	MINYAR_MAX_MEMORY_MIB=2048 $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --sanitize; \
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --peer-binary build/yamux-peer --streams 1536 --sanitize; \
+	MINYAR_MAX_MEMORY_MIB=2048 $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-go-test --fin-schedule --sanitize
 
 check check-portable: check-yamux-churn check-transport-cancel
 check: check-transport-go
@@ -977,20 +977,20 @@ check-sanitize: check-yamux-churn-sanitize check-transport-cancel-sanitize check
 
 .PHONY: check-tls-handshake-validity check-tls-handshake-validity-sanitize
 check-tls-handshake-validity: build/minyarc build/tooling/tests/tls-handshake-validity-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-handshake-validity-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/tls-handshake-validity-test
 
 check-tls-handshake-validity-sanitize: build/minyarc build/tooling/tests/tls-handshake-validity-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-handshake-validity-test --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-handshake-validity-test --sanitize
 
 check-tls: check-tls-handshake-validity
 check-tls-sanitize: check-tls-handshake-validity-sanitize
 
 .PHONY: check-tls-signing-usage check-tls-signing-usage-sanitize
 check-tls-signing-usage: build/minyarc build/tooling/tests/tls-signing-usage-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/tls-signing-usage-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/tls-signing-usage-test
 
 check-tls-signing-usage-sanitize: build/minyarc build/tooling/tests/tls-signing-usage-test
-	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-signing-usage-test --sanitize
+	$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/tls-signing-usage-test --sanitize
 
 check-tls: check-tls-signing-usage
 check-tls-sanitize: check-tls-signing-usage-sanitize
@@ -1013,9 +1013,9 @@ check check-portable check-sanitize: check-generated-llvm-sanitizer
 # Actual UDP blackholes before/mid-session, then independent TCP mTLS/yamux.
 .PHONY: check-transport-udp-fallback check-transport-udp-fallback-sanitize
 check-transport-udp-fallback: build/minyarc build/yamux-peer build/tooling/tests/transport-udp-fallback-test | build
-	@set -e; rm -rf -- build/transport-udp-fallback-native.*; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-native.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/transport-udp-fallback-test --go-binary build/yamux-peer --evidence "$$evidence"
+	@set -e; rm -rf -- build/transport-udp-fallback-native.*; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-native.XXXXXXXX"); MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/transport-udp-fallback-test --go-binary build/yamux-peer --evidence "$$evidence"
 check-transport-udp-fallback-sanitize: build/minyarc build/yamux-peer build/tooling/tests/transport-udp-fallback-test | build
-	@set -e; rm -rf -- build/transport-udp-fallback-sanitize.*; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-udp-fallback-test --go-binary build/yamux-peer --sanitize --evidence "$$evidence"
+	@set -e; rm -rf -- build/transport-udp-fallback-sanitize.*; evidence=$$(mktemp -d "$(abspath build)/transport-udp-fallback-sanitize.XXXXXXXX"); $(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/transport-udp-fallback-test --go-binary build/yamux-peer --sanitize --evidence "$$evidence"
 check: check-transport-udp-fallback
 check-sanitize: check-transport-udp-fallback-sanitize
 
@@ -1023,44 +1023,44 @@ check-sanitize: check-transport-udp-fallback-sanitize
 .PHONY: check-raw-syscall-arm64
 build/tooling/tests/raw-syscall-arm64.ll: tests/sha256-support.min
 check-raw-syscall-arm64: build/minyarc build/tooling/tests/raw-syscall-arm64
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall-arm64
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/raw-syscall-arm64
 
 build/tooling/tests/raw-syscall: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/raw-syscall: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/raw-syscall: runtime/native/sha256.c
 check-raw-syscall: build/minyarc build/tooling/tests/raw-syscall
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/raw-syscall
 
 # Explicit: fails on other hosts, so a portability pass cannot stand in for
 # native Linux kernel execution. Cross ABI checks are compile proof only.
 check-raw-syscall-linux-native: build/minyarc build/tooling/tests/raw-syscall
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall --linux-native
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/raw-syscall --linux-native
 
 check-raw-syscall-sanitize: build/minyarc-sanitize build/tooling/tests/raw-syscall
-	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) ./build/tooling/tests/raw-syscall --sanitize
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) ./build/tooling/tests/raw-syscall --sanitize
 
 check-raw-syscall-abi: build/minyarc build/tooling/tests/raw-syscall
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall --abi
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/raw-syscall --abi
 
 check-raw-syscall-frontends: build/minyarc-modules build/minyarc-callbacks build/minyarc-errors build/tooling/tests/raw-syscall
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/raw-syscall --frontends
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/raw-syscall --frontends
 
 check check-portable: check-raw-syscall
 check-sanitize: check-raw-syscall-sanitize
 
 .PHONY: check-list-basics check-list-basics-sanitize check-map-basics check-map-basics-sanitize
 check-list-basics: build/minyarc build/minyar-runtime.o build/tooling/tests/list-basics tests/list-basics.c $(RUNTIME_HEADERS)
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/list-basics
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/list-basics
 check-list-basics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/list-basics tests/list-basics.c $(RUNTIME_HEADERS)
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/list-basics
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/list-basics
 check-map-basics: build/minyarc build/minyar-runtime.o build/tooling/tests/map-basics tests/memory-contracts-runtime.c $(RUNTIME_HEADERS)
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/map-basics
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/map-basics
 check-map-basics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/map-basics tests/memory-contracts-runtime.c $(RUNTIME_HEADERS)
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/map-basics
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/map-basics
 check check-portable: check-list-basics check-map-basics
 check-sanitize: check-list-basics-sanitize check-map-basics-sanitize
 
 .PHONY: check-mutation-coverage
 check-mutation-coverage: build/minyarc build/minyar-runtime.o build/tooling/tests/mutation-coverage
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/mutation-coverage
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/mutation-coverage
 check check-portable: check-mutation-coverage

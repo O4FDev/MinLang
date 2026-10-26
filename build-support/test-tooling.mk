@@ -122,8 +122,24 @@ build/tooling/tests/maps-baseline: build/tooling/tests/maps-baseline.ll build/mi
 CHECKS ?= check-portable
 CHECK_JOBS ?= 8
 .PHONY: check-in-parallel
-check-in-parallel: build/tooling/tools/check-in-parallel
+check-in-parallel: build/tooling/tools/check-in-parallel $(TEST_CLANG_PREREQUISITES)
 	./build/tooling/tools/check-in-parallel --jobs $(CHECK_JOBS) $(CHECKS)
+
+# The fixture Clang for MINYAR_TEST_CLANG_CACHE=1 (TEST_CLANG in the Makefile). Its MINYAR_TOOLCHAIN_KEY covers the
+# exact compiler, C++ compiler, linker and sanitizer runtimes and the cache tool, so no other toolchain shares an
+# entry; entries unused for 7 days are pruned whenever the wrapper is written.
+$(TEST_CLANG_WRAPPER): build/tooling/tools/clang-cache build/.toolchain.json build-support/test-tooling.mk
+	@set -eu; real=$$(command -v "$(LLVM_CC)"); directory=$$(dirname "$$(readlink -f "$$real")"); cxx="$$directory/clang++"; \
+	linker=$$("$$real" -print-prog-name=ld.lld); case $$linker in /*) ;; *) linker=$$(command -v "$$linker");; esac; \
+	cache="$(TEST_CLANG_CACHE_DIR)"; tool="$(CURDIR)/build/tooling/tools/clang-cache"; mkdir -p "$$cache" "$(@D)"; \
+	find "$$cache" -maxdepth 1 -type f -mtime +7 -delete; \
+	"$$tool" --compiler-identity "$$real" "$$cxx" "$$linker" > "$@.identity"; \
+	key=$$("$$tool" --toolchain-key "$$tool" "$$real" "$$cxx" "$$linker" "$@.identity"); \
+	{ printf '#!/bin/sh\n# Test fixture Clang: %s through tools/clang-cache.min (MINYAR_TEST_CLANG_CACHE=1)\n' "$$real"; \
+	  printf '# LLVM_CC=%s\n' "$(LLVM_CC)"; \
+	  printf "export MINYAR_TOOLCHAIN_KEY=%s MINYAR_TOOLCHAIN_LINKER='%s'\n" "$$key" "$$linker"; \
+	  printf "exec '%s' '%s' '%s' '%s' \"\$$@\"\n" "$$tool" "$$tool" "$$cache" "$$real"; } > "$@.tmp"; \
+	chmod +x "$@.tmp"; mv -f "$@.tmp" "$@"; echo "fixture Clang cache: $@ -> $$cache"
 
 .PHONY: check-in-parallel-tool
 check-in-parallel-tool: build/tooling/tools/check-in-parallel build/tooling/tests/check-in-parallel

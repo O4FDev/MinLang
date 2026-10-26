@@ -4,7 +4,7 @@ QUIC_LEDGER_INPUTS = tests/quic-amplification-ledger.min tests/quic-ledger-suppo
 # Receipt controls retain Clang itself; permit files up to 512 MiB here.
 check-quic-amplification-ledger: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-quic-amplification-ledger: $(QUIC_LEDGER_INPUTS) build/tooling/tests/quic-amplification-ledger build/tooling/tests/quic-ledger-checker build/tooling/tools/clang-driver | build
-	@set -e; rm -rf -- build/quic-ledger.*; artifacts=$$(mktemp -d "$(abspath build)/quic-ledger.XXXXXXXX"); MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-amplification-ledger --artifacts "$$artifacts/run"
+	@set -e; rm -rf -- build/quic-ledger.*; artifacts=$$(mktemp -d "$(abspath build)/quic-ledger.XXXXXXXX"); MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-amplification-ledger --artifacts "$$artifacts/run"
 
 QUIC_LEDGER_TOOLS = build/tooling/tests/quic-amplification-ledger build/tooling/tests/quic-ledger-checker
 $(QUIC_LEDGER_TOOLS:%=%.ll): tests/quic-ledger-support.min tests/quic-test-support.min tests/quic-json.min

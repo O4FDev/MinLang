@@ -32,19 +32,19 @@ check-os-net-stack-sanitize: build/tooling/tests/os-net-stack.ll build/minyar-ru
 	$(SANITIZER_LIMITED) ./build/os-net-stack-test-sanitize
 
 check-errors-values: build/minyarc build/minyar-runtime.o build/tooling/tests/errors-values
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/errors-values
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/errors-values
 
 check-net: build/minyarc build/tooling/tests/net-native-test build/tooling/tests/soak-observer-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/soak-observer-test
-	@set -eu; rm -rf -- build/net-native.*; evidence=$$(mktemp -d "$(abspath build)/net-native.XXXXXX"); echo "Network native evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-native-test --mode native --evidence "$$evidence"
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/soak-observer-test
+	@set -eu; rm -rf -- build/net-native.*; evidence=$$(mktemp -d "$(abspath build)/net-native.XXXXXX"); echo "Network native evidence: $$evidence"; MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/net-native-test --mode native --evidence "$$evidence"
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
-	@set -eu; rm -rf -- build/net-native-sanitize.*; evidence=$$(mktemp -d "$(abspath build)/net-native-sanitize.XXXXXX"); echo "Network sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/net-native-test --mode sanitize --evidence "$$evidence"
+	@set -eu; rm -rf -- build/net-native-sanitize.*; evidence=$$(mktemp -d "$(abspath build)/net-native-sanitize.XXXXXX"); echo "Network sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/net-native-test --mode sanitize --evidence "$$evidence"
 endif
 
 check-net-loop: build/minyarc build/tooling/tests/net-loop-test
-	@set -eu; rm -rf -- build/net-loop.*; evidence=$$(mktemp -d "$(abspath build)/net-loop.XXXXXX"); echo "Event-loop native evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-loop-test --mode native --evidence "$$evidence"
+	@set -eu; rm -rf -- build/net-loop.*; evidence=$$(mktemp -d "$(abspath build)/net-loop.XXXXXX"); echo "Event-loop native evidence: $$evidence"; MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/net-loop-test --mode native --evidence "$$evidence"
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
-	@set -eu; rm -rf -- build/net-loop-sanitize.*; evidence=$$(mktemp -d "$(abspath build)/net-loop-sanitize.XXXXXX"); echo "Event-loop sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/net-loop-test --mode sanitize --evidence "$$evidence"
+	@set -eu; rm -rf -- build/net-loop-sanitize.*; evidence=$$(mktemp -d "$(abspath build)/net-loop-sanitize.XXXXXX"); echo "Event-loop sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/net-loop-test --mode sanitize --evidence "$$evidence"
 endif
 
 check-net-connect: build/minyarc build/tooling/tests/net-connect-test
@@ -76,7 +76,7 @@ NET_SANITIZER_CLANG = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.
 NET_SANITIZER_PATH = $(if $(MINYAR_SANITIZER_CLANG),$(shell sh tools/toolchain.sh host-directory $(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG))):$(PATH),$(PATH))
 
 check-net-udp-offload: build/minyarc build/minyar-default-runtime.o build/tooling/tests/net-udp-offload-test
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-udp-offload-test --evidence build/net-udp-offload
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/net-udp-offload-test --evidence build/net-udp-offload
 
 check-net-udp-offload-sanitize: build/minyarc build/minyar-default-runtime.o tools/toolchain.sh build/tooling/tests/net-udp-offload-test
 	PATH="$(NET_SANITIZER_PATH)" MINYAR_TEST_CLANG=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/net-udp-offload-test --sanitize --evidence build/net-udp-offload-sanitize
@@ -102,10 +102,10 @@ build/tooling/tests/os-providers: TOOL_NATIVE = tests/os-providers-runtime.c
 build/tooling/tests/os-providers: tests/os-providers-runtime.c
 .PHONY: check-os-providers check-os-providers-sanitize
 check-os-providers: build/minyarc build/tooling/tests/os-providers
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/os-providers
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/os-providers
 
 check-os-providers-sanitize: build/minyarc build/tooling/tests/os-providers
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/os-providers --sanitize
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/os-providers --sanitize
 
 # The executable vector and inet_pton oracle route is a Linux ELF host gate.
 ifeq ($(shell uname -s),Linux)

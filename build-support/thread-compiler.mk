@@ -26,22 +26,22 @@ build/tooling/tests/thread-tsan-control: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/thread-tsan-control: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/thread-tsan-control: runtime/native/sha256.c
 check-thread-native-regions: build/minyarc build/minyar-default-runtime.o build/tooling/tests/thread-native-regions build/tooling/tools/clang-driver
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-native-regions
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-native-regions
 
 check-thread-native-regions-sanitize: build/minyarc-sanitize build/minyar-default-runtime.o build/tooling/tests/thread-native-regions build/tooling/tools/clang-driver
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-native-regions --sanitizer address
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-native-regions --sanitizer address
 
 check-thread-native-regions-tsan: build/minyarc build/minyar-default-runtime.o build/tooling/tests/thread-native-regions build/tooling/tools/clang-driver
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-native-regions --sanitizer thread
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-native-regions --sanitizer thread
 
 check-thread-generated-recovery: build/minyarc-threads build/minyar-default-runtime.o build/minyar-runtime-eager.o build/tooling/tests/thread-generated-recovery build/tooling/tools/clang-driver
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-generated-recovery
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-generated-recovery
 
 check-thread-generated-recovery-sanitize: build/minyarc-threads build/minyar-default-runtime.o build/minyar-runtime-eager.o build/tooling/tests/thread-generated-recovery build/tooling/tools/clang-driver
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-generated-recovery --sanitizer address
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-generated-recovery --sanitizer address
 
 check-thread-generated-recovery-tsan: build/minyarc-threads build/minyar-default-runtime.o build/minyar-runtime-eager.o build/tooling/tests/thread-generated-recovery build/tooling/tools/clang-driver
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-generated-recovery --sanitizer thread
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-generated-recovery --sanitizer thread
 
 build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: TOOL_NATIVE = runtime/native/sha256.c tests/performance-resources.c
 build/tooling/tests/concurrency-scaling-test build/tooling/tools/concurrency-scaling: TOOL_LIBS = $(TOOL_CRYPTO)
@@ -54,25 +54,25 @@ build/tooling/tests/thread-compiler: TOOL_NATIVE = tests/sha256-test-native.c ru
 build/tooling/tests/thread-compiler: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/thread-compiler: tests/sha256-test-native.c runtime/native/sha256.c
 check-thread-compiler: build/minyarc-threads build/tooling/tests/thread-compiler
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-compiler
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-compiler
 
 check-thread-effects: build/thread-compiler.min build/minyarc build/minyar-compiler-runtime.ll build/tooling/tests/thread-effects
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-effects
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-effects
 
 check-thread-language: build/minyarc-threads build/minyar-default-runtime.o build/tooling/tests/thread-language
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/thread-language
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-language
 
 check-thread-language-sanitize: build/minyarc-threads build/minyar-default-runtime.o build/tooling/tests/thread-language
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-language --sanitizer address
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-language --sanitizer address
 
 check-thread-language-tsan: build/minyarc-threads build/minyar-default-runtime.o build/tooling/tests/thread-language
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-language --sanitizer thread
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-language --sanitizer thread
 
 # Link evidence retains Clang itself (282 MB for an LLVM release build); permit files up to 512 MiB, as the other
 # evidence checks do, or the link dies with SIGXFSZ (status 153) under the default 128 MiB file limit.
 check-thread-tsan-control: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-thread-tsan-control: build/minyarc-threads build/minyar-default-runtime.o build/tooling/tests/thread-tsan-control build/tooling/tools/clang-driver
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-tsan-control
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/thread-tsan-control
 
 check check-portable: check-thread-compiler check-thread-effects check-thread-language check-thread-scaling-protocol check-thread-generated-recovery
 check-sanitize: check-thread-language-sanitize check-thread-language-tsan check-thread-tsan-control check-thread-generated-recovery-sanitize check-thread-generated-recovery-tsan

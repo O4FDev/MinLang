@@ -3,10 +3,10 @@ FILES_TEST_SOURCES = tests/files-focused.min tests/files-test-path.h tests/files
 # Sparse offset controls write beyond 4 GiB; allow 8 GiB logical file sizes here.
 check-files check-files-sanitize: export MINYAR_MAX_FILE_BLOCKS ?= 16777216
 check-files: build/minyarc $(FILES_TEST_SOURCES) build/tooling/tests/files-focused
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/files-focused
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/files-focused
 
 check-files-sanitize: build/minyarc $(FILES_TEST_SOURCES) build/tooling/tests/files-focused
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/files-focused --sanitize
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/files-focused --sanitize
 
 # The files backend is POSIX-only for now; tests/files-focused.min refuses Windows.
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)

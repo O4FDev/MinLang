@@ -20,36 +20,36 @@ check-module-constants-sanitize: build/minyarc-sanitize build/minyar-runtime-san
 	$(SANITIZER_LIMITED) env MINYAR_TEST_COMPILER=build/minyarc-sanitize MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" ./build/tooling/tests/module-constants
 
 check-module-constant-graphs: build/minyarc build/minyarc-callbacks build/tooling/tests/module-constant-graphs
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/module-constant-graphs
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/module-constant-graphs
 
 check-module-constant-graphs-sanitize: build/minyarc-sanitize build/minyarc-callbacks-sanitize build/tooling/tests/module-constant-graphs
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/module-constant-graphs
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/module-constant-graphs
 
 check check-portable: check-octal-literals check-reserved-names check-module-constants check-module-constant-graphs
 check-sanitize: check-octal-literals-sanitize check-reserved-names-sanitize check-module-constants-sanitize check-module-constant-graphs-sanitize
 
 .PHONY: check-collections-integration check-collections-integration-sanitize
 check-collections-integration: build/minyarc build/minyarc-callbacks build/minyar-runtime.o build/tooling/tests/collections-integration
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/collections-integration
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/collections-integration
 check-collections-integration-sanitize: build/minyarc-sanitize build/minyarc-callbacks-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/collections-integration
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/collections-integration
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/collections-integration
 check check-portable: check-collections-integration
 check-sanitize: check-collections-integration-sanitize
 
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 .PHONY: check-feature-declarations-incremental check-feature-declarations-incremental-sanitize
 check-feature-declarations-incremental: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/feature-declarations-incremental
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/feature-declarations-incremental
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/feature-declarations-incremental
 check-feature-declarations-incremental-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/feature-declarations-incremental
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/feature-declarations-incremental
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/feature-declarations-incremental
 check check-portable: check-feature-declarations-incremental
 check-sanitize: check-feature-declarations-incremental-sanitize
 endif
 
 .PHONY: check-core-modules check-core-modules-sanitize
 check-core-modules: build/minyarc build/minyar-runtime.o build/tooling/tests/core-modules
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/core-modules
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/core-modules
 check-core-modules-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/core-modules
-	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) ./build/tooling/tests/core-modules
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS="$(SANITIZER_FLAGS)" $(SANITIZER_LIMITED) ./build/tooling/tests/core-modules
 check check-portable: check-core-modules
 check-sanitize: check-core-modules-sanitize

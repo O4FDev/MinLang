@@ -5,13 +5,13 @@ check-mobile-tools:
 	python3 tests/mobile-tools.py
 
 check-mobile-bridge: build/minyarc build/testing/cycle-runtime.c
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/check-mobile-bridge.py
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" python3 tests/check-mobile-bridge.py
 
 check-mobile-sanitize: build/minyarc build/testing/cycle-runtime.c check-mobile-android-transport-sanitize
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/check-mobile-bridge.py --sanitize
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" python3 tests/check-mobile-bridge.py --sanitize
 
 check-mobile-gallery: build/minyarc
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/check-mobile-gallery.py
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" python3 tests/check-mobile-gallery.py
 
 check-mobile: check-mobile-tools check-mobile-bridge check-mobile-gallery check-mobile-android-transport
 check check-portable: check-mobile
@@ -22,21 +22,21 @@ check-mobile-android: build/minyarc build/testing/cycle-runtime.c
 
 # The copied transport has no SDK/JVM dependency and belongs to portable gates.
 check-mobile-android-transport:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/check-mobile-android-ui.py --stage transport
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" python3 tests/check-mobile-android-ui.py --stage transport
 
 check-mobile-android-transport-sanitize:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/check-mobile-android-ui.py --stage transport --sanitize
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" python3 tests/check-mobile-android-ui.py --stage transport --sanitize
 
 # Explicit JDK/SDK extras. Desktop JVM execution proves the JNI/model boundary,
 # not Android Activity rendering or device lifecycle behavior.
 check-mobile-android-host: build/minyarc build/testing/cycle-runtime.c
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/check-mobile-android-ui.py --stage jni
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" python3 tests/check-mobile-android-ui.py --stage jni
 
 check-mobile-android-host-sanitize: build/minyarc build/testing/cycle-runtime.c
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/check-mobile-android-ui.py --stage jni --sanitize
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" python3 tests/check-mobile-android-ui.py --stage jni --sanitize
 
 check-mobile-android-java:
-	MINYAR_TEST_CLANG="$(LLVM_CC)" python3 tests/check-mobile-android-ui.py --stage java --android-api
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" python3 tests/check-mobile-android-ui.py --stage java --android-api
 
 # SDK work only; run through the coordination lx wrapper on shared machines.
 # This target never boots a Simulator or installs an application.

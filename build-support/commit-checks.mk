@@ -5,7 +5,7 @@
 check-core: check-commit-core
 check-core check-commit-core: export MINYAR_INTERACTIVE_BOOTSTRAP = 1
 check-commit-core: check-smoke check-diagnostics check-conformance check-runtime-unit check-modules build/minyarc build/minyar-runtime.o build/tooling/tests/compiler-behavior
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) "./build/tooling/tests/compiler-behavior" --compiler "build/minyarc" --profile core
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) "./build/tooling/tests/compiler-behavior" --compiler "build/minyarc" --profile core
 
 ifneq ($(wildcard tests/core-modules.min),)
 check-commit-core: check-core-modules

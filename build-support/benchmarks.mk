@@ -18,6 +18,6 @@ build/tooling/tests/benchmarks-cli: TOOL_NATIVE = tools/clang-driver-host.c
 build/tooling/tests/benchmarks-cli: tools/clang-driver-host.c runtime/minyar_native.h
 
 check-benchmarks-cli: build/tooling/tests/benchmarks-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build benchmarks/standard-library/src/standard-library.min
-	+MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/tests/benchmarks-cli
+	+MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/benchmarks-cli
 
 check check-portable: check-benchmarks check-benchmarks-cli

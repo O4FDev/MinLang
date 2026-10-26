@@ -1,7 +1,7 @@
 .PHONY: check-language-ergonomics check-language-ergonomics-sanitize
 
 check-language-ergonomics: build/minyarc build/minyar-runtime.o build/tooling/tests/language-ergonomics build/tooling/tests/backend-contract
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/language-ergonomics
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/language-ergonomics
 	$(LIMITED) ./build/tooling/tests/backend-contract
 
 check-language-ergonomics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/language-ergonomics

@@ -7,15 +7,15 @@ check-maps: build/minyar-module-build
 check-maps: map-module-cache
 .PHONY: map-module-cache
 map-module-cache: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/maps-incremental
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/maps-incremental
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/maps-incremental
 endif
 check-maps: $(MAP_FRONTENDS) build/minyar-runtime.o build/tooling/tests/maps-frontends build/tooling/tests/maps-matrix
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/maps-matrix
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/maps-frontends
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/maps-matrix
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/maps-frontends
 
 check-maps-sanitize: $(MAP_SANITIZED_FRONTENDS) build/tooling/tests/maps-frontends build/tooling/tests/maps-matrix
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/maps-matrix --sanitize
-	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/maps-frontends
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/maps-matrix --sanitize
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/maps-frontends
 
 check check-portable: check-maps
 check-sanitize: check-maps-sanitize
@@ -25,7 +25,7 @@ build/tooling/tests/maps-bench: TOOL_NATIVE = tests/maps-baseline-runtime.c runt
 build/tooling/tests/maps-bench: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/maps-bench: tests/maps-baseline-runtime.c runtime/native/sha256.c
 bench-maps: build/minyarc build/tooling/tests/maps-bench
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/maps-bench
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/maps-bench
 
 bench-maps-baseline: build/minyarc build/minyarc-baseline build/tooling/tests/maps-baseline
 	$(LIMITED) ./build/tooling/tests/maps-baseline

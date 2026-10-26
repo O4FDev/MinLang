@@ -23,8 +23,8 @@ completionio-neodb-linux:
 # First require the existing strict C provider + public API/gallery kernel proof.
 # Exit 77, unsupported rings, setup/restriction errors and timeouts all fail.
 check-completionio-neodb-kernel: completionio-neodb-linux check-completionio-kernel build/tooling/tests/completionio-neodb
-	MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_NEODB_COMPLETION_KEEP=1 $(LIMITED) "./build/tooling/tests/completionio-neodb"
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_NEODB_COMPLETION_KEEP=1 $(LIMITED) "./build/tooling/tests/completionio-neodb"
 
 check-completionio-neodb-sanitize: completionio-neodb-linux check-completionio-kernel build/completionio/neodb-kernel-sanitize build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/completionio-neodb
 	$(NATIVE_SANITIZER_ENV) $(SANITIZER_LIMITED) "./build/completionio/neodb-kernel-sanitize"
-	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_NEODB_COMPLETION_KEEP=1 $(SANITIZER_LIMITED) "./build/tooling/tests/completionio-neodb"
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER="./build/minyarc-sanitize" MINYAR_TEST_RUNTIME="./build/minyar-runtime-sanitize.o" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_NEODB_COMPLETION_KEEP=1 $(SANITIZER_LIMITED) "./build/tooling/tests/completionio-neodb"

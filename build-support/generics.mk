@@ -1,12 +1,12 @@
 .PHONY: check-generics check-generics-sanitize check-generics-smoke
 
 check-generics-smoke: build/minyarc build/minyar-runtime.o build/tooling/tests/generics-smoke
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/generics-smoke
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/generics-smoke
 
 check-generics: build/minyarc build/minyar-runtime.o build/tooling/tests/generics build/tooling/tests/generics-records build/tooling/tests/generic-literals
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/generics
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/generics-records
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/generic-literals
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/generics
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/generics-records
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/generic-literals
 
 check-generics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/generics build/tooling/tests/generics-records build/tooling/tests/generic-literals
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/generics
@@ -18,7 +18,7 @@ check-sanitize: check-generics-sanitize
 
 .PHONY: check-generic-aliases check-generic-aliases-sanitize
 check-generic-aliases: build/minyarc build/minyar-runtime.o build/tooling/tests/generic-aliases
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/generic-aliases
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/generic-aliases
 
 check-generic-aliases-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/generic-aliases
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/generic-aliases
@@ -28,7 +28,7 @@ check-sanitize: check-generic-aliases-sanitize
 
 .PHONY: check-generic-constraints check-generic-constraints-sanitize
 check-generic-constraints: build/minyarc build/minyar-runtime.o build/tooling/tests/generic-constraints
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/generic-constraints
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/generic-constraints
 
 check-generic-constraints-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/generic-constraints
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/generic-constraints
@@ -38,7 +38,7 @@ check-sanitize: check-generic-constraints-sanitize
 
 .PHONY: check-generic-results check-generic-results-sanitize
 check-generic-results: build/minyarc build/minyar-runtime.o build/tooling/tests/generic-results
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/generic-results
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/generic-results
 
 check-generic-results-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/generic-results
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/generic-results

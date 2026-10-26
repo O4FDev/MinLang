@@ -161,7 +161,7 @@ build/.toolchain.json: FORCE tools/toolchain.sh | build
 
 .PHONY: check-native-records
 check-native-records: build/minyarc build/minyarc-errors build/minyar-runtime.o build/tooling/tests/native-records
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/native-records
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/native-records
 
 check check-portable: check-native-records
 

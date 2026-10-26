@@ -30,7 +30,7 @@ endif
 build/tooling/tests/httpserver-front-test: TOOL_NATIVE = runtime/native/net.c tests/net-wire-native.c
 build/tooling/tests/httpserver-front-test: runtime/native/net.c tests/net-wire-native.c
 check-httpserver-front: build/minyarc build/minyar-default-runtime-release.ll build/tooling/tests/httpserver-front-test
-	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/httpserver-front-test
+	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/httpserver-front-test
 
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check check-portable: check-httpserver-front
@@ -40,26 +40,26 @@ endif
 build/tooling/benchmarks/httpserver/compare: TOOL_NATIVE = runtime/native/net.c tests/net-wire-native.c
 build/tooling/benchmarks/httpserver/compare: runtime/native/net.c tests/net-wire-native.c
 bench-httpserver: build/tooling/benchmarks/httpserver/compare
-	MINYAR_TEST_CLANG="$(LLVM_CC)" ./build/tooling/benchmarks/httpserver/compare --minyar "$(HTTP_FRONT_MINYAR)" --axum "$(HTTP_FRONT_AXUM)" --queries benchmarks/httpserver/inputs/queries.tsv --replay benchmarks/httpserver/inputs/bodies.jsonl.gz --output "$(HTTP_FRONT_RESULTS)"
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/benchmarks/httpserver/compare --minyar "$(HTTP_FRONT_MINYAR)" --axum "$(HTTP_FRONT_AXUM)" --queries benchmarks/httpserver/inputs/queries.tsv --replay benchmarks/httpserver/inputs/bodies.jsonl.gz --output "$(HTTP_FRONT_RESULTS)"
 
 # Unauthenticated reverse-proxy TLS ingress must reject hostile SNI locally.
 build/tooling/tests/proxy-tls-sni-test.ll build/tooling/tests/proxy-http-drain-test.ll: tests/net-fixtures.min
 .PHONY: check-proxy-tls-sni check-proxy-tls-sni-sanitize
 check-proxy-tls-sni: build/minyarc build/tooling/tests/proxy-tls-sni-test
-	+MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/proxy-tls-sni-test
+	+MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/proxy-tls-sni-test
 
 check-proxy-tls-sni-sanitize: build/minyarc build/tooling/tests/proxy-tls-sni-test
-	+$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/proxy-tls-sni-test --sanitize
+	+$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/proxy-tls-sni-test --sanitize
 
 check-tls-server: check-proxy-tls-sni
 check-tls-server-sanitize: check-proxy-tls-sni-sanitize
 
 .PHONY: check-proxy-http-drain check-proxy-http-drain-sanitize
 check-proxy-http-drain: build/minyarc build/tooling/tests/proxy-http-drain-test
-	+MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/proxy-http-drain-test
+	+MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/proxy-http-drain-test
 
 check-proxy-http-drain-sanitize: build/minyarc build/tooling/tests/proxy-http-drain-test
-	+$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/proxy-http-drain-test --sanitize
+	+$(NATIVE_SANITIZER_ENV) MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/proxy-http-drain-test --sanitize
 
 check-httpserver: check-proxy-http-drain
 check-httpserver-sanitize: check-proxy-http-drain-sanitize

@@ -25,11 +25,11 @@ build/tooling/scripts/linux-flatpak: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/scripts/linux-flatpak: runtime/native/sha256.c
 .PHONY: check-shipping
 check-shipping: build/minyarc build/tooling/tests/http-bounded-test build/tooling/tests/update-native build/tooling/tests/update-policy build/tooling/tests/shipping build/tooling/scripts/linux-flatpak build/tooling/tests/update-manifest build/tooling/scripts/update-manifest build/tooling/scripts/update-bundle
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/shipping
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/update-manifest
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/update-native
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/update-policy
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/http-bounded-test
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/shipping
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/update-manifest
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/update-native
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/update-policy
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/http-bounded-test
 
 check: check-shipping
 check-portable: check-shipping
@@ -38,9 +38,9 @@ check-portable: check-shipping
 check-update-bundle: build/tooling/tests/update-bundle
 	$(LIMITED) ./build/tooling/tests/update-bundle
 check-update-launch: build/minyarc build/tooling/tests/update-launch
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/update-launch
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/update-launch
 check-update-launch-native: build/tooling/tests/update-launch-native
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/update-launch-native
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/update-launch-native
 check-shipping: check-update-bundle check-update-launch check-update-launch-native
 check-sanitize: check-update-launch-native
 

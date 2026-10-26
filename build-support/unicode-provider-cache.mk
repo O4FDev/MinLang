@@ -7,6 +7,6 @@ build/tooling/tests/unicode-provider-cache: tests/toolchain-files.c
 build/tooling/tests/unicode-provider-cache.ll: tests/toolchain-files.min tests/release-support.min
 
 check-unicode-provider-cache: build/tooling/tools/clang-driver build/tooling/tests/unicode-provider-cache $(UNICODE_PROVIDER_CACHE_INPUTS)
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/unicode-provider-cache
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/unicode-provider-cache
 
 check check-portable: check-unicode-provider-cache

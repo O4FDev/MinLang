@@ -24,11 +24,11 @@ check-quic-protocol-artifacts: build/tooling/tests/quic-protocol-artifacts build
 check-quic-rfc check-quic-rfc-sanitize: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
 check-quic-rfc: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
 	./build/tooling/tests/quic-rfc-harness
-	@set -e; rm -rf -- build/quic-rfc-native.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization both --artifacts "$$artifacts/run"
+	@set -e; rm -rf -- build/quic-rfc-native.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization both --artifacts "$$artifacts/run"
 
 check-quic-rfc-sanitize: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
 	MINYAR_QUIC_RFC_PORT=44310 ./build/tooling/tests/quic-rfc-harness
-	@set -e; rm -rf -- build/quic-rfc-sanitize.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44310 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization both --sanitize --artifacts "$$artifacts/run"
+	@set -e; rm -rf -- build/quic-rfc-sanitize.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44310 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization both --sanitize --artifacts "$$artifacts/run"
 
 check check-portable check-quic: check-quic-rfc
 check-sanitize check-quic-sanitize: check-quic-rfc-sanitize

@@ -29,19 +29,19 @@ build/tooling/tests/parallel-signatures: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/parallel-signatures: tests/evidence-support-native.c runtime/native/sha256.c
 
 check-parallel-signatures: $(addprefix build/,$(PARALLEL_SIGNATURE_FRONTENDS)) build/minyar-runtime.o build/compiler-stage3.ll build/closure-compiler-stage3.ll build/errors-compiler-stage3.ll $(PARALLEL_SIGNATURE_INPUTS) build/testing/cycle-runtime.o build/tooling/tests/compiler-behavior | build
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile callbacks --ir build/closure-compiler-stage3.ll
-	MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile errors --ir build/errors-compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile callbacks --ir build/closure-compiler-stage3.ll
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile errors --ir build/errors-compiler-stage3.ll
 	@set -e; rm -rf -- build/parallel-signatures-native-*; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-native-XXXXXX"); \
 	for frontend in $(PARALLEL_SIGNATURE_FRONTENDS); do \
-	    MINYAR_TEST_COMPILER="./build/$$frontend" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/$$frontend" MINYAR_TEST_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/parallel-signatures; \
+	    MINYAR_TEST_COMPILER="./build/$$frontend" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/$$frontend" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/parallel-signatures; \
 	done
 
 # The driver emits LLVM but never links its synthetic native-package controls.
 check-parallel-signatures-sanitize: $(addprefix build/,$(PARALLEL_SIGNATURE_SANITIZER_FRONTENDS)) build/minyar-runtime.o $(PARALLEL_SIGNATURE_INPUTS) | build
 	@set -e; rm -rf -- build/parallel-signatures-sanitize-*; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-sanitize-XXXXXX"); \
 	for frontend in $(PARALLEL_SIGNATURE_SANITIZER_FRONTENDS); do \
-	    $(NATIVE_SANITIZER_ENV) MINYAR_TEST_COMPILER="./build/$$frontend" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/$$frontend" MINYAR_TEST_CLANG="$(LLVM_CC)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/parallel-signatures; \
+	    $(NATIVE_SANITIZER_ENV) MINYAR_TEST_COMPILER="./build/$$frontend" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/$$frontend" MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/parallel-signatures; \
 	done
 
 check check-portable check-parallel check-callbacks check-errors-language: check-parallel-signatures

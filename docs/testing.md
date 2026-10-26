@@ -45,6 +45,16 @@ for example `make check-in-parallel CHECKS="check-portable check-suite-catalogue
 As in CI, harnesses do not add their own parallelism or pause for host load.
 Checks must not rebuild shared artefacts with a different toolchain: a launcher
 test that needs another Clang identity uses a private copy of the tree.
+`MINYAR_TEST_CLANG_CACHE=1 make check-in-parallel …` compiles test fixtures
+through `build/test-clang/clang`, a wrapper that caches the pinned Clang's
+outputs with `tools/clang-cache.min` under `TEST_CLANG_CACHE_DIR` (default
+`~/.cache/minyar/test-clang`; entries unused for 7 days are pruned). Recipes pass
+it to harnesses as `MINYAR_TEST_CLANG` through the Makefile's `TEST_CLANG`, which
+is never part of `build/.toolchain.json`, so the compiler is not rebuilt. Checks
+whose label names a budget, performance, timing or measurement compile uncached.
+A harness that hands a Clang to the launcher or a sub-make, or records its
+identity as evidence, uses `test.realClang` (`fixtures.realClang`), the real
+compiler in `MINYAR_TEST_REAL_CLANG`.
 `make check-in-parallel-tool` (in `check-portable`) runs the runner on a
 scratch Makefile: an aggregate of passing checks passes, its shared file
 prerequisite is built exactly once, and every check sees `MINYAR_TEST_JOBS=1`
