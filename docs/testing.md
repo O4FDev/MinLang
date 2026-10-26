@@ -169,6 +169,8 @@ process groups. Output readiness and FIFO handshakes establish ordering.
 `make check-live-transform` executes LLVM forwarding at O0/O2 and checks source
 and image ABI guards. `make check-live-hot` checks the same PID and heap roots
 across function updates and rejected edits, and reports edit-to-observation time.
+Its Clang-counting launcher runs from a private copy of the tree, so it never
+rebuilds the shared compiler and is safe as a `make check-in-parallel` extra.
 `make check-live-generic-names` patches a body that swaps the first uses of two
 same-ABI generic instances and requires a closure stored before the patch to keep
 calling its own instance (instance names hash their type arguments, and the image
