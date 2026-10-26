@@ -80,9 +80,26 @@ function newGenericStream(kinds: List<Integer>, texts: List<Text>, lines: Source
     return GenericStream { kinds: kinds; texts: texts; lines: lines; replacements: replacements; ends: ends; prefixes: prefixes }
 }
 
+// `deterministic (A) -> B` keeps its own name in generic inference and its
+// source spelling, which the callable-type pass lowers after instantiation.
+function genericCallable(name: Text): Boolean {
+    return name == "Callback" || name == "DeterministicCallback"
+}
+
 function genericType(program: GenericProgram, name: Text, arguments: List<Integer>): Integer {
     let spelling = name
     if arguments.length > 0 { spelling = genericSpelling(program, name, arguments) }
+    if name == "DeterministicCallback" && arguments.length > 0 {
+        let pieces: List<Text> = ["deterministic ("]
+        let position = 0
+        while position + 1 < arguments.length {
+            if position > 0 { pieces.add(", ") }
+            pieces.add(program.types[arguments[position]].spelling)
+            position = position + 1
+        }
+        pieces.add(") -> " + program.types[arguments[arguments.length - 1]].spelling)
+        spelling = joinText(pieces)
+    }
     let found = genericIndexGet(program.typeIndex, spelling)
     if found >= 0 { return found }
     let type = program.types.length
@@ -121,6 +138,11 @@ function genericReadType(program: GenericProgram, stream: GenericStream, cursor:
     if depth >= 64 { genericError(stream, cursor[0], "generic type nesting exceeds 64") }
     let name = stream.texts[cursor[0]]
     let arguments: List<Integer> = []
+    if cursor[1] == 0 && name == "deterministic" && callableTypeArrow(stream.kinds, stream.texts, cursor[0] + 1) >= 0 {
+        cursor[0] = cursor[0] + 1
+        let plain = genericReadType(program, stream, cursor, depth + 1)
+        return genericType(program, "DeterministicCallback", program.types[plain].arguments)
+    }
     if cursor[1] == 0 && name == "(" {
         cursor[0] = cursor[0] + 1
         while !tokenIs(stream.kinds, stream.texts, cursor, ")") {
@@ -201,7 +223,7 @@ function genericUnify(program: GenericProgram, stream: GenericStream, position: 
         bindings[variable] = genericMergeBinding(program, stream, position, bindings[variable], actual, variables[variable], 0)
         return
     }
-    if wanted.name != received.name || wanted.arguments.length != received.arguments.length { return }
+    if (wanted.name != received.name && !(genericCallable(wanted.name) && genericCallable(received.name))) || wanted.arguments.length != received.arguments.length { return }
     let child = 0
     let loopEnd7 = wanted.arguments.length
     while child < loopEnd7 {
@@ -361,6 +383,17 @@ function genericEmitType(program: GenericProgram, stream: GenericStream, positio
     let declaration = genericDeclaration(program, shape.name, 2)
     if declaration >= 0 && program.declarations[declaration].variables.length > 0 {
         return genericInstantiate(program, stream, position, declaration, shape.arguments)
+    }
+    if shape.name == "DeterministicCallback" && shape.arguments.length > 0 {
+        let callable: List<Text> = ["deterministic ("]
+        let argument = 0
+        while argument + 1 < shape.arguments.length {
+            if argument > 0 { callable.add(", ") }
+            callable.add(genericEmitType(program, stream, position, shape.arguments[argument], depth + 1))
+            argument = argument + 1
+        }
+        callable.add(") -> " + genericEmitType(program, stream, position, shape.arguments[shape.arguments.length - 1], depth + 1))
+        return joinText(callable)
     }
     let pieces: List<Text> = [shape.name]
     if shape.arguments.length > 0 {
@@ -607,7 +640,6 @@ function genericCollectDeclaration(program: GenericProgram, stream: GenericStrea
     let parametersStart = cursor[0]
     let interruptFunction = kind == 1 && isInterruptFunctionAt(stream.kinds, stream.texts, start)
     if interruptFunction && variables.length > 0 { genericError(stream, start, "interrupt handlers cannot have type parameters") }
-    if kind == 1 && variables.length > 0 && isDeterministicFunctionAt(stream.kinds, stream.texts, start) { genericError(stream, start + 1, "a deterministic function cannot be generic yet; mark a concrete function that calls it") }
     let registerLayout = kind == 2 && stream.texts[parametersStart] == "native" && registerLayoutWidth(stream.texts[parametersStart + 1]) > 0
     if registerLayout && variables.length > 0 { genericError(stream, start, "register layouts cannot have type parameters") }
     let dmaLayout = kind == 2 && stream.texts[parametersStart] == "native" && dmaMarkerKind(stream.texts[parametersStart + 1]) > 0
@@ -756,13 +788,13 @@ function genericCall(program: GenericProgram, stream: GenericStream, cursor: Lis
     }
     let declaration = genericDeclaration(program, name, 1)
     let localCallable = genericScopeType(program, scope, name)
-    if localCallable > 0 && program.types[localCallable].name == "Callback" { declaration = -1 }
+    if localCallable > 0 && genericCallable(program.types[localCallable].name) { declaration = -1 }
     cursor[0] = cursor[0] + 1
     let bindings: List<Integer> = []
     let variables: List<Text> = []
     let parameterTypes: List<Integer> = []
     let result = 0
-    if declaration < 0 && localCallable > 0 && program.types[localCallable].name == "Callback" {
+    if declaration < 0 && localCallable > 0 && genericCallable(program.types[localCallable].name) {
         let signature = program.types[localCallable].arguments
         let parameter = 0
         while parameter + 1 < signature.length { parameterTypes.add(signature[parameter]); parameter = parameter + 1 }
@@ -818,7 +850,7 @@ function genericCall(program: GenericProgram, stream: GenericStream, cursor: Lis
     if name == "cAddress" { return genericNamedType(program, "Integer") }
     if name == "Ok" || name == "Err" { return expected }
     let callable = genericScopeType(program, scope, name)
-    if callable > 0 && program.types[callable].name == "Callback" {
+    if callable > 0 && genericCallable(program.types[callable].name) {
         let signature = program.types[callable].arguments
         if signature.length > 0 { return signature[signature.length - 1] }
     }
@@ -990,7 +1022,7 @@ function genericPostfix(program: GenericProgram, stream: GenericStream, cursor: 
             }
         } else {
             let callSignature: List<Integer> = []
-            if type > 0 && program.types[type].name == "Callback" { callSignature = program.types[type].arguments }
+            if type > 0 && genericCallable(program.types[type].name) { callSignature = program.types[type].arguments }
             let argument = 0
             while !tokenIs(stream.kinds, stream.texts, cursor, ")") {
                 let expected = 0
@@ -1085,7 +1117,7 @@ function genericPrimary(program: GenericProgram, stream: GenericStream, cursor: 
         let closure = GenericScope { names: scope.names; types: scope.types; active: scope.active; result: genericNamedType(program, "Nothing") }
         let arguments: List<Integer> = []
         let contextual: List<Integer> = []
-        if expected > 0 && program.types[expected].name == "Callback" { contextual = program.types[expected].arguments }
+        if expected > 0 && genericCallable(program.types[expected].name) { contextual = program.types[expected].arguments }
         while !tokenIs(stream.kinds, stream.texts, cursor, ")") {
             let name = stream.texts[cursor[0]]
             cursor[0] = cursor[0] + 1
@@ -1384,6 +1416,10 @@ function genericInstanceStream(program: GenericProgram, instance: GenericInstanc
     if declaration.kind == 2 && source.texts[declaration.parametersStart] == "native" && lines.features / 32 % 2 == 0 { lines.features = lines.features + 32 }
     let typePositions = program.typePositions
     let position = declaration.start
+    // Every instance of a deterministic generic function is itself proved.
+    if declaration.kind == 1 && isDeterministicFunctionAt(source.kinds, source.texts, declaration.start) {
+        copyModuleToken(kinds, texts, lines, 6, "deterministic", source.lines, declaration.start - 1, sourcePath(lines, tokenPath(source.lines, declaration.start - 1)))
+    }
     let angleDepth = 0
     while position < declaration.end {
         if position == declaration.start + 1 {
@@ -1501,7 +1537,10 @@ function normalizeGenericTokens(kinds: List<Integer>, texts: List<Text>, lines: 
     while instance < instances.length || constraint < program.constraints.length {
         if instance < instances.length {
         let stream = genericInstanceStream(program, instances[instance])
-        let declaration = genericCollectDeclaration(program, stream, 0, stream.kinds.length - 1)
+        // A modifier such as `deterministic` precedes the instance's `function`.
+        let first = 0
+        if stream.kinds[0] == 6 { first = 1 }
+        let declaration = genericCollectDeclaration(program, stream, first, stream.kinds.length - 1)
         genericProcessDeclaration(program, stream, declaration)
         genericAppendStream(stream, outputKinds, outputTexts, outputLines)
         instance = instance + 1

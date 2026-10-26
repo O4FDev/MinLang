@@ -5,7 +5,7 @@ use "io" as io
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 frontend.helpers = "#include \"minyar_stack_frames.h\"\n"
 let levels = ["-O0", "-O2"]
-let cases = ["seed", "replay", "ordering", "causality", "durability", "namespace", "torn-write", "faults", "packets", "clock-cancel", "invalid", "gallery", "determinism", "sectors", "guide", "windows"]
+let cases = ["seed", "replay", "ordering", "causality", "durability", "namespace", "torn-write", "faults", "packets", "clock-cancel", "invalid", "gallery", "determinism", "deterministic-callbacks", "deterministic-generics", "sectors", "guide", "windows"]
 fixtures.validate("simulation", cases)
 // Each source joins a shared header and must fail at compile time.
 function rejectNondeterministic(frontend: fixtures.Frontend, source: Text, diagnostic: Text) {
@@ -671,14 +671,122 @@ if fixtures.selected("simulation", "determinism") {
         deterministic function tick(): Integer { native "host_clock" }
         """#, "a native function cannot be deterministic; mark the Minyar function that calls it")
     rejectNondeterministic(frontend, #"""
-        deterministic function first<Item>(items: List<Item>): Item { return items[0] }
-        print(first([1]))
-        """#, "a deterministic function cannot be generic yet; mark a concrete function that calls it")
-    rejectNondeterministic(frontend, #"""
         record Box { value: Integer }
         deterministic function Box.stamped(): Integer { return self.value + system.monotonicNanoseconds() % 2 }
         print(Box { value: 2 }.stamped())
         """#, "deterministic function 'Box.stamped' can reach the host clock: Box.stamped -> monotonicNanoseconds (native \"system\")")
+}
+
+if fixtures.selected("simulation", "deterministic-callbacks") {
+    // A `deterministic (A) -> B` holds only functions proved where they are
+    // passed, so a deterministic function may call through it even when the
+    // program takes the address of a clock reader with the same signature.
+    frontend.sources = ["runtime/native/system.c"]
+    fixtures.executes(frontend, #"""
+        use "simulation" as sim
+        use "system" as system
+        record Call { value: Integer }
+        record Registry { bodies: List<deterministic (Call) -> Integer> }
+        function Registry.define(body: deterministic (Call) -> Integer) { self.bodies.add(body) }
+        function twice(call: Call): Integer { return call.value * 2 }
+        function clocked(call: Call): Integer { return call.value + system.wallClockMicroseconds() % 1 }
+        deterministic function host(registry: Registry, seed: Integer): Integer {
+            let world = sim.create(seed)
+            let total = 0
+            for body in registry.bodies { total = total + body(Call { value: sim.choose(world, 10) }) }
+            return total
+        }
+        function apply<T>(items: List<T>, f: deterministic (T) -> T): List<T> {
+            let result: List<T> = []
+            for item in items { result.add(f(item)) }
+            return result
+        }
+        function increment(value: Integer): Integer { return value + 1 }
+        let plain: (Call) -> Integer = clocked
+        print(plain(Call { value: 1 }))
+        let registry = Registry { bodies: [] }
+        registry.define(twice)
+        let offset = 1
+        registry.define(function(call) { return call.value + offset })
+        print(host(registry, 7) == host(registry, 7))
+        let kept: deterministic (Call) -> Integer = twice
+        let widened: (Call) -> Integer = kept
+        print(widened(Call { value: 4 }))
+        print(apply([1, 2], increment)[1])
+        print(apply(["a"], function(text) { return text + "!" })[0])
+        """#, "1\ntrue\n8\n3\na!\n", levels, 0, "", true)
+    frontend.sources = []
+
+    rejectNondeterministic(frontend, #"""
+        record Call { value: Integer }
+        function define(body: deterministic (Call) -> Integer): Integer { return body(Call { value: 1 }) }
+        function stamp(call: Call): Integer { return call.value + system.wallClockMicroseconds() % 2 }
+        function clocked(call: Call): Integer { return stamp(call) }
+        print(define(clocked))
+        """#, "function 'clocked', passed as deterministic (Call) -> Integer, can reach the host clock: clocked -> stamp -> wallClockMicroseconds (native \"system\")")
+    rejectNondeterministic(frontend, #"""
+        record Call { value: Integer }
+        function define(body: deterministic (Call) -> Integer): Integer { return body(Call { value: 1 }) }
+        print(define(function(call) { return call.value + system.monotonicNanoseconds() % 2 }))
+        """#, "this anonymous function, passed as deterministic (Call) -> Integer, can reach the host clock: an anonymous function -> monotonicNanoseconds (native \"system\")")
+    rejectNondeterministic(frontend, #"""
+        record Call { value: Integer }
+        function define(body: deterministic (Call) -> Integer): Integer { return body(Call { value: 1 }) }
+        function twice(call: Call): Integer { return call.value * 2 }
+        let plain: (Call) -> Integer = twice
+        print(define(plain))
+        """#, "this place needs a deterministic (Call) -> Integer, but this (Call) -> Integer is not known to be deterministic")
+    rejectNondeterministic(frontend, #"""
+        function apply<T>(items: List<T>, f: deterministic (T) -> T): List<T> {
+            let result: List<T> = []
+            for item in items { result.add(f(item)) }
+            return result
+        }
+        function noisy(value: Integer): Integer { return value + system.wallClockMicroseconds() % 1 }
+        print(apply([1], noisy)[0])
+        """#, "function 'noisy', passed as deterministic (Integer) -> Integer, can reach the host clock: noisy -> wallClockMicroseconds (native \"system\")")
+    // A plain callable parameter still stands for every function of its signature.
+    rejectNondeterministic(frontend, #"""
+        record Call { value: Integer }
+        function clocked(call: Call): Integer { return call.value + system.wallClockMicroseconds() % 1 }
+        deterministic function host(body: (Call) -> Integer): Integer { return body(Call { value: 2 }) }
+        let plain: (Call) -> Integer = clocked
+        print(host(plain))
+        """#, "deterministic function 'host' can reach the host clock: host -> a callback that may be clocked -> wallClockMicroseconds (native \"system\")")
+}
+
+if fixtures.selected("simulation", "deterministic-generics") {
+    // Every instance of a deterministic generic function is proved on its own.
+    fixtures.executes(frontend, #"""
+        use "simulation" as sim
+        deterministic function biggest<Item: Ordered>(items: List<Item>): Item {
+            let best = items[0]
+            for item in items { if item > best { best = item } }
+            return best
+        }
+        record Score { value: Integer }
+        function Score.compare(other: Score): Integer { return self.value - other.value }
+        conform Score to Ordered
+        deterministic function universe(seed: Integer): Integer {
+            let world = sim.create(seed)
+            return biggest([sim.choose(world, 10), 3]) + biggest([Score { value: 4 }, Score { value: 9 }]).value
+        }
+        print(universe(1) == universe(1))
+        print(biggest(["a", "c", "b"]))
+        """#, "true\nc\n", levels, 0, "", true)
+
+    rejectNondeterministic(frontend, #"""
+        record Stamp { value: Integer }
+        function Stamp.compare(other: Stamp): Integer { return self.value - other.value + system.wallClockMicroseconds() % 1 }
+        conform Stamp to Ordered
+        deterministic function biggest<Item: Ordered>(items: List<Item>): Item {
+            let best = items[0]
+            for item in items { if item > best { best = item } }
+            return best
+        }
+        print(biggest([1, 2]))
+        print(biggest([Stamp { value: 1 }, Stamp { value: 2 }]).value)
+        """#, "deterministic function 'biggest' can reach the host clock: biggest -> the ordering of Stamp -> Stamp.compare -> wallClockMicroseconds (native \"system\")")
 }
 
 test.removeTree(frontend.compiler.directory)

@@ -94,19 +94,62 @@ error: deterministic function 'simulate' can reach the host clock: simulate -> o
   = help: called from cover (raftkv.min:230, column 10); use the simulation World's virtual time (simulation.now or simulation.wallTime) and pass the World in
 ```
 
-The marked function must be a named, non-generic Minyar function or record
-method; the functions it calls may be generic. Its callers keep ordinary host effects,
+The marked function must be a named Minyar function or record method. A
+generic one is proved once per instance, with that instance's types, so
+`deterministic function biggest<Item: Ordered>` fails for an `Item` whose
+`compare` reads the clock and passes for every other. Its callers keep ordinary host effects,
 so a driver can read arguments, time a run or write reports around the
 proved part. The check reads the final LLVM module, adds no instructions or
 runtime calls, and runs only when a program uses the modifier. Programs that
 use it compile with the complete frontend instead of reusing incremental
 module state.
 
+### Deterministic callbacks
+
+A plugin interface can require proved bodies with the callable type
+`deterministic (A) -> B`. A parameter, field or List element of that type
+accepts a function by name or an anonymous function, and the compiler proves
+it where it is passed, exactly as for `deterministic function`. A call through
+such a value is then known to be deterministic: it does not stand for every
+function of its signature, so a host can call registered extensions from its
+own deterministic code while other parts of the program take the address of
+clock readers with the same signature.
+
+```minyar
+record Call { value: Integer }
+record Registry { bodies: List<deterministic (Call) -> Integer> }
+function Registry.define(body: deterministic (Call) -> Integer) { self.bodies.add(body) }
+function twice(call: Call): Integer { return call.value * 2 }
+
+deterministic function run(registry: Registry, value: Integer): Integer {
+    let total = 0
+    for body in registry.bodies { total = total + body(Call { value: value }) }
+    return total
+}
+
+let registry = Registry { bodies: [] }
+registry.define(twice)
+registry.define(function(call) { return call.value + 1 })
+print(run(registry, 10)) // 31
+```
+
+A deterministic callable value can be used wherever the plain `(A) -> B` is
+expected. The reverse needs proof, so a plain value is rejected:
+
+```text
+error: this place needs a deterministic (Call) -> Integer, but this (Call) -> Integer is not known to be deterministic
+error: function 'clocked', passed as deterministic (Call) -> Integer, can reach the host clock: clocked -> stamp -> wallClockMicroseconds (native "system")
+```
+
+The type has the same representation and call cost as `(A) -> B`; the proof
+runs at compile time.
+
 The proof covers effects, not every input. It does not track the contents
 of a List, record or Map global that code outside the function changes, and it does
 not make out-of-memory or stack exhaustion reproducible. Floating-point
 `math` results are fixed for one build on one platform. `deterministic` is an
-ordinary identifier everywhere except directly before `function`.
+ordinary identifier everywhere except directly before `function` or a
+callable type `(A) -> B`.
 
 ## Running many universes
 

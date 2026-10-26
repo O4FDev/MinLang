@@ -162,10 +162,42 @@ function callbackSignatureTypes(name: Text): List<Integer> {
 function isCallbackType(type: Integer, names: List<Text>): Boolean {
     if !isRecordType(type) { return false }
     let name = names[recordTypeIndex(type)]
-    return name.length > 10 && name.slice(0, 10) == "#Callback:"
+    return (name.length > 10 && name.slice(0, 10) == "#Callback:") || resultPrefix(name, "#DeterministicCallback:")
+}
+
+// `deterministic (A) -> B` has the same representation and calls as `(A) -> B`.
+// Every value of it was proved deterministic where it was created, so an
+// indirect call through it adds nothing to a determinism proof.
+function isDeterministicCallbackType(type: Integer, names: List<Text>): Boolean {
+    return isRecordType(type) && resultPrefix(names[recordTypeIndex(type)], "#DeterministicCallback:")
+}
+
+function deterministicCallbackName(types: List<Integer>): Text {
+    return "#Deterministic" + callbackSignatureName(types).slice(1, callbackSignatureName(types).length)
+}
+
+// The deterministic callable type with a plain one's signature, or -1.
+function deterministicCallbackFor(type: Integer, names: List<Text>, symbols: List<Integer>): Integer {
+    let record = findSymbol(names, symbols, deterministicCallbackName(callbackSignatureTypes(names[recordTypeIndex(type)])), 4)
+    if record < 0 { return -1 }
+    return 1000 + record
+}
+
+// ":<parameter types>:<result>" of a callable type's private name.
+function callbackSignatureSuffix(name: Text): Text {
+    return name.slice(findCharacter(name, ':'), name.length)
+}
+
+// Whether two callable types have the same parameters and result.
+function sameCallbackSignature(left: Integer, right: Integer, names: List<Text>): Boolean {
+    return callbackSignatureSuffix(names[recordTypeIndex(left)]) == callbackSignatureSuffix(names[recordTypeIndex(right)])
 }
 
 function takeCallbackType(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, names: List<Text>, symbols: List<Integer>, create: Boolean): Integer {
+    return takeCallbackTypeKind(kinds, texts, lines, cursor, names, symbols, create, false)
+}
+
+function takeCallbackTypeKind(kinds: List<Integer>, texts: List<Text>, lines: SourceMap, cursor: List<Integer>, names: List<Text>, symbols: List<Integer>, create: Boolean, deterministic: Boolean): Integer {
     cursor[0] = cursor[0] + 1
     expectToken(kinds, texts, lines, cursor, "<")
     let types: List<Integer> = [takeType(kinds, texts, lines, cursor, names, symbols)]
@@ -180,6 +212,7 @@ function takeCallbackType(kinds: List<Integer>, texts: List<Text>, lines: Source
         parameter = parameter + 1
     }
     let name = callbackSignatureName(types)
+    if deterministic { name = deterministicCallbackName(types) }
     let record = findSymbol(names, symbols, name, 4)
     if record < 0 && create {
         record = names.length
@@ -255,7 +288,13 @@ function prepareCallbackSymbols(kinds: List<Integer>, texts: List<Text>, lines: 
     while position >= 0 {
         if kinds[position] == 1 && typePositions[position] && texts[position] == "Callback" && texts[position + 1] == "<" {
             let cursor: List<Integer> = [position]
-            takeCallbackType(kinds, texts, lines, cursor, names, symbols, true)
+            let deterministic = position > 0 && texts[position - 1] == "#deterministic"
+            if deterministic {
+                // Its plain form too: values widen to it and calls share it.
+                let plain: List<Integer> = [position]
+                takeCallbackTypeKind(kinds, texts, lines, plain, names, symbols, true, false)
+            }
+            takeCallbackTypeKind(kinds, texts, lines, cursor, names, symbols, true, deterministic)
         }
         position = position - 1
     }
@@ -391,6 +430,7 @@ function parseClosure(context: CompilerContext, localNames: List<Text>, localTyp
     let functionParameterTypes = context.functionParameterTypes
     if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "indirect", "closure creation", "unreviewed") }
     let start = state[0]
+    let expected = resultType[0]
     let parameters: List<Text> = []
     let types: List<Integer> = []
     let signature = takeCallbackHeader(tokenKinds, tokenTexts, tokenLines, state, functionNames, symbolKinds, parameters, types, resultType[0], false)
@@ -455,9 +495,37 @@ function parseClosure(context: CompilerContext, localNames: List<Text>, localTyp
     output.add("  call void @minyar_record_set(ptr " + callback + ", i64 2, i64 " + domain + ")\n")
     globals.add("; minyar-closure-body: " + Text(start) + "\n")
     state[0] = end
-    setType(resultType, signature)
+    let type = signature
+    if isDeterministicCallbackType(expected, functionNames) && sameCallbackSignature(expected, signature, functionNames) {
+        type = expected
+        noteDeterministicValue(context, ".minyar.closure." + Text(start), start, "this anonymous function, passed as " + diagnosticType(context, expected) + ",")
+    }
+    setType(resultType, type)
     markOwner(resultType, owner)
     return callback
+}
+
+// Each body reaching a `deterministic (A) -> B` is proved once, after
+// emission, with the same audit as `deterministic function`.
+function noteDeterministicValue(context: CompilerContext, symbol: Text, origin: Integer, label: Text) {
+    let values = context.deterministicValues
+    if findText(values.symbols, symbol) >= 0 { return }
+    values.symbols.add(symbol)
+    values.origins.add(origin)
+    values.labels.add(label)
+}
+
+// A value meets the type its context expects: a deterministic callable widens
+// to the plain one with its signature; a plain one never narrows.
+function adoptCallableType(context: CompilerContext, resultType: List<Integer>, expected: Integer, position: Integer) {
+    let actual = resultType[0]
+    let names = context.functionNames
+    if !isCallbackType(expected, names) || !isCallbackType(actual, names) || !sameCallbackSignature(expected, actual, names) { return }
+    if isDeterministicCallbackType(actual, names) {
+        setType(resultType, expected)
+        return
+    }
+    failDiagnostic(sourceSpan(context.tokenLines, context.tokenLines.inputPath, position, position + 1), "this place needs a " + diagnosticType(context, expected) + ", but this " + diagnosticType(context, actual) + " is not known to be deterministic", "", "pass a function by name or an anonymous function here, which the compiler proves deterministic, or give the place this value comes from the deterministic type")
 }
 
 function parseCallbackCall(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, callback: Text, callbackType: Integer): Text {
@@ -490,6 +558,8 @@ function parseCallbackCall(context: CompilerContext, localNames: List<Text>, loc
     let env = readRecordField(output, textState, state, callback, 1, 8)
     let value = ""
     let result = signature[count]
+    // The determinism audit trusts this call: its callee was proved when the value was made.
+    if isDeterministicCallbackType(callbackType, functionNames) { output.add("  ; minyar-deterministic-call\n") }
     output.add("  ")
     if result != 5 {
         value = valueName(textState, newTemporary(state))
@@ -1079,7 +1149,9 @@ function parseFunctionValue(context: CompilerContext, state: List<Integer>, text
     }
     types.add(context.functionReturnTypes[function])
     let expected = resultType[0]
-    if isCallbackType(expected, functionNames) && callbackSignatureName(types) != functionNames[recordTypeIndex(expected)] {
+    let expectedName = ""
+    if isCallbackType(expected, functionNames) { expectedName = functionNames[recordTypeIndex(expected)] }
+    if expectedName != "" && callbackSignatureSuffix(callbackSignatureName(types)) != callbackSignatureSuffix(expectedName) {
         let wanted = callbackSignatureTypes(functionNames[recordTypeIndex(expected)])
         let help = "pass a function of that type, or adapt this one in an anonymous function"
         if wanted.length != types.length { help = "this place calls it with " + Text(wanted.length - 1) + " argument(s); " + help }
@@ -1089,16 +1161,23 @@ function parseFunctionValue(context: CompilerContext, state: List<Integer>, text
     if signature < 0 || (state[15] % 2) == 0 { failDiagnostic(span, "function '" + readable + "' cannot be used as a value here", "", "pass it as an anonymous function: function(...) { " + readable + "(...) }") }
     if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "indirect", "function value", "unreviewed") }
     let thunk = functionValueThunk(context, globals, function, types)
+    let type = 1000 + signature
+    if isDeterministicCallbackType(expected, functionNames) {
+        type = expected
+        let callee = context.functionIRNames[function]
+        if callee.length >= 2 && callee[0] == '"' { callee = callee.slice(1, callee.length - 1) }
+        noteDeterministicValue(context, callee, position, "function '" + readable + "', passed as " + diagnosticType(context, expected) + ",")
+    }
     let callback = valueName(textState, newTemporary(state))
     output.add("  " + callback + " = call ptr @minyar_record_new_scalar(i64 3)\n")
-    let owner = keepReference(output, state, callback, 1000 + signature)
+    let owner = keepReference(output, state, callback, type)
     let code = valueAsListSlot(output, textState, state, "@" + thunk, 8)
     output.add("  call void @minyar_record_set_scalar(ptr " + callback + ", i64 0, i64 " + code + ")\n")
     let domain = valueName(textState, newTemporary(state))
     output.add("  " + domain + " = call i64 @minyar_callback_domain()\n")
     output.add("  call void @minyar_record_set_scalar(ptr " + callback + ", i64 2, i64 " + domain + ")\n")
     state[0] = position + 1
-    setType(resultType, 1000 + signature)
+    setType(resultType, type)
     markOwner(resultType, owner)
     return callback
 }

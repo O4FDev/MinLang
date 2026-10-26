@@ -1680,6 +1680,10 @@ values. Generic functions are instantiated by calls, so pass a concrete wrapper
 instead. Under `--incremental`, a program that reads a function as a value uses
 the ordinary full frontend.
 
+`deterministic (A) -> B` is a callable type whose values the compiler proves
+deterministic where they are passed; see
+[Deterministic callbacks](simulation.md#deterministic-callbacks).
+
 Without a contextual callable type, anonymous parameters need annotations and
 an omitted return type means `Nothing`. The earlier
 `Callback<ArgumentTypes..., ReturnType>` spelling remains accepted for source

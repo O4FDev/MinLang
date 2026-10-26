@@ -22,7 +22,6 @@ function collectDeterministicRoots(context: CompilerContext, roots: List<Integer
     while position + 2 < kinds.length {
         if texts[position] == "function" && isDeterministicFunctionAt(kinds, texts, position) {
             if kinds[position + 1] != 1 || texts[position + 1] == "(" { failAtToken(lines, position, "a deterministic function needs a name") }
-            if texts[position + 2] == "<" { failAtToken(lines, position + 1, "a deterministic function cannot be generic yet; mark a concrete function that calls it") }
             let symbol = findCompiledSymbol(context.functionNames, context.symbolKinds, lines.symbolLookup, texts[position + 1], 1)
             if symbol < 0 { failAtToken(lines, position + 1, "a deterministic function needs its own ordinary function declaration") }
             if determinismNativeLibrary(context, symbol) != "" { failAtToken(lines, position + 1, "a native function cannot be deterministic; mark the Minyar function that calls it") }
@@ -506,6 +505,17 @@ function determinismReadable(context: CompilerContext, module: DeterminismModule
     if resultPrefix(name, ".minyar.derived.hash") { return "a Map key's hash" }
     if resultPrefix(name, ".minyar.derived.equal") { return "a Map key's equality" }
     if resultPrefix(name, ".minyar.derived.copy") { return "a Map key's copy" }
+    if resultPrefix(name, ".minyar.derived.compare|") {
+        // `.minyar.derived.compare|<type>|...`: the record whose order is compared.
+        let first = ".minyar.derived.compare|".length
+        let end = first
+        while end < name.length && name[end] != '|' { end = end + 1 }
+        let type = 0
+        let digit = first
+        while digit < end { type = type * 10 + findCharacter("0123456789", name[digit]); digit = digit + 1 }
+        if isRecordType(type) && recordTypeIndex(type) < context.functionNames.length { return "the ordering of " + readableDeclarationName(context.functionNames[recordTypeIndex(type)]) }
+        return "an ordering"
+    }
     let constant = "minyar.constant|"
     if resultPrefix(name, constant) {
         let end = constant.length
@@ -554,6 +564,18 @@ function determinismWhere(context: CompilerContext, module: DeterminismModule, s
     return "called from " + readable + " (" + tokenLocation(context.tokenLines, token) + "); "
 }
 
+// A call through a `deterministic (A) -> B` value: the compiler writes the
+// line `  ; minyar-deterministic-call` just before it. Every such value was
+// proved where it was made (auditDeterministicRoots), so the call adds nothing.
+function determinismTrustedCall(code: Bytes, position: Integer): Boolean {
+    let lineStart = position
+    while lineStart > 0 && code[lineStart - 1] != 10 { lineStart = lineStart - 1 }
+    if lineStart < 2 { return false }
+    let previous = lineStart - 1
+    while previous > 0 && code[previous - 1] != 10 { previous = previous - 1 }
+    return determinismStartsWith(code, previous, "  ; minyar-deterministic-call\n")
+}
+
 // An indirect call `call T %callee(types...)` may reach every address-taken
 // function with the same result and parameter types.
 function determinismIndirectCall(module: DeterminismModule, search: DeterminismSearch, index: Integer, position: Integer) {
@@ -562,6 +584,7 @@ function determinismIndirectCall(module: DeterminismModule, search: DeterminismS
     if open <= 0 { return }
     let callee = determinismWordBefore(module, open)
     if callee.length == 0 || callee[0] != '%' { return }
+    if determinismTrustedCall(code, position) { return }
     let signature = determinismWordBefore(module, open - callee.length) + "(" + determinismTypes(module, open)
     if findText(search.indirect, signature) >= 0 { return }
     search.indirect.add(signature)
@@ -632,9 +655,54 @@ function determinismScan(context: CompilerContext, module: DeterminismModule, se
     }
 }
 
+// Proves one body from its final symbol `start`; reports `subject can reach ...`.
+function determinismProve(context: CompilerContext, module: DeterminismModule, start: Integer, span: SourceSpan, subject: Text): Boolean {
+    let parents: List<Integer> = []
+    let indirectEdges: List<Boolean> = []
+    let index = 0
+    while index < module.names.length { parents.add(-2); indirectEdges.add(false); index = index + 1 }
+    let search = DeterminismSearch { parents: parents, indirectEdges: indirectEdges, queue: [], indirect: [], collections: false, effect: "", detail: "", at: -1 }
+    determinismReach(search, start, -1, false)
+    let next = 0
+    while next < search.queue.length && search.effect == "" {
+        determinismScan(context, module, search, search.queue[next])
+        next = next + 1
+    }
+    if search.effect != "" {
+        let chain: List<Text> = []
+        let step = search.at
+        while step >= 0 {
+            // A named function passed as a value forwards through its own
+            // `.minyar.value|` function; the chain shows the function once.
+            if resultPrefix(module.names[step], ".minyar.value|") && chain.length > 0 {
+                if search.indirectEdges[step] { chain[chain.length - 1] = "a callback that may be " + chain[chain.length - 1] }
+            } else {
+                let readable = determinismReadable(context, module, step)
+                if search.indirectEdges[step] { readable = "a callback that may be " + readable }
+                chain.add(readable)
+            }
+            step = search.parents[step]
+        }
+        let path: List<Text> = []
+        let position = chain.length - 1
+        while position >= 0 {
+            path.add(chain[position])
+            if position > 0 { path.add(" -> ") }
+            position = position - 1
+        }
+        if search.detail != "" && search.detail[0] == '(' { path.add(" " + search.detail) } else { path.add(" -> " + search.detail) }
+        failDiagnostic(span, subject + " can reach " + search.effect + ": " + joinText(path), "", determinismWhere(context, module, search) + determinismHelp(search.effect))
+        return false
+    }
+    return true
+}
+
 function auditDeterministicRoots(context: CompilerContext, output: List<Text>, roots: List<Integer>, origins: List<Integer>) {
-    if roots.length == 0 { return }
+    let values = context.deterministicValues
+    if roots.length == 0 && values.symbols.length == 0 { return }
     let module = parseDeterminismModule(context, output)
+    // Instances of one generic function share its declaration: report the first failure.
+    let failedOrigins: List<Text> = []
     let root = 0
     while root < roots.length {
         let name = determinismMethodName(readableDeclarationName(context.functionNames[roots[root]]))
@@ -642,39 +710,20 @@ function auditDeterministicRoots(context: CompilerContext, output: List<Text>, r
         let start = determinismLookupName(module, context.functionIRNames[roots[root]])
         // Fail closed: an unproved function must never pass silently.
         if start < 0 || module.kinds[start] != 1 { failDiagnostic(span, "a deterministic function must compile to its own code; '" + name + "' was not found in the final module", "", "") }
-        if start >= 0 && module.kinds[start] == 1 {
-            let parents: List<Integer> = []
-            let indirectEdges: List<Boolean> = []
-            let index = 0
-            while index < module.names.length { parents.add(-2); indirectEdges.add(false); index = index + 1 }
-            let search = DeterminismSearch { parents: parents, indirectEdges: indirectEdges, queue: [], indirect: [], collections: false, effect: "", detail: "", at: -1 }
-            determinismReach(search, start, -1, false)
-            let next = 0
-            while next < search.queue.length && search.effect == "" {
-                determinismScan(context, module, search, search.queue[next])
-                next = next + 1
-            }
-            if search.effect != "" {
-                let chain: List<Text> = []
-                let step = search.at
-                while step >= 0 {
-                    let readable = determinismReadable(context, module, step)
-                    if search.indirectEdges[step] { readable = "a callback that may be " + readable }
-                    chain.add(readable)
-                    step = search.parents[step]
-                }
-                let path: List<Text> = []
-                let position = chain.length - 1
-                while position >= 0 {
-                    path.add(chain[position])
-                    if position > 0 { path.add(" -> ") }
-                    position = position - 1
-                }
-                if search.detail != "" && search.detail[0] == '(' { path.add(" " + search.detail) } else { path.add(" -> " + search.detail) }
-                failDiagnostic(span, "deterministic function '" + name + "' can reach " + search.effect + ": " + joinText(path), "", determinismWhere(context, module, search) + determinismHelp(search.effect))
-            }
+        let origin = tokenLocation(context.tokenLines, origins[root])
+        if start >= 0 && module.kinds[start] == 1 && findText(failedOrigins, origin) < 0 {
+            if !determinismProve(context, module, start, span, "deterministic function '" + name + "'") { failedOrigins.add(origin) }
         }
         root = root + 1
+    }
+    // Bodies passed where a `deterministic (A) -> B` is needed.
+    let value = 0
+    while value < values.symbols.length {
+        let span = sourceSpan(context.tokenLines, context.tokenLines.inputPath, values.origins[value], values.origins[value] + 1)
+        let start = determinismLookupName(module, values.symbols[value])
+        if start < 0 || module.kinds[start] != 1 { failDiagnostic(span, values.labels[value] + " must compile to its own code, but it was not found in the final module", "", "") }
+        if start >= 0 && module.kinds[start] == 1 { determinismProve(context, module, start, span, values.labels[value]) }
+        value = value + 1
     }
     diagnosticFinish()
 }
