@@ -61,10 +61,11 @@ bool minyar_callbackruntime_service(void) {
 #elif defined(MINYAR_BOUNDED_RC)
 #ifdef MINYAR_RC_BACKLOG
     minyar_rc_poll_idle(MINYAR_RC_POLL_BUDGET); /* About to wait: idle service. */
+    return rc_pending_count || rc_backlog_count;
 #else
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
-#endif
     return rc_pending_count != 0;
+#endif
 #elif defined(MINYAR_CYCLE_RC)
     rc_cycle_eager_service(32);
     return rc_cycle_pending != 0;

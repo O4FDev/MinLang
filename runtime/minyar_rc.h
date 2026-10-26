@@ -100,12 +100,12 @@ static MINYAR_THREAD_LOCAL size_t rc_object_count, rc_bytes, rc_immortal_object_
 #endif
 _Static_assert(MINYAR_RC_POLL_BUDGET > 0 && MINYAR_RC_POLL_BUDGET <= 1024,
                "cleanup budget must be between 1 and 1024");
-/* The old-object backlog's average share of each service point (see
+/* The old-object backlog's average share of each managed allocation (see
  * docs/bounded-runtime-contract.md); idle service points lift it. Zero, the
- * default, keeps one object queue: pacing at K/8 cuts tail latency but its
- * per-service-point credit still costs 3-5% instructions on allocation-heavy
- * programs. Pools must keep zero: their capacity planning assumes cleanup
- * serves every pending object at the next service point. */
+ * default, keeps one object queue: pacing at K/8 cuts tail latency about
+ * eightfold but costs throughput on allocation-heavy loops (trickled cleanup
+ * is less cache-friendly). Pools must keep zero: their capacity planning
+ * assumes cleanup serves every pending object at the next service point. */
 #ifndef MINYAR_RC_BACKLOG_BUDGET
 #define MINYAR_RC_BACKLOG_BUDGET 0
 #endif
@@ -122,6 +122,26 @@ static inline size_t rc_service_pending(size_t budget) {
 #endif
     return 0;
 }
+/* Old-object backlog tasks, outside rc_pending_count (minyar_bounded_rc.h). */
+static MINYAR_THREAD_LOCAL size_t rc_backlog_count;
+/* A managed allocation is a service point that also paces the backlog.
+ * Without a backlog it is an ordinary service point. */
+#if MINYAR_RC_BACKLOG_BUDGET
+static size_t rc_bounded_allocation_work(size_t budget);
+static inline void rc_service_allocation(void) {
+    if (rc_pending_count || rc_backlog_count) {
+        rc_bounded_allocation_work(MINYAR_RC_POLL_BUDGET);
+        return;
+    }
+#ifdef MINYAR_RC_TESTING
+    rc_bounded_last_work = 0;
+#endif
+}
+#else
+static inline void rc_service_allocation(void) {
+    rc_service_pending(MINYAR_RC_POLL_BUDGET);
+}
+#endif
 #else
 /* Eager release frees objects as they die, so most allocations are short
  * lived. The size-class heap serves them without libc bookkeeping. */
@@ -133,7 +153,7 @@ static inline size_t rc_service_pending(size_t budget) {
 
 static void *rc_allocate_object(size_t size, unsigned kind) {
 #ifdef MINYAR_BOUNDED_RC
-    rc_service_pending(MINYAR_RC_POLL_BUDGET);
+    rc_service_allocation();
 #endif
     if (size > SIZE_MAX - sizeof(RcObject)) out_of_memory();
     RcObject *object = RC_ALLOCATE(sizeof(*object) + size);
@@ -146,7 +166,7 @@ static void *rc_allocate_object(size_t size, unsigned kind) {
 
 static void *rc_allocate_data(size_t size) {
 #ifdef MINYAR_BOUNDED_RC
-    rc_service_pending(MINYAR_RC_POLL_BUDGET);
+    rc_service_allocation();
 #endif
     if (size > SIZE_MAX - sizeof(RcData)) out_of_memory();
     RcData *data = RC_ALLOCATE(sizeof(*data) + size);
@@ -186,7 +206,7 @@ static inline void rc_free_text_bytes(const MinyarText *text) {
 static void *rc_reallocate_data(void *pointer, size_t size) {
     if (!pointer) return rc_allocate_data(size);
 #ifdef MINYAR_BOUNDED_RC
-    rc_service_pending(MINYAR_RC_POLL_BUDGET);
+    rc_service_allocation();
 #endif
     if (size > SIZE_MAX - sizeof(RcData)) out_of_memory();
     RcData *data = (RcData *)pointer - 1;
@@ -509,7 +529,7 @@ void minyar_rc_step(void) {
 #ifdef MINYAR_BOUNDED_RC
     /* Most statements own no temporaries: only the pending test remains. */
     if (frame->temporary_head) {
-        if (rc_pending_count == rc_backlog_count && rc_bounded_step_chunks(frame)) return;
+        if (!rc_pending_count && rc_bounded_step_chunks(frame)) return;
         rc_bounded_retire_temporaries(frame);
     }
     minyar_rc_poll(MINYAR_RC_POLL_BUDGET);

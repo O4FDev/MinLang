@@ -170,8 +170,8 @@ int main(void) {
         for (unsigned i = 0; i < POOL; i++) minyar_rc_release(pool[i]);
         line("pool-release");
         size_t polls = 0;
-        while (rc_pending_count) {
-            minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+        while (rc_pending_count || rc_backlog_count) {
+            minyar_rc_poll_idle(MINYAR_RC_POLL_BUDGET);
             assert(++polls < 10000000);
         }
         line("drained");

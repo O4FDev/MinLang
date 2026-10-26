@@ -27,7 +27,11 @@ __attribute__((destructor)) static void check_memory_contract(void) {
     assert(rc_scopes == NULL);
 #ifdef MINYAR_BOUNDED_RC
     /* Exit is idle: left-over (backlog) work gets the whole budget. */
+#ifdef MINYAR_RC_BACKLOG
+    while (rc_pending_count || rc_backlog_count) assert(minyar_rc_poll_idle(MINYAR_RC_POLL_BUDGET) > 0);
+#else
     while (rc_pending_count) assert(minyar_rc_poll_idle(MINYAR_RC_POLL_BUDGET) > 0);
+#endif
 #else
     assert(rc_pending_count == 0);
 #endif

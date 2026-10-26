@@ -422,9 +422,9 @@ check-direct-service: tests/direct-service-transcript.c runtime/minyar_runtime.c
 	    echo "direct service K$$k backlog share $$p: $$(grep -c . build/direct-service-k$$k-p$$p-d1.txt) transcript lines match the scheduler"; \
 	  done; \
 	done
-	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) tests/direct-service-transcript.c $(LDLIBS) -o build/direct-service-sanitize
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -DMINYAR_RC_BACKLOG_BUDGET=4 tests/direct-service-transcript.c $(LDLIBS) -o build/direct-service-sanitize
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/direct-service-sanitize > build/direct-service-sanitize.txt
-	cmp build/direct-service-sanitize.txt build/direct-service-k32-p0-d1.txt
+	cmp build/direct-service-sanitize.txt build/direct-service-k32-p4-d1.txt
 
 # The paced old-object backlog's exact cadence, order, idle and sleep service.
 BACKLOG_PACING_BUDGETS = 8 32 1024

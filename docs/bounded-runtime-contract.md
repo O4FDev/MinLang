@@ -60,7 +60,7 @@ activate incremental cleanup. Combining lazy and system allocation is rejected.
 | --- | ---: | --- |
 | `MINYAR_RC_POLL_BUDGET` | 32 work units | 1–1,024 |
 | `MINYAR_BOUNDED_HEAP_BYTES` | 64 MiB | A representable power of two, at least 4,096 bytes |
-| `MINYAR_RC_BACKLOG_BUDGET` | 0 (one object queue) | 0–K, system heap only; average old-object backlog units per service point |
+| `MINYAR_RC_BACKLOG_BUDGET` | 0 (one object queue) | 0–K, system heap only; average old-object backlog units per managed allocation |
 | `MINYAR_FRAME_CACHE_BYTES` | 256 KiB | Shared frame and retired temporary-chunk cache capacity |
 | `MINYAR_INTEGER_TEXT_CACHE_LIMIT` | 32,768 entries | 0–32,768 |
 
@@ -163,27 +163,34 @@ Once it is exhausted, the recent stack becomes the next batch in constant
 bookkeeping work.
 
 With `MINYAR_RC_BACKLOG_BUDGET` set above zero (system heap only; K/8 is
-the tested setting), object tasks still pending when a service point ends
-become the old-object backlog (the traced runtime that
-cycle-capable programs select keeps one object queue, see
-[runtime ownership](runtime-memory.md#closures-cycles-and-execution-domains)): a second instance of the
-same object queue, served in arrival order, whose units free objects into the
-backlog itself. If the backlog was empty it continues exactly where the fresh
-queue stopped. Each service point that finds the backlog pending earns it
-`MINYAR_RC_BACKLOG_BUDGET` units of credit, up to K. When a whole K
-has accrued, that service point reserves min(budget, K/8) units for the
-backlog and gives it whatever fresh work leaves, up to the credit; other
-service points give it nothing and keep their direct paths. The backlog
-therefore averages at most that share per service point; at K/8 a large
-dropped graph is reclaimed over about eight times as many service points as
-fresh work would take, unless idle service points drain it sooner. Every service
-point still performs at most K units, and an ordinary poll that finds only
-backlog with no batch due performs none. The default is zero: on edge's
-tail-latency loop K/8 cuts p99.9 from about 1.8 ms to 0.3 ms, but the credit
-bookkeeping costs 3–5% more instructions on allocation-heavy programs
-(json, stdlib, the tail loop itself). Fixed and lazy pools must keep zero:
-their capacity planning assumes every pending object is served at the next
-service point, and allocation under pressure depends on it.
+the tested setting), object work that is still pending at the end of the
+service point after the one that queued it becomes the old-object backlog
+(the traced runtime that cycle-capable programs select keeps one object
+queue, see
+[runtime ownership](runtime-memory.md#closures-cycles-and-execution-domains)):
+a second instance of the same object queue, served in arrival order, whose
+units free objects into the backlog itself. A drop that fits in two service
+points' budgets therefore keeps the unpaced schedule exactly. If the backlog
+was empty it continues exactly where the fresh queue stopped. Only managed
+allocations (object, data and resize) serve it: each one that finds it
+pending earns it `MINYAR_RC_BACKLOG_BUDGET` units of credit, up to K, and
+the allocation at which a whole K has accrued reserves min(budget, share)
+units for the backlog and gives it whatever fresh work leaves, up to the
+credit. Every other service point ignores the backlog and keeps its direct
+paths. Reclamation of old work thus keeps pace with allocation: at K/8 a
+large dropped graph is reclaimed over about eight times as many allocations
+as fresh work would take, unless idle service points drain it sooner. Every
+service point still performs at most K units.
+
+The default is zero. On edge's tail-latency loop (8 vCPU Boat box, two
+pinned CPUs, 20,000 requests, three rounds) K/8 cuts p99.9 from 1.7–2.3 ms to
+0.19–0.35 ms (Rust 1.7–2.4 ms, Go 0.38–1.25 ms), but closed-loop p50 rises
+from 11 µs to 14–17 µs and total time by about 14%: cleanup trickled between
+allocations is less cache-friendly than cleanup in bursts. Allocation-heavy
+programs also run 0.2–1.6% more instructions (self-compile 4% fewer). Fixed
+and lazy pools must keep zero: their capacity planning assumes every pending
+object is served at the next service point, and allocation under pressure
+depends on it.
 
 Each captured or backlog task has finitely many predecessors, so finite
 acyclic data is eventually reclaimed if service points continue. Pacing
@@ -217,8 +224,8 @@ Batching reduces scheduler overhead under specific conditions:
   and parity state before returning. Shared children use the normal decrement
   path.
 
-- Frame exit and statement cleanup usually find no fresh work pending (an
-  old-object backlog may be, if no backlog batch is due). When the exiting
+- Frame exit and statement cleanup usually find nothing pending (an
+  old-object backlog does not count). When the exiting
   frame's written slots plus its retirement, or the statement's temporaries
   plus their chunk retirements, fit within K, they are released at that
   service point without entering the queues, in the order and with the units

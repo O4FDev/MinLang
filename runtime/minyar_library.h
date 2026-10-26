@@ -513,13 +513,13 @@ long long minyar_runtime_processId(void) {
  * sleep can end at most one service point (K units) late. */
 static long long rc_sleep_idle(long long nanoseconds) {
     struct timespec start, now;
-    if (!rc_pending_count || clock_gettime(CLOCK_MONOTONIC, &start)) return nanoseconds;
+    if ((!rc_pending_count && !rc_backlog_count) || clock_gettime(CLOCK_MONOTONIC, &start)) return nanoseconds;
     while (minyar_rc_poll_idle(MINYAR_RC_POLL_BUDGET)) {
         if (clock_gettime(CLOCK_MONOTONIC, &now)) break;
         long long elapsed = (long long)(now.tv_sec - start.tv_sec) * 1000000000LL
                           + (now.tv_nsec - start.tv_nsec);
         if (elapsed >= nanoseconds) return 0;
-        if (!rc_pending_count) return nanoseconds - elapsed;
+        if (!rc_pending_count && !rc_backlog_count) return nanoseconds - elapsed;
     }
     return nanoseconds;
 }
