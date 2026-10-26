@@ -94,24 +94,27 @@ class Projection:
             raise FormatError("unsupported type")
 
     def _map(self):
+        # One bucket record: its length word, then (hash, key, value) slots.
         self.length = count(self.value.field("length").integer())
-        hashes = Sequence(self.value.field("hashes"))
-        self.keys = Sequence(self.value.field("keys"))
-        self.values = Sequence(self.value.field("values"))
-        if hashes.length != self.keys.length or hashes.length != self.values.length:
-            raise FormatError("Map bucket lengths disagree")
-        if self.length > hashes.length:
+        buckets = self.value.field("buckets")
+        hashes = buckets.field("hashes")
+        self.keys = buckets.field("keys")
+        self.values = buckets.field("values")
+        capacity = count(self.value.field("capacity").integer(), "capacity")
+        if self.length > capacity:
             raise FormatError("Map length exceeds bucket count")
-        self.bucket_count = hashes.length
+        if capacity:
+            checked_address(hashes.integer(), 3 * capacity)
+        self.bucket_count = capacity
         self.scanned = 0
         if self.length:
-            for bucket in range(min(hashes.length, MAX_MAP_BUCKETS)):
+            for bucket in range(min(capacity, MAX_MAP_BUCKETS)):
                 self.scanned = bucket + 1
-                if hashes.at(bucket).integer() != 0:
+                if slot_value(hashes, 1 + 3 * bucket).integer() != 0:
                     self.indices.append(bucket)
                     if len(self.indices) == min(self.length, MAX_CHILDREN // 2):
                         break
-        if self.scanned == hashes.length and len(self.indices) != self.length:
+        if self.scanned == capacity and len(self.indices) != self.length:
             raise FormatError("Map length disagrees with occupied buckets")
         for index in range(len(self.indices)):
             self.names.extend(("[{}].key".format(index), "[{}].value".format(index)))
@@ -174,8 +177,10 @@ class Projection:
         if self.kind == "List":
             return self.sequence.at(index)
         if self.kind == "Map":
-            sequence = self.values if index % 2 else self.keys
-            return sequence.at(self.indices[index // 2])
+            bucket = self.indices[index // 2]
+            if index % 2:
+                return slot_value(self.values, 3 + 3 * bucket)
+            return slot_value(self.keys, 2 + 3 * bucket)
         return self.value.field(self.payload_fields[index])
 
 

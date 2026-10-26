@@ -59,9 +59,24 @@ def sequence(items=None, length=None, capacity=None, name="List<Integer>"):
     })
 
 
-def mapped(hashes, keys, values, length):
+def buckets(capacity, hashes=None, keys=None, values=None):
+    """One bucket record: slot 0 is its length, then (hash, key, value) slots."""
+    return {
+        "hashes": Node("minyar.slot<Integer> *", 4096,
+                       slots={1 + 3 * b: h for b, h in (hashes or {}).items()}),
+        "keys": Node("minyar.slot<Integer> *", 4096,
+                     slots={2 + 3 * b: k for b, k in (keys or {}).items()}),
+        "values": Node("minyar.slot<Text> *", 4096,
+                       slots={3 + 3 * b: v for b, v in (values or {}).items()}),
+        "capacity": capacity,
+    }
+
+
+def mapped(parts, length):
     return Node("Map<Integer, Text>", fields={
-        "hashes": hashes, "keys": keys, "values": values,
+        "buckets": Node("minyar.buckets<Map<Integer, Text>>", fields={
+            "hashes": parts["hashes"], "keys": parts["keys"], "values": parts["values"]}),
+        "capacity": Node(number=parts["capacity"]),
         "length": Node(number=length),
     })
 
@@ -112,34 +127,29 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(child_index(view.names, "[10000]"), -1)
 
     def test_sparse_map_skips_empty_buckets_and_projects_pairs(self):
-        hashes = sequence({1: Node(number=-7), 3: Node(number=8)}, length=8)
         key = Node(number=42)
         value = Node("Text")
-        view = Projection(mapped(hashes, sequence({3: key}, length=8),
-                                 sequence({3: value}, length=8), 2))
+        parts = buckets(8, {1: Node(number=-7), 3: Node(number=8)}, {3: key}, {3: value})
+        view = Projection(mapped(parts, 2))
         self.assertEqual(view.names, ["[0].key", "[0].value", "[1].key", "[1].value"])
         self.assertIs(view.child(2), key)
         self.assertIs(view.child(3), value)
-        self.assertEqual(hashes.field("values").reads, [0, 1, 2, 3])
+        self.assertEqual(parts["hashes"].reads, [1, 4, 7, 10])
 
     def test_sparse_map_scan_is_bounded_and_reports_incomplete_preview(self):
-        hashes = sequence({MAX_MAP_BUCKETS + 1: Node(number=8)}, length=1000000)
-        view = Projection(mapped(hashes, sequence(length=1000000),
-                                 sequence(length=1000000), 1))
+        parts = buckets(1000000, {MAX_MAP_BUCKETS + 1: Node(number=8)})
+        view = Projection(mapped(parts, 1))
         self.assertEqual(view.names, [])
-        self.assertEqual(len(hashes.field("values").reads), MAX_MAP_BUCKETS)
+        self.assertEqual(len(parts["hashes"].reads), MAX_MAP_BUCKETS)
         self.assertIn("showing=0, scanned=256/1000000 buckets", view.summary())
 
     def test_map_limits_pairs_and_rejects_inconsistent_headers(self):
-        hashes = sequence({i: Node(number=1) for i in range(100)}, length=128)
-        value = mapped(hashes, sequence(length=128), sequence(length=128), 100)
+        value = mapped(buckets(128, {i: Node(number=1) for i in range(100)}), 100)
         self.assertEqual(len(Projection(value).names), MAX_CHILDREN)
-        value.members["keys"] = sequence(length=64)
-        with self.assertRaisesRegex(FormatError, "bucket lengths disagree"):
-            Projection(value)
-        value = mapped(sequence(length=8), sequence(length=8), sequence(length=8), 1)
+        with self.assertRaisesRegex(FormatError, "exceeds bucket count"):
+            Projection(mapped(buckets(8), 9))
         with self.assertRaisesRegex(FormatError, "occupied buckets"):
-            Projection(value)
+            Projection(mapped(buckets(8), 1))
 
     def test_choice_reads_only_active_payload(self):
         radius = Node("Float")

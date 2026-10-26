@@ -14,8 +14,7 @@ static void choice_set_header(const MinyarRecord *value) {
     assert(value->length == MAP_FIELDS);
     assert(value->values[MAP_KEY_KIND] == 1);
     assert(value->values[MAP_VALUE_REFERENCES] == 0);
-    for (unsigned field = MAP_HASHES; field <= MAP_VALUES; ++field)
-        assert(map_array(value, field) != NULL);
+    assert(map_entries(value) != NULL);
 }
 
 MinyarRecord *minyar_choice_set_nativeOptional(long long mode) {

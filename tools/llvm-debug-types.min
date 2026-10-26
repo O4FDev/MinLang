@@ -66,8 +66,9 @@ function composite(graph: Graph, body: Integer, name: Text, bits: Integer, membe
 }
 function pointer(graph: Graph, body: Integer): Integer { return node(graph, "!DIDerivedType(tag: DW_TAG_pointer_type, baseType: !" + Text(body) + ", size: 64)") }
 function integer(graph: Graph): Integer { return entry(graph, "1").id }
-function list(graph: Graph, body: Integer, name: Text, child: Description) {
-    // Slots occupy eight bytes even when the semantic value is Boolean/Character.
+// A pointer to eight-byte slots holding child values. Slots occupy eight bytes
+// even when the semantic value is Boolean/Character.
+function slotPointer(graph: Graph, child: Description): Integer {
     let slot = node(graph, "!{}")
     let bits = 64
     if child.parts.length > 3 && child.parts[1] == "basic" { bits = Integer(child.parts[3]) }
@@ -75,7 +76,10 @@ function list(graph: Graph, body: Integer, name: Text, child: Description) {
     let childName = child.key
     if child.parts.length > 2 { childName = child.parts[2] }
     composite(graph, slot, "minyar.slot<" + childName + ">", 64, slotMembers)
-    let members: List<Integer> = [member(graph, body, "values", pointer(graph, slot), 64, 0), member(graph, body, "length", integer(graph), 64, 64), member(graph, body, "capacity", integer(graph), 64, 128)]
+    return pointer(graph, slot)
+}
+function list(graph: Graph, body: Integer, name: Text, child: Description) {
+    let members: List<Integer> = [member(graph, body, "values", slotPointer(graph, child), 64, 0), member(graph, body, "length", integer(graph), 64, 64), member(graph, body, "capacity", integer(graph), 64, 128)]
     composite(graph, body, name, 192, members)
 }
 function listPointer(graph: Graph, child: Description): Integer {
@@ -124,10 +128,12 @@ function complete(graph: Graph, item: Description, virtualRecord: Boolean) {
     } else if kind == "list" {
         list(graph, item.body, name, entry(graph, parts[4]))
     } else if kind == "map" {
-        let hashes = listPointer(graph, entry(graph, "1"))
-        let keys = listPointer(graph, entry(graph, parts[4]))
-        let values = listPointer(graph, entry(graph, parts[5]))
-        let members: List<Integer> = [member(graph, item.body, "minyar_record_length", integer(graph), 64, 0), member(graph, item.body, "hashes", hashes, 64, 64), member(graph, item.body, "keys", keys, 64, 128), member(graph, item.body, "values", values, 64, 192), member(graph, item.body, "key_kind", integer(graph), 64, 256), member(graph, item.body, "value_references", integer(graph), 64, 320), member(graph, item.body, "length", integer(graph), 64, 384)]
+        // The buckets are one record: its length word, then hash, key and value
+        // slots for each bucket. Three typed views of the same pointer.
+        let buckets = node(graph, "!{}")
+        let views: List<Integer> = [member(graph, buckets, "hashes", slotPointer(graph, entry(graph, "1")), 64, 0), member(graph, buckets, "keys", slotPointer(graph, entry(graph, parts[4])), 64, 0), member(graph, buckets, "values", slotPointer(graph, entry(graph, parts[5])), 64, 0)]
+        set(graph, buckets, "distinct !DICompositeType(tag: DW_TAG_union_type, name: \"minyar.buckets<" + name + ">\", size: 64, elements: !" + Text(tuple(graph, views)) + ")")
+        let members: List<Integer> = [member(graph, item.body, "minyar_record_length", integer(graph), 64, 0), member(graph, item.body, "buckets", buckets, 64, 64), member(graph, item.body, "capacity", integer(graph), 64, 128), member(graph, item.body, "key_kind", integer(graph), 64, 256), member(graph, item.body, "value_references", integer(graph), 64, 320), member(graph, item.body, "length", integer(graph), 64, 384)]
         composite(graph, item.body, name, Integer(parts[3]), members)
     } else if kind == "record" {
         let members: List<Integer> = []

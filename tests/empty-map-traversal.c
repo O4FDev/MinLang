@@ -147,7 +147,7 @@ static void equal_case(const char *name, MinyarRecord *a, MinyarRecord *b, long 
 static void keys_case(MinyarRecord *map) {
     debt(); hashes_called = equals_called = copies_called = polls = 0;
     observing = 1; MinyarList *keys = minyar_map_keys(map); observing = 0;
-    assert(keys && keys != map_array(map, MAP_KEYS) && !keys->length && !keys->capacity && !keys->values);
+    assert(keys && (void *)keys != (void *)map_entries(map) && !keys->length && !keys->capacity && !keys->values);
 #ifndef MINYAR_COMPILER_ARENA
     size_t kind = ((RcObject *)keys - 1)->ownership & 7;
     size_t expected_kind = (size_t)(map_key_references(map->values[MAP_KEY_KIND]) ?
@@ -165,7 +165,7 @@ static void keys_case(MinyarRecord *map) {
 #ifdef MINYAR_BOUNDED_RC
     assert(polls == 1);
 #endif
-    printf("keys kind=%lld capacity=%lld polls=%zu\n", map->values[MAP_KEY_KIND], map_array(map, MAP_HASHES)->length, polls);
+    printf("keys kind=%lld capacity=%lld polls=%zu\n", map->values[MAP_KEY_KIND], (long long)map_capacity(map), polls);
     minyar_rc_release(keys); drain();
 }
 int main(int argc, char **argv) {
@@ -191,8 +191,8 @@ int main(int argc, char **argv) {
             assert(minyar_map_remove(a, key) && minyar_map_remove(b, key)); release_key(kinds[k], key);
         }
         assert(!a->values[MAP_LENGTH] && !b->values[MAP_LENGTH]);
-        assert((map_array(a, MAP_HASHES)->length > 0) == history);
-        for (long long i = 0; i < map_array(a, MAP_HASHES)->length; i++) assert(!map_array(a, MAP_HASHES)->values[i]);
+        assert((map_capacity(a) > 0) == history);
+        for (size_t i = 0; i < map_capacity(a); i++) assert(!MAP_HASH(map_entries(a), i));
         minyar_rc_retain(a); keys_case(a);
         MinyarMapReadGuard outer; map_read_begin(&outer, a, NULL); outer_guard = &outer;
         for (size_t t = 0; t < 5; t++) equal_case("empty-distinct", a, b, types[t], 1);

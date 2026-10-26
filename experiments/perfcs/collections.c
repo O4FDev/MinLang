@@ -88,12 +88,12 @@ static uint64_t sparse_map(uint64_t count, uint64_t repeats, int empty,
     MinyarRecord *alias = map;
     minyar_rc_retain(alias);
     for (uint64_t i = 0; i < count; i++) minyar_map_set(map, (long long)i, (long long)i + 5);
-    *peak_capacity = (uint64_t)map_array(map, MAP_HASHES)->length;
+    *peak_capacity = (uint64_t)map_capacity(map);
     assert(*peak_capacity >= count);
     for (uint64_t i = empty ? 0 : 1; i < count; i++) assert(minyar_map_remove(alias, (long long)i));
     if (!empty) minyar_map_set(peer, 0, 5);
     assert(minyar_map_length(alias) == !empty);
-    assert((uint64_t)map_array(map, MAP_HASHES)->length == *peak_capacity);
+    assert((uint64_t)map_capacity(map) == *peak_capacity);
     uint64_t sum = 0;
     for (uint64_t i = 0; i < repeats; i++) {
         memory_observation();
