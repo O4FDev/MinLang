@@ -102,7 +102,8 @@ static void clean_cache(void) {
 }
 static void drain(MinyarRecord **roots) {
     size_t guard = 0;
-    while (rc_pending_count) { verify(roots); assert(minyar_rc_poll(1) == 1); assert(++guard < 100000); }
+    /* Idle polls serve left-over (backlog) work with the whole budget. */
+    while (rc_pending_count) { verify(roots); assert(minyar_rc_poll_idle(1) == 1); assert(++guard < 100000); }
     verify(roots);
 }
 static MinyarRecord *record(long long serial) {
@@ -167,6 +168,9 @@ static size_t remaining_chain_debt(void) {
     for (size_t i=0;i<entry_count;++i) if(entries[i].dead) {
         RcObject *o=entries[i].object;
         size_t cursor=o==rc_bounded_active ? rc_bounded_cursor
+#ifdef MINYAR_RC_BACKLOG
+                        : o==rc_backlog.active ? rc_backlog.cursor
+#endif
                         : saved_record_cursor((MinyarRecord *)(o+1));
         assert(cursor <= 4 && debt >= cursor); debt-=cursor;
     }

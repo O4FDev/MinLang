@@ -21,7 +21,12 @@ static void snapshot(size_t work,void *shared) {
            id(rc_bounded_active),rc_bounded_cursor,rc_bounded_recent_turn,rc_bounded_next_queue,
            shared?((RcObject *)shared-1)->ownership>>3:0);
     list_queue(rc_bounded_head);printf(" R");list_queue(rc_bounded_recent_head);
-    printf(" T%zu/%zu\n",id(rc_bounded_tail),id(rc_bounded_recent_tail));
+    printf(" T%zu/%zu",id(rc_bounded_tail),id(rc_bounded_recent_tail));
+    /* The old-object backlog: the same queue state for work left over from
+     * earlier service points. */
+    printf(" B%zu,%zu,%zu,%u O",rc_backlog_count,id(rc_backlog.active),rc_backlog.cursor,rc_backlog.recent_turn);
+    list_queue(rc_backlog.head);printf(" R");list_queue(rc_backlog.recent_head);
+    printf(" T%zu/%zu\n",id(rc_backlog.tail),id(rc_backlog.recent_tail));
 }
 int main(void) {
  for(size_t budget=1;budget<=33;budget++)for(int kind=0;kind<11;kind++)for(int parity=0;parity<2;parity++) {
@@ -42,7 +47,8 @@ int main(void) {
     rc_drop(root);
     if(kind==7) {assert(minyar_rc_poll(1)==1);} /* Start with active/visited fallback. */
     printf("CASE %zu %d %d\n",budget,kind,parity);snapshot(0,shared);
-    while(rc_pending_count){size_t work=minyar_rc_poll(budget);assert(work>0&&work<=budget);snapshot(work,shared);}
+    /* Idle polls give left-over work the whole budget at every K. */
+    while(rc_pending_count){size_t work=minyar_rc_poll_idle(budget);assert(work>0&&work<=budget);snapshot(work,shared);}
     if(shared){assert(minyar_record_get(shared,0)==713);minyar_rc_release(shared);}
     assert(!rc_object_count&&!rc_bytes&&!rc_heap_allocation_count);
  }

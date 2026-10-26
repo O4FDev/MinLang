@@ -100,7 +100,19 @@ static MINYAR_THREAD_LOCAL size_t rc_object_count, rc_bytes, rc_immortal_object_
 #endif
 _Static_assert(MINYAR_RC_POLL_BUDGET > 0 && MINYAR_RC_POLL_BUDGET <= 1024,
                "cleanup budget must be between 1 and 1024");
+/* The old-object backlog's average share of each service point (see
+ * docs/bounded-runtime-contract.md); idle service points lift it. Zero, the
+ * default, keeps one object queue: pacing at K/8 cuts tail latency but its
+ * per-service-point credit still costs 3-5% instructions on allocation-heavy
+ * programs. Pools must keep zero: their capacity planning assumes cleanup
+ * serves every pending object at the next service point. */
+#ifndef MINYAR_RC_BACKLOG_BUDGET
+#define MINYAR_RC_BACKLOG_BUDGET 0
+#endif
+_Static_assert(MINYAR_RC_BACKLOG_BUDGET <= MINYAR_RC_POLL_BUDGET,
+               "backlog share must not exceed the cleanup budget");
 size_t minyar_rc_poll(size_t budget);
+size_t minyar_rc_poll_idle(size_t budget);
 /* Preserve poll instrumentation even when an idle service point takes only
  * the pending-count branch. This path is exercised by instrumented tests. */
 static inline size_t rc_service_pending(size_t budget) {
@@ -390,6 +402,7 @@ void minyar_rc_leave(void) {
     else rc_bounded_frame_head = frame;
     rc_bounded_frame_tail = frame;
     rc_pending_count++;
+    rc_bounded_owner_tasks++;
     minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
 #else
     minyar_rc_step();
@@ -496,7 +509,7 @@ void minyar_rc_step(void) {
 #ifdef MINYAR_BOUNDED_RC
     /* Most statements own no temporaries: only the pending test remains. */
     if (frame->temporary_head) {
-        if (!rc_pending_count && rc_bounded_step_chunks(frame)) return;
+        if (rc_pending_count == rc_backlog_count && rc_bounded_step_chunks(frame)) return;
         rc_bounded_retire_temporaries(frame);
     }
     minyar_rc_poll(MINYAR_RC_POLL_BUDGET);

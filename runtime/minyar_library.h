@@ -507,6 +507,25 @@ long long minyar_runtime_processId(void) {
     errno = saved_errno;
     return result;
 }
+#if defined(MINYAR_RC_BACKLOG) && !defined(_WIN32) && defined(__STDC_HOSTED__) && __STDC_HOSTED__
+/* A sleep is idle time: spend it on queued cleanup through idle service
+ * points, rereading the clock after each one, then sleep what remains. A
+ * sleep can end at most one service point (K units) late. */
+static long long rc_sleep_idle(long long nanoseconds) {
+    struct timespec start, now;
+    if (!rc_pending_count || clock_gettime(CLOCK_MONOTONIC, &start)) return nanoseconds;
+    while (minyar_rc_poll_idle(MINYAR_RC_POLL_BUDGET)) {
+        if (clock_gettime(CLOCK_MONOTONIC, &now)) break;
+        long long elapsed = (long long)(now.tv_sec - start.tv_sec) * 1000000000LL
+                          + (now.tv_nsec - start.tv_nsec);
+        if (elapsed >= nanoseconds) return 0;
+        if (!rc_pending_count) return nanoseconds - elapsed;
+    }
+    return nanoseconds;
+}
+#else
+static long long rc_sleep_idle(long long nanoseconds) { return nanoseconds; }
+#endif
 long long minyar_runtime_sleepNanoseconds(long long nanoseconds) {
     int saved_errno = errno;
     long long result = 0;
@@ -515,6 +534,9 @@ long long minyar_runtime_sleepNanoseconds(long long nanoseconds) {
 #if MINYAR_THREADED
         rc_thread_domain_drain();
 #endif
+        nanoseconds = rc_sleep_idle(nanoseconds);
+    }
+    if (nanoseconds > 0) {
 #ifdef _WIN32
         HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
         if (!timer) result = -EIO;

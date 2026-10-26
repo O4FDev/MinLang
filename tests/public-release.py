@@ -115,8 +115,11 @@ def main():
                 expected = SUCCESS
                 if profile != "eager":
                     backend, budget = profile.split("-k")
+                    # These cells pin exact per-service-point cleanup amounts, so they keep one
+                    # object queue (MINYAR_RC_BACKLOG_BUDGET=0); tests/backlog-pacing.c and
+                    # tests/direct-service-transcript.c cover the paced old-object backlog.
                     flags += ["-DMINYAR_" + ("SYSTEM" if backend == "system" else "BOUNDED") + "_HEAP=1",
-                              "-DMINYAR_RC_POLL_BUDGET=" + budget]
+                              "-DMINYAR_RC_POLL_BUDGET=" + budget, "-DMINYAR_RC_BACKLOG_BUDGET=0"]
                     expected = TRANSCRIPTS[budget]
                 if options.mode == "sanitize":
                     flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]

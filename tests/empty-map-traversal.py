@@ -140,9 +140,13 @@ def main():
         source = engine(variant, kind)
         if tree_hashes(source.parent) != copied_hashes[variant, kind] or digest(fixture) != manifest["fixture_sha256"]:
             raise ValueError("executed snapshot changed before compilation")
+        # These cells pin exact per-service-point cleanup amounts, so they keep one
+        # object queue (MINYAR_RC_BACKLOG_BUDGET=0); tests/backlog-pacing.c and
+        # tests/direct-service-transcript.c cover the paced old-object backlog.
         argv = [args.clang, "-std=c11", "-Wall", "-Wextra", "-Werror", "-" + optimization,
                 '-DMINYAR_RUNTIME_SOURCE="' + str(source) + '"',
-                "-DMINYAR_RC_POLL_BUDGET=" + budget, "-DMINYAR_BOUNDED_HEAP_BYTES=4194304"]
+                "-DMINYAR_RC_POLL_BUDGET=" + budget, "-DMINYAR_BOUNDED_HEAP_BYTES=4194304",
+                "-DMINYAR_RC_BACKLOG_BUDGET=0"]
         flags = {"system": ["-DMINYAR_SYSTEM_HEAP=1"], "fixed": ["-DMINYAR_BOUNDED_HEAP=1"],
                  "lazy": ["-DMINYAR_BOUNDED_HEAP=1", "-DMINYAR_LAZY_HEAP=1"],
                  "eager": [], "arena": ["-DMINYAR_COMPILER_ARENA=1"]}

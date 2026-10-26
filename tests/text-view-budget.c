@@ -11,10 +11,11 @@ static void bounded(size_t before) {
     assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);
     assert(before - rc_object_count <= rc_bounded_last_work);
 }
+/* Idle polls serve left-over (backlog) work with the whole budget. */
 static void drain(void) {
     while (rc_pending_count) {
         size_t before = rc_object_count;
-        assert(minyar_rc_poll(1) == 1);
+        assert(minyar_rc_poll_idle(1) == 1);
         assert(before - rc_object_count <= 1);
     }
 }
@@ -95,7 +96,8 @@ int main(void) {
     v = view(); alias = view();
     rc_drop(older);
     assert(minyar_rc_poll(1) == 1);
-    assert(rc_bounded_active == (RcObject *)older - 1);
+    /* Its unfinished visit continues in the old-object backlog. */
+    assert((rc_backlog_count ? rc_backlog.active : rc_bounded_active) == (RcObject *)older - 1);
     assert(rc_drop(v) == 1 && rc_drop(alias) == 1);
     drain(); clear();
     puts("Text-view release, aliases, replacement, frame/chunk/stack retirement obey actual destruction budgets");

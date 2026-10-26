@@ -59,7 +59,11 @@ bool minyar_callbackruntime_service(void) {
 #ifdef MINYAR_COMPILER_ARENA
     return false;
 #elif defined(MINYAR_BOUNDED_RC)
+#ifdef MINYAR_RC_BACKLOG
+    minyar_rc_poll_idle(MINYAR_RC_POLL_BUDGET); /* About to wait: idle service. */
+#else
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
+#endif
     return rc_pending_count != 0;
 #elif defined(MINYAR_CYCLE_RC)
     rc_cycle_eager_service(32);

@@ -10,7 +10,8 @@ int main(void) {
         else minyar_list_add_take(list,(long long)(uintptr_t)minyar_record_new_scalar(2));
     }
     minyar_rc_release(list);
-    while(rc_pending_count){assert(minyar_rc_poll(1)==1);assert(minyar_record_get(shared,0)==1901);}
+    /* Idle polls serve left-over work with the whole budget. */
+    while(rc_pending_count){assert(minyar_rc_poll_idle(1)==1);assert(minyar_record_get(shared,0)==1901);}
     assert((((RcObject *)shared-1)->ownership>>3)==1);minyar_rc_release(shared);
     assert(!rc_bytes&&!rc_object_count&&!rc_heap_allocation_count);
     puts("inlined List leaf free preserves shared aliases and one-unit visits");

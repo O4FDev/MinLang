@@ -13,6 +13,22 @@ static MINYAR_THREAD_LOCAL size_t rc_bounded_cursor;
 static MINYAR_THREAD_LOCAL RcObject *rc_bounded_recent_head, *rc_bounded_recent_tail;
 static MINYAR_THREAD_LOCAL unsigned rc_bounded_recent_turn;
 
+/* The old-object backlog: object tasks still pending when the service point
+ * that queued them ends. It is a second instance of the object scheduler
+ * state above, swapped in while it is serviced, so its tasks keep their
+ * cursors, order and recent/captured alternation, and objects that its units
+ * free join it rather than the fresh queue. rc_pending_count includes its
+ * rc_backlog_count tasks; rc_bounded_owner_tasks counts queued frames and
+ * temporary chunks, so fresh object tasks are the remainder. */
+typedef struct {
+    RcObject *head, *tail, *active, *recent_head, *recent_tail;
+    size_t cursor;
+    unsigned recent_turn;
+} RcBoundedObjects;
+#define MINYAR_RC_BACKLOG 1
+static MINYAR_THREAD_LOCAL RcBoundedObjects rc_backlog;
+static MINYAR_THREAD_LOCAL size_t rc_backlog_count, rc_backlog_credit, rc_bounded_owner_tasks;
+
 /* Dead List capacity is spare. Dead record map bytes retain their low-bit
  * reference flag and store seven cursor bits each. The loop executes at most
  * ceil(sizeof(size_t)*CHAR_BIT/7) iterations, independent of graph size. */
@@ -157,8 +173,10 @@ static void rc_bounded_retire_temporaries(RcFrame *frame) {
     if (rc_bounded_chunk_tail) rc_bounded_chunk_tail->next = frame->temporary_head;
     else rc_bounded_chunk_head = frame->temporary_head;
     rc_bounded_chunk_tail = frame->temporary_tail;
-    rc_pending_count += frame->temporary_count / RC_TEMPORARY_CHUNK_SLOTS
-                      + (frame->temporary_count % RC_TEMPORARY_CHUNK_SLOTS != 0);
+    size_t chunks = frame->temporary_count / RC_TEMPORARY_CHUNK_SLOTS
+                  + (frame->temporary_count % RC_TEMPORARY_CHUNK_SLOTS != 0);
+    rc_pending_count += chunks;
+    rc_bounded_owner_tasks += chunks;
     frame->temporary_head = frame->temporary_tail = NULL;
     frame->temporary_count = 0;
 }
@@ -289,6 +307,7 @@ static void rc_bounded_frame_unit(void) {
     if (!rc_bounded_frame_head) rc_bounded_frame_tail = NULL;
     rc_bounded_cache_frame(frame);
     rc_pending_count--;
+    rc_bounded_owner_tasks--;
 }
 
 static void rc_bounded_chunk_unit(void) {
@@ -301,13 +320,15 @@ static void rc_bounded_chunk_unit(void) {
     if (!rc_bounded_chunk_head) rc_bounded_chunk_tail = NULL;
     rc_bounded_chunk_retire(chunk);
     rc_pending_count--;
+    rc_bounded_owner_tasks--;
 }
 
 /* Round-robin service across three queues: every continuously ready queue
  * receives one unit within three units, including when the poll budget is 1.
- * rc_pending_count includes objects, detached frames and temporary chunks. */
-static size_t rc_bounded_poll_work(size_t budget) {
-    if (budget > MINYAR_RC_POLL_BUDGET) budget = MINYAR_RC_POLL_BUDGET;
+ * Here rc_pending_count counts the selected instance's objects plus the
+ * detached frames and temporary chunks (rc_bounded_poll_work excludes the
+ * backlog's tasks while it runs). The caller limits budget to K. */
+static size_t rc_bounded_schedule(size_t budget) {
     size_t work = 0;
     if (!rc_bounded_frame_head && !rc_bounded_chunk_head) {
         /* Object processing can only enqueue objects. With no frame/chunk
@@ -456,10 +477,152 @@ static size_t rc_bounded_poll_work(size_t budget) {
             work++;
         }
     }
+    return work;
+}
+
+static void rc_bounded_swap_objects(void) {
+    RcBoundedObjects fresh = {rc_bounded_head, rc_bounded_tail, rc_bounded_active,
+                              rc_bounded_recent_head, rc_bounded_recent_tail,
+                              rc_bounded_cursor, rc_bounded_recent_turn};
+    rc_bounded_head = rc_backlog.head;
+    rc_bounded_tail = rc_backlog.tail;
+    rc_bounded_active = rc_backlog.active;
+    rc_bounded_recent_head = rc_backlog.recent_head;
+    rc_bounded_recent_tail = rc_backlog.recent_tail;
+    rc_bounded_cursor = rc_backlog.cursor;
+    rc_bounded_recent_turn = rc_backlog.recent_turn;
+    rc_backlog = fresh;
+}
+
+/* Up to budget backlog units through the object scheduler. Fresh frames and
+ * chunks are hidden meanwhile, and their queue turn is kept. Called with
+ * rc_pending_count excluding the backlog's tasks. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static size_t rc_bounded_backlog_work(size_t budget) {
+    RcFrame *frame_head = rc_bounded_frame_head, *frame_tail = rc_bounded_frame_tail;
+    RcTemporaryChunk *chunk_head = rc_bounded_chunk_head, *chunk_tail = rc_bounded_chunk_tail;
+    unsigned next_queue = rc_bounded_next_queue;
+    size_t fresh = rc_pending_count;
+    rc_bounded_frame_head = rc_bounded_frame_tail = NULL;
+    rc_bounded_chunk_head = rc_bounded_chunk_tail = NULL;
+    rc_bounded_swap_objects();
+    rc_pending_count = rc_backlog_count;
+    size_t work = rc_bounded_schedule(budget);
+    rc_backlog_count = rc_pending_count;
+    rc_pending_count = fresh;
+    rc_bounded_swap_objects();
+    rc_bounded_frame_head = frame_head;
+    rc_bounded_frame_tail = frame_tail;
+    rc_bounded_chunk_head = chunk_head;
+    rc_bounded_chunk_tail = chunk_tail;
+    rc_bounded_next_queue = next_queue;
+    return work;
+}
+
+/* Fresh object tasks still pending when their service point ends join the
+ * backlog's captured FIFO in the order the fresh scheduler would have served
+ * them: recent stack, then the active object with its cursor, then the
+ * captured batch. Constant work. */
+static void rc_bounded_link(RcObject **first, RcObject **last, RcObject *head, RcObject *tail) {
+    if (!head) return;
+    if (*last) (*last)->ownership = ((*last)->ownership & 7) | (size_t)(uintptr_t)head;
+    else *first = head;
+    *last = tail;
+}
+
+static void rc_bounded_defer_objects(void) {
+    if (!rc_backlog_count) {
+        /* An empty backlog continues exactly where the fresh scheduler
+         * stopped; the fresh queue keeps its alternation parity. */
+        rc_backlog = (RcBoundedObjects){rc_bounded_head, rc_bounded_tail, rc_bounded_active,
+                                        rc_bounded_recent_head, rc_bounded_recent_tail,
+                                        rc_bounded_cursor, rc_bounded_recent_turn};
+        rc_backlog_count = rc_pending_count - rc_bounded_owner_tasks;
+        rc_pending_count = rc_bounded_owner_tasks;
+        rc_bounded_head = rc_bounded_tail = rc_bounded_active = NULL;
+        rc_bounded_recent_head = rc_bounded_recent_tail = NULL;
+        return;
+    }
+    RcObject *first = NULL, *last = NULL;
+    rc_bounded_link(&first, &last, rc_bounded_recent_head, rc_bounded_recent_tail);
+    if (rc_bounded_active) {
+        rc_bounded_save_cursor(rc_bounded_active, rc_bounded_cursor);
+        rc_bounded_link(&first, &last, rc_bounded_active, rc_bounded_active);
+    }
+    rc_bounded_link(&first, &last, rc_bounded_head, rc_bounded_tail);
+    RcObject *backlog_first = rc_backlog.head, *backlog_last = rc_backlog.tail;
+    rc_bounded_link(&backlog_first, &backlog_last, first, last);
+    rc_backlog.head = backlog_first;
+    rc_backlog.tail = backlog_last;
+    rc_backlog_count += rc_pending_count - rc_bounded_owner_tasks;
+    rc_pending_count = rc_bounded_owner_tasks;
+    rc_bounded_head = rc_bounded_tail = rc_bounded_active = NULL;
+    rc_bounded_recent_head = rc_bounded_recent_tail = NULL;
+}
+
+/* The backlog earns MINYAR_RC_BACKLOG_BUDGET units of credit at each service
+ * point that finds it pending, up to K, and spends the credit in one batch
+ * once a whole budget has accrued. Its average share therefore stays at most
+ * that many units per service point, while each batch costs one scheduler
+ * entry. Returns the units this service point may give the backlog. */
+static inline size_t rc_bounded_backlog_allowance(void) {
+    size_t credit = rc_backlog_credit + MINYAR_RC_BACKLOG_BUDGET;
+    if (credit >= MINYAR_RC_POLL_BUDGET) credit = MINYAR_RC_POLL_BUDGET;
+    rc_backlog_credit = credit;
+    return credit == MINYAR_RC_POLL_BUDGET ? credit : 0;
+}
+
+/* One service point. Fresh work (frames, temporary chunks and objects queued
+ * since the last service point) receives the budget; when the backlog may
+ * work here, it first reserves min(budget, MINYAR_RC_BACKLOG_BUDGET) units
+ * and then receives what fresh work leaves, up to allowance. Fresh objects
+ * still pending become backlog. Out of line, like the scheduler: the inline
+ * service entries must stay a pending-count test and a call. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static size_t rc_bounded_service(size_t budget, size_t allowance) {
+    if (budget > MINYAR_RC_POLL_BUDGET) budget = MINYAR_RC_POLL_BUDGET;
+    size_t backlog = rc_backlog_count;
+    size_t share = 0;
+    if (backlog && allowance)
+        share = budget < MINYAR_RC_BACKLOG_BUDGET ? budget : MINYAR_RC_BACKLOG_BUDGET;
+    rc_pending_count -= backlog;
+    size_t work = rc_bounded_schedule(budget - share);
+    if (share) {
+        size_t limit = budget - work;
+        if (limit > allowance) limit = allowance;
+        size_t done = rc_bounded_backlog_work(limit);
+        work += done;
+        rc_backlog_credit = done < rc_backlog_credit ? rc_backlog_credit - done : 0;
+        if (!rc_backlog_count) rc_backlog_credit = 0;
+    }
+    if (MINYAR_RC_BACKLOG_BUDGET && rc_pending_count != rc_bounded_owner_tasks) rc_bounded_defer_objects();
+    rc_pending_count += rc_backlog_count;
 #ifdef MINYAR_RC_TESTING
     rc_bounded_last_work = work;
 #endif
     return work;
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static size_t rc_bounded_poll_work(size_t budget) {
+    size_t allowance = 0;
+    if (MINYAR_RC_BACKLOG_BUDGET && rc_backlog_count) {
+        allowance = rc_bounded_backlog_allowance();
+        /* Only backlog pending and no batch due: nothing to do here. */
+        if (!allowance && rc_pending_count == rc_backlog_count) {
+#ifdef MINYAR_RC_TESTING
+            rc_bounded_last_work = 0;
+#endif
+            return 0;
+        }
+    }
+    return rc_bounded_service(budget, allowance);
 }
 
 /* Every queue holds pending work, so with nothing pending a poll does no work
@@ -475,20 +638,51 @@ size_t minyar_rc_poll(size_t budget) {
     return rc_bounded_poll_work(budget);
 }
 
+/* An idle service point (a sleep, or an event loop about to wait): the same
+ * K limit, but the backlog may use all of it. */
+size_t minyar_rc_poll_idle(size_t budget) {
+    if (!rc_pending_count) {
+#ifdef MINYAR_RC_TESTING
+        rc_bounded_last_work = 0;
+#endif
+        return 0;
+    }
+    return rc_bounded_service(budget, MINYAR_RC_POLL_BUDGET);
+}
+
 /* Direct frame exit and statement cleanup perform what one poll would; test
- * probes that count poll work observe them here with the same total. */
+ * probes that count poll work observe them here with the same total.
+ * MINYAR_RC_DIRECT_SERVICE=0 sends them through the scheduler instead, the
+ * reference for tests/direct-service-transcript.c. */
+#ifndef MINYAR_RC_DIRECT_SERVICE
+#define MINYAR_RC_DIRECT_SERVICE 1
+#endif
 #ifndef MINYAR_RC_DIRECT_SERVICE_OBSERVER
 #define MINYAR_RC_DIRECT_SERVICE_OBSERVER(work) ((void)(work))
 #endif
 
-/* Frame exit with nothing else pending, the commonest service point. The
- * scheduler would give this frame every unit: one per written owner slot, in
- * reverse order, then one to retire it. Do exactly that here without queueing
- * the frame or entering the general scheduler. If a release queues an object,
- * link the frame with its remaining slots and continue in the scheduler from
- * the state it would have reached. Returns 0 when the general path must run. */
+/* A direct service point runs only when no fresh work is pending. With only
+ * backlog pending it may still run if no backlog batch is due; it then earns
+ * the backlog's credit like any service point. Call only once committed. */
+static inline int rc_bounded_direct_allowed(void) {
+    if (!rc_pending_count) return 1;
+    if (!MINYAR_RC_BACKLOG_BUDGET || rc_pending_count != rc_backlog_count ||
+        rc_backlog_credit + MINYAR_RC_BACKLOG_BUDGET >= MINYAR_RC_POLL_BUDGET) return 0;
+    rc_backlog_credit += MINYAR_RC_BACKLOG_BUDGET;
+    return 1;
+}
+
+/* Frame exit with no fresh work pending and no backlog batch due, the
+ * commonest service point. The scheduler would give this frame every unit:
+ * one per written owner slot, in reverse order, then one to retire it. Do
+ * exactly that here without queueing the frame or entering the general
+ * scheduler. If a release queues an object, link the frame with its remaining
+ * slots and continue in the scheduler from the state it would have reached.
+ * Returns 0 when the general path must run. */
 static int rc_bounded_leave_direct(RcFrame *frame) {
-    if (rc_pending_count || frame->written_count >= MINYAR_RC_POLL_BUDGET) return 0;
+    if (!MINYAR_RC_DIRECT_SERVICE) return 0;
+    if (frame->written_count >= MINYAR_RC_POLL_BUDGET || !rc_bounded_direct_allowed()) return 0;
+    size_t pending = rc_pending_count;
     size_t work = 0;
     frame->local_count = frame->written_count;
     rc_bounded_next_queue = 2;
@@ -499,11 +693,12 @@ static int rc_bounded_leave_direct(RcFrame *frame) {
         frame->locals[index] = NULL;
         rc_drop(value);
         work++;
-        if (rc_pending_count) {
+        if (rc_pending_count != pending) {
             frame->previous = NULL;
             rc_bounded_frame_head = rc_bounded_frame_tail = frame;
             rc_pending_count++;
-            size_t more = rc_bounded_poll_work(MINYAR_RC_POLL_BUDGET - work);
+            rc_bounded_owner_tasks++;
+            size_t more = rc_bounded_service(MINYAR_RC_POLL_BUDGET - work, 0);
 #ifdef MINYAR_RC_TESTING
             rc_bounded_last_work = work + more;
 #endif
@@ -519,33 +714,37 @@ static int rc_bounded_leave_direct(RcFrame *frame) {
     return 1;
 }
 
-/* Statement cleanup with nothing else pending. The scheduler would give the
- * statement's temporary chunks every unit: one per owner, newest first, then
- * one to retire each chunk, oldest chunk first. Do exactly that here; if a
- * release queues an object, queue the remaining chunks and continue in the
- * scheduler from the state it would have reached. */
+/* Statement cleanup with no fresh work pending and no backlog batch due.
+ * The scheduler would give the statement's temporary chunks every unit: one
+ * per owner, newest first, then one to retire each chunk, oldest chunk first.
+ * Do exactly that here; if a release queues an object, queue the remaining
+ * chunks and continue in the scheduler from the state it would have
+ * reached. */
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noinline))
 #endif
 static int rc_bounded_step_chunks(RcFrame *frame) {
+    if (!MINYAR_RC_DIRECT_SERVICE) return 0;
     RcTemporaryChunk *chunk = frame->temporary_head;
     size_t chunks = frame->temporary_count / RC_TEMPORARY_CHUNK_SLOTS
                   + (frame->temporary_count % RC_TEMPORARY_CHUNK_SLOTS != 0);
-    if (frame->temporary_count + chunks > MINYAR_RC_POLL_BUDGET) return 0;
+    if (frame->temporary_count + chunks > MINYAR_RC_POLL_BUDGET || !rc_bounded_direct_allowed()) return 0;
     RcTemporaryChunk *tail = frame->temporary_tail;
     frame->temporary_head = frame->temporary_tail = NULL;
     frame->temporary_count = 0;
+    size_t pending = rc_pending_count;
     size_t work = 0;
     rc_bounded_next_queue = 0;
     while (chunk) {
         while (chunk->count) {
             rc_drop(chunk->values[--chunk->count]);
             work++;
-            if (rc_pending_count) {
+            if (rc_pending_count != pending) {
                 rc_bounded_chunk_head = chunk;
                 rc_bounded_chunk_tail = tail;
                 rc_pending_count += chunks;
-                size_t more = rc_bounded_poll_work(MINYAR_RC_POLL_BUDGET - work);
+                rc_bounded_owner_tasks += chunks;
+                size_t more = rc_bounded_service(MINYAR_RC_POLL_BUDGET - work, 0);
 #ifdef MINYAR_RC_TESTING
                 rc_bounded_last_work = work + more;
 #endif

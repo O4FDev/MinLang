@@ -161,8 +161,12 @@ class Runner:
         capacity = {"default": 262144, "zero": 0, "below": chunk - 1, "exact": chunk,
                     "shared-below": chunk + 63, "shared-exact": chunk + 64}[cap]
         executable = directory / "fixture"
+        # These cells pin exact per-service-point cleanup amounts, so they keep one
+        # object queue (MINYAR_RC_BACKLOG_BUDGET=0); tests/backlog-pacing.c and
+        # tests/direct-service-transcript.c cover the paced old-object backlog.
         argv = [self.args.clang, "-std=c11", "-Wall", "-Wextra", "-Werror", "-" + optimization,
-                "-DMINYAR_RC_POLL_BUDGET=" + str(budget), "-DMINYAR_FRAME_CACHE_BYTES=" + str(capacity),
+                "-DMINYAR_RC_POLL_BUDGET=" + str(budget), "-DMINYAR_RC_BACKLOG_BUDGET=0",
+                "-DMINYAR_FRAME_CACHE_BYTES=" + str(capacity),
                 "-DMINYAR_BOUNDED_HEAP_BYTES=4194304", '-DMINYAR_RUNTIME_SOURCE="' + str(engine) + '"']
         argv += ["-DMINYAR_SYSTEM_HEAP=1"] if profile == "system" else ["-DMINYAR_BOUNDED_HEAP=1"]
         if profile == "lazy":

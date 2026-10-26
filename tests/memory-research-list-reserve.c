@@ -1,4 +1,7 @@
 /* Count backing allocator calls separately from the ownership work counters. */
+/* Exact per-service-point cleanup amounts: one object queue (no old-object
+ * backlog); tests/backlog-pacing.c covers the paced backlog. */
+#define MINYAR_RC_BACKLOG_BUDGET 0
 #if defined(__linux__) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE 1
 #endif

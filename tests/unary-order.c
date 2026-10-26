@@ -12,10 +12,16 @@ static void observe_release(void *pointer) {
 #define MINYAR_SYSTEM_HEAP 1
 #define MINYAR_RC_TESTING 1
 #include "../runtime/minyar_runtime.c"
+/* Object work left at the end of a service point continues in the old-object
+ * backlog, a second instance of the same queue. Idle polls give it the whole
+ * budget, so these exact unit counts and orders hold in every configuration. */
+static RcObject *active(void){return rc_backlog_count?rc_backlog.active:rc_bounded_active;}
+static RcObject *captured(void){return rc_backlog_count?rc_backlog.head:rc_bounded_head;}
+static size_t cursor(void){return rc_backlog_count?rc_backlog.cursor:rc_bounded_cursor;}
 static size_t completed_units;
 static void drain(void) {
     while(rc_pending_count) {
-        size_t work=minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+        size_t work=minyar_rc_poll_idle(MINYAR_RC_POLL_BUDGET);
         assert(work>0 && work<=MINYAR_RC_POLL_BUDGET);
         completed_units+=work;
     }
@@ -54,21 +60,21 @@ int main(void) {
     MinyarRecord *parent=minyar_record_new(1);
     minyar_record_set_take(parent,0,(long long)(uintptr_t)child);
     rc_drop(successor);rc_drop(parent);
-    assert(minyar_rc_poll(1)==1);
-    assert(rc_bounded_active==(RcObject *)parent-1 && rc_bounded_head==(RcObject *)successor-1);
-    assert(minyar_rc_poll(1)==1);
+    assert(minyar_rc_poll_idle(1)==1);
+    assert(active()==(RcObject *)parent-1 && captured()==(RcObject *)successor-1);
+    assert(minyar_rc_poll_idle(1)==1);
     /* An older captured successor disables the exception: recent child wins. */
-    assert(rc_object_count==3 && rc_bounded_active==(RcObject *)parent-1);
+    assert(rc_object_count==3 && active()==(RcObject *)parent-1);
     assert(rc_bounded_saved_cursor((RcObject *)child-1)==1);
     drain();
     rc_bounded_recent_turn=0;
     child=minyar_record_new(128);parent=minyar_record_new(1);
     minyar_record_set_take(parent,0,(long long)(uintptr_t)child);
     rc_drop(parent);
-    assert(minyar_rc_poll(1)==1);
-    assert(minyar_rc_poll(1)==1 && rc_object_count==1);
-    assert(minyar_rc_poll(1)==1);
-    assert(rc_bounded_active==(RcObject *)child-1 && rc_bounded_cursor==1);
+    assert(minyar_rc_poll_idle(1)==1);
+    assert(minyar_rc_poll_idle(1)==1 && rc_object_count==1);
+    assert(minyar_rc_poll_idle(1)==1);
+    assert(active()==(RcObject *)child-1 && cursor()==1);
     drain();
     assert(!rc_object_count&&!rc_bytes&&!rc_heap_allocation_count);
     puts("completed unary parents retire in allocation-reverse order; aliases and K hold");

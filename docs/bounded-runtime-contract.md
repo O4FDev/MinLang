@@ -60,6 +60,7 @@ activate incremental cleanup. Combining lazy and system allocation is rejected.
 | --- | ---: | --- |
 | `MINYAR_RC_POLL_BUDGET` | 32 work units | 1–1,024 |
 | `MINYAR_BOUNDED_HEAP_BYTES` | 64 MiB | A representable power of two, at least 4,096 bytes |
+| `MINYAR_RC_BACKLOG_BUDGET` | 0 (one object queue) | 0–K, system heap only; average old-object backlog units per service point |
 | `MINYAR_FRAME_CACHE_BYTES` | 256 KiB | Shared frame and retired temporary-chunk cache capacity |
 | `MINYAR_INTEGER_TEXT_CACHE_LIMIT` | 32,768 entries | 0–32,768 |
 
@@ -109,6 +110,10 @@ later cleared; slots that only ever held null need no visit.
 
 Cleanup advances only when the program reaches a service point. A long
 computation or foreign call can leave retired values waiting.
+Sleeping (`process.sleepNanoseconds`) and an event loop about to wait for
+readiness are idle service points: they spend the wait on queued cleanup,
+rereading the clock after each K-unit batch, so a sleep can end at most one
+batch late. Native code can do the same through `minyar_rc_poll_idle(budget)`.
 
 ## The work budget
 
@@ -150,16 +155,45 @@ all operations along its critical path and validation on the target system.
 
 ## Scheduling and batching
 
-Objects, frames, and temporary chunks receive round-robin service. Within the
-object queue, service alternates between recent work and an older captured
-batch. New arrivals cannot join that batch. Once it is exhausted, the recent
-stack becomes the next batch in constant bookkeeping work. Each captured task
-therefore has finitely many predecessors; finite acyclic data is eventually
-reclaimed if polling continues.
+Work queued since the previous service point is fresh: objects, detached
+frames and temporary chunks. Fresh work receives round-robin service across
+those three queues. Within the object queue, service alternates between
+recent work and an older captured batch. New arrivals cannot join that batch.
+Once it is exhausted, the recent stack becomes the next batch in constant
+bookkeeping work.
 
-When all three queues and both object classes stay ready, the active older
-object advances within six queued work units. An object behind it must first
-wait for its predecessors, so the six-unit bound does not apply to every object.
+With `MINYAR_RC_BACKLOG_BUDGET` set above zero (system heap only; K/8 is
+the tested setting), object tasks still pending when a service point ends
+become the old-object backlog (the traced runtime that
+cycle-capable programs select keeps one object queue, see
+[runtime ownership](runtime-memory.md#closures-cycles-and-execution-domains)): a second instance of the
+same object queue, served in arrival order, whose units free objects into the
+backlog itself. If the backlog was empty it continues exactly where the fresh
+queue stopped. Each service point that finds the backlog pending earns it
+`MINYAR_RC_BACKLOG_BUDGET` units of credit, up to K. When a whole K
+has accrued, that service point reserves min(budget, K/8) units for the
+backlog and gives it whatever fresh work leaves, up to the credit; other
+service points give it nothing and keep their direct paths. The backlog
+therefore averages at most that share per service point; at K/8 a large
+dropped graph is reclaimed over about eight times as many service points as
+fresh work would take, unless idle service points drain it sooner. Every service
+point still performs at most K units, and an ordinary poll that finds only
+backlog with no batch due performs none. The default is zero: on edge's
+tail-latency loop K/8 cuts p99.9 from about 1.8 ms to 0.3 ms, but the credit
+bookkeeping costs 3–5% more instructions on allocation-heavy programs
+(json, stdlib, the tail loop itself). Fixed and lazy pools must keep zero:
+their capacity planning assumes every pending object is served at the next
+service point, and allocation under pressure depends on it.
+
+Each captured or backlog task has finitely many predecessors, so finite
+acyclic data is eventually reclaimed if service points continue. Pacing
+retains a dropped graph's storage for longer; it does not change the units
+spent on it.
+
+When all three fresh queues and both object classes stay ready, the active
+older object advances within six queued work units. An object behind it must
+first wait for its predecessors, so the six-unit bound does not apply to every
+object.
 
 Suspended cursors occupy dead List capacity fields or the upper bits of dead
 record reference-map bytes. Reference flags remain intact. Cursor encoding
@@ -183,13 +217,16 @@ Batching reduces scheduler overhead under specific conditions:
   and parity state before returning. Shared children use the normal decrement
   path.
 
-- Frame exit and statement cleanup usually find nothing else pending. When
-  the exiting frame's written slots plus its retirement, or the statement's
-  temporaries plus their chunk retirements, fit within K, they are released at
-  that service point without entering the queues, in the order and with the
-  units the scheduler would use. If a release queues an object, the remaining
-  slots or chunks are queued and the scheduler continues from the state it
-  would have reached.
+- Frame exit and statement cleanup usually find no fresh work pending (an
+  old-object backlog may be, if no backlog batch is due). When the exiting
+  frame's written slots plus its retirement, or the statement's temporaries
+  plus their chunk retirements, fit within K, they are released at that
+  service point without entering the queues, in the order and with the units
+  the scheduler would use. If a release queues an object, the
+  remaining slots or chunks are queued and the scheduler continues from the
+  state it would have reached. `make check-direct-service` compares both
+  paths' complete transcripts at K 1, 2, 4, 7, 32 and 1,024, with no
+  backlog and with a K/8 one.
 
 These paths require non-reentrant runtime and allocator hooks. Intermediate
 pending ownership remains local to the poll; batching neither raises K nor

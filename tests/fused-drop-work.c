@@ -12,6 +12,7 @@ int main(void) {
     assert(minyar_rc_poll(32)==32);
     assert(generic_drop_calls-before==1);
     assert(rc_object_count==1 && rc_pending_count==1 && !rc_bounded_active);
-    assert(minyar_rc_poll(32)==2);
+    /* The last record is left-over work: an idle poll finishes it at once. */
+    assert(minyar_rc_poll_idle(32)==2);
     assert(!rc_object_count&&!rc_bytes&&!rc_pending_count&&!rc_heap_allocation_count);
 }

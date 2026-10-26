@@ -540,6 +540,11 @@ size_t minyar_rc_poll(size_t budget) {
     return rc_bounded_poll_work(budget);
 }
 
+/* The traced runtime has one object queue: idle service is an ordinary poll. */
+size_t minyar_rc_poll_idle(size_t budget) {
+    return minyar_rc_poll(budget);
+}
+
 void minyar_rc_release(void *value) {
     unsigned immediate = rc_drop(value);
     rc_service_pending(immediate < MINYAR_RC_POLL_BUDGET

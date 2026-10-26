@@ -407,7 +407,37 @@ check-recursive-data: build/minyarc build/minyarc-sanitize build/minyar-runtime.
 	$(LIMITED) ./build/tooling/experiments/memory/production-contract-model
 	$(SANITIZER_LIMITED) ./build/tooling/tests/recursive-mutation
 
-check-bounded: build/minyarc build/minyar-runtime-bounded.o build/bounded-runtime build/bounded-runtime-sanitize build/bounded-ownership-runtime.o build/production-live-oracle build/production-frame-oracle build/bounded-list-capacity build/bounded-list-capacity-sanitize build/tooling/tests/recursive-data build/tooling/tests/bounded-configurations build/tooling/tests/production-memory
+# Direct frame-exit/statement service must reproduce the scheduler exactly,
+# with and without an old-object backlog, at several cleanup budgets.
+DIRECT_SERVICE_BUDGETS = 1 2 4 7 32 1024
+.PHONY: check-direct-service
+check-direct-service: tests/direct-service-transcript.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
+	@set -e; for k in $(DIRECT_SERVICE_BUDGETS); do \
+	  for p in 0 $$((k / 8)); do \
+	    for d in 0 1; do \
+	      $(LIMITED) "$(LLVM_CC)" $(CFLAGS) -DMINYAR_RC_POLL_BUDGET=$$k -DMINYAR_RC_BACKLOG_BUDGET=$$p -DMINYAR_RC_DIRECT_SERVICE=$$d tests/direct-service-transcript.c $(LDLIBS) -o build/direct-service-k$$k-p$$p-d$$d; \
+	      $(LIMITED) ./build/direct-service-k$$k-p$$p-d$$d > build/direct-service-k$$k-p$$p-d$$d.txt; \
+	    done; \
+	    cmp build/direct-service-k$$k-p$$p-d0.txt build/direct-service-k$$k-p$$p-d1.txt; \
+	    echo "direct service K$$k backlog share $$p: $$(grep -c . build/direct-service-k$$k-p$$p-d1.txt) transcript lines match the scheduler"; \
+	  done; \
+	done
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) tests/direct-service-transcript.c $(LDLIBS) -o build/direct-service-sanitize
+	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/direct-service-sanitize > build/direct-service-sanitize.txt
+	cmp build/direct-service-sanitize.txt build/direct-service-k32-p0-d1.txt
+
+# The paced old-object backlog's exact cadence, order, idle and sleep service.
+BACKLOG_PACING_BUDGETS = 8 32 1024
+.PHONY: check-backlog-pacing
+check-backlog-pacing: tests/backlog-pacing.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
+	@set -e; for k in $(BACKLOG_PACING_BUDGETS); do \
+	  $(LIMITED) "$(LLVM_CC)" $(CFLAGS) -DMINYAR_RC_POLL_BUDGET=$$k tests/backlog-pacing.c $(LDLIBS) -o build/backlog-pacing-k$$k; \
+	  $(LIMITED) ./build/backlog-pacing-k$$k; \
+	done
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) tests/backlog-pacing.c $(LDLIBS) -o build/backlog-pacing-sanitize
+	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/backlog-pacing-sanitize
+
+check-bounded: check-direct-service check-backlog-pacing build/minyarc build/minyar-runtime-bounded.o build/bounded-runtime build/bounded-runtime-sanitize build/bounded-ownership-runtime.o build/production-live-oracle build/production-frame-oracle build/bounded-list-capacity build/bounded-list-capacity-sanitize build/tooling/tests/recursive-data build/tooling/tests/bounded-configurations build/tooling/tests/production-memory
 	$(LIMITED) ./build/bounded-runtime
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/bounded-runtime-sanitize
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/production-live-oracle

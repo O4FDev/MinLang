@@ -66,29 +66,38 @@ static size_t saved_record_cursor(MinyarRecord *record) {
 #endif
 }
 
+static size_t mark_queue(RcObject *head) {
+    size_t pending = 0;
+    for (RcObject *p = head; p; p = (RcObject *)(uintptr_t)(p->ownership & ~(size_t)7)) {
+        size_t i = entry(p);
+        assert(!entries[i].dead && ++pending < LIMIT);
+        entries[i].dead = 1;
+    }
+    return pending;
+}
+
+static size_t mark_active(RcObject *active) {
+    if (!active) return 0;
+    size_t i = entry(active);
+    assert(!entries[i].dead);
+    entries[i].dead = 1;
+    return 1;
+}
+
 static void verify(MinyarRecord **roots) {
     entry_count = 0;
-    size_t pending = 0;
-    for (RcObject *p = rc_bounded_head; p;
-         p = (RcObject *)(uintptr_t)(p->ownership & ~(size_t)7)) {
-        size_t i = entry(p);
-        assert(!entries[i].dead && ++pending < LIMIT);
-        entries[i].dead = 1;
-    }
+    size_t pending = mark_queue(rc_bounded_head);
 #ifdef MINYAR_RC_RECENT_OBJECTS
-    for (RcObject *p = rc_bounded_recent_head; p;
-         p = (RcObject *)(uintptr_t)(p->ownership & ~(size_t)7)) {
-        size_t i = entry(p);
-        assert(!entries[i].dead && ++pending < LIMIT);
-        entries[i].dead = 1;
-    }
+    pending += mark_queue(rc_bounded_recent_head);
 #endif
-    if (rc_bounded_active) {
-        size_t i = entry(rc_bounded_active);
-        assert(!entries[i].dead);
-        entries[i].dead = 1;
-        pending++;
-    }
+    pending += mark_active(rc_bounded_active);
+#ifdef MINYAR_RC_BACKLOG
+    /* The old-object backlog is a second instance of the same queues. */
+    size_t backlog = mark_queue(rc_backlog.head) + mark_queue(rc_backlog.recent_head)
+                   + mark_active(rc_backlog.active);
+    assert(backlog == rc_backlog_count);
+    pending += backlog;
+#endif
     pending += PRODUCTION_EXTRA_OWNER_SCAN();
     assert(pending == rc_pending_count);
     for (size_t i = 0; i < ROOTS; i++) if (roots[i])
@@ -103,6 +112,9 @@ static void verify(MinyarRecord **roots) {
         assert(record->length == 4);
         unsigned char *map = (unsigned char *)(record->values + 4);
         size_t first = object == rc_bounded_active ? rc_bounded_cursor
+#ifdef MINYAR_RC_BACKLOG
+                     : object == rc_backlog.active ? rc_backlog.cursor
+#endif
                      : entries[i].dead ? saved_record_cursor(record) : 0;
         for (size_t slot = first; slot < 4; slot++) if ((map[slot] & 1) && record->values[slot])
             entries[entry((RcObject *)(uintptr_t)record->values[slot] - 1)].expected++;

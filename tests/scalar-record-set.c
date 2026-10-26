@@ -1,5 +1,8 @@
 #define MINYAR_SYSTEM_HEAP 1
 #define MINYAR_RC_TESTING 1
+/* Exact per-service-point cleanup amounts: one object queue (no old-object
+ * backlog); tests/backlog-pacing.c covers the paced backlog. */
+#define MINYAR_RC_BACKLOG_BUDGET 0
 #include "../runtime/minyar_runtime.c"
 #include <assert.h>
 int main(int argc,char **argv) {
