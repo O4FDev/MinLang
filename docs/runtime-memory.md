@@ -225,6 +225,12 @@ both endpoints of traced ownership operations use the physical payload type.
   statements, always take the count. A count taken this way is still released
   by that statement's cleanup, like any other temporary. `--scope-owners` keeps the borrows: its lowering derives
   scope cells from them.
+  A field path whose root is a readonly parameter, capture, constant or
+  never-reassigned binding, and whose fields no compiled code assigns, cannot
+  be replaced while its root lives. Its value takes no count even across user
+  code: a method called on `holder.vec` borrows its receiver exactly as
+  `dot(holder.vec, other)` borrows its argument. Cycle-capable types keep
+  their counts.
   A block's `let name = local[index]` binding (the root local not reassigned in
   the block) borrows its element like a parameter. A hidden guard owner is
   reserved at the binding and filled at the end of the block only if later code
