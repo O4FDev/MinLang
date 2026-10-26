@@ -34,6 +34,8 @@ _Static_assert(sizeof(RcSystemSlot) == 16 && sizeof(RcSystemPage) <= RC_SYSTEM_P
 _Static_assert(_Alignof(max_align_t) <= 16,
                "small system backing must preserve malloc alignment");
 static RcSystemPage *rc_system_available[RC_SYSTEM_SIZE_CLASSES];
+/* Live small slots in every class. */
+static size_t rc_system_live;
 
 static inline void rc_system_unlink(RcSystemPage *page) {
     if (!page->link) abort(); /* An unlinked page must never be removed twice. */
@@ -91,6 +93,7 @@ MINYAR_HOT void *rc_system_allocate(size_t bytes) {
     if (!page->free_slots && page->used + page->stride > RC_SYSTEM_PAGE_BYTES)
         rc_system_unlink(page);
     page->live++;
+    rc_system_live++;
     slot->value.bytes = bytes;
     SMALL_HEAP_UNPOISON(slot + 1, bytes);
     return slot + 1;
@@ -99,9 +102,28 @@ static inline void rc_system_deallocate(void *pointer) {
     RcSystemSlot *slot = (RcSystemSlot *)pointer - 1;
     RcSystemPage *page = slot->page;
     if (!page) { free(slot); return; }
+    rc_system_live--;
     if (--page->live == 0) {
-        if (page->link) rc_system_unlink(page);
-        free(page);
+        RcSystemPage *first = rc_system_available[page->index];
+        if ((first && first != page) || !rc_system_live) {
+            if (page->link) rc_system_unlink(page);
+            free(page);
+            /* Nothing small is live: no empty page stays either. */
+            if (!rc_system_live)
+                for (unsigned index = 0; index < RC_SYSTEM_SIZE_CLASSES; index++) {
+                    RcSystemPage *kept = rc_system_available[index];
+                    if (kept && !kept->live) { rc_system_unlink(kept); free(kept); }
+                }
+            return;
+        }
+        /* While other small objects live, the class's only available page
+         * stays, emptied: a loop whose temporaries alone occupy it would
+         * otherwise free it and allocate a fresh page on every iteration. */
+        page->free_slots = NULL;
+        page->used = RC_SYSTEM_PAGE_PREFIX;
+        SMALL_HEAP_POISON((unsigned char *)page + RC_SYSTEM_PAGE_PREFIX,
+                          RC_SYSTEM_PAGE_BYTES - RC_SYSTEM_PAGE_PREFIX);
+        if (!page->link) rc_system_link(page);
         return;
     }
     SMALL_HEAP_POISON(pointer, page->stride - sizeof(*slot));
