@@ -74,8 +74,12 @@ The compiler follows every call the function can make, including calls into
 other modules, generic instances, contract helpers, closures and the
 initializers of the globals it reads. Nothing reachable may use a host clock,
 randomness, files, sockets, process arguments, the environment, threads,
-parallel execution, inline assembly, volatile machine access, raw addresses
-(`cAddress`, `cAt`, `parallelEntry`) or native code. Pure natives are allowed
+inline assembly, volatile machine access, raw addresses
+(`cAddress`, `cAt`, `parallelEntry`) or native code. Safe `parallel for` loops
+and their reductions are allowed, and their bodies are checked like any other
+call: each iteration writes only its own index and partial sums combine in
+chunk order, so the result is the same on every schedule and thread count. If
+several iterations stop, which one reports first can depend on the schedule. Pure natives are allowed
 when they match their standard library declaration exactly: `math`, `unicode`,
 `aes`, `securecrypto`, checked Integer overflow and `json` number parsing. A call through a callback value counts
 as a call to every function whose address the program takes with that
