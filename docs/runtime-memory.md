@@ -520,8 +520,12 @@ hoist loop-invariant List and record loads. Otherwise each iteration is serviced
 as before, and the loop re-asks after each service. A `while` loop counts its
 iterations in a local for this; its `continue` paths share the loop's one
 back-edge service point. The eager cycle collector is never idle.
-When such a `for` loop reads or writes a List at its position (`a[j]` with the
-loop variable unchanged, or the element of a List walk), and each such List is
+LLVM already removes the checks of such a loop that only reads Lists up to a
+List length (a List walk, or `0..values.length`): nothing in it can change that
+length. When a `for` loop stores a scalar into a List, record or Bytes (which,
+as far as LLVM knows, might change a length), or its bound is not a List
+length, and it reads or writes a List at its position (`a[j]` with the loop
+variable unchanged, or the element of a List walk), and each such List is
 reached only through locals the loop never stores, reference List slots, record
 fields and lengths (none of which a call-free loop can change), the idle entry
 also runs one test: the first position is not negative and the bound is at most

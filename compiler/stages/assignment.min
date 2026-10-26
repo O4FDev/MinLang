@@ -673,6 +673,7 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                     output.add(transfers)
                     output.add(")\n")
                 } else {
+                    context.valueBorrows.scalarStores = context.valueBorrows.scalarStores + 1
                     output.add("  call void @.minyar.record.set.scalar.checked(ptr ")
                     output.add(receiver)
                     output.add(", i64 ")
@@ -749,6 +750,7 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                     }
                     let value = assignedValue(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, 1, valueType, operatorLocation)
                     requireType(tokenLines, state, valueType[0], 1, "a byte must be an Integer")
+                    context.valueBorrows.scalarStores = context.valueBorrows.scalarStores + 1
                     output.add("  call void @.minyar.bytes.set.checked(ptr ")
                     output.add(receiver)
                     output.add(", i64 ")
@@ -779,6 +781,7 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                         if isReferenceType(elementType) {
                             output.add("  call void @minyar_list_set(ptr ")
                         } else {
+                            context.valueBorrows.scalarStores = context.valueBorrows.scalarStores + 1
                             output.add("  call void @.minyar.list.set.scalar.checked(ptr ")
                         }
                     }
@@ -954,11 +957,14 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     addLocal(localNames, localTypes, localIds, localLengths, state, " for limit", 1, limit)
     let collection = -1
     let elementType = 1
+    let lengthBound = false
     if tokenIs(tokenKinds, tokenTexts, state, "..") {
         requireType(tokenLines, state, sourceType[0], 1, "a range starts with an Integer")
         state[0] = state[0] + 1
         let endType: List<Integer> = [0]
+        let endStart = state[0]
         let end = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, endType)
+        lengthBound = state[0] == endStart + 3 && tokenKinds[endStart] == 1 && tokenTexts[endStart + 1] == "." && tokenTexts[endStart + 2] == "length"
         requireType(tokenLines, state, endType[0], 1, "a range ends with an Integer")
         if parts.length > 0 { parallelReductionHeader(context, localNames, localTypes, localIds, localLengths, state, parts, name) }
         storeLocal(output, counter, 1, source)
@@ -1065,6 +1071,7 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -2, loopLabel)
     if parts.length > 0 { parts[4] = context.callTargets.length; parts[5] = state[0] }
     let callsBefore = context.callTargets.length
+    let storesBefore = context.valueBorrows.scalarStores
     let bodyStart = output.length
     let bodyReturns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
     if collectionPiece >= 0 || elementPiece >= 0 {
@@ -1087,6 +1094,12 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     output.add("  br label %for.condition." + Text(loopLabel) + "\n\nfor.end." + Text(endLabel) + ":\n")
     if pure && pureLoopCode(context, output, entryPiece + 2, stepPiece) {
         versionPureLoop(output, entryPiece, testPiece, stepPiece, loopLabel, bodyLabel, endLabel, strip, continuing, position)
+    }
+    // LLVM already removes the checks of a loop that only reads Lists when its
+    // bound is a List length (a List walk or `0..list.length`): nothing in the
+    // loop can change that length. A scalar store may, as far as LLVM knows,
+    // and an unrelated bound proves nothing, so only those loops are versioned.
+    if pure && output[stepPiece] == "" && ((collection < 0 && !lengthBound) || context.valueBorrows.scalarStores != storesBefore) {
         let condition: List<Text> = ["for.condition." + Text(loopLabel) + ":\n"]
         let piece = entryPiece + 3
         while piece < testPiece {

@@ -15,11 +15,17 @@
 // values buffers, and the slots of reference Lists and reference record
 // fields. The test computes each List from them before the loop; a check that
 // would fail there sends the loop to its checked copy instead.
+// The region is classified once: each line's defined name and loaded local.
+// `%value.N` definitions are found by number; other names and labels by a
+// short list.
 record LoopCopy {
     lines: List<Text>
-    names: List<Text>
-    definitions: List<Integer>
-    labels: List<Text>
+    defined: List<Text>
+    loaded: List<Text>
+    valueBase: Integer
+    valueLines: List<Integer>
+    otherNames: List<Text>
+    otherLines: List<Integer>
     touched: List<Text>
     invariant: List<Text>
     hoisted: List<Text>
@@ -31,20 +37,6 @@ record LoopCopy {
     variable: Text
     lists: List<Text>
     values: List<Text>
-}
-
-function loopLineDefinition(line: Text): Text {
-    if !line.startsWith("  %") { return "" }
-    let equals = line.find(" = ")
-    if equals < 0 { return "" }
-    return line.slice(2, equals)
-}
-
-function loopLineLabel(line: Text): Text {
-    if line.length < 2 || !line.endsWith(":") { return "" }
-    let first = line[0]
-    if first == ' ' || first == ';' { return "" }
-    return "%" + line.slice(0, line.length - 1)
 }
 
 function loopNameCharacter(character: Character): Boolean {
@@ -60,53 +52,123 @@ function loopNamed(names: List<Text>, name: Text): Integer {
     return -1
 }
 
+// N for `%value.N`, otherwise -1.
+function loopValueNumber(name: Text): Integer {
+    if name.length < 8 || !name.startsWith("%value.") { return -1 }
+    let number = 0
+    let index = 7
+    while index < name.length {
+        let digit = Integer(name[index]) - 48
+        if digit < 0 || digit > 9 { return -1 }
+        number = number * 10 + digit
+        index = index + 1
+    }
+    return number
+}
+
+// The line defining a region name, -2 for a region label, -1 for a name the
+// region does not define.
+function loopDefinitionLine(copy: LoopCopy, name: Text): Integer {
+    let number = loopValueNumber(name)
+    if number >= 0 {
+        let index = number - copy.valueBase
+        if index < 0 || index >= copy.valueLines.length { return -1 }
+        return copy.valueLines[index] - 1
+    }
+    let other = loopNamed(copy.otherNames, name)
+    if other < 0 { return -1 }
+    return copy.otherLines[other]
+}
+
+// Each `%local.N` a line names.
+function loopLocalsIn(line: Text, touched: List<Text>) {
+    let parts = line.split("%local.")
+    let index = 1
+    while index < parts.length {
+        let part = parts[index]
+        let end = 0
+        while end < part.length && loopNameCharacter(part[end]) { end = end + 1 }
+        let local = "%local." + part.slice(0, end)
+        if loopNamed(touched, local) < 0 { touched.add(local) }
+        index = index + 1
+    }
+}
+
 // The arguments of `call <type> @callee(<type> <value>, ...)` as values.
 function loopCallArguments(line: Text, callee: Text): List<Text> {
     let result: List<Text> = []
     let start = line.find(callee + "(")
     if start < 0 || !line.endsWith(")") { return result }
-    let rest = line.slice(start + callee.length + 1, line.length - 1)
-    while rest.length > 0 {
-        let comma = rest.find(", ")
-        let argument = rest
-        if comma >= 0 { argument = rest.slice(0, comma) }
+    let parts = line.slice(start + callee.length + 1, line.length - 1).split(", ")
+    let index = 0
+    while index < parts.length {
+        let argument = parts[index]
         let space = argument.find(" ")
         if space < 0 { return [] }
         result.add(argument.slice(space + 1, argument.length))
-        if comma < 0 { rest = "" } else { rest = rest.slice(comma + 2, rest.length) }
+        index = index + 1
     }
     return result
 }
 
-// The local slot `%local.N` read by `%x = load <type>, ptr %local.N`, if any.
-function loopLoadedLocal(line: Text): Text {
-    let load = line.find(" = load ")
-    let slot = line.find(", ptr %local.")
-    if load < 0 || slot < 0 { return "" }
-    let local = line.slice(slot + 6, line.length)
-    if local.find(" ") >= 0 || local.find(",") >= 0 { return "" }
-    return local
-}
-
-// Every local the region stores to or passes by address.
-function loopTouchedLocals(copy: LoopCopy) {
-    let scan = 0
-    while scan < copy.lines.length {
-        let line = copy.lines[scan]
-        scan = scan + 1
-        let found = line.find("%local.")
-        if found >= 0 && loopLoadedLocal(line) == "" {
-            let rest = line
-            while found >= 0 {
-                rest = rest.slice(found, rest.length)
-                let end = 1
-                while end < rest.length && loopNameCharacter(rest[end]) { end = end + 1 }
-                let local = rest.slice(0, end)
-                if loopNamed(copy.touched, local) < 0 { copy.touched.add(local) }
-                rest = rest.slice(end, rest.length)
-                found = rest.find("%local.")
+// Classify every line: its definition, the local a load reads, the region's
+// labels, and every local the region stores to or passes by address. Debug
+// comments name locals but do not touch them.
+function loopClassify(copy: LoopCopy) {
+    let numbers: List<Integer> = []
+    let numberLines: List<Integer> = []
+    let index = 0
+    while index < copy.lines.length {
+        let line = copy.lines[index]
+        let name = ""
+        let local = ""
+        if line.startsWith("  %") {
+            let equals = line.find(" = ")
+            if equals > 2 {
+                name = line.slice(2, equals)
+                let value = line.slice(equals + 3, line.length)
+                if value.startsWith("load ") {
+                    let slot = value.find(", ptr %local.")
+                    if slot >= 0 {
+                        local = value.slice(slot + 6, value.length)
+                        if local.find(" ") >= 0 || local.find(",") >= 0 { local = "" }
+                    }
+                }
+                if local == "" && value.find("%local.") >= 0 { loopLocalsIn(value, copy.touched) }
+                let number = loopValueNumber(name)
+                if number >= 0 {
+                    numbers.add(number)
+                    numberLines.add(index)
+                } else {
+                    copy.otherNames.add(name)
+                    copy.otherLines.add(index)
+                }
             }
+        } else if line.length > 1 && line.endsWith(":") && line[0] != ' ' && line[0] != ';' {
+            copy.otherNames.add("%" + line.slice(0, line.length - 1))
+            copy.otherLines.add(-2)
+        } else if !line.startsWith(";") && line.find("%local.") >= 0 {
+            loopLocalsIn(line, copy.touched)
         }
+        copy.defined.add(name)
+        copy.loaded.add(local)
+        index = index + 1
+    }
+    if numbers.length == 0 { return }
+    let lowest = numbers[0]
+    let highest = numbers[0]
+    index = 1
+    while index < numbers.length {
+        if numbers[index] < lowest { lowest = numbers[index] }
+        if numbers[index] > highest { highest = numbers[index] }
+        index = index + 1
+    }
+    copy.valueBase = lowest
+    while copy.valueLines.length <= highest - lowest { copy.valueLines.add(0) }
+    index = 0
+    while index < numbers.length {
+        copy.valueLines[numbers[index] - lowest] = numberLines[index] + 1
+        index = index + 1
     }
 }
 
@@ -129,14 +191,12 @@ function loopInvariant(copy: LoopCopy, value: Text, slot: Boolean): Text {
     if !value.startsWith("%") { return value }
     let known = loopNamed(copy.invariant, value)
     if known >= 0 { return copy.hoisted[known] }
-    let defined = loopNamed(copy.names, value)
-    if defined < 0 {
-        if loopNamed(copy.labels, value) >= 0 { return "" }
-        return value
-    }
-    let line = copy.lines[copy.definitions[defined]]
+    let defined = loopDefinitionLine(copy, value)
+    if defined == -1 { return value }
+    if defined < 0 { return "" }
+    let line = copy.lines[defined]
     let name = loopGuardName(copy, value, "")
-    let local = loopLoadedLocal(line)
+    let local = copy.loaded[defined]
     if local != "" {
         if loopNamed(copy.touched, local) >= 0 { return "" }
         copy.guard.add("  " + name + line.slice(line.find(" = "), line.length) + "\n")
@@ -183,9 +243,19 @@ function loopInvariant(copy: LoopCopy, value: Text, slot: Boolean): Text {
 function loopAtPosition(copy: LoopCopy, value: Text): Boolean {
     if value == copy.position { return true }
     if copy.variable == "" { return false }
-    let defined = loopNamed(copy.names, value)
+    let defined = loopDefinitionLine(copy, value)
     if defined < 0 { return false }
-    return loopLoadedLocal(copy.lines[copy.definitions[defined]]) == copy.variable && copy.lines[copy.definitions[defined]].find(" = load i64, ") >= 0
+    return copy.loaded[defined] == copy.variable && copy.lines[defined].find(" = load i64, ") >= 0
+}
+
+function loopTruncated(values: List<Text>, length: Integer): List<Text> {
+    let result: List<Text> = []
+    let index = 0
+    while index < length {
+        result.add(values[index])
+        index = index + 1
+    }
+    return result
 }
 
 // The values buffer of an invariant List indexed at the loop position.
@@ -212,39 +282,30 @@ function loopCheckedList(copy: LoopCopy, line: Text, callee: Text): Text {
     return values
 }
 
-function loopTruncated(values: List<Text>, length: Integer): List<Text> {
-    let result: List<Text> = []
-    let index = 0
-    while index < length {
-        result.add(values[index])
-        index = index + 1
-    }
-    return result
-}
-
+// The copy's text for a line: region labels and names get the copy's suffix;
+// values computed before the loop use their hoisted names.
 function loopRename(copy: LoopCopy, line: Text): Text {
-    if loopLineLabel(line) != "" { return line.slice(0, line.length - 1) + copy.suffix + ":" }
-    let pieces: List<Text> = []
-    let rest = line
-    let found = rest.find("%")
-    while found >= 0 {
-        pieces.add(rest.slice(0, found))
-        rest = rest.slice(found, rest.length)
-        let end = 1
-        while end < rest.length && loopNameCharacter(rest[end]) { end = end + 1 }
-        let name = rest.slice(0, end)
+    if line.length > 1 && line.endsWith(":") && line[0] != ' ' && line[0] != ';' { return line.slice(0, line.length - 1) + copy.suffix + ":" }
+    if line.find("%") < 0 { return line }
+    let parts = line.split("%")
+    let pieces: List<Text> = [parts[0]]
+    let index = 1
+    while index < parts.length {
+        let part = parts[index]
+        let end = 0
+        while end < part.length && loopNameCharacter(part[end]) { end = end + 1 }
+        let name = "%" + part.slice(0, end)
         let known = loopNamed(copy.invariant, name)
         if known >= 0 {
             pieces.add(copy.hoisted[known])
-        } else if loopNamed(copy.names, name) >= 0 || loopNamed(copy.labels, name) >= 0 {
+        } else if loopDefinitionLine(copy, name) != -1 {
             pieces.add(name + copy.suffix)
         } else {
             pieces.add(name)
         }
-        rest = rest.slice(end, rest.length)
-        found = rest.find("%")
+        pieces.add(part.slice(end, part.length))
+        index = index + 1
     }
-    pieces.add(rest)
     return joinText(pieces)
 }
 
@@ -253,79 +314,58 @@ function loopRename(copy: LoopCopy, line: Text): Text {
 // the condition. Returns false, changing nothing, when no access qualifies.
 function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Text, loopLabel: Integer, counter: Integer, variable: Integer, position: Text, bound: Text): Boolean {
     let loop = Text(loopLabel)
-    let copy = LoopCopy { lines: [], names: [], definitions: [], labels: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".fast" + loop, loop: loop, blocks: 0, position: position, variable: "", lists: [], values: [] }
-    let start = 0
-    let index = 0
-    while index < region.length {
-        if region[index] == '\n' {
-            copy.lines.add(region.slice(start, index))
-            start = index + 1
-        }
-        index = index + 1
-    }
-    if start < region.length { copy.lines.add(region.slice(start, region.length)) }
-    index = 0
-    while index < copy.lines.length {
-        let line = copy.lines[index]
-        let name = loopLineDefinition(line)
-        if name != "" {
-            // Numbered values must stay in sequence; this compiler names its own.
-            if name.length > 1 && name[1] >= '0' && name[1] <= '9' { return false }
-            copy.names.add(name)
-            copy.definitions.add(index)
-        }
-        let label = loopLineLabel(line)
-        if label != "" { copy.labels.add(label) }
-        index = index + 1
-    }
-    loopTouchedLocals(copy)
+    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".fast" + loop, loop: loop, blocks: 0, position: position, variable: "", lists: [], values: [] }
+    loopClassify(copy)
     // The loop variable is an alias of the position only if the region stores
     // nothing else into it.
     let variableSlot = "%local." + Text(variable)
     let stores = 0
     let positionStores = 0
-    let storeLine = 0
-    while storeLine < copy.lines.length {
-        let line = copy.lines[storeLine]
-        storeLine = storeLine + 1
+    let index = 0
+    while index < copy.lines.length {
+        let line = copy.lines[index]
         if line.startsWith("  store ") && line.endsWith(", ptr " + variableSlot) {
             stores = stores + 1
             if line == "  store i64 " + position + ", ptr " + variableSlot { positionStores = positionStores + 1 }
         }
+        index = index + 1
     }
     if variable >= 0 && stores == 1 && positionStores == 1 { copy.variable = variableSlot }
     let limit = loopInvariant(copy, bound, false)
     if limit == "" { return false }
     // Find every qualifying access first, so the copy uses one value for each
     // hoisted name throughout.
-    let accessLine = 0
-    while accessLine < copy.lines.length {
-        let line = copy.lines[accessLine]
-        accessLine = accessLine + 1
-        if loopLineDefinition(line) != "" && line.find(" = call i64 @.minyar.list.get.checked(") >= 0 { let ignored = loopCheckedList(copy, line, "@.minyar.list.get.checked") }
-        if line.startsWith("  call void @.minyar.list.set.scalar.checked(") { let ignored = loopCheckedList(copy, line, "@.minyar.list.set.scalar.checked") }
+    let getting: List<Boolean> = []
+    let setting: List<Boolean> = []
+    index = 0
+    while index < copy.lines.length {
+        let line = copy.lines[index]
+        let reads = copy.defined[index] != "" && line.find(" = call i64 @.minyar.list.get.checked(") >= 0
+        let writes = !reads && line.startsWith("  call void @.minyar.list.set.scalar.checked(")
+        getting.add(reads)
+        setting.add(writes)
+        if reads { let ignored = loopCheckedList(copy, line, "@.minyar.list.get.checked") }
+        if writes { let ignored = loopCheckedList(copy, line, "@.minyar.list.set.scalar.checked") }
+        index = index + 1
     }
     if copy.lists.length == 0 { return false }
     let body: List<Text> = []
     let slots = 0
-    let copiedLine = 0
-    while copiedLine < copy.lines.length {
-        let line = copy.lines[copiedLine]
-        copiedLine = copiedLine + 1
-        let name = loopLineDefinition(line)
-        let getting = name != "" && line.find(" = call i64 @.minyar.list.get.checked(") >= 0
-        let setting = line.startsWith("  call void @.minyar.list.set.scalar.checked(")
+    index = 0
+    while index < copy.lines.length {
+        let line = copy.lines[index]
+        let name = copy.defined[index]
         let values = ""
-        if getting { values = loopCheckedList(copy, line, "@.minyar.list.get.checked") }
-        if setting { values = loopCheckedList(copy, line, "@.minyar.list.set.scalar.checked") }
+        if getting[index] { values = loopCheckedList(copy, line, "@.minyar.list.get.checked") }
+        if setting[index] { values = loopCheckedList(copy, line, "@.minyar.list.set.scalar.checked") }
         // Hoisted values are computed once before the loop.
         if name != "" && loopNamed(copy.invariant, name) >= 0 {
             values = ""
-        } else if getting && values != "" {
+        } else if getting[index] && values != "" {
             let arguments = loopCallArguments(line, "@.minyar.list.get.checked")
             let renamed = name + copy.suffix
             body.add("  " + renamed + ".slot = getelementptr inbounds i64, ptr " + values + ", i64 " + loopRename(copy, arguments[1]) + "\n  " + renamed + " = load i64, ptr " + renamed + ".slot\n")
-        } else if setting && values != "" {
+        } else if setting[index] && values != "" {
             let arguments = loopCallArguments(line, "@.minyar.list.set.scalar.checked")
             let slot = "%loop.slot" + copy.suffix + "." + Text(slots)
             slots = slots + 1
@@ -333,6 +373,7 @@ function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Tex
         } else {
             body.add(loopRename(copy, line) + "\n")
         }
+        index = index + 1
     }
     let first = "%loop.first." + loop
     let test: List<Text> = ["  " + first + " = load i64, ptr %local." + Text(counter) + "\n  %loop.from." + loop + " = icmp sge i64 " + first + ", 0\n"]
