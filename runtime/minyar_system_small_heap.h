@@ -41,8 +41,12 @@ static inline void rc_system_unlink(RcSystemPage *page) {
     if (page->next) page->next->link = page->link;
     page->link = NULL;
 }
+/* Allocation takes the class's first page. A page regaining free slots goes
+ * second, so consecutive allocations stay on one page until it fills rather
+ * than following each free; objects allocated together share pages. */
 static inline void rc_system_link(RcSystemPage *page) {
     RcSystemPage **head = &rc_system_available[page->index];
+    if (*head) head = &(*head)->next;
     page->next = *head;
     page->link = head;
     if (*head) (*head)->link = &page->next;
