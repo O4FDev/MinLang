@@ -1,4 +1,5 @@
-// TCP connections for programs running on macOS, Linux or Windows.
+// TCP connections for programs running on macOS, Linux or Windows, and Unix
+// domain sockets with descriptor passing on Linux and macOS (end of this file).
 // Import it with `use "net" as net`.
 //
 //     let connection = net.connect("example.com", 80)
@@ -440,3 +441,73 @@ public function DatagramOffload.watch(loop: Integer, interest: Integer, token: I
 public function DatagramOffload.close(): Result<Nothing, errors.Error> { return typedStatus(closeDatagramOffload(self)) }
 public function DatagramOffload.sendTo(source: Text, port: Integer, data: Bytes, segmentSize: Integer): Result<Integer, errors.Error> { return typedInteger(sendDatagramOffloadTo(self, source, port, data, segmentSize)) }
 public function DatagramOffload.receive(maximum: Integer, limit: Integer): Result<List<Datagram>, BatchFailure> { return typedBatch(receiveDatagramsOffload(self, maximum, limit)) }
+
+// ---- Unix domain sockets and descriptor passing (Linux and macOS) ----
+// A stream socket named by a file system path instead of a host and port, for
+// processes on one machine. Use the handles with every stream operation above
+// (acceptConnection, readBytes, writeBytes, waitReady, closeConnection, ...).
+// A path listener, like a TCP one, is non-blocking. Binding fails while the path
+// exists: remove a stale path first (files.remove). Paths are at most 103 bytes.
+// Windows reports an unsupported-operation error for each call here.
+
+// Two connected stream sockets: one for this process, one to hand to another
+// (a child process or, with writeWithHandles, a process across a socket).
+public record ConnectionPair { first: Integer; second: Integer }
+
+// Bytes read together with the descriptors that arrived with them. The reader
+// owns the descriptors: close each one (closeConnection, files.close) or pass it on.
+public record Delivery { data: Bytes; handles: List<Integer> }
+
+function listenPath(path: Text, backlog: Integer): Integer { native "net" }
+function connectPath(path: Text): Integer { native "net" }
+function pairResult(): Bytes { native "net" }
+function sendHandlesResult(connection: Integer, data: Bytes, handles: Bytes): Bytes { native "net" }
+function receiveHandlesResult(connection: Integer, limit: Integer, maximum: Integer): Bytes { native "net" }
+
+function resultError(result: Bytes, operation: Text): errors.Error {
+    let category = errors.systemCode()
+    if result.getUInt32(0) == 1 { category = errors.wouldBlockCode() }
+    return errors.make(category, result.getUInt32(4), operation + " failed").withContext(operation)
+}
+
+public function listenOnPath(path: Text, backlog: Integer): Result<Integer, errors.Error> { return socketHandle(listenPath(path, backlog), "listening on " + path) }
+public function openPathConnection(path: Text): Result<Integer, errors.Error> { return socketHandle(connectPath(path), "connecting to " + path) }
+public function openConnectionPair(): Result<ConnectionPair, errors.Error> {
+    let result = pairResult()
+    if result.getUInt32(0) != 0 { return Err(resultError(result, "opening a connection pair")) }
+    return Ok(ConnectionPair { first: result.getInt64(8); second: result.getInt64(16) })
+}
+
+// Send data once with the descriptors attached to its first byte (at most 253;
+// data must not be empty). Returns the bytes sent: when fewer than data.length,
+// the descriptors still went with them; send the rest with writeBytes. The
+// sender keeps its own descriptors open until it closes them.
+public function writeWithHandles(connection: Integer, data: Bytes, handles: List<Integer>): Result<Integer, errors.Error> {
+    if data.length == 0 { return Err(errors.make(errors.invalidDataCode(), 0, "descriptors travel with at least one byte of data")) }
+    if handles.length > 253 { return Err(errors.make(errors.invalidDataCode(), 0, "one message carries at most 253 descriptors")) }
+    let table = Bytes(handles.length * 8)
+    for index in 0..handles.length { table.setInt64(index * 8, handles[index]) }
+    let result = sendHandlesResult(connection, data, table)
+    if result.getUInt32(0) != 0 { return Err(resultError(result, "writing with descriptors")) }
+    return Ok(result.getInt64(8))
+}
+
+// One read of up to `limit` bytes and up to `maximumHandles` descriptors (0 to
+// 253). Ok(None) is the end of the stream. When more descriptors arrive than
+// maximumHandles, every descriptor of that message is closed and the result is
+// a ReadFailure whose prefix() keeps the bytes that came with them.
+public function readWithHandles(connection: Integer, limit: Integer, maximumHandles: Integer): Result<Maybe<Delivery>, ReadFailure> {
+    let result = receiveHandlesResult(connection, limit, maximumHandles)
+    let status = result.getUInt32(0)
+    let count = result.getInt64(8)
+    let data = result.slice(16 + count * 8, result.length)
+    if status == 2 { return Ok(None) }
+    if status == 4 {
+        let problem = errors.make(errors.invalidDataCode(), result.getUInt32(4), "more descriptors arrived than maximumHandles; they were closed")
+        return Err(ReadFailure { diagnostic: problem; readablePrefix: data })
+    }
+    if status != 0 { return Err(ReadFailure { diagnostic: resultError(result, "reading with descriptors"); readablePrefix: Bytes() }) }
+    let handles: List<Integer> = []
+    for index in 0..count { handles.add(result.getInt64(16 + index * 8)) }
+    return Ok(Some(Delivery { data: data; handles: handles }))
+}

@@ -618,6 +618,7 @@ MinyarText *minyar_net_lastError(void) {
 
 #include "net_datagrams.h"
 #include "net_loop.h"
+#include "net_paths.h"
 
 long long minyar_net_monotonicMilliseconds(void) {
     uint64_t now = net_loop_now();

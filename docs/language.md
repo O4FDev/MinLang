@@ -1632,6 +1632,42 @@ channel still require the same external coordination. `waitReady` returns
 `Ok(false)` on a timeout. `readBytesInto` appends to the supplied buffer and
 requires a positive limit. The original operations retain their contracts.
 
+Unix domain sockets (Linux and macOS) have the same shape as TCP, with a file
+system path instead of a host and port: `net.listenOnPath(path, backlog)` and
+`net.openPathConnection(path)` return handles that every stream operation
+above accepts, and `acceptConnection` takes path listeners, which are
+non-blocking like TCP ones. Binding fails while the path exists; remove a stale
+path with `files.remove` first. `net.openConnectionPair()` returns a connected
+`ConnectionPair { first; second }`. Descriptor passing (SCM_RIGHTS):
+`net.writeWithHandles(connection, data, handles)` sends at least one byte of
+data with up to 253 descriptors attached to its first byte, and
+`net.readWithHandles(connection, limit, maximumHandles)` returns
+`Ok(Some(Delivery { data; handles }))`, `Ok(None)` at the end of the stream, or
+a `ReadFailure`. The reader owns every received descriptor (close-on-exec is
+set): close it or pass it on. When more descriptors arrive than
+`maximumHandles`, all of that message's descriptors are closed and the
+`ReadFailure` keeps its bytes as `prefix()`. On Windows each of these calls
+returns an unsupported-operation error.
+
+```minyar
+use "net" as net
+match net.openConnectionPair() {
+    Ok(ends) {
+        // Any descriptor can travel: here, a socket end itself.
+        match net.writeWithHandles(ends.first, Bytes("s"), [ends.first]) {
+            Ok(sent) { print(sent) }                               // 1
+            Err(problem) { print(problem.describe()) }
+        }
+        match net.readWithHandles(ends.second, 16, 4) {
+            Ok(Some(delivery)) { print(delivery.handles.length) }   // 1
+            Ok(None) { print("closed") }
+            Err(problem) { print(problem.describe()) }
+        }
+    }
+    Err(problem) { print(problem.describe()) }
+}
+```
+
 Worker messages distinguish `Some(Bytes())` from EOF `None`; a timeout is a
 would-block error. `currentMode` returns None outside a worker, and
 `readRequest`/`replyMessage` return an error there. TLS methods operate on the

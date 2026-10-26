@@ -1,6 +1,6 @@
 # Portable networking foundations have their own gates so protocol tests can
 # grow without mixing native desktop prerequisites into the portable suite.
-.PHONY: check-errors-values check-net check-net-loop check-net-connect check-net-connect-sanitize check-os-net-stack check-os-net-stack-sanitize
+.PHONY: check-errors-values check-net check-net-loop check-net-connect check-net-connect-sanitize check-net-paths check-net-paths-sanitize check-os-net-stack check-os-net-stack-sanitize
 NET_FIXTURE_TOOLS = http-package-test http-bounded-test httpserver-test httpserver-front-test net-native-test net-loop-test \
     net-udp-offload-test os-tlsverify-test peer-auth-mutants-test peer-auth-device-test peer-auth-test peer-wire-flow-test \
     peer-live-redis-test peer-live-test peer-wire-test redis-pipeline-test redis-protocol-test securecrypto-test \
@@ -53,9 +53,20 @@ check-net-connect: build/minyarc build/tooling/tests/net-connect-test
 check-net-connect-sanitize: build/minyarc tools/toolchain.sh build/tooling/tests/net-connect-test
 	PATH="$(NET_SANITIZER_PATH)" MINYAR_CLANG=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/net-connect-test --sanitize
 
+# Unix domain sockets and descriptor passing: Linux and macOS.
+check-net-paths: build/minyarc build/tooling/tests/net-paths-test
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/net-paths-test
+
+check-net-paths-sanitize: build/minyarc tools/toolchain.sh build/tooling/tests/net-paths-test
+	PATH="$(NET_SANITIZER_PATH)" MINYAR_CLANG=$(call NET_SANITIZER_QUOTE,$(NET_SANITIZER_CLANG)) $(SANITIZER_LIMITED) ./build/tooling/tests/net-paths-test --sanitize
+
 check: check-errors-values check-net check-net-loop check-net-connect
 check-portable: check-errors-values check-net check-net-loop check-net-connect
 check-sanitize: check-net-connect-sanitize
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+check check-portable: check-net-paths
+check-sanitize: check-net-paths-sanitize
+endif
 
 # Offload succeeds only on Linux; other OS providers must report unavailable.
 .PHONY: check-net-udp-offload check-net-udp-offload-sanitize

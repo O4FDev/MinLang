@@ -1,0 +1,196 @@
+// Unix domain sockets named by a path, connection pairs and descriptor passing
+// (SCM_RIGHTS) through the typed net API. Linux and macOS.
+use "net" as net
+use "files" as files
+use "errors" as errors
+use "process" as processInfo
+
+function check(condition: Boolean, what: Text) {
+    if !condition { fail("net-paths: " + what) }
+}
+function same(data: Bytes, expected: Text): Boolean {
+    let wanted = Bytes(expected)
+    if data.length != wanted.length { return false }
+    for index in 0..data.length { if data[index] != wanted[index] { return false } }
+    return true
+}
+function handle(result: Result<Integer, errors.Error>, what: Text): Integer {
+    match result {
+        Ok(value) { return value }
+        Err(problem) { fail("net-paths: " + what + ": " + problem.describe()) }
+    }
+}
+function written(result: Result<Integer, errors.Error>, what: Text): Integer { return handle(result, what) }
+function failure(result: Result<Integer, errors.Error>): errors.Error {
+    match result {
+        Ok(value) { fail("net-paths: expected a failure, got " + Text(value)) }
+        Err(problem) { return problem }
+    }
+}
+// Read exactly `count` bytes from a blocking stream socket.
+function readExactly(connection: Integer, count: Integer): Bytes {
+    let data = Bytes()
+    while data.length < count {
+        match net.readBytes(connection, count - data.length) {
+            Ok(Some(chunk)) { data.addBytes(chunk) }
+            Ok(None) { fail("net-paths: early end of stream") }
+            Err(problem) { fail("net-paths: read: " + problem.describe()) }
+        }
+    }
+    return data
+}
+function delivery(result: Result<Maybe<net.Delivery>, net.ReadFailure>, what: Text): net.Delivery {
+    match result {
+        Ok(Some(value)) { return value }
+        Ok(None) { fail("net-paths: " + what + ": end of stream") }
+        Err(problem) { fail("net-paths: " + what + ": " + problem.describe()) }
+    }
+}
+function closeAll(handles: List<Integer>) {
+    for value in handles {
+        match net.closeConnection(value) {
+            Ok() { }
+            Err(problem) { fail("net-paths: close: " + problem.describe()) }
+        }
+    }
+}
+
+let base = "/tmp/minyar-net-paths-" + Text(processInfo.processId())
+let path = base + ".sock"
+files.remove(path)
+
+// A path listener behaves like a TCP one: non-blocking accept, ordinary stream I/O.
+let listener = handle(net.listenOnPath(path, 8), "listen")
+match net.acceptConnection(listener) {
+    Ok(value) { fail("net-paths: accept on an empty listener returned a connection") }
+    Err(problem) { check(problem.code() == errors.wouldBlockCode(), "empty accept would block: " + problem.describe()) }
+}
+let client = handle(net.openPathConnection(path), "connect")
+match net.waitReady(listener, 2000) {
+    Ok(ready) { check(ready, "listener readiness") }
+    Err(problem) { fail("net-paths: wait: " + problem.describe()) }
+}
+let server = handle(net.acceptConnection(listener), "accept")
+match net.setNonBlocking(server, false) {
+    Ok() { }
+    Err(problem) { fail("net-paths: blocking server side: " + problem.describe()) }
+}
+check(written(net.writeBytes(client, Bytes("ping")), "client write") == 4, "client write count")
+check(same(readExactly(server, 4), "ping"), "server read")
+check(written(net.writeBytes(server, Bytes("pong!")), "server write") == 5, "server write count")
+check(same(readExactly(client, 5), "pong!"), "client read")
+closeAll([client])
+match net.readBytes(server, 16) {
+    Ok(None) { }
+    Ok(Some(data)) { fail("net-paths: data after the peer closed") }
+    Err(problem) { fail("net-paths: read at the end: " + problem.describe()) }
+}
+closeAll([server])
+
+// The path stays bound while the listener lives; a stale path must be removed.
+let busy = failure(net.listenOnPath(path, 8))
+check(busy.code() == errors.systemCode() && busy.nativeCode() > 0, "second listener on a bound path fails: " + busy.describe())
+closeAll([listener])
+check(failure(net.listenOnPath(path, 8)).code() == errors.systemCode(), "a stale path still blocks binding")
+check(files.remove(path) == 0, "remove the stale path")
+let again = handle(net.listenOnPath(path, 8), "listen after removing the stale path")
+closeAll([again])
+files.remove(path)
+
+// Bad paths are recoverable errors, not stops.
+let long = "/tmp/"
+while long.length < 120 { long = long + "x" }
+check(failure(net.listenOnPath(long, 8)).nativeCode() > 0, "a path longer than sun_path fails")
+check(failure(net.openPathConnection("")).nativeCode() > 0, "an empty path fails")
+check(failure(net.openPathConnection(base + ".missing")).code() == errors.systemCode(), "connecting to a missing path fails")
+
+// A connected pair.
+let ends = net.ConnectionPair { first: -1; second: -1 }
+match net.openConnectionPair() {
+    Ok(value) { ends = value }
+    Err(problem) { fail("net-paths: pair: " + problem.describe()) }
+}
+check(written(net.writeBytes(ends.first, Bytes("across")), "pair write") == 6, "pair write count")
+check(same(readExactly(ends.second, 6), "across"), "pair read")
+
+// Pass an open file: the receiver reads it through its own descriptor.
+let filePath = base + ".data"
+let file = files.open(filePath, files.WRITE | files.CREATE | files.TRUNCATE)
+check(file >= 0, "open the data file")
+check(files.write(file, Bytes("descriptor payload"), 0, 18) == 18, "write the data file")
+check(written(net.writeWithHandles(ends.first, Bytes("f"), [file]), "send a file") == 1, "send a file count")
+check(files.close(file) == 0, "the sender closes its own copy")
+let got = delivery(net.readWithHandles(ends.second, 16, 4), "receive a file")
+check(same(got.data, "f") && got.handles.length == 1, "one byte and one descriptor arrive")
+check(got.handles[0] >= 0, "the received descriptor is valid")
+check(same(files.readAt(got.handles[0], 0, 18), "descriptor payload"), "read the passed file")
+check(files.close(got.handles[0]) == 0, "close the received file")
+files.remove(filePath)
+
+// Pass a socket: the receiver talks through the passed end of another pair.
+let inner = net.ConnectionPair { first: -1; second: -1 }
+match net.openConnectionPair() {
+    Ok(value) { inner = value }
+    Err(problem) { fail("net-paths: inner pair: " + problem.describe()) }
+}
+check(written(net.writeWithHandles(ends.first, Bytes("socket"), [inner.second]), "send a socket") == 6, "send a socket count")
+closeAll([inner.second])
+let passed = delivery(net.readWithHandles(ends.second, 16, 4), "receive a socket")
+check(same(passed.data, "socket") && passed.handles.length == 1, "the socket arrives with its bytes")
+check(written(net.writeBytes(passed.handles[0], Bytes("through")), "write through the passed socket") == 7, "passed socket write")
+check(same(readExactly(inner.first, 7), "through"), "read what went through the passed socket")
+closeAll([passed.handles[0], inner.first])
+
+// Several descriptors in one message keep their order.
+let a = net.ConnectionPair { first: -1; second: -1 }
+let b = net.ConnectionPair { first: -1; second: -1 }
+match net.openConnectionPair() { Ok(value) { a = value } Err(problem) { fail("net-paths: pair a") } }
+match net.openConnectionPair() { Ok(value) { b = value } Err(problem) { fail("net-paths: pair b") } }
+check(written(net.writeWithHandles(ends.first, Bytes("ab"), [a.second, b.second]), "send two") == 2, "send two count")
+let two = delivery(net.readWithHandles(ends.second, 16, 2), "receive two")
+check(two.handles.length == 2, "two descriptors arrive")
+check(written(net.writeBytes(two.handles[0], Bytes("A")), "write a") == 1 && written(net.writeBytes(two.handles[1], Bytes("B")), "write b") == 1, "write through both")
+check(same(readExactly(a.first, 1), "A") && same(readExactly(b.first, 1), "B"), "descriptors keep their order")
+closeAll(two.handles)
+
+// More descriptors than the reader accepts: all of them are closed and the bytes are a readable prefix.
+check(written(net.writeWithHandles(ends.first, Bytes("xyz"), [a.second, b.second]), "send too many") == 3, "send too many count")
+match net.readWithHandles(ends.second, 16, 1) {
+    Ok(value) { fail("net-paths: too many descriptors were accepted") }
+    Err(problem) {
+        check(problem.error().code() == errors.invalidDataCode(), "too many descriptors is invalid data: " + problem.describe())
+        check(same(problem.prefix(), "xyz"), "the bytes stay readable")
+    }
+}
+check(written(net.writeWithHandles(ends.first, Bytes("0"), [a.second]), "send to a reader that takes none") == 1, "send one")
+match net.readWithHandles(ends.second, 16, 0) {
+    Ok(value) { fail("net-paths: a reader that takes no descriptors accepted one") }
+    Err(problem) { check(same(problem.prefix(), "0"), "maximumHandles 0 keeps the byte") }
+}
+closeAll([a.first, a.second, b.first, b.second])
+
+// Plain bytes through readWithHandles: no descriptors.
+check(written(net.writeBytes(ends.first, Bytes("plain")), "plain write") == 5, "plain write count")
+let plain = delivery(net.readWithHandles(ends.second, 5, 4), "plain read")
+check(same(plain.data, "plain") && plain.handles.length == 0, "plain bytes carry no descriptors")
+
+// Misuse is a recoverable error.
+check(failure(net.writeWithHandles(ends.first, Bytes(), [ends.first])).code() == errors.invalidDataCode(), "descriptors need at least one byte")
+let many: List<Integer> = []
+while many.length < 254 { many.add(ends.first) }
+check(failure(net.writeWithHandles(ends.first, Bytes("m"), many)).code() == errors.invalidDataCode(), "at most 253 descriptors")
+check(failure(net.writeWithHandles(ends.first, Bytes("m"), [-5])).nativeCode() > 0, "a negative descriptor fails")
+match net.readWithHandles(ends.second, 16, 254) {
+    Ok(value) { fail("net-paths: maximumHandles 254 was accepted") }
+    Err(problem) { check(problem.error().nativeCode() > 0, "maximumHandles above 253 fails") }
+}
+
+// End of stream.
+closeAll([ends.first])
+match net.readWithHandles(ends.second, 16, 4) {
+    Ok(None) { }
+    Ok(Some(value)) { fail("net-paths: data after the pair closed") }
+    Err(problem) { fail("net-paths: readWithHandles at the end: " + problem.describe()) }
+}
+closeAll([ends.second])
+print("net-paths: ok")
