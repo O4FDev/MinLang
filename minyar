@@ -380,9 +380,18 @@ else
 fi
 driver="$project_dir/build/tooling/tools/clang-driver"
 if [ "$check_only" -eq 0 ]; then set -- "$@" build/tooling/tools/clang-driver; fi
+# A watch session prepares the toolchain with its first build; later rebuilds
+# in the session skip the check (MINYAR_PREPARED_TOOLCHAIN, set by project-cli).
 # Interactive first-use builds keep resource caps and low CPU priority, while
 # avoiding the macOS background scheduling class used by bulk development.
-if [ "$list_tests" -eq 1 ] || [ "$list_benchmarks" -eq 1 ] || [ "$doc_json" -eq 1 ]; then
+if [ "${MINYAR_PREPARED_TOOLCHAIN-}" = 1 ]; then
+    for prepared in "$@"; do
+        [ -f "$project_dir/$prepared" ] || { MINYAR_PREPARED_TOOLCHAIN=; break; }
+    done
+fi
+if [ "${MINYAR_PREPARED_TOOLCHAIN-}" = 1 ]; then
+    :
+elif [ "$list_tests" -eq 1 ] || [ "$list_benchmarks" -eq 1 ] || [ "$doc_json" -eq 1 ]; then
     MINYAR_INTERACTIVE_BOOTSTRAP=1 sh "$project_dir/tools/toolchain.sh" bootstrap "$project_dir" "$@" >&2
 else
     MINYAR_INTERACTIVE_BOOTSTRAP=1 sh "$project_dir/tools/toolchain.sh" bootstrap "$project_dir" "$@"
@@ -464,16 +473,10 @@ CONFIG
     if [ "$cleanup_budget" -gt 1 ]; then
         printf '#include "minyar_stack_frames.h"\n' >> "$runtime_source"
     fi
-    if [ "$release" -eq 1 ] && [ "$("$driver" runtime-format)" = llvm ]; then
-        runtime_file="$llvm_dir/runtime.ll"
-        "$driver" compile -iquote "$project_dir/runtime" \
-            -S -emit-llvm "$runtime_source" -o "$llvm_dir/runtime.raw.ll"
-        sed -E 's/"(target-cpu|target-features|tune-cpu)"="[^"]*" ?//g' "$llvm_dir/runtime.raw.ll" > "$runtime_file"
-    else
-        runtime_file="$llvm_dir/runtime.o"
-        "$driver" compile -iquote "$project_dir/runtime" \
-            -c "$runtime_source" -o "$runtime_file"
-    fi
+    # Compiled once per configuration and Clang, then reused from the build cache.
+    runtime_format=object
+    if [ "$release" -eq 1 ] && [ "$("$driver" runtime-format)" = llvm ]; then runtime_format=llvm; fi
+    runtime_file=$("$driver" configured-runtime "$project_dir" "$runtime_source" "$runtime_format")
 fi
 binary_file=$output_file
 if [ "$app" -eq 1 ]; then binary_file="$llvm_dir/application"; fi

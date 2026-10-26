@@ -56,7 +56,7 @@ function clangIdentity(clang: Text): Bytes {
     let info = host.fileStatus(path)
     if info.kind == "" { host.stop(host.osError(2, path)) }
     let identity = Bytes("[" + info.device + ", " + info.inode + ", " + Text(info.size) + ", " + Text(info.modified) + ", " + Text(info.changed) + "]")
-    identity.addBytes(Bytes(host.captureOutput([clang, "--version"], 0)))
+    identity.addBytes(Bytes(host.clangVersion(clang)))
     identity.addBytes(Bytes(host.jsonList([path, host.hostName(), host.hostMachine()])))
     return identity
 }
@@ -216,18 +216,35 @@ function debugManagedRecords(project: Text, clang: Text, runtime: Text): Boolean
     if standard && host.setting("PROGRAM_RUNTIME_FLAGS", "-DMINYAR_SYSTEM_HEAP=1") == "-DMINYAR_SYSTEM_HEAP=1" { known = true }
     // Unknown prebuilt runtimes keep records opaque rather than guessing an ABI.
     if !known { return false }
-    let directory = host.temporaryDirectory("", "minyar-debug-layout-")
-    let source = directory + "/runtime.c"
-    host.writeBytes(source, Bytes(runtimeConfiguration(project, runtime, "debug type layout")))
+    let configuration = runtimeConfiguration(project, runtime, "debug type layout")
+    let options = host.flags("MINYAR_RUNTIME_FLAGS", DEFAULT_FLAGS)
+    // The answer depends only on the configuration, flags, Clang and runtime
+    // headers, so it is kept in the build cache.
+    let identity = clangIdentity(clang)
+    identity.addBytes(Bytes(host.jsonList(options)))
+    identity.addBytes(Bytes(configuration))
+    let directory = host.buildCache(project) + "/native"
+    let cached = directory + "/debug-layout-" + digestOf(identity, project, headers(project, [".h", ".c"]))
+    if host.isFile(cached) { return host.readText(cached) == "records" }
+    let scratch = host.temporaryDirectory("", "minyar-debug-layout-")
+    let source = scratch + "/runtime.c"
+    host.writeBytes(source, Bytes(configuration))
     let command = [clang]
-    for option in host.flags("MINYAR_RUNTIME_FLAGS", DEFAULT_FLAGS) { command.add(option) }
+    for option in options { command.add(option) }
     for option in ["-iquote", project + "/runtime", "-E", "-dM", source] { command.add(option) }
     let macros = host.captureOutput(command, 0)
-    host.release(directory)
+    host.release(scratch)
+    let records = true
     for line in host.lines(macros) {
-        if line == "#define MINYAR_COMPILER_ARENA" || line.startsWith("#define MINYAR_COMPILER_ARENA ") { return false }
+        if line == "#define MINYAR_COMPILER_ARENA" || line.startsWith("#define MINYAR_COMPILER_ARENA ") { records = false }
     }
-    return true
+    host.makeDirectories(directory)
+    let answer = "arena"
+    if records { answer = "records" }
+    let temporary = cached + "." + Text(system.processId())
+    host.writeBytes(temporary, Bytes(answer))
+    if files.rename(temporary, cached) != 0 { files.remove(temporary) }
+    return records
 }
 function threadSource(project: Text, runtime: Text, cycles: Boolean): Text {
     let configuration = runtimeConfiguration(project, runtime, "thread memory policy")
@@ -919,7 +936,7 @@ function linkSteps(link: Link, clang: Text, prefix: List<Text>, linkFlags: List<
         host.jsonPut(doc, tools, "clang.bin", host.jsonString(doc, bound.digest))
         host.jsonPut(doc, bindings, "clang.bin", bindingObject(doc, bound))
         host.jsonPut(doc, root, "compiler", host.jsonString(doc, compiler))
-        host.jsonPut(doc, root, "compiler_version", host.jsonString(doc, host.captureOutput([clang, "--version"], 0)))
+        host.jsonPut(doc, root, "compiler_version", host.jsonString(doc, host.clangVersion(clang)))
     }
     return publish(link, command, output, source)
 }
@@ -1170,6 +1187,68 @@ function compile(arguments: List<Text>) {
     for item in arguments { command.add(item) }
     host.runWithTerminalDiagnostics(command)
 }
+// A runtime the launcher configured (memory profile, cleanup budget, or a
+// selected Clang): compiled once per configuration, Clang and runtime source,
+// then reused from the build cache. The configuration stays beside it as
+// runtime.c, which debug layouts and thread/cycle variants read.
+function configuredRuntime(arguments: List<Text>) {
+    let project = arguments[0]
+    let configuration = host.readText(arguments[1])
+    let llvm = arguments[2] == "llvm"
+    let clang = host.pinnedLlvm(host.selectedClang())
+    let options = host.flags("MINYAR_RUNTIME_FLAGS", DEFAULT_FLAGS)
+    let identity = clangIdentity(clang)
+    identity.addBytes(Bytes(host.jsonList(options) + host.jsonList([arguments[2]])))
+    identity.addBytes(Bytes(configuration))
+    let directory = host.buildCache(project) + "/native"
+    host.makeDirectories(directory)
+    let output = directory + "/configured-runtime-" + digestOf(identity, project, headers(project, [".h", ".c"]))
+    let file = "runtime.o"
+    if llvm { file = "runtime.ll" }
+    if !host.isFile(output + "/" + file) {
+        let staging = host.temporaryDirectory(directory, "configured-runtime-")
+        host.writeBytes(staging + "/runtime.c", Bytes(configuration))
+        let command = [clang]
+        for item in options { command.add(item) }
+        for item in ["-iquote", project + "/runtime"] { command.add(item) }
+        if llvm { for item in ["-S", "-emit-llvm", staging + "/runtime.c", "-o", staging + "/runtime.raw.ll"] { command.add(item) } }
+        else { for item in ["-c", staging + "/runtime.c", "-o", staging + "/runtime.o"] { command.add(item) } }
+        host.runWithTerminalDiagnostics(command)
+        // Programs choose their own target CPU; the runtime IR must not pin one.
+        if llvm { host.writeBytes(staging + "/runtime.ll", Bytes(withoutTargetAttributes(host.readText(staging + "/runtime.raw.ll")))) }
+        // Another build may have finished the same runtime meanwhile; either copy is the same.
+        if files.rename(staging, output) != 0 && !host.isFile(output + "/" + file) { host.stop(host.osError(files.lastError(), output)) }
+        if host.isDirectory(staging) { host.release(staging) }
+    }
+    print(output + "/" + file)
+}
+function withoutTargetAttributes(text: Text): Text {
+    let data = Bytes(text)
+    let patterns: List<Bytes> = [Bytes("\"target-cpu\"=\""), Bytes("\"target-features\"=\""), Bytes("\"tune-cpu\"=\"")]
+    let result = Bytes()
+    let index = 0
+    while index < data.length {
+        let skipped = false
+        if data[index] == 34 {
+            for pattern in patterns {
+                let matched = index + pattern.length <= data.length
+                let offset = 0
+                while matched && offset < pattern.length { if data[index + offset] != pattern[offset] { matched = false }; offset += 1 }
+                if matched {
+                    let end = index + pattern.length
+                    while end < data.length && data[end] != 34 { end += 1 }
+                    end += 1
+                    if end < data.length && data[end] == 32 { end += 1 }
+                    index = end
+                    skipped = true
+                    break
+                }
+            }
+        }
+        if !skipped { result.add(data[index]); index += 1 }
+    }
+    return Text(result)
+}
 function runtimeFormat() {
     let format = "llvm"
     for option in host.flags("MINYAR_RUNTIME_FLAGS", DEFAULT_FLAGS) { if option.startsWith("-fsanitize=") { format = "object" } }
@@ -1188,6 +1267,7 @@ if processInfo.argumentCount() > 0 { command = processInfo.argument(0) }
 if command == "toolchain" && given.length == 0 { print(host.pinnedLlvm(host.selectedClang())) }
 else if command == "runtime-format" && given.length == 0 { runtimeFormat() }
 else if command == "compile" && given.length >= 2 { compile(given) }
+else if command == "configured-runtime" && given.length == 3 && (given[2] == "object" || given[2] == "llvm") { configuredRuntime(given) }
 else if command == "link" && given.length >= 5 { linkCommand(given) }
 else if command == "sanitize-llvm" && given.length == 2 { sanitizeFile(given) }
 else if command == "format-provider" { providers.formatCommand(given) }

@@ -282,7 +282,7 @@ static int lw_events(LWWatcher *watcher, int timeout) {
 }
 
 static pid_t lw_spawn(char **arguments, const char *root, const char *roots_file,
-                      const char *publication_file, bool application_running) {
+                      const char *publication_file, bool application_running, bool prepared) {
     posix_spawn_file_actions_t actions;
     posix_spawnattr_t attributes;
     int error = posix_spawn_file_actions_init(&actions);
@@ -310,17 +310,21 @@ static pid_t lw_spawn(char **arguments, const char *root, const char *roots_file
     char *publication_setting = NULL;
     char running_setting[] = "MINYAR_WATCH_RUNNING=0";
     running_setting[sizeof(running_setting) - 2] = application_running ? '1' : '0';
+    // After a successful build the toolchain is prepared for the session.
+    char prepared_setting[] = "MINYAR_WATCH_PREPARED=0";
+    prepared_setting[sizeof(prepared_setting) - 2] = prepared ? '1' : '0';
     if (!error) {
         const char prefix[] = "MINYAR_WATCH_ROOTS=";
         const char publication_prefix[] = "MINYAR_WATCH_PUBLICATION=";
         const char running_prefix[] = "MINYAR_WATCH_RUNNING=";
+        const char prepared_prefix[] = "MINYAR_WATCH_PREPARED=";
         // The watched program follows this session's own live state; a
         // deployment's relocation setting in the developer's shell must not
         // redirect it.
         const char state_prefix[] = "MINYAR_LIVE_STATE=";
         size_t count = 0;
         while (environment[count]) count++;
-        override = calloc(count + 4, sizeof(*override));
+        override = calloc(count + 5, sizeof(*override));
         if (roots_file) {
             setting = malloc(sizeof(prefix) + strlen(roots_file));
             publication_setting = malloc(sizeof(publication_prefix) + strlen(publication_file));
@@ -333,7 +337,8 @@ static pid_t lw_spawn(char **arguments, const char *root, const char *roots_file
                 if (roots_file &&
                     (!strncmp(environment[index], prefix, sizeof(prefix) - 1) ||
                      !strncmp(environment[index], publication_prefix, sizeof(publication_prefix) - 1) ||
-                     !strncmp(environment[index], running_prefix, sizeof(running_prefix) - 1))) continue;
+                     !strncmp(environment[index], running_prefix, sizeof(running_prefix) - 1) ||
+                     !strncmp(environment[index], prepared_prefix, sizeof(prepared_prefix) - 1))) continue;
                 override[next++] = environment[index];
             }
             if (roots_file) {
@@ -343,6 +348,7 @@ static pid_t lw_spawn(char **arguments, const char *root, const char *roots_file
                 override[next++] = setting;
                 override[next++] = publication_setting;
                 override[next++] = running_setting;
+                override[next++] = prepared_setting;
             }
             override[next] = NULL;
             environment = override;
@@ -564,7 +570,7 @@ static int lw_supervise(char *launcher, char *root, char **roots, char **argumen
     fprintf(stderr, "[watch] Watching for changes in %s (%s).\n", root,
             preserve ? "preserving runtime state" : "restarting after successful builds");
     unsigned long long generation = 1, build_generation = 0;
-    int dirty = 1;
+    int dirty = 1, prepared = 0;
     int64_t rebuild_at = lw_now();
     for (;;) {
         if (lw_signal) { result = 128 + (int)lw_signal; break; }
@@ -582,6 +588,7 @@ static int lw_supervise(char *launcher, char *root, char **roots, char **argumen
             if (exited == building) {
                 kill(-building, SIGKILL); building = 0;
                 int code = lw_status(status);
+                if (!code) prepared = 1;
                 int changed = 0;
                 for (;;) {
                     int pending = lw_events(&watcher, 0);
@@ -622,7 +629,7 @@ static int lw_supervise(char *launcher, char *root, char **roots, char **argumen
                 } else if (accepted) {
                     lw_stop(running, wake[0]); running = 0;
                     if (lw_signal) continue;
-                    running = lw_spawn(program, root, NULL, NULL, false);
+                    running = lw_spawn(program, root, NULL, NULL, false, false);
                     if (running < 0) goto cleanup;
                     fprintf(stderr, "[watch] Program started (pid %ld).\n", (long)running);
                 }
@@ -635,7 +642,7 @@ static int lw_supervise(char *launcher, char *root, char **roots, char **argumen
         if (dirty && !building && now >= rebuild_at) {
             fprintf(stderr, "[watch] Building...\n");
             if (lw_reset_record(roots_file) || lw_reset_record(publication_file)) goto cleanup;
-            building = lw_spawn(build, root, roots_file, publication_file, running > 0);
+            building = lw_spawn(build, root, roots_file, publication_file, running > 0, prepared);
             if (building < 0) goto cleanup;
             build_generation = generation; dirty = 0;
         }

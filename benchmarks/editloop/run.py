@@ -115,10 +115,17 @@ def main():
     with tempfile.TemporaryDirectory(prefix="editloop-") as temporary:
         base = Path(temporary)
         results = {}
+        # EDITLOOP_VARIANTS=minyar-hot,minyar-watch runs a subset.
+        chosen = [name for name in os.environ.get("EDITLOOP_VARIANTS", "minyar-hot,minyar-watch,rust,go").split(",") if name]
         for name, hot in (("minyar-hot", True), ("minyar-watch", False)):
+            if name not in chosen:
+                continue
             work = base / name
             work.mkdir()
             results[name] = minyar(work, rounds, hot)
+        if "rust" not in chosen and "go" not in chosen:
+            report(results)
+            return
         rust = base / "rust"
         shutil.copytree(ROOT / "benchmarks/connections/rust", rust)
         source = rust / "src/main.rs"
@@ -130,11 +137,15 @@ def main():
         (go / "go.mod").write_text("module editloop\n\ngo 1.21\n")
         results["go"] = rebuild_restart(go, rounds, go / "server.go", '"version={} served=', ["go", "build", "-o", "server", "."],
                                         go / "server", {"GOFLAGS": "-buildvcs=false"})
-        for name, times in results.items():
-            ordered = sorted(times)
-            print(json.dumps({"variant": name, "rounds": len(times), "median_s": round(ordered[len(ordered) // 2], 3),
-                              "min_s": round(ordered[0], 3), "max_s": round(ordered[-1], 3),
-                              "state_kept": name == "minyar-hot"}), flush=True)
+        report(results)
+
+
+def report(results):
+    for name, times in results.items():
+        ordered = sorted(times)
+        print(json.dumps({"variant": name, "rounds": len(times), "median_s": round(ordered[len(ordered) // 2], 3),
+                          "min_s": round(ordered[0], 3), "max_s": round(ordered[-1], 3),
+                          "state_kept": name == "minyar-hot"}), flush=True)
 
 
 if __name__ == "__main__":
