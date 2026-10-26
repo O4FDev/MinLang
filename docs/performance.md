@@ -107,7 +107,7 @@ of what it ever allocated, not what is live. Two rules keep that bounded:
 - A List of 2,048 or more entries owns a malloc block that grows by `realloc`,
   and `clear()` frees it. On glibc the mmap threshold is pinned so growth remaps
   pages instead of copying them.
-- Token passes copy the whole token stream into a fresh stage. The owner of a
+- Token passes copy the token stream into a fresh stage. The owner of a
   superseded stage releases it: `compileTokens` marks stages through
   `SourceMap.stage` and calls `adoptTokenStage` after each pass, and a pass
   that keeps a private full copy (a prelude or a declaration prefix) releases it
@@ -122,6 +122,39 @@ To measure, compare byte-identical output and record both peak RSS and the
 smallest `ulimit -v` that lets the self-compile finish (the test runner's cap is
 address space, not RSS). On 2026-10-25 a normal self-compile needed 144 MiB and
 a `--scope-owners` one 227 MiB, down from 700 and 810 MiB.
+
+## Compiler time
+
+Token passes copy most of their input unchanged. A pass advances over tokens it
+keeps and calls `copyTokenRun` for the pending run before it emits a rewrite
+and at its end; `copyModuleToken` is for single rewritten or synthetic tokens.
+`copyTokenRun` hands a `TokenTables` record (aliases of a stage's Lists) to the
+runtime helpers `compilerCopyTokens` and `compilerCopyPaths`, which append kinds,
+texts, coordinates, documentation and origins in bulk and translate path indices,
+adding paths to the new stage in the order its tokens first use them. The result
+is the same stage a token-by-token copy builds.
+
+Module builds compute the declaration tables' nominal types once and share that
+List with every module until compiling renames a symbol. The per-module copy of
+the return-type table and the symbol-node table are filled by the runtime helpers
+`compilerAppendIntegers` and `compilerFillIntegers` (a `CompilerIntegers` record).
+
+The scope-ownership lowering (`--scope-owners`) gets the piece range of every
+function `compileFunction` emitted (`CompilerContext.functionPieces`) and whether
+its entry calls `minyar_rc_enter`. Only those bodies are joined and split into
+lines; other functions keep their pieces, and the code between functions is cut
+where each definition starts and passed through unless it calls
+`minyar_rc_enter`. The two borrow-coalescing rules audit every local name of a
+body in one scan; `scopeNextReference` and `scopeNameEnd` are runtime helpers.
+Module builds have no piece table and lower their joined module the same way.
+
+Measured on a Linux x86_64 Boat box (LLVM 23.1.3, `perf stat -e instructions:u`,
+the compiler source of b0b160445 as fixed input, byte-identical output before
+and after each change): a normal self-compile fell from 2.011 G to 1.671 G
+instructions with the bulk token copies, a `--scope-owners` self-compile from
+2.610 G to 2.101 G with those and the per-function lowering, and a cold
+incremental build of 400 modules × 21 functions without loops from 2.418 G to
+2.225 G with the shared module tables (800 modules: 4.749 G to 3.982 G).
 
 ## Known release-build cost
 
