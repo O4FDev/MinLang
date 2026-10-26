@@ -1,0 +1,823 @@
+// TINQL parser: query text -> a tree of nodes (PlanetScale TIN's query language). Keywords are upper case only;
+// precedence from loosest to tightest: OR, AND (also juxtaposition), AND NOT, IN ..., span relations,
+// THEN/NEAR, WITHIN, ^, primaries.
+//   terms: word, wild*card?, fuzzy~1, fuzzy~2:1 (prefix 2), from TO to, MATCHES 'regex', CONTAINS word, *
+//   [a b c] (any of), AT LEAST N OF [..], AT LEAST N% OF [..], ALL OF [..]
+//   "a b c", "a _ c" (one-word gap), "a [b c] d", "a b"~N (slop)
+//   A THEN/N B, A NEAR/N B, (A) WITHIN N, A IN FIRST N WORDS / IN LAST N WORDS / IN FIRST N% / IN LAST N% /
+//   IN MIDDLE N% / IN WORDS X TO Y, A ENCLOSES B, A ENCLOSED BY B, A OVERLAPPING B, A BEFORE B, A AFTER B
+//   (each relation also as NOT ENCLOSES ...), expr^N boosts.
+
+public constant Q_TERM = 1        // text; flags: QF_*; a = fuzzy distance, b = fuzzy prefix, c = TO end text index
+public constant Q_ALL = 2         // standalone *
+public constant Q_AND = 3         // kids
+public constant Q_OR = 4          // kids
+public constant Q_ANDNOT = 5      // a AND NOT b
+public constant Q_ATLEAST = 6     // kids; a = N; flags QF_PERCENT
+public constant Q_PHRASE = 7      // kids: Q_TERM / Q_OR of terms / Q_GAP; a = slop
+public constant Q_GAP = 8         // _ inside a phrase
+public constant Q_THEN = 9        // a, b; c = N (-1 = no limit)
+public constant Q_NEAR = 10       // a, b; c = N
+public constant Q_WITHIN = 11     // a; c = N
+public constant Q_INPOS = 12      // a; b = mode IP_*; c = x; d = y
+public constant Q_REL = 13        // a, b; c = REL_*; flags QF_NOT
+public constant Q_BOOST = 14      // a; f = factor
+public constant Q_MATCHES = 15    // text = regex
+public constant Q_NONE = 16       // matches nothing (empty query)
+
+public constant QF_WILD = 1       // term has * or ?
+public constant QF_FUZZY = 2
+public constant QF_RANGE = 4      // text TO texts[c]
+public constant QF_PERCENT = 8
+public constant QF_NOT = 16
+public constant QF_CONTAINS = 32  // CONTAINS word: substring of a term
+public constant QF_ESCAPED = 64   // written with a backslash escape
+public constant QF_DROP = 128     // an escaped word that folds to nothing: left out of its phrase
+
+public constant IP_FIRST_WORDS = 1
+public constant IP_LAST_WORDS = 2
+public constant IP_FIRST_PCT = 3
+public constant IP_LAST_PCT = 4
+public constant IP_MIDDLE_PCT = 5
+public constant IP_WORDS = 6
+
+public constant REL_ENCLOSES = 1
+public constant REL_ENCLOSED_BY = 2
+public constant REL_OVERLAPPING = 3
+public constant REL_BEFORE = 4
+public constant REL_AFTER = 5
+
+public record Query {
+    kind: List<Integer>
+    a: List<Integer>
+    b: List<Integer>
+    c: List<Integer>
+    d: List<Integer>
+    flags: List<Integer>
+    f: List<Float>
+    text: List<Text>
+    kids: List<List<Integer>>
+    root: Integer
+    err: Text
+    errPos: Integer
+}
+
+// Lexer tokens
+constant T_EOF = 0
+constant T_WORD = 1       // word (may contain * ? ~ : digits)
+constant T_QUOTE = 2
+constant T_LB = 3
+constant T_RB = 4
+constant T_LP = 5
+constant T_RP = 6
+constant T_CARET = 7
+constant T_SLASH = 8
+constant T_TILDE = 9
+constant T_STRING = 10    // 'regex' after MATCHES
+constant T_UNDERSCORE = 11
+
+record Lex {
+    src: Bytes
+    pos: Integer
+    tk: List<Integer>
+    tFrom: List<Integer>
+    tTo: List<Integer>
+    i: Integer
+}
+
+function newQuery(): Query {
+    return Query { kind: []; a: []; b: []; c: []; d: []; flags: []; f: []; text: []; kids: []; root: -1; err: ""; errPos: -1 }
+}
+
+public function node(q: Query, kind: Integer, text: Text): Integer {
+    q.kind.add(kind)
+    q.a.add(0)
+    q.b.add(0)
+    q.c.add(-1)
+    q.d.add(0)
+    q.flags.add(0)
+    q.f.add(1.0)
+    q.text.add(text)
+    q.kids.add([])
+    return q.kind.length - 1
+}
+
+function isSpace(b: Integer): Boolean { return b == 32 || b == 9 || b == 10 || b == 13 }
+
+function special(b: Integer): Boolean {
+    return b == 34 || b == 91 || b == 93 || b == 40 || b == 41 || b == 94
+}
+
+function isDigit(b: Integer): Boolean { return b >= 48 && b <= 57 }
+
+// Does src[i, j) spell kw?
+function spells(src: Bytes, i: Integer, j: Integer, kw: Text): Boolean {
+    let k = Bytes(kw)
+    if j - i != k.length { return false }
+    let x = 0
+    while x < k.length {
+        if src[i + x] != k[x] { return false }
+        x += 1
+    }
+    return true
+}
+
+function lex(src: Bytes): Lex {
+    let x = Lex { src: src; pos: 0; tk: []; tFrom: []; tTo: []; i: 0 }
+    let i = 0
+    let n = src.length
+    while i < n {
+        let b = src[i]
+        if isSpace(b) {
+            i += 1
+            continue
+        }
+        let kind = -1
+        if b == 34 { kind = T_QUOTE }
+        if b == 91 { kind = T_LB }
+        if b == 93 { kind = T_RB }
+        if b == 40 { kind = T_LP }
+        if b == 41 { kind = T_RP }
+        if b == 94 { kind = T_CARET }
+        if b == 47 && x.tk.length > 0 && x.tTo[x.tTo.length - 1] == i && x.tk[x.tk.length - 1] == T_WORD &&
+           (spells(src, x.tFrom[x.tFrom.length - 1], i, "THEN") || spells(src, x.tFrom[x.tFrom.length - 1], i, "NEAR")) {
+            kind = T_SLASH
+        }
+        if b == 44 {
+            // a comma separates words (lists: [a,b]); inside numbers it is part of the word (47,000)
+            i += 1
+            continue
+        }
+        if kind >= 0 {
+            x.tk.add(kind)
+            x.tFrom.add(i)
+            x.tTo.add(i + 1)
+            i += 1
+            continue
+        }
+        if b == 39 {
+            // 'quoted string' (MATCHES regex); '' escapes a quote
+            let j = i + 1
+            while j < n {
+                if src[j] == 39 {
+                    if j + 1 < n && src[j + 1] == 39 {
+                        j += 2
+                        continue
+                    }
+                    break
+                }
+                j += 1
+            }
+            x.tk.add(T_STRING)
+            x.tFrom.add(i + 1)
+            x.tTo.add(j)
+            i = j + 1
+            continue
+        }
+        let j = i
+        while j < n && !isSpace(src[j]) && !special(src[j]) {
+            let c = src[j]
+            if c == 92 && j + 1 < n {
+                // backslash escape: the next character is literal
+                j += 2
+                continue
+            }
+            // '/' ends THEN/N and NEAR/N; elsewhere it is part of a word (URLs, paths)
+            if c == 47 && (spells(src, i, j, "THEN") || spells(src, i, j, "NEAR")) { break }
+            if c == 44 && !(j > i && isDigit(src[j - 1]) && j + 1 < n && isDigit(src[j + 1])) { break }
+            j += 1
+        }
+        if j == i + 1 && b == 95 {
+            x.tk.add(T_UNDERSCORE)
+        } else if j == i + 1 && b == 126 {
+            x.tk.add(T_TILDE)
+        } else {
+            x.tk.add(T_WORD)
+        }
+        x.tFrom.add(i)
+        x.tTo.add(j)
+        i = j
+    }
+    x.tk.add(T_EOF)
+    x.tFrom.add(n)
+    x.tTo.add(n)
+    return x
+}
+
+record P {
+    q: Query
+    x: Lex
+    i: Integer
+    inList: Boolean    // inside [ ]: juxtaposed words are separate items, not an implicit AND
+}
+
+function cur(p: P): Integer {
+    if p.i >= p.x.tk.length { return T_EOF }
+    return p.x.tk[p.i]
+}
+
+function curText(p: P): Text {
+    if p.i >= p.x.tk.length { return "" }
+    return Text(p.x.src.slice(p.x.tFrom[p.i], p.x.tTo[p.i]))
+}
+
+function isKw(p: P, kw: Text): Boolean { return cur(p) == T_WORD && curText(p) == kw }
+
+function isKwAt(p: P, k: Integer, kw: Text): Boolean {
+    let j = p.i + k
+    if j >= p.x.tk.length || p.x.tk[j] != T_WORD { return false }
+    return Text(p.x.src.slice(p.x.tFrom[j], p.x.tTo[j])) == kw
+}
+
+function perr(p: P, msg: Text) {
+    if p.q.err != "" { return }
+    p.q.err = msg
+    p.q.errPos = p.x.src.length
+    if p.i < p.x.tFrom.length { p.q.errPos = p.x.tFrom[p.i] }
+}
+
+function expectKw(p: P, kw: Text) {
+    if isKw(p, kw) {
+        p.i += 1
+        return
+    }
+    perr(p, "expected " + kw)
+}
+
+function isKeyword(t: Text): Boolean {
+    return t == "OR" || t == "AND" || t == "NOT" || t == "IN" || t == "THEN" || t == "NEAR" || t == "WITHIN" ||
+        t == "ENCLOSES" || t == "ENCLOSED" || t == "OVERLAPPING" || t == "BEFORE" || t == "AFTER" || t == "TO" ||
+        t == "OF" || t == "AT" || t == "ALL" || t == "MATCHES" || t == "CONTAINS" || t == "LEAST" || t == "BY"
+}
+
+function parseNumber(t: Text): Integer {
+    let b = Bytes(t)
+    if b.length == 0 { return -1 }
+    let x = 0
+    let i = 0
+    while i < b.length {
+        let c = b[i]
+        if c < 48 || c > 57 { return -1 }
+        if x > 100000000 { return -1 }
+        x = x * 10 + (c - 48)
+        i += 1
+    }
+    return x
+}
+
+public function parse(src: Text): Query {
+    let q = newQuery()
+    let p = P { q: q; x: lex(Bytes(src)); i: 0; inList: false }
+    if cur(p) == T_EOF {
+        q.root = node(q, Q_NONE, "")
+        return q
+    }
+    q.root = parseOr(p)
+    if q.err == "" && cur(p) != T_EOF { perr(p, "unexpected \"" + curText(p) + "\"") }
+    return q
+}
+
+function parseOr(p: P): Integer {
+    let first = parseAnd(p)
+    if !isKw(p, "OR") { return first }
+    let n = node(p.q, Q_OR, "")
+    p.q.kids[n].add(first)
+    while isKw(p, "OR") && p.q.err == "" {
+        p.i += 1
+        p.q.kids[n].add(parseAnd(p))
+    }
+    return n
+}
+
+function startsPrimary(p: P): Boolean {
+    let k = cur(p)
+    if k == T_QUOTE || k == T_LB || k == T_LP { return true }
+    if k == T_WORD {
+        let t = curText(p)
+        if t == "AT" || t == "ALL" || t == "MATCHES" || t == "CONTAINS" { return true }
+        return !isKeyword(t)
+    }
+    return false
+}
+
+function parseAnd(p: P): Integer {
+    let first = parseAndNot(p)
+    let n = -1
+    while p.q.err == "" {
+        if isKw(p, "AND") && !isKwAt(p, 1, "NOT") {
+            p.i += 1
+        } else if p.inList || !startsPrimary(p) {
+            break
+        }
+        if n < 0 {
+            n = node(p.q, Q_AND, "")
+            p.q.kids[n].add(first)
+        }
+        p.q.kids[n].add(parseAndNot(p))
+    }
+    if n < 0 { return first }
+    return n
+}
+
+function parseAndNot(p: P): Integer {
+    let left = parseIn(p)
+    while isKw(p, "AND") && isKwAt(p, 1, "NOT") && p.q.err == "" {
+        p.i += 2
+        let right = parseIn(p)
+        let n = node(p.q, Q_ANDNOT, "")
+        p.q.a[n] = left
+        p.q.b[n] = right
+        left = n
+    }
+    return left
+}
+
+function parseIn(p: P): Integer {
+    let inner = parseRel(p)
+    while isKw(p, "IN") && p.q.err == "" {
+        p.i += 1
+        let n = node(p.q, Q_INPOS, "")
+        p.q.a[n] = inner
+        if isKw(p, "FIRST") || isKw(p, "LAST") {
+            let first = isKw(p, "FIRST")
+            p.i += 1
+            PCT_SEEN.clear()
+            let num = parseCount(p)
+            let pct = PCT_SEEN.length > 0
+            PCT_SEEN.clear()
+            if !pct && cur(p) == T_WORD && curText(p) == "%" {
+                p.i += 1
+                pct = true
+            }
+            if pct {
+                if first { p.q.b[n] = IP_FIRST_PCT } else { p.q.b[n] = IP_LAST_PCT }
+            } else {
+                expectKw(p, "WORDS")
+                if first { p.q.b[n] = IP_FIRST_WORDS } else { p.q.b[n] = IP_LAST_WORDS }
+            }
+            p.q.c[n] = num
+        } else if isKw(p, "MIDDLE") {
+            p.i += 1
+            p.q.c[n] = parseCount(p)
+            if PCT_SEEN.length == 0 {
+                if cur(p) == T_WORD && curText(p) == "%" { p.i += 1 } else { perr(p, "IN MIDDLE needs a percentage") }
+            }
+            p.q.b[n] = IP_MIDDLE_PCT
+            PCT_SEEN.clear()
+        } else if isKw(p, "WORDS") {
+            p.i += 1
+            p.q.c[n] = parseCount(p)
+            expectKw(p, "TO")
+            p.q.d[n] = parseCount(p)
+            p.q.b[n] = IP_WORDS
+        } else {
+            perr(p, "expected FIRST, LAST, MIDDLE or WORDS after IN")
+        }
+        inner = n
+    }
+    return inner
+}
+
+// "N" or "N%" (percent noted in PCT_SEEN, cleared by the caller)
+global PCT_SEEN: Bytes = Bytes()
+
+function parseCount(p: P): Integer {
+    if cur(p) != T_WORD {
+        perr(p, "expected a number")
+        return 0
+    }
+    let t = curText(p)
+    let b = Bytes(t)
+    if b.length > 1 && b[b.length - 1] == 37 {
+        PCT_SEEN.add(1)
+        t = Text(b.slice(0, b.length - 1))
+    }
+    let x = parseNumber(t)
+    if x < 0 {
+        perr(p, "expected a number")
+        return 0
+    }
+    p.i += 1
+    return x
+}
+
+function relKind(p: P): Integer {
+    if isKw(p, "ENCLOSES") { return REL_ENCLOSES }
+    if isKw(p, "ENCLOSED") && isKwAt(p, 1, "BY") { return REL_ENCLOSED_BY }
+    if isKw(p, "OVERLAPPING") { return REL_OVERLAPPING }
+    if isKw(p, "BEFORE") { return REL_BEFORE }
+    if isKw(p, "AFTER") { return REL_AFTER }
+    return 0
+}
+
+function parseRel(p: P): Integer {
+    let left = parseProx(p)
+    while p.q.err == "" {
+        let negated = false
+        let save = p.i
+        if isKw(p, "NOT") {
+            p.i += 1
+            negated = true
+        }
+        let k = relKind(p)
+        if k == 0 {
+            p.i = save
+            break
+        }
+        p.i += 1
+        if k == REL_ENCLOSED_BY { p.i += 1 }
+        let right = parseProx(p)
+        let n = node(p.q, Q_REL, "")
+        p.q.a[n] = left
+        p.q.b[n] = right
+        p.q.c[n] = k
+        if negated { p.q.flags[n] = QF_NOT }
+        left = n
+    }
+    return left
+}
+
+function parseProx(p: P): Integer {
+    let left = parseWithin(p)
+    while (isKw(p, "THEN") || isKw(p, "NEAR")) && p.q.err == "" {
+        let then = isKw(p, "THEN")
+        p.i += 1
+        let dist = -1
+        if cur(p) == T_SLASH {
+            p.i += 1
+            dist = parseCount(p)
+        } else {
+            perr(p, "THEN and NEAR need a distance: THEN/N, NEAR/N")
+        }
+        let right = parseWithin(p)
+        let kind = Q_NEAR
+        if then { kind = Q_THEN }
+        let n = node(p.q, kind, "")
+        p.q.a[n] = left
+        p.q.b[n] = right
+        p.q.c[n] = dist
+        left = n
+    }
+    return left
+}
+
+function parseWithin(p: P): Integer {
+    let inner = parseBoost(p)
+    while isKw(p, "WITHIN") && p.q.err == "" {
+        p.i += 1
+        let n = node(p.q, Q_WITHIN, "")
+        p.q.a[n] = inner
+        p.q.c[n] = parseCount(p)
+        inner = n
+    }
+    return inner
+}
+
+function parseBoost(p: P): Integer {
+    let inner = parsePrimary(p)
+    if cur(p) == T_CARET {
+        if p.i > 0 && p.x.tFrom[p.i] != p.x.tTo[p.i - 1] {
+            perr(p, "'^' must follow its expression without a space")
+            return inner
+        }
+        p.i += 1
+        let t = curText(p)
+        let f = parseFloat(t)
+        if f < 0.0 || f > 10000.0 {
+            perr(p, "boost must be between 0 and 10000")
+            return inner
+        }
+        p.i += 1
+        let n = node(p.q, Q_BOOST, "")
+        p.q.a[n] = inner
+        p.q.f[n] = f
+        return n
+    }
+    return inner
+}
+
+function parseFloat(t: Text): Float {
+    let b = Bytes(t)
+    let x = 0.0
+    let i = 0
+    let seenDot = false
+    let scale = 1.0
+    if b.length == 0 { return -1.0 }
+    while i < b.length {
+        let c = b[i]
+        if (c == 101 || c == 69) && i > 0 && i + 1 < b.length {
+            // exponent: 1e3
+            let e = parseNumber(Text(b.slice(i + 1, b.length)))
+            if e < 0 || e > 10 { return -1.0 }
+            while e > 0 {
+                x = x * 10.0
+                e -= 1
+            }
+            return x
+        }
+        if c == 46 && !seenDot {
+            seenDot = true
+        } else if c >= 48 && c <= 57 {
+            if seenDot {
+                scale = scale / 10.0
+                x = x + Float(c - 48) * scale
+            } else {
+                x = x * 10.0 + Float(c - 48)
+            }
+        } else {
+            return -1.0
+        }
+        i += 1
+    }
+    return x
+}
+
+function parseList(p: P, n: Integer) {
+    if cur(p) != T_LB {
+        perr(p, "expected [")
+        return
+    }
+    p.i += 1
+    let saved = p.inList
+    p.inList = true
+    while cur(p) != T_RB && cur(p) != T_EOF && p.q.err == "" {
+        p.q.kids[n].add(parseOr(p))
+    }
+    p.inList = saved
+    if cur(p) != T_RB {
+        perr(p, "expected ]")
+        return
+    }
+    p.i += 1
+}
+
+function parsePrimary(p: P): Integer {
+    let q = p.q
+    let k = cur(p)
+    if k == T_LP {
+        p.i += 1
+        let saved = p.inList
+        p.inList = false
+        let inner = parseOr(p)
+        p.inList = saved
+        if cur(p) != T_RP {
+            perr(p, "expected )")
+            return inner
+        }
+        p.i += 1
+        return inner
+    }
+    if k == T_LB {
+        let n = node(q, Q_OR, "")
+        parseList(p, n)
+        if q.kids[n].length == 0 { perr(p, "empty alternatives") }
+        return n
+    }
+    if k == T_QUOTE { return parsePhrase(p) }
+    if k == T_WORD {
+        let t = curText(p)
+        if t == "AT" && isKwAt(p, 1, "LEAST") {
+            p.i += 2
+            let n = node(q, Q_ATLEAST, "")
+            q.a[n] = parseCount(p)
+            if PCT_SEEN.length > 0 {
+                q.flags[n] = QF_PERCENT
+                PCT_SEEN.clear()
+            } else if cur(p) == T_WORD && curText(p) == "%" {
+                p.i += 1
+                q.flags[n] = QF_PERCENT
+            }
+            expectKw(p, "OF")
+            parseList(p, n)
+            return n
+        }
+        if t == "ALL" && isKwAt(p, 1, "OF") {
+            p.i += 2
+            let n = node(q, Q_AND, "")
+            parseList(p, n)
+            if q.kids[n].length == 0 { q.kind[n] = Q_ALL }
+            return n
+        }
+        if t == "MATCHES" {
+            p.i += 1
+            if cur(p) == T_STRING {
+                let n = node(q, Q_MATCHES, unquote(curText(p)))
+                p.i += 1
+                return n
+            }
+            if cur(p) == T_EOF {
+                perr(p, "expected a regular expression after MATCHES")
+                return node(q, Q_NONE, "")
+            }
+            // unquoted: the regex runs to the next whitespace
+            let from = p.x.tFrom[p.i]
+            let to = from
+            let depth = 0
+            while to < p.x.src.length && !isSpace(p.x.src[to]) {
+                let c = p.x.src[to]
+                if c == 92 && to + 1 < p.x.src.length {
+                    to += 2
+                    continue
+                }
+                if c == 40 { depth += 1 }
+                if c == 41 {
+                    if depth == 0 { break }
+                    depth -= 1
+                }
+                to += 1
+            }
+            while p.i < p.x.tk.length - 1 && p.x.tFrom[p.i] < to { p.i += 1 }
+            return node(q, Q_MATCHES, Text(p.x.src.slice(from, to)))
+        }
+        if t == "CONTAINS" {
+            // CONTAINS x is x
+            p.i += 1
+            if !startsPrimary(p) {
+                perr(p, "expected a term after CONTAINS")
+                return node(q, Q_NONE, "")
+            }
+            return parsePrimary(p)
+        }
+        if t == "*" {
+            if isKwAt(p, 1, "TO") { return parseTerm(p) }
+            p.i += 1
+            return node(q, Q_ALL, "")
+        }
+        if isKeyword(t) {
+            perr(p, "unexpected keyword " + t)
+            return node(q, Q_NONE, "")
+        }
+        if p.x.src[p.x.tFrom[p.i]] == 58 {
+            perr(p, "unexpected ':'")
+            return node(q, Q_NONE, "")
+        }
+        return parseTerm(p)
+    }
+    if k == T_STRING {
+        let n = node(q, Q_TERM, curText(p))
+        p.i += 1
+        return n
+    }
+    if k == T_EOF {
+        perr(p, "unexpected end of query")
+        return node(q, Q_NONE, "")
+    }
+    perr(p, "unexpected \"" + curText(p) + "\"")
+    p.i += 1
+    return node(q, Q_NONE, "")
+}
+
+function unquote(t: Text): Text {
+    let b = Bytes(t)
+    let out = Bytes()
+    let i = 0
+    while i < b.length {
+        out.add(b[i])
+        if b[i] == 39 && i + 1 < b.length && b[i + 1] == 39 { i += 1 }
+        i += 1
+    }
+    return Text(out)
+}
+
+// word, word~N, word~P:N, wild*card?, from TO to
+function parseTerm(p: P): Integer {
+    let q = p.q
+    let src = p.x.src
+    let from = p.x.tFrom[p.i]
+    let to = p.x.tTo[p.i]
+    p.i += 1
+    let n = node(q, Q_TERM, "")
+    // fuzzy suffix ~N or ~P:N (also as a separate ~ token)
+    let tilde = -1
+    let j = from
+    while j < to {
+        if src[j] == 126 { tilde = j }
+        j += 1
+    }
+    let wordTo = to
+    if tilde > from {
+        wordTo = tilde
+        let colon = -1
+        j = tilde + 1
+        while j < to {
+            if src[j] == 58 { colon = j }
+            j += 1
+        }
+        q.flags[n] = q.flags[n] | QF_FUZZY
+        if tilde + 1 == to {
+            q.a[n] = 2
+            q.b[n] = 1
+        } else if colon >= 0 {
+            q.b[n] = parseNumber(Text(src.slice(tilde + 1, colon)))
+            q.a[n] = parseNumber(Text(src.slice(colon + 1, to)))
+        } else {
+            q.a[n] = parseNumber(Text(src.slice(tilde + 1, to)))
+            q.b[n] = 1      // TIN's default fuzzy prefix is one character
+        }
+        if q.a[n] < 0 || q.b[n] < 0 {
+            perr(p, "bad fuzzy term")
+        }
+    }
+    // backslash escapes make the next character literal (\? \* \_)
+    let wb = Bytes()
+    j = from
+    while j < wordTo {
+        let c = src[j]
+        if c == 92 && j + 1 < wordTo {
+            q.flags[n] = q.flags[n] | QF_ESCAPED
+            wb.add(src[j + 1])
+            j += 2
+            continue
+        }
+        if c == 42 || c == 63 { q.flags[n] = q.flags[n] | QF_WILD }
+        wb.add(c)
+        j += 1
+    }
+    q.text[n] = Text(wb)
+    if isKw(p, "TO") {
+        p.i += 1
+        if cur(p) != T_WORD {
+            perr(p, "expected a term after TO")
+            return n
+        }
+        let hi = curText(p)
+        if ((q.flags[n] & QF_WILD) != 0 && q.text[n] != "*") || (hi != "*" && (hasWild(hi))) {
+            perr(p, "range bounds must be plain terms")
+            return n
+        }
+        q.flags[n] = (q.flags[n] & ~QF_WILD) | QF_RANGE
+        q.c[n] = node(q, Q_TERM, hi)
+        p.i += 1
+    }
+    return n
+}
+
+function hasWild(t: Text): Boolean {
+    for b in Bytes(t) {
+        if b == 42 || b == 63 { return true }
+    }
+    return false
+}
+
+// "a b _ [c d] e"~N
+function hasEscapedQuote(src: Bytes, from: Integer, to: Integer): Boolean {
+    let j = from
+    while j + 1 < to {
+        if src[j] == 92 {
+            if src[j + 1] == 34 { return true }
+            j += 2
+        } else {
+            j += 1
+        }
+    }
+    return false
+}
+
+function parsePhrase(p: P): Integer {
+    let q = p.q
+    p.i += 1
+    let n = node(q, Q_PHRASE, "")
+    while cur(p) != T_QUOTE && cur(p) != T_EOF && q.err == "" {
+        let k = cur(p)
+        if k == T_UNDERSCORE {
+            q.kids[n].add(node(q, Q_GAP, ""))
+            p.i += 1
+        } else if k == T_LB {
+            let alt = node(q, Q_OR, "")
+            p.i += 1
+            while cur(p) != T_RB && cur(p) != T_EOF && q.err == "" {
+                if cur(p) == T_WORD && hasEscapedQuote(p.x.src, p.x.tFrom[p.i], p.x.tTo[p.i]) {
+                    // Lead: a phrase's [ ] alternatives cannot hold an escaped quote
+                    perr(p, "expected a word inside [ ] in a phrase, found an escaped quote")
+                } else if cur(p) == T_WORD {
+                    q.kids[alt].add(parseBoost(p))
+                } else {
+                    perr(p, "expected a word inside [ ] in a phrase")
+                }
+            }
+            if cur(p) == T_RB { p.i += 1 }
+            q.kids[n].add(alt)
+        } else if k == T_WORD {
+            q.kids[n].add(parseTerm(p))
+        } else {
+            // punctuation inside a phrase separates words
+            p.i += 1
+        }
+    }
+    if cur(p) != T_QUOTE {
+        perr(p, "unterminated phrase")
+        return n
+    }
+    if q.kids[n].length == 0 { perr(p, "empty phrase") }
+    p.i += 1
+    if cur(p) == T_TILDE {
+        p.i += 1
+        q.a[n] = parseCount(p)
+    } else if cur(p) == T_WORD && p.x.src[p.x.tFrom[p.i]] == 126 && p.x.tFrom[p.i] == p.x.tTo[p.i - 1] {
+        let x = parseNumber(Text(p.x.src.slice(p.x.tFrom[p.i] + 1, p.x.tTo[p.i])))
+        if x < 0 { perr(p, "bad phrase slop") }
+        q.a[n] = x
+        p.i += 1
+    }
+    return n
+}

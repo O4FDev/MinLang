@@ -1,0 +1,75 @@
+// pgvector-compatible vectors for neo-db: the SQL surface of pgvector 0.8 (vector, halfvec and sparsevec types
+// with type modifiers, text and binary forms, distance functions and operators, arithmetic, ordering, avg/sum,
+// casts between them, and the bit-string distances), written against neodb-sdk. No index access methods yet:
+// nearest-neighbour queries are exact scans.
+use "neodb-sdk" as sdk
+use "./dense.min" as dense
+use "./sparsevec.min" as sparsevec
+
+public function extension(): sdk.Extension {
+    let x = sdk.extension("vector", "0.8.0", "vector data type and ivfflat and hnsw access methods")
+    dense.register(x, false)
+    dense.register(x, true)
+    sparsevec.register(x)
+    dense.registerCasts(x)
+    sparsevec.registerCasts(x)
+    x.define("hamming_distance", ["bit", "bit"], "float8", function(call) { hammingDistance(call) })
+    x.define("jaccard_distance", ["bit", "bit"], "float8", function(call) { jaccardDistance(call) })
+    x.operator("<~>", "bit", "bit", "hamming_distance")
+    x.operator("<%>", "bit", "bit", "jaccard_distance")
+    return x
+}
+
+// ---------------------------------------------------------------- bit strings (core bit type: int32 count, bytes)
+
+function bits(call: sdk.Call, i: Integer): Integer { return call.int32(i, 0) }
+
+function popcount(b: Integer): Integer {
+    let n = 0
+    let x = b
+    while x > 0 {
+        n += x % 2
+        x = x / 2
+    }
+    return n
+}
+
+function sameLength(call: sdk.Call): Boolean {
+    if bits(call, 0) != bits(call, 1) {
+        call.fail("22000", "different bit lengths " + Text(bits(call, 0)) + " and " + Text(bits(call, 1)))
+        return false
+    }
+    return true
+}
+
+deterministic function hammingDistance(call: sdk.Call) {
+    if !sameLength(call) { return }
+    let d = 0
+    let i = 4
+    while i < call.length(0) {
+        d += popcount(call.byte(0, i) ^ call.byte(1, i))
+        i += 1
+    }
+    call.returnFloat(Float(d))
+}
+
+deterministic function jaccardDistance(call: sdk.Call) {
+    if !sameLength(call) { return }
+    let both = 0
+    let ca = 0
+    let cb = 0
+    let i = 4
+    while i < call.length(0) {
+        let a = call.byte(0, i)
+        let b = call.byte(1, i)
+        both += popcount(a & b)
+        ca += popcount(a)
+        cb += popcount(b)
+        i += 1
+    }
+    if both == 0 {
+        call.returnFloat(1.0)
+        return
+    }
+    call.returnFloat(1.0 - Float(both) / Float(ca + cb - both))
+}

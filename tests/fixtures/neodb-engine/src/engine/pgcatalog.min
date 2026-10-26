@@ -11,6 +11,7 @@ use "./values.min" as v
 use "./table.min" as tb
 use "./index.min" as ix
 use "./catalog.min" as cat
+use "./ext.min" as ext
 
 public constant OID_TABLE = 16384
 public constant OID_VIEW = 1016384
@@ -66,7 +67,11 @@ public constant R_IS_KEY_COLUMN_USAGE = 38
 public constant R_IS_TABLE_CONSTRAINTS = 39
 public constant R_IS_REFERENTIAL_CONSTRAINTS = 40
 public constant R_IS_VIEWS = 41
-public constant R_LAST = 41
+public constant R_AVAILABLE_EXTENSIONS = 42
+public constant R_AVAILABLE_EXTENSION_VERSIONS = 43
+public constant R_LAST = 43
+
+function isInfoCode(code: Integer): Boolean { return code >= R_IS_TABLES && code <= R_IS_VIEWS }
 
 // ---------------------------------------------------------------- relation registry
 
@@ -112,6 +117,8 @@ public function relName(code: Integer): Text {
     if code == R_IS_TABLE_CONSTRAINTS { return "table_constraints" }
     if code == R_IS_REFERENTIAL_CONSTRAINTS { return "referential_constraints" }
     if code == R_IS_VIEWS { return "views" }
+    if code == R_AVAILABLE_EXTENSIONS { return "pg_available_extensions" }
+    if code == R_AVAILABLE_EXTENSION_VERSIONS { return "pg_available_extension_versions" }
     return ""
 }
 
@@ -154,7 +161,7 @@ public function relOidOf(code: Integer): Integer {
 }
 
 public function relSchemaOid(code: Integer): Integer {
-    if code >= R_IS_TABLES { return NS_INFO }
+    if isInfoCode(code) { return NS_INFO }
     return NS_CATALOG
 }
 
@@ -162,7 +169,7 @@ public function relSchemaOid(code: Integer): Integer {
 public function relKindOf(code: Integer): Integer {
     if code == R_SETTINGS || code == R_TABLES || code == R_INDEXES || code == R_VIEWS || code == R_ROLES || code == R_USER || code == R_STAT_ACTIVITY { return 118 }
     if code >= R_STAT_ARCHIVER && code <= R_STATIO_USER_INDEXES { return 118 }
-    if code >= R_IS_TABLES { return 118 }
+    if isInfoCode(code) || code == R_AVAILABLE_EXTENSIONS || code == R_AVAILABLE_EXTENSION_VERSIONS { return 118 }
     return 114
 }
 
@@ -173,7 +180,7 @@ public function lookup(schema: Text, name: Text): Integer {
     let code = 1
     while code <= R_LAST {
         if relName(code) == name {
-            let isInfo = code >= R_IS_TABLES
+            let isInfo = isInfoCode(code)
             if schema == "information_schema" && isInfo { return code }
             if schema != "information_schema" && !isInfo { return code }
         }
@@ -248,6 +255,8 @@ function relSpec(code: Integer): Text {
     }
     if code == R_TABLESPACE { return "oid oid;spcname name;spcowner oid;spcacl aclitem[];spcoptions text[]" }
     if code == R_EXTENSION { return "oid oid;extname name;extowner oid;extnamespace oid;extrelocatable bool;extversion text;extconfig oid[];extcondition text[]" }
+    if code == R_AVAILABLE_EXTENSIONS { return "name name;default_version text;installed_version text;comment text" }
+    if code == R_AVAILABLE_EXTENSION_VERSIONS { return "name name;version text;installed bool;superuser bool;trusted bool;relocatable bool;schema name;requires name[];comment text" }
     if code == R_ENUM { return "oid oid;enumtypid oid;enumsortorder float4;enumlabel name" }
     if code == R_RANGE { return "rngtypid oid;rngsubtype oid;rngmultitypid oid;rngcollation oid;rngsubopc oid;rngcanonical regproc;rngsubdiff regproc" }
     if code == R_STAT_ACTIVITY {
@@ -583,7 +592,7 @@ public function relNameByOid(c: cat.Catalog, oid: Integer): Text {
     let code = 1
     while code <= R_LAST {
         if relOidOf(code) == oid {
-            if code >= R_IS_TABLES { return "information_schema." + relName(code) }
+            if isInfoCode(code) { return "information_schema." + relName(code) }
             return relName(code)
         }
         code += 1
@@ -665,9 +674,68 @@ public function pgTypeName(t: Integer): Text {
     return "text"
 }
 
+// regtype: a pg_type name (PG's typname, a few SQL spellings, or an installed extension type) -> oid, or -1.
+public function typeOidByName(c: cat.Catalog, nameIn: Text): Integer {
+    let name = nameIn
+    if name.length > 11 && name.slice(0, 11) == "pg_catalog." { name = name.slice(11, name.length) }
+    if name.length > 7 && name.slice(0, 7) == "public." { name = name.slice(7, name.length) }
+    if name == "integer" || name == "int" { name = "int4" }
+    if name == "bigint" { name = "int8" }
+    if name == "smallint" { name = "int2" }
+    if name == "boolean" { name = "bool" }
+    if name == "real" { name = "float4" }
+    if name == "double precision" { name = "float8" }
+    if name == "character varying" { name = "varchar" }
+    if name == "character" { name = "bpchar" }
+    let xt = ext.findType(c.extensions, name)
+    if xt >= 0 { return xt - ext.TYPE_BASE }
+    let xa = ext.findArrayOid(c.extensions, name)
+    if xa >= 0 { return xa }
+    let all = Bytes(typeTable())
+    let i = 0
+    let n = all.length
+    while i < n {
+        let j = i
+        while j < n && all[j] != 59 { j += 1 }
+        let f: List<Text> = []
+        splitFields(all.slice(i, j), f)
+        i = j + 1
+        if f.length >= 2 && f[1] == name { return toInt(f[0]) }
+    }
+    return -1
+}
+
+// regtype output: the type's name (format_type without a modifier), or "" when the oid is unknown.
+public function typeNameByOid(c: cat.Catalog, oid: Integer): Text {
+    let xt = ext.TYPE_BASE + oid
+    if ext.typeAt(xt) >= 0 {
+        if ext.isInstalled(c.extensions, ext.typeExt(xt)) { return ext.typeName(xt) }
+        return ""
+    }
+    let xa = ext.arrayTypeName(c.extensions, oid)
+    if xa != "" { return xa }
+    let all = Bytes(typeTable())
+    let i = 0
+    let n = all.length
+    while i < n {
+        let j = i
+        while j < n && all[j] != 59 { j += 1 }
+        let f: List<Text> = []
+        splitFields(all.slice(i, j), f)
+        i = j + 1
+        if f.length >= 2 && toInt(f[0]) == oid { return formatType(oid, -1) }
+    }
+    return ""
+}
+
 // format_type(oid, typmod) for the types neo-db knows; PG's own type names for the rest of pg_type.
 public function formatType(oid: Integer, typmod: Integer): Text {
     let t = v.typeFromOid(oid)
+    if v.isExtType(t) {
+        // extension types keep their modifier as is (vector(3) has typmod 3, as in pgvector)
+        if typmod >= 0 { return v.typeName(t) + "(" + Text(typmod) + ")" }
+        return v.typeName(t)
+    }
     let mod = typmod - 4
     if oid == 1043 {
         if typmod >= 4 { return "character varying(" + Text(mod) + ")" }
@@ -847,6 +915,67 @@ function fillTypes(b: RB) {
         pI(b, toInt(f[10]))
         endRow(b)
     }
+}
+
+// pg_type rows for the types of installed extensions, and their array types ("_name").
+function fillExtensionTypes(c: cat.Catalog, b: RB) {
+    let i = 0
+    let n = ext.registry().types.length
+    while i < n {
+        let ty = ext.registry().types[i]
+        if ext.isInstalled(c.extensions, ty.ext) {
+            let ns = NS_PUBLIC
+            if ext.isBuiltin(ty.ext) { ns = NS_CATALOG }
+            extTypeRow(b, ty.oid, ty.def.name, ty.def.category, 0, ty.arrayOid, ns)
+            extTypeRow(b, ty.arrayOid, "_" + ty.def.name, "A", ty.oid, 0, ns)
+        }
+        i += 1
+    }
+}
+
+function extTypeRow(b: RB, oid: Integer, name: Text, category: Text, elem: Integer, array: Integer, ns: Integer) {
+    let isArr = elem != 0
+    startRow(b)
+    pI(b, oid)
+    pT(b, name)
+    pI(b, ns)
+    pI(b, 10)
+    pI(b, -1)
+    pB(b, false)
+    pT(b, "b")
+    pT(b, category)
+    pB(b, false)
+    pB(b, true)
+    pT(b, ",")
+    pI(b, 0)
+    if isArr { pT(b, "array_subscript_handler") } else { pT(b, "-") }
+    pI(b, elem)
+    pI(b, array)
+    if isArr {
+        pT(b, "array_in")
+        pT(b, "array_out")
+        pT(b, "array_recv")
+        pT(b, "array_send")
+        pT(b, "-")
+        pT(b, "-")
+        pT(b, "array_typanalyze")
+    } else {
+        pT(b, name + "_in")
+        pT(b, name + "_out")
+        pT(b, name + "_recv")
+        pT(b, name + "_send")
+        pT(b, name + "_typmod_in")
+        pT(b, "-")
+        pT(b, "-")
+    }
+    pT(b, "i")
+    pT(b, "x")
+    pB(b, false)
+    pI(b, 0)
+    pI(b, -1)
+    pI(b, 0)
+    pI(b, 0)
+    endRow(b)
 }
 
 function toInt(s: Text): Integer {
@@ -1090,6 +1219,7 @@ public function fill(c: cat.Catalog, code: Integer, t: tb.Table) {
     }
     if code == R_TYPE {
         fillTypes(b)
+        fillExtensionTypes(c, b)
         return
     }
     if code == R_INDEX {
@@ -1329,6 +1459,67 @@ public function fill(c: cat.Catalog, code: Integer, t: tb.Table) {
         pB(b, false)
         pT(b, "1.0")
         endRow(b)
+        let i = 0
+        while i < c.extensions.length {
+            let xi = c.extensions[i]
+            startRow(b)
+            pI(b, ext.extensionOid(xi))
+            pT(b, ext.extension(xi).name)
+            pI(b, 10)
+            pI(b, NS_PUBLIC)
+            pB(b, false)
+            pT(b, c.extensionVersions[i])
+            endRow(b)
+            i += 1
+        }
+        return
+    }
+    if code == R_AVAILABLE_EXTENSIONS || code == R_AVAILABLE_EXTENSION_VERSIONS {
+        // plpgsql is always installed; then every extension compiled into this build
+        let names: List<Text> = ["plpgsql"]
+        let versions: List<Text> = ["1.0"]
+        let comments: List<Text> = ["PL/pgSQL procedural language"]
+        let installed: List<Text> = ["1.0"]
+        let xi = 0
+        while xi < ext.extensionCount() {
+            let x = ext.extension(xi)
+            if x.builtin {
+                xi += 1
+                continue
+            }
+            names.add(x.name)
+            versions.add(x.version)
+            comments.add(x.comment)
+            let iv = ""
+            let j = 0
+            while j < c.extensions.length {
+                if c.extensions[j] == xi { iv = c.extensionVersions[j] }
+                j += 1
+            }
+            installed.add(iv)
+            xi += 1
+        }
+        let i = 0
+        while i < names.length {
+            startRow(b)
+            pT(b, names[i])
+            if code == R_AVAILABLE_EXTENSIONS {
+                pT(b, versions[i])
+                if installed[i] == "" { pN(b) } else { pT(b, installed[i]) }
+                pT(b, comments[i])
+            } else {
+                pT(b, versions[i])
+                pB(b, installed[i] != "")
+                pB(b, false)
+                pB(b, true)
+                pB(b, false)
+                if i == 0 { pT(b, "pg_catalog") } else { pN(b) }
+                pN(b)
+                pT(b, comments[i])
+            }
+            endRow(b)
+            i += 1
+        }
         return
     }
     if code == R_IS_TABLES {

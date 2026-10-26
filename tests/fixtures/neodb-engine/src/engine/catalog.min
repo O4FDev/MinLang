@@ -2,6 +2,7 @@
 use "./values.min" as v
 use "./table.min" as tb
 use "./index.min" as ix
+use "../search/index.min" as si
 
 public record Catalog {
     tables: List<tb.Table>
@@ -15,6 +16,11 @@ public record Catalog {
     fks: List<ForeignKey>    // foreign keys (position = identity, dropped ones stay as tombstones); rebuilt by DDL replay
     conNames: List<Text>     // index names that back a PRIMARY KEY / UNIQUE constraint (pg_constraint rows)
     nLiveFks: Integer        // foreign keys not dropped: 0 keeps the DML paths free of FK work
+    searchIdx: List<si.Index>      // full-text search indexes (tables refer to them by position: tb.Table.searchIds)
+    searchDir: Text                // data directory holding saved search indexes ("" = none)
+    searchLsn: Integer             // checkpoint LSN saved indexes must carry to be loaded (-1 = always rebuild)
+    extensions: List<Integer>      // installed extensions (positions in ext.min's registry), in install order
+    extensionVersions: List<Text>  // their installed versions
 }
 
 // FOREIGN KEY (childCols) REFERENCES parent (parentCols). Enforced at statement end (src/engine/fk.min).
@@ -36,7 +42,8 @@ public record ForeignKey {
 
 public function newCatalog(): Catalog {
     return Catalog { tables: []; hashIdx: []; ordIdx: []; viewNames: []; viewSql: []; ddlLog: []; version: 1; nextOid: 16384
-                     fks: []; conNames: []; nLiveFks: 0 }
+                     fks: []; conNames: []; nLiveFks: 0; searchIdx: []; searchDir: ""; searchLsn: -1
+                     extensions: []; extensionVersions: [] }
 }
 
 public function addForeignKey(c: Catalog, fk: ForeignKey) {
@@ -106,6 +113,7 @@ public function dropTable(c: Catalog, id: Integer) {
 }
 
 public function indexNameExists(c: Catalog, name: Text): Boolean {
+    if findSearchIndexNamed(c, name) >= 0 { return true }
     for h in c.hashIdx {
         if h.name == name { return true }
     }
@@ -173,6 +181,82 @@ function ordHasDuplicates(t: tb.Table, o: ix.OrdIndex): Boolean {
 public function rebuildIndexes(c: Catalog, t: tb.Table) {
     for hid in t.hashIds { ix.hashBuild(c.hashIdx[hid], t) }
     for oid in t.ordIds { ix.ordBuild(c.ordIdx[oid], t) }
+    for sid in t.searchIds { si.build(c.searchIdx[sid], t) }
+}
+
+// ---- full-text search indexes (src/search/index.min)
+
+public function buildSearchIndexes(c: Catalog, t: tb.Table) {
+    for sid in t.searchIds { si.build(c.searchIdx[sid], t) }
+}
+
+public function searchFile(c: Catalog, t: tb.Table, sid: Integer): Text {
+    return c.searchDir + "/search-" + Text(t.id) + "-" + Text(sid) + ".idx"
+}
+
+// A table loaded from its checkpoint image: use the search index saved at the same checkpoint when there is one.
+public function loadSearchIndexes(c: Catalog, t: tb.Table) {
+    for sid in t.searchIds {
+        let x = c.searchIdx[sid]
+        if c.searchDir == "" || !si.load(x, t, searchFile(c, t, sid), c.searchLsn) { si.build(x, t) }
+    }
+}
+
+// Clean shutdown after the final checkpoint: save every built search index of loaded tables.
+public function saveSearchIndexes(c: Catalog, lsn: Integer) {
+    if c.searchDir == "" { return }
+    for t in c.tables {
+        if !isDropped(t) && t.chunk < 0 {
+            for sid in t.searchIds { si.save(c.searchIdx[sid], t, c.searchDir, searchFile(c, t, sid), lsn) }
+        }
+    }
+}
+
+public function addSearchIndex(c: Catalog, t: tb.Table, name: Text, col: Integer, stemmer: Integer): Integer {
+    let id = c.searchIdx.length
+    let x = si.newIndex(id, t.id, col, name, stemmer)
+    c.searchIdx.add(x)
+    t.searchIds.add(id)
+    if t.chunk < 0 { si.build(x, t) }
+    c.version += 1
+    return id
+}
+
+// Registry id of the search index named `name` on a live table, or -1.
+public function findSearchIndexNamed(c: Catalog, name: Text): Integer {
+    for t in c.tables {
+        for sid in t.searchIds {
+            if c.searchIdx[sid].name == name { return sid }
+        }
+    }
+    return -1
+}
+
+// Search index on column col of t, or -1.
+public function findSearchIndexOn(c: Catalog, t: tb.Table, col: Integer): Integer {
+    for sid in t.searchIds {
+        if c.searchIdx[sid].column == col { return sid }
+    }
+    return -1
+}
+
+public function dropSearchIndexNamed(c: Catalog, name: Text): Boolean {
+    let found = false
+    for t in c.tables {
+        let keep: List<Integer> = []
+        for sid in t.searchIds {
+            if c.searchIdx[sid].name == name {
+                found = true
+                let dropped = c.searchIdx[sid]
+                dropped.name = ""
+            } else {
+                keep.add(sid)
+            }
+        }
+        t.searchIds = keep
+    }
+    if found { c.version += 1 }
+    return found
 }
 
 // Does any index of t involve column ci?
@@ -187,6 +271,9 @@ public function columnIndexed(c: Catalog, t: tb.Table, ci: Integer): Boolean {
             if k == ci { return true }
         }
     }
+    for sid in t.searchIds {
+        if c.searchIdx[sid].column == ci { return true }
+    }
     return false
 }
 
@@ -196,6 +283,7 @@ public function indexRemoveRow(c: Catalog, t: tb.Table, r: Integer) {
         ix.hashRemove(h, ix.hashRow(t, h.cols, r), r)
     }
     for oid in t.ordIds { ix.ordRemove(c.ordIdx[oid], t, r) }
+    for sid in t.searchIds { si.touchRow(c.searchIdx[sid], t, r) }
 }
 
 public function indexInsertRow(c: Catalog, t: tb.Table, r: Integer) {
@@ -204,6 +292,7 @@ public function indexInsertRow(c: Catalog, t: tb.Table, r: Integer) {
         ix.hashInsert(h, t, ix.hashRow(t, h.cols, r), r)
     }
     for oid in t.ordIds { ix.ordInsert(c.ordIdx[oid], t, r) }
+    for sid in t.searchIds { si.insertRow(c.searchIdx[sid], t, r) }
 }
 
 // Find a hash index whose columns are exactly `cols` (any order), or -1.

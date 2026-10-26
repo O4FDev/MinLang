@@ -3,6 +3,7 @@
 use "../../lib/dbio.min" as dbio
 use "../sql/ast.min" as ast
 use "../sql/parser.min" as parser
+use "../sql/lexer.min" as lexer
 use "../storage/wal.min" as wal
 use "../storage/snapshot.min" as snapshot
 use "./values.min" as v
@@ -19,6 +20,8 @@ use "./compat.min" as compat
 use "./fk.min" as fkm
 use "./persist.min" as persist
 use "../storage/datafile.min" as df
+use "./notify.min" as nt
+use "./ext.min" as ext
 
 public constant STATUS_OK = 0
 public constant STATUS_ERROR = 1
@@ -47,6 +50,8 @@ public record Outcome {
     waitLsn: Integer
     copyColumns: Integer
     notices: List<Text>
+    copyFormat: Integer       // COPY FROM STDIN: 0 text/csv, 1 binary (CopyInResponse)
+    copyOut: Boolean          // rowData holds a whole COPY ... TO STDOUT response (CopyOutResponse, CopyData..., CopyDone)
 }
 
 record CacheEntry {
@@ -117,6 +122,11 @@ public record Engine {
     private noOutcome: Outcome
     private noColumns: List<Column>
     private idleCopy: IdleCopy
+    private hub: nt.Hub            // LISTEN / NOTIFY and table change feeds
+    private replOn: Boolean        // synchronous replica: a commit is durable once the replica acknowledged it too
+    private replOut: Bytes         // WAL record frames not yet handed to the server for the replica
+    private replAcked: Integer     // highest WAL LSN the replica made durable
+    private replUnacked: Bytes     // frames the replica has not acknowledged yet (resent after a reconnect)
 }
 
 // Storage options (docs/STORAGE_API.md "Engine open/close"). checkpointWalBytes: a checkpoint starts once this
@@ -154,6 +164,8 @@ public record Session {
     private copyBulk: Integer
     private copyErr: Outcome
     private copyImplicit: Boolean
+    private copyBinary: Boolean          // COPY FROM ... (FORMAT BINARY): copyBuf holds an unparsed tuple tail
+    private copyBinaryHeader: Boolean    // the binary header has been read
     private savepointNames: List<Text>
     private savepointUndo: Bytes
     private savepointRedo: Bytes
@@ -173,6 +185,7 @@ public record Session {
     private spReadOnly: Bytes
     private cursors: List<Cursor>
     private ddlUndo: List<DdlUndo>
+    private tag: Integer           // the server's connection token (notification delivery)
 }
 
 // Catalog change made inside a transaction block, undone by ROLLBACK (TO SAVEPOINT).
@@ -223,7 +236,7 @@ public record Prepared {
 function newOutcome(): Outcome {
     return Outcome {
         status: STATUS_OK; hasRowDescription: false; columns: []; rowData: Bytes(); rowCount: 0; commandTag: ""
-        sqlstate: ""; message: ""; detail: ""; position: 0; txnStatus: 73; waitLsn: 0; copyColumns: 0; notices: []
+        sqlstate: ""; message: ""; detail: ""; position: 0; txnStatus: 73; waitLsn: 0; copyColumns: 0; notices: []; copyFormat: 0; copyOut: false
     }
 }
 
@@ -282,7 +295,8 @@ public function openWithOptions(dataDir: Text, opts: Options): Engine {
     dbio.init()
     let c = cat.newCatalog()
     let tm = txn.newTxnMgr()
-    let env = ex.Env { cat: c; tm: tm; me: -1; nowMicros: 0; randState: 88172645463325252; session: 0; tempCount: 0 }
+    tm.catalog = [c]
+    let env = ex.Env { cat: c; tm: tm; me: -1; nowMicros: 0; randState: 88172645463325252; session: 0; tempCount: 0; notes: [] }
     let ic = newIdleCopy(env)
     let e = Engine {
         c: c; tm: tm; views: pl.newViewCache(); env: env; dataDir: dataDir; walBox: []; hasWal: false
@@ -290,10 +304,11 @@ public function openWithOptions(dataDir: Text, opts: Options): Engine {
         replaying: false; ckptLsn: 0; lastCkptTick: 0; ticks: 0; nextXid: 1; sys: blankSession(0, ic); stmtCount: 0; snapBox: []; idleTicks: 0; lastSeenStmt: 0
         nBlocks: 0; nCommits: 0; nReleases: 0; nSyncWakes: 0; lastStatTick: 0; statStmts: 0; opts: opts; closed: false
         st: persist.newStore(dataDir); snapVersion: 3; pointHits: 0; ck: persist.idleCkpt(); ckptGen: 0; ckptWanted: 0; ckptPublishUs: 0; pubPhase: 0; pubLsn: 0; pubBytes: Bytes(); pubSlot: 0; pubFd: -1; pubSyncer: 0; curSlot: -1; lastCkptMs: dbio.monotonicNanos() / 1000000
-        prepMap: hm.newIntMap(64); prepCache: []; tags: []; noOutcome: newOutcome(); noColumns: []; idleCopy: ic
+        prepMap: hm.newIntMap(64); prepCache: []; tags: []; noOutcome: newOutcome(); noColumns: []; idleCopy: ic; hub: nt.newHub(); replOn: false; replOut: Bytes(); replAcked: 0; replUnacked: Bytes()
     }
     if dataDir == "" { return e }
     dbio.mkdir(dataDir)
+    c.searchDir = dataDir
     e.replaying = true
     let names = dbio.listDir(dataDir)
     let snap = snapshot.openLatestIn(dataDir, names)
@@ -312,6 +327,11 @@ public function openWithOptions(dataDir: Text, opts: Options): Engine {
         let b = wal.buffer(r)
         let off = wal.payloadOffset(r)
         let len = wal.payloadLength(r)
+        if len > 9 && b[off] == 70 {
+            // a record stored by a replica: 'F', the primary's LSN, then the primary's record
+            off += 9
+            len -= 9
+        }
         if len > 0 {
             let kind = b[off]
             if kind == 67 {
@@ -342,6 +362,8 @@ public function openWithOptions(dataDir: Text, opts: Options): Engine {
     // A snapshot that is alone in the directory went through retention (published + verified); with no WAL after
     // it, close may retire the segments below it without writing a new checkpoint.
     if snap.found && wal.recordsRead(r) == 0 && (snapshot.slotOf(snap) >= 0 || snapshotFiles(names) == 1) { wal.setVerifiedSnapshot(e.walBox[0], snap.lsn) }
+    // tables loaded from now on are exactly their checkpoint images: saved search indexes may be used
+    if snap.found && wal.recordsRead(r) == 0 { c.searchLsn = snap.lsn }
     e.durable = wal.durableLsn(e.walBox[0])
     for t in e.c.tables {
         if !cat.isDropped(t) && t.chunk < 0 && t.nrows > 0 { cat.rebuildIndexes(e.c, t) }
@@ -405,9 +427,9 @@ function blankSession(id: Integer, ic: IdleCopy): Session {
         id: id; user: ""; txSlot: -1; inBlock: false; failed: false; defaultSerializable: false; nextSerializable: false
         remaining: ""; settingNames: ic.names; settingValues: ic.names; copyTable: -1; copyCols: ic.cols; copyBuf: ic.buf; copyRows: 0
         copyCsv: false; copyDelim: 9; copyNull: ic.buf; copyHeader: false; copyPlan: ic.plan
-        copyBulk: -1; copyErr: ic.err; copyImplicit: false; savepointNames: ic.names; savepointUndo: ic.buf; savepointRedo: ic.buf; txStart: 0; xid: 0; waitSlot: -1; waitGen: 0; ckptWait: 0
+        copyBulk: -1; copyErr: ic.err; copyImplicit: false; copyBinary: false; copyBinaryHeader: false; savepointNames: ic.names; savepointUndo: ic.buf; savepointRedo: ic.buf; txStart: 0; xid: 0; waitSlot: -1; waitGen: 0; ckptWait: 0
         txIso: 0; txReadOnly: false; txDeferrable: false; txSnap: false; defaultReadOnly: false; spReadOnly: Bytes()
-        cursors: []; ddlUndo: []
+        cursors: []; ddlUndo: []; tag: 0
         ownSettings: false; ownSavepoints: false
     }
 }
@@ -485,7 +507,15 @@ function imageOf(e: Engine, tid: Integer, chunk: Integer): persist.TableImage {
 
 // A SELECT whose only access to a table that is not loaded is one probe of a hash index (a primary-key point
 // lookup) is answered from the table's image: the index probe and the matching row's cells are preads into a
-// one-row stand-in (persist.pagedSetup). Anything else loads the table.
+// one-row stand-in (persist.pagedSetup). Anything else loads the table. So does sustained lookup traffic: a lookup
+// from the image costs ~1.1-1.4 us more than from memory (about 11 preads) and loading costs ~34 ns per row
+// (10M rows in 0.34 s, box 2), so once the lookups' extra cost has paid for a load (faults * 32 >= rows), the
+// table is loaded; rarely used tables of idle tenants stay on disk. Total cost stays within 2x of the better choice.
+// The load is one synchronous step that stalls every session of the process, so only tables that load within a few
+// milliseconds (LOOKUP_LOAD_MAX_ROWS) are loaded this way; a 10M-row load put p99.9 at 135 ms in a fixed-rate test
+// (ops/run25/tail_restart.sh). Bigger tables keep paged lookups until loads are sliced.
+constant LOOKUP_LOAD_MAX_ROWS = 131072    // ~4.5 ms to load at 34 ns per row
+
 function pointLookup(e: Engine, st: pl.Stmt): Boolean {
     if st.kind != pl.SK_SELECT || st.tableIds.length != 1 || e.snapVersion != 3 { return false }
     let tid = st.tableIds[0]
@@ -508,6 +538,8 @@ function pointLookup(e: Engine, st: pl.Stmt): Boolean {
         o += 1
     }
     if uses != 1 { return false }
+    let rows = persist.pagedRows(t)
+    if rows <= LOOKUP_LOAD_MAX_ROWS && persist.faults(t) * 32 >= rows + 2048 { return false }
     if !persist.pagedSetup(e.st, e.c, t, hid, imageOf(e, tid, t.chunk)) { return false }
     e.pointHits += 1
     return true
@@ -546,6 +578,7 @@ public function close(e: Engine) {
             e.snapBox = []
         }
         let end = wal.appendedLsn(w)
+        if e.ckptLsn == end { cat.saveSearchIndexes(e.c, end) }
         if wal.verifiedSnapshot(w) == end && e.ckptLsn == end {
             wal.closeAfterCheckpoint(w, end, 1)
         } else {
@@ -562,7 +595,8 @@ public function close(e: Engine) {
     let c = cat.newCatalog()
     e.c = c
     e.tm = txn.newTxnMgr()
-    e.env = ex.Env { cat: c; tm: e.tm; me: -1; nowMicros: 0; randState: 1; session: 0; tempCount: 0 }
+    e.tm.catalog = [c]
+    e.env = ex.Env { cat: c; tm: e.tm; me: -1; nowMicros: 0; randState: 1; session: 0; tempCount: 0; notes: [] }
     e.views = pl.newViewCache()
     e.cache = []
     e.cacheMap = hm.newIntMap(16)
@@ -623,6 +657,7 @@ public function closeSession(e: Engine, s: Session) {
     e.env.session = s.id
     // abort any open transaction (undoing its catalog changes) and close cursors
     rollbackSession(e, s)
+    nt.dropSession(e.hub, s.id)
     s.cursors = []
     if e.env.tempCount > 0 {
         // drop this session's temp tables (logged, so replay drops them too)
@@ -688,10 +723,12 @@ function ensureTxn(e: Engine, s: Session): txn.Txn {
 function commitTxn(e: Engine, s: Session, tx: txn.Txn): Integer {
     s.txSlot = -1
     if tx.redo.length <= 1 && tx.uCount == 0 {
+        nt.commitNotes(e.hub, s.id, 0, 0)
         txn.finishEmpty(e.tm, tx)
         return 0
     }
     if !e.hasWal || e.replaying {
+        if !e.replaying { nt.commit(e.hub, e.c, tx, s.id, 0, 0) }
         txn.finishCommit(e.tm, e.c, tx)
         return 0
     }
@@ -702,14 +739,15 @@ function commitTxn(e: Engine, s: Session, tx: txn.Txn): Integer {
         rec.add(69)
         tb.putVarint(rec, s.xid)
         rec.addBytes(tx.redo.slice(1 + varintLen(s.xid), tx.redo.length))
-        lsn = wal.append(e.walBox[0], rec)
+        lsn = walAppend(e, rec)
     } else {
-        lsn = wal.append(e.walBox[0], tx.redo)
+        lsn = walAppend(e, tx.redo)
     }
     tx.state = txn.TX_COMMITTING
     tx.commitLsn = lsn
     e.nCommits += 1
     e.committing.addInt64(tx.slot)
+    nt.commit(e.hub, e.c, tx, s.id, lsn, e.durable)
     return lsn
 }
 
@@ -729,11 +767,92 @@ function maybeSpill(e: Engine, s: Session, tx: txn.Txn) {
     let hdr = 1
     if tx.redo[0] == 80 { hdr = 1 + varintLen(s.xid) }
     rec.addBytes(tx.redo.slice(hdr, tx.redo.length))
-    wal.append(e.walBox[0], rec)
+    walAppend(e, rec)
     tx.redo.clear()
     tx.redo.add(80)
     tb.putVarint(tx.redo, s.xid)
 }
+
+// Every logical WAL record goes through here, so a synchronous replica receives exactly what recovery replays.
+// Frame: LSN after the record (int64), payload length (int32), payload; little-endian.
+function walAppend(e: Engine, rec: Bytes): Integer {
+    let lsn = wal.append(e.walBox[0], rec)
+    if e.replOn {
+        e.replOut.addInt64(lsn)
+        e.replOut.addInt32(rec.length)
+        e.replOut.addBytes(rec)
+        e.replUnacked.addInt64(lsn)
+        e.replUnacked.addInt32(rec.length)
+        e.replUnacked.addBytes(rec)
+    }
+    return lsn
+}
+
+function effectiveDurable(e: Engine, local: Integer): Integer {
+    if e.replOn && e.replAcked < local { return e.replAcked }
+    return local
+}
+
+// Synchronous replication (primary side). The replica must start from a copy of this data directory taken while
+// the server was stopped; from then on it receives every WAL record, and commits wait for its acknowledgement.
+public function enableReplication(e: Engine) {
+    if !e.hasWal { return }
+    e.replOn = true
+    e.replAcked = wal.appendedLsn(e.walBox[0])
+}
+public function takeReplication(e: Engine): Bytes {
+    let b = e.replOut
+    if b.length > 0 { e.replOut = Bytes() }
+    return b
+}
+public function replicaAcknowledged(e: Engine, lsn: Integer) {
+    if !e.replOn || lsn <= e.replAcked { return }
+    e.replAcked = lsn
+    e.replUnacked = framesAfter(e.replUnacked, lsn)
+    releaseDurable(e, effectiveDurable(e, wal.durableLsn(e.walBox[0])))
+}
+
+// Frames (LSN int64, length int32, payload) of b whose LSN is above lsn.
+function framesAfter(b: Bytes, lsn: Integer): Bytes {
+    let pos = 0
+    while pos + 12 <= b.length && b.getInt64(pos) <= lsn { pos += 12 + b.getInt32(pos + 8) }
+    if pos == 0 { return b }
+    return b.slice(pos, b.length)
+}
+
+// A replica (re)connected and reports the last primary LSN it holds durably: everything after it, to send first.
+// It cannot report more than it was sent, so acknowledging up to it is safe.
+public function replicationResume(e: Engine, replicaLsn: Integer): Bytes {
+    if !e.replOn { return Bytes() }
+    e.replOut = Bytes()
+    if replicaLsn > e.replAcked { replicaAcknowledged(e, replicaLsn) }
+    return framesAfter(e.replUnacked, replicaLsn)
+}
+
+// Replica side: the primary LSN of the last intact record this directory holds (records are stored wrapped as
+// 'F' + LSN + record, so the torn-tail rule of the WAL reader makes this exact).
+public function lastReplicatedLsn(dataDir: Text): Integer {
+    let names = dbio.listDir(dataDir)
+    let r = wal.openReaderIn(dataDir, names, 0)
+    let last = 0
+    while wal.next(r) {
+        let b = wal.buffer(r)
+        let off = wal.payloadOffset(r)
+        if wal.payloadLength(r) > 9 && b[off] == 70 { last = b.getInt64(off + 1) }
+    }
+    return last
+}
+
+// Replica side: store a record received from the primary in this WAL (not applied; recovery applies it when
+// the replica is started as a normal server), and make everything received durable.
+public function storeReplicated(e: Engine, primaryLsn: Integer, payload: Bytes) {
+    let rec = Bytes()
+    rec.add(70)
+    rec.addInt64(primaryLsn)
+    rec.addBytes(payload)
+    wal.append(e.walBox[0], rec)
+}
+public function syncReplicated(e: Engine) { if e.hasWal { wal.syncNow(e.walBox[0]) } }
 
 function rollbackSession(e: Engine, s: Session) {
     if s.txSlot >= 0 {
@@ -743,6 +862,7 @@ function rollbackSession(e: Engine, s: Session) {
     s.txSlot = -1
     s.inBlock = false
     s.failed = false
+    nt.rollback(e.hub, s.id)
     dropSavepoints(e, s)
     s.spReadOnly.clear()
     cursorsAtEnd(s, false)
@@ -788,11 +908,12 @@ public function onSyncReadable(e: Engine) {
     if !e.hasWal { return }
     let d = wal.onSyncReadable(e.walBox[0])
     e.nSyncWakes += 1
-    releaseDurable(e, d)
+    releaseDurable(e, effectiveDurable(e, d))
 }
 
 function releaseDurable(e: Engine, d: Integer) {
     e.durable = d
+    nt.release(e.hub, d)
     let n = e.committing.length / 8
     if n == 0 { return }
     let keep = Bytes()
@@ -809,6 +930,28 @@ function releaseDurable(e: Engine, d: Integer) {
         i += 1
     }
     e.committing = keep
+}
+
+// Embedded mode (no event loop): block until the WAL is durable up to lsn, then finish the commits it covers.
+public function waitDurable(e: Engine, lsn: Integer) {
+    if !e.hasWal || lsn <= e.durable { return }
+    releaseDurable(e, wal.syncNow(e.walBox[0]))
+}
+
+// Notification delivery (LISTEN / NOTIFY, table change feeds). The server tags each session with its connection
+// token, asks which tokens have messages after the engine ran, and sends a session's messages while it is idle.
+public function setSessionTag(s: Session, tag: Integer) { s.tag = tag }
+public function sessionTag(s: Session): Integer { return s.tag }
+public function notificationsReady(e: Engine): Boolean { return nt.hasReady(e.hub) }
+public function notificationsListened(e: Engine): Boolean { return nt.hasListeners(e.hub) }
+public function takeNotificationTags(e: Engine): List<Integer> { return nt.takeReady(e.hub) }
+public function takeNotifications(e: Engine, s: Session): Bytes { return nt.takeInbox(e.hub, s.id) }
+
+// Make every committed transaction durable now (one WAL fsync on the caller's thread) and release them.
+public function syncCommitsNow(e: Engine) {
+    if !e.hasWal || e.committing.length == 0 { return }
+    let d = wal.syncNow(e.walBox[0])
+    releaseDurable(e, effectiveDurable(e, d))
 }
 
 public function durableLsn(e: Engine): Integer {
@@ -1086,6 +1229,7 @@ function runEntry(e: Engine, s: Session, ce: CacheEntry, sql: Text, cached: Bool
                 ok = false
             }
             o = runPlanned(e, s, st, [], ce.cols[i])
+            if e.env.notes.length > 0 { drainNotes(e, s, o) }
             if o.columns.length > 0 { ce.cols[i] = o.columns }
         }
         outs.add(o)
@@ -1107,6 +1251,18 @@ public function simpleQueryRemaining(e: Engine, s: Session): Text {
 // ---------------------------------------------------------------- planned statement execution
 
 // cols: the statement's result columns if the caller has them cached (empty = compute).
+// pg_notify() calls of a statement that succeeded become NOTIFYs (held until COMMIT inside a block).
+function drainNotes(e: Engine, s: Session, o: Outcome) {
+    let notes = e.env.notes
+    e.env.notes = []
+    if o.status != STATUS_OK { return }
+    let i = 0
+    while i + 1 < notes.length {
+        nt.notify(e.hub, s.id, notes[i], notes[i + 1], s.inBlock)
+        i += 2
+    }
+}
+
 function runPlanned(e: Engine, s: Session, st: pl.Stmt, formats: List<Integer>, cols: List<Column>): Outcome {
     if st.err {
         let o = errOut(s, st.errCode, st.errMsg, st.errPos + 1)
@@ -1361,6 +1517,7 @@ public function paramTypes(p: Prepared): List<Integer> { return p.params }
 public function resultColumns(p: Prepared): List<Column> { return p.columns }
 public function returnsRows(p: Prepared): Boolean { return p.columns.length > 0 }
 public function preparedMemo(p: Prepared): Bytes { return p.memo }
+public function preparedSql(p: Prepared): Text { return p.sql }
 public function setPreparedMemo(p: Prepared, b: Bytes) { p.memo = b }
 
 public function execute(e: Engine, s: Session, p: Prepared, params: List<Bytes>, paramNulls: List<Boolean>,
@@ -1395,7 +1552,9 @@ public function execute(e: Engine, s: Session, p: Prepared, params: List<Bytes>,
         o.txnStatus = txnStatus(s)
         return o
     }
-    return runPlanned(e, s, st, resultFormats, cols)
+    let ro = runPlanned(e, s, st, resultFormats, cols)
+    if e.env.notes.length > 0 { drainNotes(e, s, ro) }
+    return ro
 }
 
 // ---------------------------------------------------------------- compat probes
@@ -1480,7 +1639,7 @@ function logDdlAuto(e: Engine, sqlIn: Text) {
     let b = Bytes(sql)
     tb.putVarint(rec, b.length)
     rec.addBytes(b)
-    wal.append(e.walBox[0], rec)
+    walAppend(e, rec)
 }
 
 function pushUndo(e: Engine, s: Session, kind: Integer, tid: Integer, name: Text) {
@@ -1553,6 +1712,139 @@ function ddlDone(e: Engine, s: Session, tag: Text, sql: Text): Outcome {
     o.txnStatus = txnStatus(s)
     e.c.version += 1
     return o
+}
+
+// ---------------------------------------------------------------- extensions (src/engine/ext.min)
+
+function extOption(a: ast.Ast, root: Integer, key: Text): Text {
+    for o in ast.items(a, ast.child(a, root, 0)) {
+        if a.nodes[o].text == key {
+            let vn = ast.child(a, o, 0)
+            if vn >= 0 { return a.nodes[vn].text }
+        }
+    }
+    return ""
+}
+
+function installedAt(e: Engine, xi: Integer): Integer {
+    let i = 0
+    while i < e.c.extensions.length {
+        if e.c.extensions[i] == xi { return i }
+        i += 1
+    }
+    return -1
+}
+
+function createExtension(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let name = nd.text
+    let xi = ext.findExtension(name)
+    if xi < 0 {
+        if e.replaying {
+            fail("this database uses extension \"" + name + "\", which this neo-db build does not include; rebuild with it (docs/r2/extensions.md)")
+        }
+        let o = errOut(s, "0A000", "extension \"" + name + "\" is not available", 0)
+        o.detail = "This neo-db build includes: " + ext.availableNames() + ". Extensions are Minyar packages compiled into the server; see docs/r2/extensions.md to add one."
+        return o
+    }
+    let x = ext.extension(xi)
+    let version = extOption(a, root, "version")
+    if version != "" && version != x.version {
+        return errOut(s, "22023", "extension \"" + name + "\" has no installation script nor update path for version \"" + version + "\"", 0)
+    }
+    if installedAt(e, xi) >= 0 {
+        if (nd.flags & ast.F_IF_NOT_EXISTS) != 0 {
+            let o = okTag(s, "CREATE EXTENSION")
+            o.notices.add("extension \"" + name + "\" already exists, skipping")
+            return o
+        }
+        return errOut(s, "42710", "extension \"" + name + "\" already exists", 0)
+    }
+    e.c.extensions.add(xi)
+    e.c.extensionVersions.add(x.version)
+    return ddlDone(e, s, "CREATE EXTENSION", sql)
+}
+
+function alterExtension(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let name = a.nodes[root].text
+    let xi = ext.findExtension(name)
+    let at = -1
+    if xi >= 0 { at = installedAt(e, xi) }
+    if at < 0 { return errOut(s, "42704", "extension \"" + name + "\" does not exist", 0) }
+    let x = ext.extension(xi)
+    let target = x.version
+    let tn = ast.child(a, root, 0)
+    if tn >= 0 { target = a.nodes[tn].text }
+    let installed = e.c.extensionVersions[at]
+    if target == installed {
+        let o = okTag(s, "ALTER EXTENSION")
+        o.notices.add("version \"" + installed + "\" of extension \"" + name + "\" is already installed")
+        return o
+    }
+    if target != x.version {
+        return errOut(s, "22023", "extension \"" + name + "\" has no update path from version \"" + installed + "\" to version \"" + target + "\"", 0)
+    }
+    e.c.extensionVersions[at] = target
+    return ddlDone(e, s, "ALTER EXTENSION", sql)
+}
+
+// A column whose type belongs to extension xi, as "column c of table t", or "".
+function extensionUser(e: Engine, xi: Integer): Text {
+    for t in e.c.tables {
+        if !cat.isDropped(t) && !pl.isTempName(t.name) {
+            for c in t.cols {
+                if ext.typeExt(c.type) == xi { return "column " + c.name + " of table " + t.name + " depends on type " + ext.typeName(c.type) }
+            }
+        }
+    }
+    return ""
+}
+
+function dropExtensions(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text): Outcome {
+    let nd = a.nodes[root]
+    let o = okTag(s, "DROP EXTENSION")
+    let drop: List<Integer> = []
+    for ref in ast.items(a, ast.child(a, root, 0)) {
+        let name = a.nodes[ref].text
+        let xi = ext.findExtension(name)
+        let at = -1
+        if xi >= 0 { at = installedAt(e, xi) }
+        if at < 0 {
+            if (nd.flags & ast.F_IF_EXISTS) != 0 {
+                o.notices.add("extension \"" + name + "\" does not exist, skipping")
+            } else {
+                return errOut(s, "42704", "extension \"" + name + "\" does not exist", 0)
+            }
+        } else {
+            let user = extensionUser(e, xi)
+            if user != "" {
+                let eo = errOut(s, "2BP01", "cannot drop extension " + name + " because other objects depend on it", 0)
+                eo.detail = user
+                return eo
+            }
+            drop.add(xi)
+        }
+    }
+    if drop.length == 0 { return o }
+    let keep: List<Integer> = []
+    let keepVersions: List<Text> = []
+    let i = 0
+    while i < e.c.extensions.length {
+        let dropped = false
+        for d in drop {
+            if d == e.c.extensions[i] { dropped = true }
+        }
+        if !dropped {
+            keep.add(e.c.extensions[i])
+            keepVersions.add(e.c.extensionVersions[i])
+        }
+        i += 1
+    }
+    e.c.extensions = keep
+    e.c.extensionVersions = keepVersions
+    let done = ddlDone(e, s, "DROP EXTENSION", sql)
+    done.notices = o.notices
+    return done
 }
 
 function settingValue(s: Session, name: Text): Text {
@@ -1656,6 +1948,8 @@ function runUtilityInner(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: 
         if k == ast.K_CREATE_VIEW { what = "CREATE VIEW" }
         if k == ast.K_ALTER_TABLE { what = "ALTER TABLE" }
         if k == ast.K_TRUNCATE { what = "TRUNCATE TABLE" }
+        if k == ast.K_CREATE_EXTENSION { what = "CREATE EXTENSION" }
+        if k == ast.K_ALTER_EXTENSION { what = "ALTER EXTENSION" }
         if k == ast.K_DROP {
             what = "DROP TABLE"
             if nd.op == ast.OBJ_VIEW { what = "DROP VIEW" }
@@ -1783,6 +2077,8 @@ function runUtilityInner(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: 
     if k == ast.K_CREATE_VIEW { return createView(e, s, a, root, sql) }
     if k == ast.K_ALTER_TABLE { return alterTable(e, s, a, root, sql) }
     if k == ast.K_CREATE_TABLE_AS { return createTableAs(e, s, a, root, sql) }
+    if k == ast.K_CREATE_EXTENSION { return createExtension(e, s, a, root, sql) }
+    if k == ast.K_ALTER_EXTENSION { return alterExtension(e, s, a, root, sql) }
     if k == ast.K_VACUUM { return okTag(s, "VACUUM") }
     if k == ast.K_ANALYZE { return okTag(s, "ANALYZE") }
     if k == ast.K_CHECKPOINT {
@@ -1809,23 +2105,48 @@ function runUtilityInner(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: 
     if k == ast.K_DISCARD { return okTag(s, "DISCARD ALL") }
     if k == ast.K_DEALLOCATE { return okTag(s, "DEALLOCATE") }
     if k == ast.K_LOCK { return okTag(s, "LOCK TABLE") }
-    if k == ast.K_LISTEN { return okTag(s, "LISTEN") }
-    if k == ast.K_UNLISTEN { return okTag(s, "UNLISTEN") }
-    if k == ast.K_NOTIFY { return okTag(s, "NOTIFY") }
+    if k == ast.K_LISTEN {
+        nt.listen(e.hub, s.id, s.tag, ast.text(a, root))
+        return okTag(s, "LISTEN")
+    }
+    if k == ast.K_UNLISTEN {
+        nt.unlisten(e.hub, s.id, ast.text(a, root))
+        return okTag(s, "UNLISTEN")
+    }
+    if k == ast.K_NOTIFY {
+        let payload = ""
+        let pn = ast.child(a, root, 0)
+        if pn >= 0 { payload = ast.text(a, pn) }
+        nt.notify(e.hub, s.id, ast.text(a, root), payload, s.inBlock)
+        return okTag(s, "NOTIFY")
+    }
     if k == ast.K_COMMENT { return okTag(s, "COMMENT") }
     if k == ast.K_CREATE_SCHEMA { return okTag(s, "CREATE SCHEMA") }
     if k == ast.K_EXPLAIN {
         let o = okTag(s, "EXPLAIN")
         o.hasRowDescription = true
         o.columns = [Column { name: "QUERY PLAN"; typeOid: 25; typeSize: -1; typeMod: -1 }]
-        let val = Bytes("neo-db plan")
+        let lines: List<Text> = ["Result"]
+        let q = ast.child(a, root, 0)
+        if q >= 0 {
+            let st = pl.planStatement(e.c, e.views, e.env, a, q, sql, [])
+            if st.err {
+                let eo = errOut(s, st.errCode, st.errMsg, st.errPos + 1)
+                if st.errPos < 0 { eo.position = 0 }
+                return eo
+            }
+            if st.kind != pl.SK_UTILITY { lines = pl.explainLines(e.c, st) }
+        }
         let out = o.rowData
-        out.add(68)
-        v.addBE32(out, 4 + 2 + 4 + val.length)
-        v.addBE16(out, 1)
-        v.addBE32(out, val.length)
-        out.addBytes(val)
-        o.rowCount = 1
+        for line in lines {
+            let val = Bytes(line)
+            out.add(68)
+            v.addBE32(out, 4 + 2 + 4 + val.length)
+            v.addBE16(out, 1)
+            v.addBE32(out, val.length)
+            out.addBytes(val)
+        }
+        o.rowCount = lines.length
         return o
     }
     return errOut(s, "0A000", "statement not supported: " + ast.kindName(k), nd.position + 1)
@@ -2033,6 +2354,8 @@ function runTxnControl(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcom
             if s.txSlot >= 0 {
                 let tx = e.tm.txns[s.txSlot]
                 lsn = commitTxn(e, s, tx)
+            } else {
+                nt.commitNotes(e.hub, s.id, 0, 0)
             }
             cursorsAtEnd(s, true)
             dropSavepoints(e, s)
@@ -2167,6 +2490,7 @@ function typmodOf(a: ast.Ast, tn: Integer, t: Integer): Integer {
             return a.nodes[mods[0]].intValue * 65536 + (sc & 65535)
         }
     }
+    if v.isExtType(t) && mods.length > 0 { return a.nodes[mods[0]].intValue }
     return -1
 }
 
@@ -2243,12 +2567,17 @@ function createTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
         } else if ast.kind(a, el) == ast.K_COLUMN_DEF {
             let tn = ast.child(a, el, 0)
             let tname = a.nodes[tn].text
-            let ty = pl.typeOfName(tname)
+            let ty = pl.typeInCatalog(e.c, tname)
             if ty < 0 { return errOut(s, "42704", "type \"" + tname + "\" does not exist", a.nodes[tn].position + 1) }
             if a.nodes[tn].intValue > 0 { return errOut(s, "0A000", "array types are not supported", a.nodes[tn].position + 1) }
             let cn = a.nodes[el].text
             if tb.columnIndex(t, cn) >= 0 { return errOut(s, "42701", "column \"" + cn + "\" specified more than once", 0) }
             let ctm = typmodOf(a, tn, ty)
+            let mods = ast.items(a, ast.child(a, tn, 0))
+            if mods.length > 0 {
+                let problem = pl.extTypmodError(ty, mods.length, a.nodes[mods[0]].intValue)
+                if problem != "" { return errOut(s, "22023", problem, a.nodes[tn].position + 1) }
+            }
             let cty = ty
             if ty == v.T_NUMERIC { cty = v.numStorageType(ctm) }
             let col = tb.newColumn(cn, cty, ctm, false)
@@ -2732,6 +3061,33 @@ function createIndex(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
     let unique = (nd.flags & ast.F_UNIQUE) != 0
     if ast.child(a, root, 2) >= 0 { return errOut(s, "0A000", "partial indexes are not supported", 0) }
     let method = ast.text(a, ast.child(a, root, 5))
+    if method == "tin" || method == "search" {
+        // full-text search index (docs/r2/search.md): one text column, optional WITH (stemmer = 'en')
+        if cols.length != 1 { return errOut(s, "0A000", "a " + method + " index covers exactly one text column", 0) }
+        if !v.isTextType(t.cols[cols[0]].type) {
+            return errOut(s, "42804", "column \"" + t.cols[cols[0]].name + "\" is not text; a " + method + " index needs a text column", 0)
+        }
+        let stemmer = 0
+        let opts = ast.child(a, root, 4)
+        if opts >= 0 {
+            for el in ast.items(a, opts) {
+                let key = a.nodes[el].text
+                let val = ""
+                let vn = ast.child(a, el, 0)
+                if vn >= 0 { val = a.nodes[vn].text }
+                if key == "stemmer" || key == "language" {
+                    if val == "en" || val == "english" || val == "EN" || val == "English" {
+                        stemmer = 1
+                    } else if val != "none" && val != "" && val != "simple" {
+                        return errOut(s, "22023", "unknown stemmer \"" + val + "\" (available: en, none)", 0)
+                    }
+                }
+            }
+        }
+        cat.addSearchIndex(e.c, t, name, cols[0], stemmer)
+        pushUndo(e, s, UNDO_INDEX, t.id, name)
+        return ddlDone(e, s, "CREATE INDEX", sql)
+    }
     let wantHash = unique || method == "hash"
     let wantOrd = method != "hash"
     if !cat.addIndex(e.c, t, name, cols, unique, false, wantHash, wantOrd) {
@@ -2749,6 +3105,7 @@ function dropObjects(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text
     if nd.op == ast.OBJ_INDEX { o.commandTag = "DROP INDEX" }
     if nd.op == ast.OBJ_SCHEMA { return okTag(s, "DROP SCHEMA") }
     if nd.op == ast.OBJ_SEQUENCE { return okTag(s, "DROP SEQUENCE") }
+    if nd.op == ast.OBJ_EXTENSION { return dropExtensions(e, s, a, root, sql) }
     let changed = false
     let inBlockDrop = false
     // resolve every name first: a partition listed after its partitioned table is dropped with it
@@ -2894,6 +3251,7 @@ function dropIndex(e: Engine, name: Text): Boolean {
         t.hashIds = hs
         t.ordIds = os
     }
+    if cat.dropSearchIndexNamed(e.c, name) { found = true }
     return found
 }
 
@@ -3104,7 +3462,7 @@ function alterTable(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Text)
 function addColumnCmd(e: Engine, s: Session, a: ast.Ast, cmd: Integer, t: tb.Table): Outcome {
     let def = ast.child(a, cmd, 0)
     let tn = ast.child(a, def, 0)
-    let ty = pl.typeOfName(a.nodes[tn].text)
+    let ty = pl.typeInCatalog(e.c, a.nodes[tn].text)
     if ty < 0 { return errOut(s, "42704", "type \"" + a.nodes[tn].text + "\" does not exist", 0) }
     let cname = a.nodes[def].text
     if tb.columnIndex(t, cname) >= 0 {
@@ -3205,6 +3563,7 @@ function createTableAs(e: Engine, s: Session, a: ast.Ast, root: Integer, sql: Te
         st.p.env = e.env
         dml.resetForRun(st)
         let p = st.p
+        ex.newExecution()
         ex.open(p, st.root)
         while ex.next(p, st.root) {
             let r = tb.reserveRow(t, 0)
@@ -3257,8 +3616,165 @@ function sqlTypeName(t: Integer): Text {
 
 // ---------------------------------------------------------------- COPY FROM STDIN
 
+// COPY table [(columns)] TO STDOUT [(FORMAT text|csv|binary)]: run the equivalent SELECT, then re-frame its DataRows
+// (a binary DataRow body is exactly a binary COPY tuple; text fields are escaped as COPY text).
+function copyTo(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
+    let tref = ast.child(a, root, 0)
+    if tref < 0 { return errOut(s, "0A000", "COPY (query) TO is not supported", 0) }
+    let format = 0
+    let delim = 9
+    let csv = false
+    for opt in ast.items(a, ast.child(a, root, 3)) {
+        let on = a.nodes[opt].text
+        let val = ast.child(a, opt, 0)
+        let vt = ""
+        if val >= 0 { vt = a.nodes[val].text }
+        if on == "format" && vt == "binary" { format = 1 }
+        if on == "format" && vt == "csv" {
+            csv = true
+            delim = 44
+        }
+        if on == "delimiter" && vt != "" { delim = Bytes(vt)[0] }
+    }
+    let cols = "*"
+    let cl = ast.child(a, root, 1)
+    if cl >= 0 {
+        cols = ""
+        for cn in ast.items(a, cl) {
+            if cols != "" { cols = cols + ", " }
+            cols = cols + quoteIdent(a.nodes[cn].text)
+        }
+    }
+    let sel = "SELECT " + cols + " FROM " + quoteIdent(a.nodes[tref].text)
+    let r = parser.parse(sel)
+    if !r.ok { return errOut(s, "42601", "COPY: cannot read its column list", 0) }
+    let st = pl.planStatement(e.c, e.views, e.env, r.ast, r.ast.statements[0], sel, [])
+    let o = runPlanned(e, s, st, [format], [])
+    if o.status != STATUS_OK { return o }
+    let ncols = st.outExprs.length
+    let out = Bytes()
+    // CopyOutResponse
+    out.add(72)
+    v.addBE32(out, 4 + 1 + 2 + 2 * ncols)
+    out.add(format)
+    v.addBE16(out, ncols)
+    let i = 0
+    while i < ncols {
+        v.addBE16(out, format)
+        i += 1
+    }
+    // binary: the 19-byte header travels in the first CopyData message, with the first tuple (as Postgres sends it)
+    let header = Bytes()
+    if format == 1 {
+        header.addBytes(Bytes("PGCOPY"))
+        header.add(10)
+        header.add(255)
+        header.add(13)
+        header.add(10)
+        header.add(0)
+        v.addBE32(header, 0)
+        v.addBE32(header, 0)
+    }
+    let rows = o.rowData
+    let pos = 0
+    let n = 0
+    while pos + 5 <= rows.length {
+        let len = v.getBE32(rows, pos + 1)
+        let body = pos + 5
+        let end = pos + 1 + len
+        out.add(100)
+        let at = out.length
+        out.addInt32(0)
+        if n == 0 { out.addBytes(header) }
+        if format == 1 {
+            let k = body
+            while k < end {
+                out.add(rows[k])
+                k += 1
+            }
+        } else {
+            let nf = v.getBE16(rows, body)
+            let f = body + 2
+            let fi = 0
+            while fi < nf {
+                if fi > 0 { out.add(delim) }
+                let fl = v.getBE32(rows, f)
+                f += 4
+                if fl < 0 {
+                    if !csv {
+                        out.add(92)
+                        out.add(78)
+                    }
+                } else {
+                    copyEscape(rows, f, fl, csv, delim, out)
+                    f += fl
+                }
+                fi += 1
+            }
+            out.add(10)
+        }
+        v.setBE32(out, at, out.length - at)
+        n += 1
+        pos = end
+    }
+    if format == 1 {
+        out.add(100)
+        if n == 0 {
+            v.addBE32(out, 6 + header.length)
+            out.addBytes(header)
+        } else {
+            v.addBE32(out, 6)
+        }
+        v.addBE16(out, -1)
+    }
+    // CopyDone
+    out.add(99)
+    v.addBE32(out, 4)
+    o.rowData = out
+    o.copyOut = true
+    o.hasRowDescription = false
+    o.commandTag = "COPY " + Text(n)
+    return o
+}
+
+function copyEscape(b: Bytes, start: Integer, len: Integer, csv: Boolean, delim: Integer, out: Bytes) {
+    let i = start
+    let end = start + len
+    if csv {
+        let quote = len == 0
+        while i < end {
+            let c = b[i]
+            if c == delim || c == 34 || c == 10 || c == 13 { quote = true }
+            i += 1
+        }
+        if quote { out.add(34) }
+        i = start
+        while i < end {
+            if b[i] == 34 { out.add(34) }
+            out.add(b[i])
+            i += 1
+        }
+        if quote { out.add(34) }
+        return
+    }
+    while i < end {
+        let c = b[i]
+        if c == 92 { out.add(92); out.add(92) }
+        else if c == 10 { out.add(92); out.add(110) }
+        else if c == 13 { out.add(92); out.add(114) }
+        else if c == 9 { out.add(92); out.add(116) }
+        else if c == 8 { out.add(92); out.add(98) }
+        else if c == 12 { out.add(92); out.add(102) }
+        else if c == 11 { out.add(92); out.add(118) }
+        else if c == delim { out.add(92); out.add(c) }
+        else { out.add(c) }
+        i += 1
+    }
+}
+
 function copyStart(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
     let nd = a.nodes[root]
+    if nd.op == ast.COPY_TO && nd.intValue == ast.COPY_STDIO { return copyTo(e, s, a, root) }
     if nd.op != ast.COPY_FROM || nd.intValue != ast.COPY_STDIO {
         return errOut(s, "0A000", "only COPY ... FROM STDIN is supported", 0)
     }
@@ -3288,6 +3804,8 @@ function copyStart(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
     s.copyDelim = 9
     s.copyNull = Bytes("\\N")
     s.copyHeader = false
+    s.copyBinary = false
+    s.copyBinaryHeader = false
     for opt in ast.items(a, ast.child(a, root, 3)) {
         let on = a.nodes[opt].text
         let val = ast.child(a, opt, 0)
@@ -3298,7 +3816,7 @@ function copyStart(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
             s.copyDelim = 44
             s.copyNull = Bytes("")
         }
-        if on == "format" && vt == "binary" { return errOut(s, "0A000", "COPY BINARY is not supported", 0) }
+        if on == "format" && vt == "binary" { s.copyBinary = true }
         if on == "delimiter" && vt != "" { s.copyDelim = Bytes(vt)[0] }
         if on == "null" { s.copyNull = Bytes(vt) }
         if on == "header" && vt != "false" && vt != "off" && vt != "0" { s.copyHeader = true }
@@ -3323,6 +3841,7 @@ function copyStart(e: Engine, s: Session, a: ast.Ast, root: Integer): Outcome {
     let o = newOutcome()
     o.status = STATUS_COPY_IN
     o.copyColumns = s.copyCols.length
+    if s.copyBinary { o.copyFormat = 1 }
     o.txnStatus = txnStatus(s)
     return o
 }
@@ -3331,6 +3850,10 @@ public function copyData(e: Engine, s: Session, data: Bytes) {
     if s.copyTable < 0 || s.copyErr.status == STATUS_ERROR { return }
     let buf = s.copyBuf
     buf.addBytes(data)
+    if s.copyBinary {
+        copyBinaryData(e, s)
+        return
+    }
     let start = 0
     let n = buf.length
     let i = 0
@@ -3349,6 +3872,156 @@ public function copyData(e: Engine, s: Session, data: Bytes) {
     maybeSpill(e, s, tx)
 }
 
+// Binary COPY: header (PGCOPY signature, flags, extension area), then tuples (int16 field count, per field int32
+// length or -1 for NULL, then the value in its binary form), then int16 -1. Complete tuples are taken from copyBuf.
+function copyBinaryData(e: Engine, s: Session) {
+    let buf = s.copyBuf
+    let n = buf.length
+    let pos = 0
+    if !s.copyBinaryHeader {
+        if n < 19 { return }
+        let sig = Bytes("PGCOPY")
+        let i = 0
+        while i < 6 {
+            if buf[i] != sig[i] {
+                s.copyErr = errOut(s, "22P04", "COPY file signature not recognized (byte " + Text(i) + " is " + Text(buf[i]) + ", " + Text(n) + " bytes)", 0)
+                return
+            }
+            i += 1
+        }
+        let extLen = v.getBE32(buf, 15)
+        if n < 19 + extLen { return }
+        pos = 19 + extLen
+        s.copyBinaryHeader = true
+    }
+    let t = e.c.tables[s.copyTable]
+    while pos + 2 <= n {
+        let nf = v.getBE16(buf, pos)
+        if nf == -1 {
+            pos = n
+            break
+        }
+        // is the whole tuple here?
+        let q = pos + 2
+        let fi = 0
+        let complete = true
+        while fi < nf {
+            if q + 4 > n {
+                complete = false
+                break
+            }
+            let fl = v.getBE32(buf, q)
+            q += 4
+            if fl > 0 { q += fl }
+            if q > n {
+                complete = false
+                break
+            }
+            fi += 1
+        }
+        if !complete { break }
+        if nf != s.copyCols.length {
+            s.copyErr = errOut(s, "22P04", "row field count is " + Text(nf) + ", expected " + Text(s.copyCols.length), 0)
+            return
+        }
+        let p = s.copyPlan
+        copyDefaults(e, s, t, p)
+        let f = pos + 2
+        fi = 0
+        while fi < nf {
+            let fl = v.getBE32(buf, f)
+            f += 4
+            let ci = s.copyCols[fi]
+            if fl < 0 {
+                ex.setNullReg(p, ci)
+            } else {
+                p.rNull[ci] = 0
+                // the value is decoded from its own copy: text-like registers keep a view of it
+                dml.bindBinary(p, ci, v.sqlType(t.cols[ci].type), buf.slice(f, f + fl))
+                if !p.err && t.cols[ci].typmod >= 0 && v.isExtType(t.cols[ci].type) {
+                    ex.castReg(p, ci, t.cols[ci].type, ci, t.cols[ci].type, t.cols[ci].typmod, false, 0)
+                }
+                if p.err {
+                    s.copyErr = errOut(s, p.errCode, p.errMsg + ", COPY " + t.name + ", line " + Text(s.copyRows + 1), 0)
+                    ex.clearError(p)
+                    return
+                }
+                f += fl
+            }
+            fi += 1
+        }
+        copyStoreRow(e, s, t, p)
+        if s.copyErr.status == STATUS_ERROR { return }
+        pos = f
+    }
+    if pos > 0 { s.copyBuf = buf.slice(pos, n) }
+    let tx = e.tm.txns[s.txSlot]
+    maybeSpill(e, s, tx)
+}
+
+// Registers of the columns a COPY does not list: their defaults (constants and serial counters), else NULL.
+function copyDefaults(e: Engine, s: Session, t: tb.Table, p: ex.Plan) {
+    let nc = t.cols.length
+    let i = 0
+    while i < nc {
+        ex.setNullReg(p, i)
+        i += 1
+    }
+    if s.copyCols.length == nc { return }
+    i = 0
+    while i < nc {
+        let listed = false
+        for ci in s.copyCols {
+            if ci == i { listed = true }
+        }
+        let c = t.cols[i]
+        if !listed && c.defaultKind == 2 {
+            let tx = e.tm.txns[s.txSlot]
+            t.serial += 1
+            ex.setIntReg(p, i, t.serial)
+            tx.redo.add(dml.R_SERIAL)
+            tb.putVarint(tx.redo, t.id)
+            tb.putVarint(tx.redo, t.serial)
+        } else if !listed && c.defaultKind == 1 && !c.defaultNull {
+            let d = Bytes(c.defaultText)
+            ex.parseInto(p, d, 0, d.length, false, i, c.type, c.typmod, 0)
+        }
+        i += 1
+    }
+}
+
+// Not-null checks, then store the row in the registers (one per column) and log it.
+function copyStoreRow(e: Engine, s: Session, t: tb.Table, p: ex.Plan) {
+    let tx = e.tm.txns[s.txSlot]
+    let nc = t.cols.length
+    let i = 0
+    while i < nc {
+        if t.cols[i].notNull && p.rNull[i] != 0 {
+            s.copyErr = errOut(s, "23502", "null value in column \"" + t.cols[i].name + "\" of relation \"" + t.name + "\" violates not-null constraint", 0)
+            return
+        }
+        i += 1
+    }
+    let r = tb.reserveRow(t, tb.ST_DEAD + tb.ST_NEW)
+    i = 0
+    while i < nc {
+        ex.storeCell(p, i, t.cols[i], r)
+        i += 1
+    }
+    if s.copyBulk < 0 {
+        s.copyBulk = tx.uCount
+        txn.addBulkUndo(tx, t, r, r + 1)
+    } else {
+        txn.extendBulkUndo(tx, s.copyBulk, r + 1)
+    }
+    if t.hashIds.length > 0 || t.ordIds.length > 0 || t.searchIds.length > 0 { cat.indexInsertRow(e.c, t, r) }
+    tx.redo.add(dml.R_INSERT)
+    tb.putVarint(tx.redo, t.id)
+    tb.putVarint(tx.redo, r)
+    tb.encodeRow(t, r, tx.redo)
+    s.copyRows += 1
+}
+
 function copyLine(e: Engine, s: Session, b: Bytes, start: Integer, end: Integer) {
     let e0 = end
     if e0 > start && b[e0 - 1] == 13 { e0 -= 1 }
@@ -3358,15 +4031,17 @@ function copyLine(e: Engine, s: Session, b: Bytes, start: Integer, end: Integer)
         return
     }
     let t = e.c.tables[s.copyTable]
-    let p = s.copyPlan
-    let tx = e.tm.txns[s.txSlot]
-    let nc = t.cols.length
-    // defaults for columns not listed: NULL
-    let i = 0
-    while i < nc {
-        ex.setNullReg(p, i)
-        i += 1
+    let line = b.slice(start, e0)
+    let bad = lexer.invalidUtf8At(line)
+    if bad >= 0 {
+        // complete lines only: a CopyData message may split a multi-byte character, a line may not
+        let hex = "0123456789abcdef"
+        s.copyErr = errOut(s, "22021", "invalid byte sequence for encoding \"UTF8\": 0x" + hex.slice(line[bad] >> 4, (line[bad] >> 4) + 1) +
+            hex.slice(line[bad] & 15, (line[bad] & 15) + 1) + ", COPY " + t.name + ", line " + Text(s.copyRows + 1), 0)
+        return
     }
+    let p = s.copyPlan
+    copyDefaults(e, s, t, p)
     let field = 0
     let pos = start
     let delim = s.copyDelim
@@ -3443,32 +4118,7 @@ function copyLine(e: Engine, s: Session, b: Bytes, start: Integer, end: Integer)
         s.copyErr = errOut(s, "22P04", "extra data after last expected column", 0)
         return
     }
-    i = 0
-    while i < nc {
-        if t.cols[i].notNull && p.rNull[i] != 0 {
-            s.copyErr = errOut(s, "23502", "null value in column \"" + t.cols[i].name + "\" of relation \"" + t.name + "\" violates not-null constraint", 0)
-            return
-        }
-        i += 1
-    }
-    let r = tb.reserveRow(t, tb.ST_DEAD + tb.ST_NEW)
-    i = 0
-    while i < nc {
-        ex.storeCell(p, i, t.cols[i], r)
-        i += 1
-    }
-    if s.copyBulk < 0 {
-        s.copyBulk = tx.uCount
-        txn.addBulkUndo(tx, t, r, r + 1)
-    } else {
-        txn.extendBulkUndo(tx, s.copyBulk, r + 1)
-    }
-    if t.hashIds.length > 0 || t.ordIds.length > 0 { cat.indexInsertRow(e.c, t, r) }
-    tx.redo.add(dml.R_INSERT)
-    tb.putVarint(tx.redo, t.id)
-    tb.putVarint(tx.redo, r)
-    tb.encodeRow(t, r, tx.redo)
-    s.copyRows += 1
+    copyStoreRow(e, s, t, p)
 }
 
 function unescapeCopy(b: Bytes, start: Integer, end: Integer): Bytes {
@@ -3496,7 +4146,11 @@ function unescapeCopy(b: Bytes, start: Integer, end: Integer): Bytes {
 
 public function copyDone(e: Engine, s: Session): Outcome {
     if s.copyTable >= 0 && s.copyErr.status != STATUS_ERROR && s.copyBuf.length > 0 {
-        copyLine(e, s, s.copyBuf, 0, s.copyBuf.length)
+        if s.copyBinary {
+            s.copyErr = errOut(s, "22P04", "unexpected EOF in COPY data", 0)
+        } else {
+            copyLine(e, s, s.copyBuf, 0, s.copyBuf.length)
+        }
     }
     let failed = s.copyErr
     // foreign keys of the loaded rows (the bulk undo entry onwards)
@@ -3617,8 +4271,7 @@ function pubStep(e: Engine, blocking: Boolean) {
                 return
             }
             wal.syncNow(w)
-            e.durable = wal.durableLsn(w)
-            releaseDurable(e, e.durable)
+            releaseDurable(e, effectiveDurable(e, wal.durableLsn(w)))
         }
         let k = 0
         if e.curSlot == 0 { k = 1 }
@@ -3684,8 +4337,7 @@ function pubDone(e: Engine) {
     e.lastCkptTick = e.ticks
     e.ckptGen += 1
     e.tm.lockEpoch += 1             // wake sessions parked in CHECKPOINT
-    e.durable = wal.durableLsn(w)
-    releaseDurable(e, e.durable)
+    releaseDurable(e, effectiveDurable(e, wal.durableLsn(w)))
 }
 
 // Blocking checkpoint (close, shutdown): finish the running one, then one at the current end of the WAL.

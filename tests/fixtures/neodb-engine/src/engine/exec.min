@@ -12,6 +12,12 @@ use "./numeric.min" as nm
 use "./strfn.min" as sf
 use "./pgcatalog.min" as pgc
 use "./regex.min" as rx
+use "./json.min" as js
+use "../sql/lexer.min" as lexer
+use "./ext.min" as ext
+use "../search/index.min" as si
+use "neodb-sdk" as sdk
+use "../../lib/dbio.min" as dbio
 
 // ---- value classes
 public constant CL_INT = 0
@@ -53,6 +59,13 @@ public constant EX_NOW = 27
 public constant EX_REGEX = 50
 public constant EX_SUBSCRIPT = 51
 public constant EX_FIELD = 52
+public constant EX_JSON = 56     // json -> key|index (ec bit 0: ->> text result, bit 1: integer index)
+public constant EX_JSONOP = 57   // jsonb @> (ec 1) and ? (ec 2): Boolean
+public constant EX_EXTFN = 60    // extension function (ext.min): a = args start, b = count, c = function, d = call
+// full-text search (src/search/index.min): c = search state (p.searches)
+public constant EX_SEARCH = 61       // col ==> query: a = column expr, b = query text expr
+public constant EX_SEARCH_SCORE = 62 // tin.score(ctid): exact BM25 of the current row
+public constant EX_SEARCH_HL = 63    // tin.highlight(col): a = text expr
 
 // arithmetic modes
 public constant AM_INT = 0
@@ -150,6 +163,7 @@ public constant FN_OVERLAY = 204
 public constant FN_UNISTR = 205
 public constant FN_SHA = 206            // ed: 224, 256, 384, 512
 public constant FN_MD5_HEX = 207
+public constant FN_PG_NOTIFY = 390   // pg_notify(channel, payload): queued on env.notes, the engine delivers it
 public constant FN_ENCODE = 208
 public constant FN_DECODE = 209
 public constant FN_FORMAT = 210         // ed: 1 when the last argument is a VARIADIC text[] (not used yet)
@@ -187,12 +201,14 @@ public constant O_MAT = 13
 public constant O_DISTINCT = 14
 public constant O_SETOP = 15
 public constant O_TEMPSCAN = 16
+public constant O_REC = 18        // WITH RECURSIVE: a = anchor, b = result temp, c = slot, d = working temp, e = olist [n, recursive root, all, next temp, anchor exprs, recursive exprs]
 public constant O_APPEND = 17     // partitioned table: b = temp, c = output slot, e = olist [n, (root, ncols, expr...)...]
 // compat agent: catalog relation (a = slot, b = temp, c = relation code, d = state node), set-returning function in
 // the select list (a = child, b = temp, c = slot, d = arg expr, e = kind), window functions (see buildWindow)
 public constant O_CATALOG = 50
 public constant O_SRF = 51
 public constant O_WINDOW = 52
+public constant O_SEARCH = 53     // full-text search scan: a = slot, b = search state, c = residual filter
 
 // aggregate kinds
 public constant AG_COUNT_STAR = 1
@@ -222,6 +238,9 @@ public constant AG_REGR_INTERCEPT = 109
 public constant AG_COVAR_POP = 110
 public constant AG_COVAR_SAMP = 111
 public constant AG_CORR = 112
+// extension aggregate (sdk Extension.aggregate): spec field 6 = its call (p.calls), field 7 = ext.agg index; the
+// group's state is the aggregate column's bytes, replaced by each step and turned into the result by finish
+public constant AG_EXT = 200
 // aggregate spec stride: kind, arg, distinct map+1, filter, extra node (min/max tmp, string_agg separator),
 // distinct temp, second arg, first regression column
 public constant AGS = 8
@@ -234,6 +253,7 @@ public record Env {
     randState: Integer
     session: Integer       // session running the current statement (temp-table namespace)
     tempCount: Integer     // live temp tables in the catalog (0: no temp lookups, plan cache usable)
+    notes: List<Text>      // pg_notify(channel, payload) calls of the running statement, as pairs
 }
 
 public record Plan {
@@ -293,6 +313,9 @@ public record Plan {
     nanText: Bytes
     regexNodes: List<Integer>
     regexes: List<rx.Regex>
+    calls: List<sdk.Call>    // EX_EXTFN calls (ed); calls[0] serves extension type input/output (created lazily)
+    host: sdk.Host
+    searches: List<SearchState>
 }
 
 public function newPlan(env: Env): Plan {
@@ -303,7 +326,7 @@ public function newPlan(env: Env): Plan {
         slotTable: []; slotBase: []; slotScratch: []; slotRow: []; slotOrig: []
         temps: []; maps: []; chains: []; keys: []
         err: false; errCode: ""; errMsg: ""; errDetail: ""; blockedBy: -1; env: env; empty: Bytes(); pq: v.newParsed()
-        numBuf: Bytes(); nanText: Bytes("NaN"); regexNodes: []; regexes: []
+        numBuf: Bytes(); nanText: Bytes("NaN"); regexNodes: []; regexes: []; calls: []; host: extHost(); searches: []
     }
 }
 
@@ -353,6 +376,283 @@ public function addExpr(p: Plan, kind: Integer, type: Integer, a: Integer, b: In
     p.scratch.add(p.empty)
     p.scratchOwned.add(0)
     return n
+}
+
+// ---------------------------------------------------------------- extensions (ext.min, neodb-sdk)
+
+function hostAddFloat(out: Bytes, f: Float, isFloat4: Boolean) { v.addFloat(out, f, isFloat4) }
+
+global HOST_PARSED: v.Parsed = v.newParsed()
+
+function hostParseFloat(b: Bytes, o: Integer, l: Integer, isFloat4: Boolean, r: sdk.ParsedFloat) {
+    let q = HOST_PARSED
+    if isFloat4 { v.parseFloat4(b, o, l, q) } else { v.parseFloat(b, o, l, q) }
+    r.ok = q.ok
+    r.value = q.f
+    r.outOfRange = q.aux == 1
+}
+
+public function extHost(): sdk.Host { return sdk.Host {
+    addFloat: function(out, f, isFloat4) { hostAddFloat(out, f, isFloat4) }
+    parseFloat: function(b, o, l, isFloat4, r) { hostParseFloat(b, o, l, isFloat4, r) }
+    clock: function() { return dbio.wallClockMicros() }
+    random: function(count) { return dbio.randomBytes(count) }
+} }
+
+// A Call for an EX_EXTFN node; returns its position in p.calls (position 0 is the type I/O call).
+public function addCall(p: Plan, arguments: Integer): Integer {
+    ioCall(p)
+    p.calls.add(ext.newCall(arguments, p.host))
+    return p.calls.length - 1
+}
+
+function ioCall(p: Plan): sdk.Call {
+    if p.calls.length == 0 { p.calls.add(ext.newCall(2, p.host)) }
+    return p.calls[0]
+}
+
+function callFailed(p: Plan, c: sdk.Call): Boolean {
+    if !c.failed { return false }
+    raise(p, c.failCode, c.failMessage)
+    return true
+}
+
+function setCallArg(p: Plan, c: sdk.Call, i: Integer, n: Integer) {
+    c.nulls[i] = p.rNull[n] != 0
+    let cl = classOf(p.et[n])
+    if cl == CL_FLT {
+        c.floats[i] = p.rFlt[n]
+    } else if cl == CL_TEXT {
+        c.buffers[i] = p.rBuf[n]
+        c.offsets[i] = p.rOff[n]
+        c.lengths[i] = p.rLen[n]
+    } else {
+        c.integers[i] = p.rInt[n]
+    }
+}
+
+// Store a call's result in register n (type t). Byte results are left in the node's scratch (c.output).
+function takeCallResult(p: Plan, c: sdk.Call, n: Integer, t: Integer) {
+    if c.resultNull {
+        p.rNull[n] = 1
+        return
+    }
+    p.rNull[n] = 0
+    let cl = classOf(t)
+    if cl == CL_FLT {
+        p.rFlt[n] = c.resultFloat
+        if t == v.T_FLOAT4 {
+            let b = p.numBuf
+            b.clear()
+            b.addFloat32(c.resultFloat)
+            p.rFlt[n] = b.getFloat32(0)
+        }
+    } else if cl == CL_TEXT {
+        p.rBuf[n] = c.output
+        p.rOff[n] = 0
+        p.rLen[n] = c.output.length
+    } else {
+        p.rInt[n] = c.resultInteger
+        if t == v.T_BOOL && p.rInt[n] != 0 { p.rInt[n] = 1 }
+    }
+}
+
+function evalExtFn(p: Plan, n: Integer) {
+    let start = p.ea[n]
+    let cnt = p.eb[n]
+    let c = p.calls[p.ed[n]]
+    let i = 0
+    while i < cnt {
+        let a = p.eargs[start + i]
+        ev(p, a)
+        if p.err { return }
+        if p.rNull[a] != 0 {
+            // extension functions are strict: a null argument gives a null result without a call
+            p.rNull[n] = 1
+            return
+        }
+        setCallArg(p, c, i, a)
+        i += 1
+    }
+    c.begin()
+    c.output = scratchOf(p, n)
+    c.modifier = -1
+    let f = ext.fn(p.ec[n])
+    f.def.body(c)
+    if callFailed(p, c) { return }
+    takeCallResult(p, c, n, p.et[n])
+}
+
+// Cast node n of literal a to an extension type: the literal cannot change during one execution, so it is
+// converted once (eState, reset per execution by dml.resetForRun) and later rows reuse register n.
+function extCastCached(p: Plan, n: Integer, a: Integer): Boolean {
+    if p.eState[n] == 0 || p.ek[a] != EX_CONST || !v.isExtType(p.et[n]) { return false }
+    p.rNull[n] = 0
+    return true
+}
+
+function extCastRemember(p: Plan, n: Integer, a: Integer) {
+    if p.err || p.ek[a] != EX_CONST || p.rNull[a] != 0 || p.rNull[n] != 0 || !v.isExtType(p.et[n]) { return }
+    p.eState[n] = 1
+}
+
+// Text -> extension type value in register dst (the type's input function; typmod checked there).
+function extInput(p: Plan, b: Bytes, o: Integer, l: Integer, dst: Integer, to: Integer, typmod: Integer) {
+    let c = ioCall(p)
+    c.nulls[0] = false
+    c.buffers[0] = b
+    c.offsets[0] = o
+    c.lengths[0] = l
+    c.begin()
+    c.output = scratchOf(p, dst)
+    c.modifier = typmod
+    ext.typeDef(to).input(c)
+    if callFailed(p, c) { return }
+    takeCallResult(p, c, dst, to)
+}
+
+// Extension value in register src -> its text form appended to out.
+function extOutput(p: Plan, src: Integer, t: Integer, out: Bytes) {
+    let c = ioCall(p)
+    c.nulls[0] = false
+    c.buffers[0] = p.rBuf[src]
+    c.offsets[0] = p.rOff[src]
+    c.lengths[0] = p.rLen[src]
+    c.begin()
+    c.output = out
+    c.modifier = -1
+    ext.typeDef(t).output(c)
+    callFailed(p, c)
+}
+
+global EXT_COMPARE: List<sdk.Call> = []
+
+// ORDER BY on an extension type: its ordering callback when it declares one, else the stored bytes.
+function extCompareCells(c: tb.Column, a: Integer, b: Integer): Integer {
+    let d = ext.typeDef(c.type)
+    if !d.hasCompare { return ix.cmpCells(c, a, c, b) }
+    if EXT_COMPARE.length == 0 { EXT_COMPARE.add(ext.newCall(2, extHost())) }
+    let call = EXT_COMPARE[0]
+    call.nulls[0] = false
+    call.buffers[0] = c.heap
+    call.offsets[0] = tb.textOff(c, a)
+    call.lengths[0] = tb.textLen(c, a)
+    call.nulls[1] = false
+    call.buffers[1] = c.heap
+    call.offsets[1] = tb.textOff(c, b)
+    call.lengths[1] = tb.textLen(c, b)
+    call.begin()
+    d.compare(call)
+    return call.resultInteger
+}
+
+// Text form of a stored extension value outside an expression (change feeds, error details).
+public function extText(t: Integer, b: Bytes, o: Integer, l: Integer): Text {
+    let c = ext.newCall(1, extHost())
+    c.buffers[0] = b
+    c.offsets[0] = o
+    c.lengths[0] = l
+    c.begin()
+    c.output = Bytes()
+    ext.typeDef(t).output(c)
+    if c.failed { return "" }
+    return Text(c.output)
+}
+
+// Binary wire form of an extension value (send); without one, the text form.
+function extSend(p: Plan, src: Integer, t: Integer, out: Bytes) {
+    let d = ext.typeDef(t)
+    let at = out.length
+    out.addInt32(0)
+    if d.hasBinary {
+        let c = ioCall(p)
+        c.nulls[0] = false
+        c.buffers[0] = p.rBuf[src]
+        c.offsets[0] = p.rOff[src]
+        c.lengths[0] = p.rLen[src]
+        c.begin()
+        c.output = out
+        c.modifier = -1
+        d.send(c)
+        callFailed(p, c)
+    } else {
+        extOutput(p, src, t, out)
+    }
+    v.setBE32(out, at, out.length - at - 4)
+}
+
+// Binary wire form -> extension value in register dst (receive); without one, the text form.
+public function extReceive(p: Plan, b: Bytes, dst: Integer, to: Integer, typmod: Integer) {
+    let d = ext.typeDef(to)
+    if !d.hasBinary {
+        extInput(p, b, 0, b.length, dst, to, typmod)
+        return
+    }
+    let c = ioCall(p)
+    c.nulls[0] = false
+    c.buffers[0] = b
+    c.offsets[0] = 0
+    c.lengths[0] = b.length
+    c.begin()
+    c.output = scratchOf(p, dst)
+    c.modifier = typmod
+    d.receive(c)
+    if callFailed(p, c) { return }
+    takeCallResult(p, c, dst, to)
+}
+
+// Extension value in src checked against typmod (vector(3)) into dst.
+function extCheck(p: Plan, src: Integer, dst: Integer, t: Integer, typmod: Integer) {
+    copyReg(p, src, dst)
+    let d = ext.typeDef(t)
+    if typmod < 0 || !d.hasCheck { return }
+    let c = ioCall(p)
+    c.nulls[0] = false
+    c.buffers[0] = p.rBuf[src]
+    c.offsets[0] = p.rOff[src]
+    c.lengths[0] = p.rLen[src]
+    c.begin()
+    c.modifier = typmod
+    d.check(c)
+    callFailed(p, c)
+}
+
+// Casts that involve an extension type: text <-> extension (input/output), extension -> itself (typmod), and
+// casts an extension declares (vector -> halfvec).
+function extCast(p: Plan, src: Integer, from: Integer, dst: Integer, to: Integer, typmod: Integer) {
+    if from == to {
+        extCheck(p, src, dst, to, typmod)
+        return
+    }
+    let ci = 0
+    while ci < ext.castCount() {
+        let k = ext.castAt(ci)
+        if k.resolved && k.from == from && k.to == to {
+            let c = ioCall(p)
+            setCallArg(p, c, 0, src)
+            c.begin()
+            c.output = scratchOf(p, dst)
+            c.modifier = typmod
+            k.def.body(c)
+            if callFailed(p, c) { return }
+            takeCallResult(p, c, dst, to)
+            return
+        }
+        ci += 1
+    }
+    if v.isExtType(to) {
+        if v.isTextType(from) && !v.isExtType(from) {
+            extInput(p, p.rBuf[src], p.rOff[src], p.rLen[src], dst, to, typmod)
+            return
+        }
+    } else if v.isTextType(to) {
+        let s = scratchOf(p, dst)
+        extOutput(p, src, from, s)
+        if p.err { return }
+        setTextReg(p, dst, s, 0, s.length)
+        return
+    }
+    raise(p, "42846", "cannot cast type " + v.typeName(from) + " to " + v.typeName(to))
 }
 
 public function addArgs(p: Plan, args: List<Integer>): Integer {
@@ -846,6 +1146,10 @@ public function keyFromReg(p: Plan, k: ix.Key, i: Integer, n: Integer) {
 // ---------------------------------------------------------------- text output (PG text format)
 
 public function formatReg(p: Plan, n: Integer, t: Integer, out: Bytes) {
+    if v.isExtType(t) {
+        extOutput(p, n, t, out)
+        return
+    }
     if t == v.T_INT4 || t == v.T_INT8 || t == v.T_INT2 || t == v.T_OID {
         v.addInt(out, p.rInt[n])
         return
@@ -918,6 +1222,11 @@ public function formatReg(p: Plan, n: Integer, t: Integer, out: Bytes) {
         if name == "" { v.addInt(out, p.rInt[n]) } else { v.addText(out, pgc.quoteIdent(name)) }
         return
     }
+    if t == v.T_REGTYPE {
+        let name = pgc.typeNameByOid(p.env.cat, p.rInt[n])
+        if name == "" { v.addInt(out, p.rInt[n]) } else { v.addText(out, name) }
+        return
+    }
     v.addInt(out, p.rInt[n])
 }
 
@@ -938,7 +1247,11 @@ public function encodeField(p: Plan, n: Integer, t: Integer, fmt: Integer, out: 
 }
 
 function encodeBinary(p: Plan, n: Integer, t: Integer, out: Bytes) {
-    if t == v.T_INT4 || t == v.T_DATE || t == v.T_OID || t == v.T_XID || t == v.T_REGCLASS {
+    if v.isExtType(t) {
+        extSend(p, n, t, out)
+        return
+    }
+    if t == v.T_INT4 || t == v.T_DATE || t == v.T_OID || t == v.T_XID || t == v.T_REGCLASS || t == v.T_REGTYPE {
         v.addBE32(out, 4)
         v.addBE32(out, p.rInt[n])
         return
@@ -1196,6 +1509,10 @@ function boolWord(b: Boolean): Bytes {
 public function castReg(p: Plan, src: Integer, from: Integer, dst: Integer, to: Integer, typmod: Integer, explicit: Boolean, unitHint: Integer) {
     if p.rNull[src] != 0 {
         p.rNull[dst] = 1
+        return
+    }
+    if v.isExtType(from) || v.isExtType(to) {
+        extCast(p, src, from, dst, to, typmod)
         return
     }
     let fc = classOf(from)
@@ -1664,14 +1981,40 @@ function typeErrorText(t: Integer): Text {
     return v.typeName(t)
 }
 
+// Text of a byte range for messages; bytes that are not UTF-8 (client input) are shown as U+FFFD instead of
+// stopping the program in the Text conversion.
 function viewText(b: Bytes, o: Integer, l: Integer): Text {
-    return Text(b.slice(o, o + l))
+    let raw = b.slice(o, o + l)
+    if lexer.invalidUtf8At(raw) < 0 { return Text(raw) }
+    let out = Bytes()
+    for x in raw {
+        if x < 128 { out.add(x) } else {
+            out.add(239)
+            out.add(191)
+            out.add(189)
+        }
+    }
+    return Text(out)
+}
+
+// A text-format value from the client that is not valid UTF-8: the PostgreSQL error, true if raised.
+public function rejectInvalidUtf8(p: Plan, b: Bytes): Boolean {
+    let bad = lexer.invalidUtf8At(b)
+    if bad < 0 { return false }
+    let hex = "0123456789abcdef"
+    raise(p, "22021", "invalid byte sequence for encoding \"UTF8\": 0x" + hex.slice(b[bad] >> 4, (b[bad] >> 4) + 1) +
+        hex.slice(b[bad] & 15, (b[bad] & 15) + 1))
+    return true
 }
 
 // Parse text into register dst of type `to`.
 public function parseInto(p: Plan, b: Bytes, o: Integer, l: Integer, fromBpchar: Boolean, dst: Integer, to: Integer, typmod: Integer, unitHint: Integer) {
     let q = p.pq
     p.rNull[dst] = 0
+    if v.isExtType(to) {
+        extInput(p, b, o, l, dst, to, typmod)
+        return
+    }
     if to == v.T_INT4 || to == v.T_INT8 || to == v.T_INT2 || to == v.T_OID {
         let lo = -9223372036854775807 - 1
         let hi = 9223372036854775807
@@ -1810,6 +2153,27 @@ public function parseInto(p: Plan, b: Bytes, o: Integer, l: Integer, fromBpchar:
             return
         }
         p.rInt[dst] = q.i
+        return
+    }
+    if to == v.T_REGTYPE {
+        // a type name or a numeric oid; unitHint 1 (to_regtype): an unknown name gives NULL
+        let q3 = v.newParsed()
+        v.parseInt(b, o, l, q3, 0, 4294967295)
+        if q3.ok {
+            p.rInt[dst] = q3.i
+            return
+        }
+        let tname = viewText(b, o, l)
+        let toid = pgc.typeOidByName(p.env.cat, tname)
+        if toid < 0 {
+            if unitHint == 1 {
+                p.rNull[dst] = 1
+                return
+            }
+            raise(p, "42704", "type \"" + tname + "\" does not exist")
+            return
+        }
+        p.rInt[dst] = toid
         return
     }
     if to == v.T_REGCLASS {
@@ -1991,7 +2355,7 @@ function constNode(p: Plan, n: Integer): Boolean {
     if k == EX_CASE { return cst(p, p.ea[n]) && argsConst(p, p.eb[n], 2 * p.ec[n]) && cst(p, p.ed[n]) }
     if k == EX_FUNC {
         let fn = p.ec[n]
-        if fn == FN_RANDOM || fn == FN_TEXTCONST || (fn >= FN_CAT_BASE && fn <= FN_CAT_END) { return false }
+        if fn == FN_RANDOM || fn == FN_TEXTCONST || fn == FN_PG_NOTIFY || (fn >= FN_CAT_BASE && fn <= FN_CAT_END) { return false }
         return argsConst(p, p.ea[n], p.eb[n])
     }
     return false
@@ -2353,6 +2717,14 @@ public function ev(p: Plan, n: Integer) {
         return
     }
     if k == EX_CONST || k == EX_PARAM { return }
+    if k == EX_EXTFN {
+        evalExtFn(p, n)
+        return
+    }
+    if k == EX_SEARCH || k == EX_SEARCH_SCORE || k == EX_SEARCH_HL {
+        evalSearchExpr(p, n)
+        return
+    }
     if k == EX_CMP {
         let a = p.ea[n]
         let b = p.eb[n]
@@ -2453,7 +2825,9 @@ public function ev(p: Plan, n: Integer) {
     if k == EX_CAST {
         let a = p.ea[n]
         ev(p, a)
+        if extCastCached(p, n, a) { return }
         castReg(p, a, p.et[a], n, p.et[n], p.ec[n], p.eb[n] == 1, p.ed[n])
+        extCastRemember(p, n, a)
         return
     }
     if k == EX_LITCAST {
@@ -2463,8 +2837,10 @@ public function ev(p: Plan, n: Integer) {
             p.rNull[n] = 1
             return
         }
+        if extCastCached(p, n, a) { return }
         if classOf(p.et[a]) == CL_TEXT {
             parseInto(p, p.rBuf[a], p.rOff[a], p.rLen[a], false, n, p.et[n], p.ec[n], p.ed[n])
+            extCastRemember(p, n, a)
         } else {
             castReg(p, a, p.et[a], n, p.et[n], p.ec[n], false, p.ed[n])
         }
@@ -2692,6 +3068,22 @@ public function ev(p: Plan, n: Integer) {
         evalRegex(p, n)
         return
     }
+    if k == EX_JSON {
+        evalJson(p, n)
+        return
+    }
+    if k == EX_JSONOP {
+        let a = p.ea[n]
+        let b = p.eb[n]
+        if !evalStrictPair(p, n, a, b) { return }
+        if p.rNull[a] != 0 || p.rNull[b] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        if p.ec[n] == 1 { setBoolReg(p, n, js.contains(p.rBuf[a], p.rOff[a], p.rOff[a] + p.rLen[a], p.rBuf[b], p.rOff[b], p.rOff[b] + p.rLen[b])) }
+        else { setBoolReg(p, n, js.hasKey(p.rBuf[a], p.rOff[a], p.rLen[a], p.rBuf[b], p.rOff[b], p.rLen[b])) }
+        return
+    }
     if k == EX_SUBSCRIPT {
         evalSubscript(p, n)
         return
@@ -2701,6 +3093,40 @@ public function ev(p: Plan, n: Integer) {
         return
     }
     raise(p, "0A000", "unsupported expression kind " + Text(k))
+}
+
+function evalJson(p: Plan, n: Integer) {
+    let a = p.ea[n]
+    let b = p.eb[n]
+    if !evalStrictPair(p, n, a, b) { return }
+    if p.rNull[a] != 0 || p.rNull[b] != 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let f = p.ec[n]
+    let doc = p.rBuf[a]
+    let at = -1
+    if (f & 2) != 0 { at = js.find(doc, p.rOff[a], p.rLen[a], doc, 0, 0, true, p.rInt[b]) }
+    else { at = js.find(doc, p.rOff[a], p.rLen[a], p.rBuf[b], p.rOff[b], p.rLen[b], false, 0) }
+    if at < 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let start = at >> 32
+    let len = at & 4294967295
+    if (f & 1) != 0 {
+        if js.isNullLiteral(doc, start, len) {
+            p.rNull[n] = 1
+            return
+        }
+        if js.isString(doc, start, len) {
+            let s = scratchOf(p, n)
+            js.unescapeInto(s, doc, start, start + len)
+            setTextReg(p, n, s, 0, s.length)
+            return
+        }
+    }
+    setTextReg(p, n, doc, start, len)
 }
 
 public function appendView(out: Bytes, b: Bytes, o: Integer, l: Integer) {
@@ -2907,6 +3333,21 @@ function argAt(p: Plan, n: Integer, i: Integer): Integer {
 
 function evalFunc(p: Plan, n: Integer) {
     let fn = p.ec[n]
+    if fn == FN_PG_NOTIFY {
+        let ch = argAt(p, n, 0)
+        let pl = argAt(p, n, 1)
+        ev(p, ch)
+        ev(p, pl)
+        p.rNull[n] = 1
+        if p.rNull[ch] != 0 { return }
+        if p.rLen[ch] == 0 {
+            raise(p, "22023", "channel name cannot be empty")
+            return
+        }
+        p.env.notes.add(viewText(p.rBuf[ch], p.rOff[ch], p.rLen[ch]))
+        if p.rNull[pl] != 0 { p.env.notes.add("") } else { p.env.notes.add(viewText(p.rBuf[pl], p.rOff[pl], p.rLen[pl])) }
+        return
+    }
     if fn != FN_CONCAT && fn != FN_CONCAT_WS && (fn < FN_STR_BASE || fn >= FN_GCD) {
         let j = 0
         let cntj = p.eb[n]
@@ -3788,7 +4229,7 @@ function evalStrFunc(p: Plan, n: Integer) {
         if fn == FN_UNISTR {
             sf.unistr(b, o, l, s, e)
         } else {
-            let fmt = Text(p.rBuf[a1].slice(p.rOff[a1], p.rOff[a1] + p.rLen[a1]))
+            let fmt = viewText(p.rBuf[a1], p.rOff[a1], p.rLen[a1])
             if fn == FN_ENCODE { sf.encode(fmt, b, o, l, s, e) } else { sf.decode(fmt, b, o, l, s, e) }
         }
         if e.code != "" {
@@ -3928,6 +4369,10 @@ public function open(p: Plan, o: Integer) {
         openHashEq(p, o)
         return
     }
+    if k == O_SEARCH {
+        openSearch(p, o)
+        return
+    }
     if k == O_RANGE {
         openRange(p, o)
         return
@@ -3996,6 +4441,13 @@ public function open(p: Plan, o: Integer) {
         if p.od[o] > 0 && lim < 0 && p.ob[o] >= 0 { raise(p, "2201W", "row count cannot be null in FETCH FIRST ... WITH TIES clause") }
         p.os2[o] = lim
         p.os3[o] = off
+        // ORDER BY ... LIMIT: the sort below only has to keep the first lim + off rows (not WITH TIES)
+        let below = p.oa[o]
+        if p.ok[below] == O_SORT {
+            // od of a sort is otherwise unused; open() resets the os* state, so the bound travels here
+            p.od[below] = 0
+            if lim > 0 && p.od[o] == 0 { p.od[below] = lim + off }
+        }
         // LIMIT 0 never runs its input (no evaluation side effects such as division errors)
         if lim != 0 { open(p, p.oa[o]) }
         return
@@ -4005,6 +4457,10 @@ public function open(p: Plan, o: Integer) {
     }
     if k == O_VALUES || k == O_MAT {
         buildMat(p, o)
+        return
+    }
+    if k == O_REC {
+        buildRec(p, o)
         return
     }
     if k == O_SERIES {
@@ -4120,6 +4576,7 @@ public function next(p: Plan, o: Integer): Boolean {
     }
     if k == O_HASHEQ { return nextHashEq(p, o) }
     if k == O_RANGE { return nextRange(p, o) }
+    if k == O_SEARCH { return nextSearch(p, o) }
     if k == O_FILTER {
         let c = p.oa[o]
         let f = p.oc[o]
@@ -4131,7 +4588,7 @@ public function next(p: Plan, o: Integer): Boolean {
     }
     if k == O_NL { return nextNL(p, o) }
     if k == O_HASHJ { return nextHashJoin(p, o) }
-    if k == O_AGG || k == O_SORT || k == O_VALUES || k == O_MAT || k == O_SETOP || k == O_TEMPSCAN || k == O_APPEND {
+    if k == O_AGG || k == O_SORT || k == O_VALUES || k == O_MAT || k == O_SETOP || k == O_TEMPSCAN || k == O_APPEND || k == O_REC {
         return nextTemp(p, o)
     }
     if k == O_LIMIT {
@@ -4650,6 +5107,106 @@ function buildMat(p: Plan, o: Integer) {
     }
 }
 
+// ---- WITH RECURSIVE. Rows produced so far live in the result temp; each iteration scans the working temp (the
+// rows the previous iteration added) through the recursive term and collects new rows into the next temp, which
+// then becomes the working temp. UNION drops rows equal to one already produced (hash of the encoded row, then an
+// exact comparison). A row limit stops runaway recursion with an error instead of exhausting memory.
+constant REC_MAX_ROWS = 5000000
+
+function buildRec(p: Plan, o: Integer) {
+    let res = p.temps[p.ob[o]]
+    let workTi = p.od[o]
+    let blk = p.oe[o]
+    let nc = p.olist[blk]
+    let recRoot = p.olist[blk + 1]
+    let all = p.olist[blk + 2] == 1
+    let nextTi = p.olist[blk + 3]
+    tb.truncate(res)
+    tb.truncate(p.temps[workTi])
+    tb.truncate(p.temps[nextTi])
+    let seen = hm.newIntMap(64)
+    let scratch = Bytes()
+    let probe = Bytes()
+    // anchor rows go straight into the working table
+    collectRec(p, p.oa[o], blk + 4, nc, p.temps[workTi], res, all, seen, scratch, probe)
+    let work = p.temps[workTi]
+    let nxt = p.temps[nextTi]
+    while !p.err && work.live > 0 {
+        tb.truncate(nxt)
+        collectRec(p, recRoot, blk + 4 + nc, nc, nxt, res, all, seen, scratch, probe)
+        // the new rows become the working table read by the recursive term's scan; the table object itself must
+        // stay the same (joins restore their slots from the table the plan was built with)
+        tb.truncate(work)
+        let r = 0
+        while r < nxt.nrows {
+            if nxt.state[r] == 0 { tb.copyRow(nxt, r, work, tb.reserveRow(work, 0)) }
+            r += 1
+        }
+    }
+    tb.truncate(p.temps[workTi])
+    tb.truncate(p.temps[nextTi])
+}
+
+// Runs child, evaluates the n expressions at exprs for each row into `into`, and appends each new row to res.
+function collectRec(p: Plan, child: Integer, exprs: Integer, n: Integer, into: tb.Table, res: tb.Table, all: Boolean,
+                    seen: hm.IntMap, scratch: Bytes, probe: Bytes) {
+    open(p, child)
+    while next(p, child) {
+        let row = tb.reserveRow(into, 0)
+        let c = 0
+        while c < n {
+            let e = p.olist[exprs + c]
+            ev(p, e)
+            storeCell(p, e, into.cols[c], row)
+            c += 1
+        }
+        if p.err { return }
+        if !all {
+            scratch.clear()
+            tb.encodeRow(into, row, scratch)
+            let h = rowHash(scratch)
+            let dup = false
+            while hm.contains(seen, h) {
+                probe.clear()
+                tb.encodeRow(res, hm.get(seen, h, 0), probe)
+                if sameBytes(probe, scratch) {
+                    dup = true
+                    break
+                }
+                h = (h + 1) & 4611686018427387903
+            }
+            if dup {
+                into.state[row] = tb.ST_DEAD
+                into.live -= 1
+                continue
+            }
+            hm.put(seen, h, res.nrows)
+        }
+        let r2 = tb.reserveRow(res, 0)
+        tb.copyRow(into, row, res, r2)
+        if res.nrows > REC_MAX_ROWS {
+            raise(p, "54000", "recursive query produced more than " + Text(REC_MAX_ROWS) + " rows")
+            return
+        }
+    }
+}
+
+function rowHash(b: Bytes): Integer {
+    let h = 1469598103934665603
+    for x in b { h = wrappingMultiply(h ^ x, 1099511628211) }
+    return h & 4611686018427387903
+}
+
+function sameBytes(a: Bytes, b: Bytes): Boolean {
+    if a.length != b.length { return false }
+    let i = 0
+    while i < a.length {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    return true
+}
+
 // ---- distinct: a = child, b = temp idx (seen values), e = block [n, exprs...], f = map idx
 function nextDistinct(p: Plan, o: Integer): Boolean {
     let child = p.oa[o]
@@ -4710,6 +5267,20 @@ function buildAgg(p: Plan, o: Integer) {
     chain.clear()
     let child = p.oa[o]
     let extraBase = ng + na
+    // SELECT count(*) ... WHERE col ==> '...': the count comes from the search index's bitmaps
+    if ng == 0 && na == 1 && p.olist[ab] == AG_COUNT_STAR && p.olist[ab + 2] == 0 && p.olist[ab + 3] < 0 &&
+       p.ok[child] == O_SEARCH && p.oc[child] < 0 {
+        let n = searchCount(p, child)
+        if p.err { return }
+        if n >= 0 {
+            let g = newGroup(p, t, blk, ng, na, ab)
+            tb.setInt(t.cols[ng], g, n)
+            finalizeAgg(p, t, ng, na, ab, extraBase)
+            return
+        }
+    }
+    // SELECT col, count(*) ... WHERE body ==> '...' GROUP BY col: count the search result per value of the column
+    if ng == 1 && na >= 1 && p.ok[child] == O_SEARCH && p.oc[child] < 0 && searchFacet(p, o, t, blk, ng, na, ab, extraBase) { return }
     // distinct support: per agg, a set keyed by (group row, value hash) in a separate map (map idx f+1+i)
     open(p, child)
     while next(p, child) {
@@ -4767,7 +5338,7 @@ function newGroup(p: Plan, t: tb.Table, blk: Integer, ng: Integer, na: Integer, 
         let cc = t.cols[ng + na + i * 2]
         tb.setInt(cc, g, 0)
         let rc = p.olist[ab + i * AGS + 7]
-        if rc >= 0 {
+        if rc >= 0 && kind != AG_EXT {
             let j = 0
             while j < 4 {
                 tb.setFloat(t.cols[rc + j], g, 0.0)
@@ -4895,7 +5466,10 @@ function accumulate(p: Plan, o: Integer, t: tb.Table, g: Integer, ng: Integer, n
         }
         let cnt = t.cols[extraBase + i * 2]
         tb.setInt(cnt, g, tb.getInt(cnt, g) + 1)
-        if kind == AG_COUNT {
+        if kind == AG_EXT {
+            extAggStep(p, c, g, arg, p.olist[ab + i * AGS + 6], p.olist[ab + i * AGS + 7])
+            if p.err { return }
+        } else if kind == AG_COUNT {
             tb.setInt(c, g, tb.getInt(c, g) + 1)
         } else if kind == AG_SUM || kind == AG_AVG || kind == AG_STDDEV || kind == AG_VARIANCE || kind == AG_STDDEV_POP || kind == AG_VAR_POP {
             let cl = classOf(c.type)
@@ -5150,10 +5724,62 @@ function finalizeRegr(p: Plan, t: tb.Table, kind: Integer, c: tb.Column, cntCol:
     }
 }
 
+// One extension-aggregate step: state (column bytes, null at first) and the input -> the new state.
+function extAggStep(p: Plan, c: tb.Column, g: Integer, arg: Integer, ci: Integer, ai: Integer) {
+    let call = p.calls[ci]
+    if tb.isNull(c, g) {
+        call.nulls[0] = true
+        call.lengths[0] = 0
+    } else {
+        call.nulls[0] = false
+        call.buffers[0] = c.heap
+        call.offsets[0] = tb.textOff(c, g)
+        call.lengths[0] = tb.textLen(c, g)
+    }
+    setCallArg(p, call, 1, arg)
+    call.begin()
+    call.output = Bytes()
+    call.modifier = -1
+    ext.agg(ai).def.step(call)
+    if callFailed(p, call) { return }
+    if call.resultNull {
+        tb.setNull(c, g)
+        return
+    }
+    tb.clearNull(c, g)
+    tb.setText(c, g, call.output, 0, call.output.length)
+}
+
 function finalizeAgg(p: Plan, t: tb.Table, ng: Integer, na: Integer, ab: Integer, extraBase: Integer) {
     let i = 0
     while i < na {
         let kind = p.olist[ab + i * AGS]
+        if kind == AG_EXT {
+            let c = t.cols[ng + i]
+            let cc = t.cols[extraBase + i * 2]
+            let call = p.calls[p.olist[ab + i * AGS + 6]]
+            let fin = ext.agg(p.olist[ab + i * AGS + 7]).def.finish
+            let g = 0
+            while g < t.nrows {
+                if tb.getInt(cc, g) == 0 || tb.isNull(c, g) {
+                    tb.setNull(c, g)
+                } else {
+                    call.nulls[0] = false
+                    call.buffers[0] = c.heap.slice(tb.textOff(c, g), tb.textOff(c, g) + tb.textLen(c, g))
+                    call.offsets[0] = 0
+                    call.lengths[0] = tb.textLen(c, g)
+                    call.nulls[1] = false
+                    call.integers[1] = tb.getInt(cc, g)
+                    call.begin()
+                    call.output = Bytes()
+                    call.modifier = -1
+                    fin(call)
+                    if callFailed(p, call) { return }
+                    if call.resultNull { tb.setNull(c, g) } else { tb.setText(c, g, call.output, 0, call.output.length) }
+                }
+                g += 1
+            }
+        }
         if kind >= AG_REGR_COUNT && kind <= AG_CORR {
             finalizeRegr(p, t, kind, t.cols[ng + i], extraBase + i * 2, p.olist[ab + i * AGS + 7])
         }
@@ -5224,6 +5850,12 @@ function buildSort(p: Plan, o: Integer) {
     let blk = p.oe[o]
     let nc = p.olist[blk]
     let child = p.oa[o]
+    if p.od[o] > 0 {
+        // ORDER BY tin.score(...) DESC LIMIT k over a search scan: the index produces only the k best rows
+        if p.ok[child] == O_SEARCH && p.searches[p.ob[child]].sortable { p.searches[p.ob[child]].topk = p.od[o] }
+        buildTopN(p, o, t, blk, nc, child, p.od[o])
+        return
+    }
     open(p, child)
     while next(p, child) {
         let row = tb.reserveRow(t, 0)
@@ -5247,6 +5879,59 @@ function buildSort(p: Plan, o: Integer) {
     sortIds(t, p.olist, kb, ids)
 }
 
+// ORDER BY ... LIMIT n: keep the n best rows in a max-heap (worst on top) while the input streams by. A row that
+// cannot enter is removed again at once, so rows keep their input order and ties resolve exactly as a full sort.
+function buildTopN(p: Plan, o: Integer, t: tb.Table, blk: Integer, nc: Integer, child: Integer, keep: Integer) {
+    let kb = blk + 1 + nc
+    let heap = p.chains[p.of[o]]
+    heap.clear()
+    let count = 0
+    open(p, child)
+    while next(p, child) {
+        let row = tb.reserveRow(t, 0)
+        let c = 0
+        while c < nc {
+            let e = p.olist[blk + 1 + c]
+            ev(p, e)
+            storeCell(p, e, t.cols[c], row)
+            c += 1
+        }
+        if p.err { return }
+        if count < keep {
+            heap.addInt64(row)
+            count += 1
+            // sift up
+            let i = count - 1
+            while i > 0 {
+                let parent = (i - 1) / 2
+                if cmpSortRows(t, p.olist, kb, heap.getInt64(i * 8), heap.getInt64(parent * 8)) <= 0 { break }
+                let x = heap.getInt64(i * 8)
+                heap.setInt64(i * 8, heap.getInt64(parent * 8))
+                heap.setInt64(parent * 8, x)
+                i = parent
+            }
+        } else if cmpSortRows(t, p.olist, kb, row, heap.getInt64(0)) < 0 {
+            heap.setInt64(0, row)
+            // sift down
+            let i = 0
+            while true {
+                let l = 2 * i + 1
+                if l >= count { break }
+                let m = l
+                if l + 1 < count && cmpSortRows(t, p.olist, kb, heap.getInt64((l + 1) * 8), heap.getInt64(l * 8)) > 0 { m = l + 1 }
+                if cmpSortRows(t, p.olist, kb, heap.getInt64(m * 8), heap.getInt64(i * 8)) <= 0 { break }
+                let x = heap.getInt64(i * 8)
+                heap.setInt64(i * 8, heap.getInt64(m * 8))
+                heap.setInt64(m * 8, x)
+                i = m
+            }
+        } else {
+            tb.dropLastRow(t)
+        }
+    }
+    sortIds(t, p.olist, kb, heap)
+}
+
 function cmpSortRows(t: tb.Table, spec: List<Integer>, kb: Integer, a: Integer, b: Integer): Integer {
     let nk = spec[kb]
     let i = 0
@@ -5268,7 +5953,9 @@ function cmpSortRows(t: tb.Table, spec: List<Integer>, kb: Integer, a: Integer, 
             }
         } else {
             let r = 0
-            if c.type == v.T_NUMERIC || c.type == v.T_NUMTEXT {
+            if v.isExtType(c.type) {
+                r = extCompareCells(c, a, b)
+            } else if c.type == v.T_NUMERIC || c.type == v.T_NUMTEXT {
                 if cellIsSmallNum(c, a) && cellIsSmallNum(c, b) {
                     r = cmpNumSmall(tb.getInt(c, a), tb.getScale(c, a), tb.getInt(c, b), tb.getScale(c, b))
                 } else {
@@ -5919,5 +6606,357 @@ function winKeysEqual(t: tb.Table, spec: List<Integer>, kb: Integer, from: Integ
         }
         i += 1
     }
+    return true
+}
+
+// ---------------------------------------------------------------- full-text search (src/search/index.min)
+
+public record SearchState {
+    index: Integer          // search index registry id
+    slot: Integer
+    query: Integer          // query text expression
+    text: Text              // text of the compiled query
+    cps: List<si.Compiled>  // the compiled query (0 or 1)
+    rows: Bytes             // O_SEARCH results (row order, or best first when topk)
+    scores: List<Float>     // top-k scores aligned with rows
+    pos: Integer
+    topk: Integer           // set by the sort above for one execution: produce only the k best rows
+    sortable: Boolean       // planner: the sort above orders by this search's score only (descending)
+    topkMode: Boolean
+    curRow: Integer
+    curScore: Float
+    scored: Boolean
+    epoch: Integer
+    filter: Integer         // residual filter of the O_SEARCH (top-k checks it per candidate)
+    hl: Bytes
+    buf: Bytes
+}
+
+global EXEC_EPOCH: List<Integer> = [1]
+
+// A new statement execution: search statistics and suspect rows are settled again before the next search.
+public function newExecution() { EXEC_EPOCH[0] = EXEC_EPOCH[0] + 1 }
+
+public function addSearch(p: Plan, index: Integer, slot: Integer, query: Integer): Integer {
+    p.searches.add(SearchState {
+        index: index; slot: slot; query: query; text: ""; cps: []; rows: Bytes(); scores: []; pos: 0; topk: 0
+        sortable: false; topkMode: false; curRow: -1; curScore: 0.0; scored: false; epoch: 0; filter: -1
+        hl: Bytes(); buf: Bytes()
+    })
+    return p.searches.length - 1
+}
+
+// Compile (when the query text or the index changed) and settle the index once per execution.
+function ensureSearch(p: Plan, ss: SearchState): Boolean {
+    let q = ss.query
+    ev(p, q)
+    if p.err { return false }
+    if p.rNull[q] != 0 { return false }
+    let txt = Text(p.rBuf[q].slice(p.rOff[q], p.rOff[q] + p.rLen[q]))
+    let sx = p.env.cat.searchIdx[ss.index]
+    // settle first: validating rows can add terms the query names
+    let refresh = false
+    if ss.epoch != EXEC_EPOCH[0] {
+        si.settleIndex(sx, p.slotBase[ss.slot])
+        ss.epoch = EXEC_EPOCH[0]
+        refresh = true
+    }
+    if ss.cps.length == 0 || txt != ss.text || !si.current(sx, ss.cps[0]) {
+        let cp = si.compile(sx, txt)
+        if cp.err != "" {
+            raise(p, "42601", "syntax error in search query: " + cp.err + " at position " + Text(cp.errPos + 1))
+            return false
+        }
+        ss.cps = [cp]
+        ss.text = txt
+    } else if refresh {
+        si.refreshStats(sx, ss.cps[0])
+    }
+    return true
+}
+
+function searchReader(p: Plan, ss: SearchState): si.Reader {
+    return si.Reader {
+        visible: function(r: Integer, out: Bytes): Boolean { return searchVisible(p, ss, r, out) }
+        accept: function(r: Integer): Boolean { return searchAccept(p, ss, r) }
+    }
+}
+
+// Text of row r as this reader sees it (rows locked by open transactions read their before-image).
+function searchVisible(p: Plan, ss: SearchState, r: Integer, out: Bytes): Boolean {
+    let s = ss.slot
+    let t = p.slotBase[s]
+    if !positionRow(p, s, t, r) { return false }
+    let c = p.slotTable[s].cols[p.env.cat.searchIdx[ss.index].column]
+    let row = p.slotRow[s]
+    if tb.isNull(c, row) { return false }
+    out.addBytes(c.heap.slice(tb.textOff(c, row), tb.textOff(c, row) + tb.textLen(c, row)))
+    return true
+}
+
+function searchAccept(p: Plan, ss: SearchState, r: Integer): Boolean {
+    if ss.filter < 0 { return true }
+    let s = ss.slot
+    let t = p.slotBase[s]
+    if t.state[r] == 0 {
+        p.slotTable[s] = t
+        p.slotRow[s] = r
+    } else if !positionRow(p, s, t, r) {
+        return false
+    }
+    return filterOk(p, ss.filter)
+}
+
+function openSearch(p: Plan, o: Integer) {
+    let ss = p.searches[p.ob[o]]
+    ss.rows.clear()
+    ss.scores = []
+    ss.pos = 0
+    ss.curRow = -1
+    ss.scored = false
+    ss.filter = p.oc[o]
+    let k = ss.topk
+    ss.topk = 0
+    ss.topkMode = false
+    if !ensureSearch(p, ss) { return }
+    let sx = p.env.cat.searchIdx[ss.index]
+    let t = p.slotBase[ss.slot]
+    if k > 0 {
+        ss.topkMode = true
+        si.topK(sx, t, ss.cps[0], k, searchReader(p, ss), ss.rows, ss.scores)
+    } else {
+        si.rows(sx, t, ss.cps[0], searchReader(p, ss), ss.rows)
+    }
+}
+
+function nextSearch(p: Plan, o: Integer): Boolean {
+    let ss = p.searches[p.ob[o]]
+    let s = ss.slot
+    let t = p.slotBase[s]
+    let n = ss.rows.length / 8
+    while ss.pos < n {
+        let i = ss.pos
+        let r = ss.rows.getInt64(i * 8)
+        ss.pos = i + 1
+        if r >= t.nrows { continue }
+        if t.state[r] == 0 {
+            p.slotTable[s] = t
+            p.slotRow[s] = r
+        } else if !positionRow(p, s, t, r) {
+            continue
+        }
+        ss.curRow = r
+        if ss.topkMode {
+            ss.curScore = ss.scores[i]
+            ss.scored = true
+        } else {
+            ss.scored = false
+            if ss.filter >= 0 && !filterOk(p, ss.filter) {
+                if p.err { return false }
+                continue
+            }
+        }
+        return true
+    }
+    p.slotRow[s] = -1
+    return false
+}
+
+// COUNT(*) of a search scan without residual filters, straight from the index (-1: not applicable).
+function searchCount(p: Plan, o: Integer): Integer {
+    let ss = p.searches[p.ob[o]]
+    if !ensureSearch(p, ss) {
+        if p.err { return -1 }
+        return 0
+    }
+    return si.count(p.env.cat.searchIdx[ss.index], p.slotBase[ss.slot], ss.cps[0], searchReader(p, ss))
+}
+
+function evalSearchExpr(p: Plan, n: Integer) {
+    let k = p.ek[n]
+    let ss = p.searches[p.ec[n]]
+    if !ensureSearch(p, ss) {
+        if p.err { return }
+        if k == EX_SEARCH { setBoolReg(p, n, false) } else { p.rNull[n] = 1 }
+        return
+    }
+    let sx = p.env.cat.searchIdx[ss.index]
+    let cp = ss.cps[0]
+    if k == EX_SEARCH {
+        let a = p.ea[n]
+        ev(p, a)
+        if p.rNull[a] != 0 {
+            setBoolReg(p, n, false)
+            return
+        }
+        setBoolReg(p, n, si.referenceScore(sx, cp, p.rBuf[a], p.rOff[a], p.rLen[a]) >= 0.0)
+        return
+    }
+    if k == EX_SEARCH_HL {
+        let a = p.ea[n]
+        ev(p, a)
+        if p.rNull[a] != 0 {
+            p.rNull[n] = 1
+            return
+        }
+        ss.hl.clear()
+        si.highlight(sx, cp, p.rBuf[a], p.rOff[a], p.rLen[a], ss.hl)
+        setTextReg(p, n, ss.hl, 0, ss.hl.length)
+        return
+    }
+    // EX_SEARCH_SCORE
+    let s = ss.slot
+    if p.slotRow[s] < 0 {
+        p.rNull[n] = 1
+        return
+    }
+    let t = p.slotBase[s]
+    let onBase = p.slotTable[s].id == t.id
+    let row = p.slotRow[s]
+    if !onBase { row = p.slotOrig[s] }
+    p.rNull[n] = 0
+    if ss.scored && ss.curRow == row {
+        p.rFlt[n] = ss.curScore
+        return
+    }
+    if onBase && t.state[row] == 0 {
+        p.rFlt[n] = si.scoreOf(sx, t, cp, row, searchReader(p, ss))
+        return
+    }
+    let c = p.slotTable[s].cols[sx.column]
+    let r0 = p.slotRow[s]
+    if tb.isNull(c, r0) {
+        p.rFlt[n] = 0.0
+        return
+    }
+    let sc = si.referenceScore(sx, cp, c.heap, tb.textOff(c, r0), tb.textLen(c, r0))
+    if sc < 0.0 { sc = 0.0 }
+    p.rFlt[n] = sc
+}
+
+// Faceted counts over a search scan: one pass over the result rows reading the group column directly (no per-row
+// expression evaluation). Only count(*) aggregates over a column of the searched table; false = use the general path.
+function searchFacet(p: Plan, o: Integer, t: tb.Table, blk: Integer, ng: Integer, na: Integer, ab: Integer, extraBase: Integer): Boolean {
+    let child = p.oa[o]
+    let ss = p.searches[p.ob[child]]
+    let g = p.olist[blk + 1]
+    // the group key is a column of the searched table, or an integer expression over its row (time / 31557600 + 1970)
+    let byExpr = p.ek[g] != EX_COL
+    if byExpr && classOf(p.et[g]) != CL_INT { return false }
+    if !byExpr && p.ea[g] != ss.slot { return false }
+    let i = 0
+    while i < na {
+        if p.olist[ab + i * AGS] != AG_COUNT_STAR || p.olist[ab + i * AGS + 2] != 0 || p.olist[ab + i * AGS + 3] >= 0 { return false }
+        i += 1
+    }
+    let base = p.slotBase[ss.slot]
+    let col = base.cols[0]
+    if !byExpr { col = base.cols[p.eb[g]] }
+    if !byExpr && col.width == 16 { return false }
+    if !byExpr {
+        // low-cardinality column: counts from the index's per-value bitmaps (popcount of result AND value)
+        if !ensureSearch(p, ss) { return p.err }
+        let sx = p.env.cat.searchIdx[ss.index]
+        let freps: List<Integer> = []
+        let fcounts: List<Integer> = []
+        if si.facetCounts(sx, base, ss.cps[0], p.eb[g], searchReader(p, ss), freps, fcounts) {
+            let k0 = 0
+            while k0 < freps.length {
+                p.slotTable[ss.slot] = base
+                p.slotRow[ss.slot] = freps[k0]
+                ev(p, g)
+                let row = newGroup(p, t, blk, ng, na, ab)
+                let a0 = 0
+                while a0 < na {
+                    tb.setInt(t.cols[ng + a0], row, fcounts[k0])
+                    a0 += 1
+                }
+                k0 += 1
+            }
+            finalizeAgg(p, t, ng, na, ab, extraBase)
+            return true
+        }
+    }
+    openSearch(p, child)
+    if p.err { return true }
+    let rows = ss.rows
+    let n = rows.length / 8
+    let isText = !byExpr && v.isTextType(col.type)
+    let groups = hm.newIntMap(64)
+    let reps: List<Integer> = []
+    let counts: List<Integer> = []
+    let nullRep = -1
+    let nullCount = 0
+    let k = 0
+    while k < n {
+        let r = rows.getInt64(k * 8)
+        // rows of open transactions read their before-image: leave them to the general path
+        if base.state[r] != 0 { return false }
+        let isNul = false
+        let ekey = 0
+        if byExpr {
+            p.slotTable[ss.slot] = base
+            p.slotRow[ss.slot] = r
+            ev(p, g)
+            if p.err { return true }
+            isNul = p.rNull[g] != 0
+            ekey = p.rInt[g]
+        } else {
+            isNul = tb.isNull(col, r)
+        }
+        if isNul {
+            if nullRep < 0 { nullRep = r }
+            nullCount += 1
+        } else {
+            let key = ekey
+            if byExpr {
+                // integer value of the expression
+            } else if isText {
+                key = v.hashBytes(col.heap, tb.textOff(col, r), tb.textLen(col, r))
+            } else if col.type == v.T_FLOAT8 || col.type == v.T_FLOAT4 {
+                key = v.hashFloat(tb.getFloat(col, r))
+            } else {
+                key = tb.getInt(col, r)
+                if col.perRowScale || col.type == v.T_NUMERIC { return false }
+            }
+            let gi = hm.get(groups, key, -1)
+            if gi < 0 {
+                hm.put(groups, key, reps.length)
+                reps.add(r)
+                counts.add(1)
+            } else {
+                if byExpr {
+                    // exact integer keys
+                } else if isText {
+                    let q = reps[gi]
+                    if !v.equalBytes(col.heap, tb.textOff(col, q), tb.textLen(col, q), col.heap, tb.textOff(col, r), tb.textLen(col, r)) { return false }
+                } else if col.type == v.T_FLOAT8 || col.type == v.T_FLOAT4 {
+                    if tb.getFloat(col, reps[gi]) != tb.getFloat(col, r) { return false }
+                }
+                counts[gi] = counts[gi] + 1
+            }
+        }
+        k += 1
+    }
+    if nullRep >= 0 {
+        reps.add(nullRep)
+        counts.add(nullCount)
+    }
+    let s = ss.slot
+    i = 0
+    while i < reps.length {
+        p.slotTable[s] = base
+        p.slotRow[s] = reps[i]
+        ev(p, g)
+        let row = newGroup(p, t, blk, ng, na, ab)
+        let a = 0
+        while a < na {
+            tb.setInt(t.cols[ng + a], row, counts[i])
+            a += 1
+        }
+        i += 1
+    }
+    if reps.length == 0 && ng == 0 { newGroup(p, t, blk, ng, na, ab) }
+    finalizeAgg(p, t, ng, na, ab, extraBase)
     return true
 }

@@ -1,0 +1,372 @@
+// JSON member access for the -> and ->> operators on json/jsonb values (stored as text). Scans in place without
+// building a tree and without recursion (nesting depth is a counter), so no input can exhaust the call stack.
+// Malformed input finds nothing (SQL NULL) instead of failing the statement.
+use "./values.min" as v
+
+function ws(c: Integer): Boolean { return c == 32 || c == 9 || c == 10 || c == 13 }
+
+function skipWs(b: Bytes, i: Integer, end: Integer): Integer {
+    let j = i
+    while j < end && ws(b[j]) { j += 1 }
+    return j
+}
+
+// End (exclusive) of the string starting at the quote at i, or -1.
+function stringEnd(b: Bytes, i: Integer, end: Integer): Integer {
+    let j = i + 1
+    while j < end {
+        let c = b[j]
+        if c == 92 { j += 2 }
+        else if c == 34 { return j + 1 }
+        else { j += 1 }
+    }
+    return -1
+}
+
+// End (exclusive) of the value starting at i, or -1.
+function valueEnd(b: Bytes, i: Integer, end: Integer): Integer {
+    if i >= end { return -1 }
+    let c = b[i]
+    if c == 34 { return stringEnd(b, i, end) }
+    if c == 123 || c == 91 {
+        let depth = 0
+        let j = i
+        while j < end {
+            let d = b[j]
+            if d == 34 {
+                j = stringEnd(b, j, end)
+                if j < 0 { return -1 }
+                continue
+            }
+            if d == 123 || d == 91 { depth += 1 }
+            if d == 125 || d == 93 {
+                depth -= 1
+                if depth == 0 { return j + 1 }
+            }
+            j += 1
+        }
+        return -1
+    }
+    let j = i
+    while j < end {
+        let d = b[j]
+        if d == 44 || d == 125 || d == 93 || ws(d) { break }
+        j += 1
+    }
+    if j == i { return -1 }
+    return j
+}
+
+// Does the JSON string at [s, e) (quotes included) decode to key?
+function keyMatches(b: Bytes, s: Integer, e: Integer, kb: Bytes, ko: Integer, kl: Integer): Boolean {
+    let raw = e - s - 2
+    let escaped = false
+    let j = s + 1
+    while j < e - 1 {
+        if b[j] == 92 { escaped = true }
+        j += 1
+    }
+    if !escaped {
+        if raw != kl { return false }
+        let k = 0
+        while k < raw {
+            if b[s + 1 + k] != kb[ko + k] { return false }
+            k += 1
+        }
+        return true
+    }
+    let d = Bytes()
+    unescapeInto(d, b, s, e)
+    if d.length != kl { return false }
+    let k = 0
+    while k < d.length {
+        if d[k] != kb[ko + k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// The value of member kb[ko, ko+kl) (byIndex false) or element index (byIndex true; negative counts from the end) of the
+// object/array in b[off, off+len): (start << 32) | length, or -1 when absent.
+public function find(b: Bytes, off: Integer, len: Integer, kb: Bytes, ko: Integer, kl: Integer, byIndex: Boolean, index: Integer): Integer {
+    let end = off + len
+    let i = skipWs(b, off, end)
+    if i >= end { return -1 }
+    if !byIndex {
+        if b[i] != 123 { return -1 }
+        i = skipWs(b, i + 1, end)
+        if i < end && b[i] == 125 { return -1 }
+        while i < end {
+            if b[i] != 34 { return -1 }
+            let ke = stringEnd(b, i, end)
+            if ke < 0 { return -1 }
+            let hit = keyMatches(b, i, ke, kb, ko, kl)
+            i = skipWs(b, ke, end)
+            if i >= end || b[i] != 58 { return -1 }
+            i = skipWs(b, i + 1, end)
+            let ve = valueEnd(b, i, end)
+            if ve < 0 { return -1 }
+            if hit { return (i << 32) | (ve - i) }
+            i = skipWs(b, ve, end)
+            if i >= end || b[i] != 44 { return -1 }
+            i = skipWs(b, i + 1, end)
+        }
+        return -1
+    }
+    if b[i] != 91 { return -1 }
+    // collect element starts once when counting from the end
+    let starts: List<Integer> = []
+    let ends: List<Integer> = []
+    i = skipWs(b, i + 1, end)
+    if i < end && b[i] == 93 { return -1 }
+    while i < end {
+        let ve = valueEnd(b, i, end)
+        if ve < 0 { return -1 }
+        if index >= 0 && starts.length == index { return (i << 32) | (ve - i) }
+        starts.add(i)
+        ends.add(ve)
+        i = skipWs(b, ve, end)
+        if i < end && b[i] == 93 { break }
+        if i >= end || b[i] != 44 { return -1 }
+        i = skipWs(b, i + 1, end)
+    }
+    if index < 0 && starts.length + index >= 0 {
+        let k = starts.length + index
+        return (starts[k] << 32) | (ends[k] - starts[k])
+    }
+    return -1
+}
+
+public function isNullLiteral(b: Bytes, s: Integer, l: Integer): Boolean {
+    return l == 4 && b[s] == 110 && b[s + 1] == 117 && b[s + 2] == 108 && b[s + 3] == 108
+}
+
+public function isString(b: Bytes, s: Integer, l: Integer): Boolean { return l >= 2 && b[s] == 34 }
+
+function hexVal(c: Integer): Integer {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return -1
+}
+
+function hex4(b: Bytes, j: Integer, e: Integer): Integer {
+    if j + 4 > e { return -1 }
+    let v = 0
+    let k = 0
+    while k < 4 {
+        let h = hexVal(b[j + k])
+        if h < 0 { return -1 }
+        v = v * 16 + h
+        k += 1
+    }
+    return v
+}
+
+function addUtf8(out: Bytes, cp: Integer) {
+    if cp < 128 { out.add(cp) }
+    else if cp < 2048 {
+        out.add(192 | (cp >> 6))
+        out.add(128 | (cp & 63))
+    } else if cp < 65536 {
+        out.add(224 | (cp >> 12))
+        out.add(128 | ((cp >> 6) & 63))
+        out.add(128 | (cp & 63))
+    } else {
+        out.add(240 | (cp >> 18))
+        out.add(128 | ((cp >> 12) & 63))
+        out.add(128 | ((cp >> 6) & 63))
+        out.add(128 | (cp & 63))
+    }
+}
+
+// Decodes the JSON string at [s, e) (quotes included) and appends its text to out.
+public function unescapeInto(out: Bytes, b: Bytes, s: Integer, e: Integer) {
+    let j = s + 1
+    let last = e - 1
+    while j < last {
+        let c = b[j]
+        if c != 92 {
+            out.add(c)
+            j += 1
+            continue
+        }
+        if j + 1 >= last { return }
+        let x = b[j + 1]
+        j += 2
+        if x == 110 { out.add(10) }
+        else if x == 116 { out.add(9) }
+        else if x == 114 { out.add(13) }
+        else if x == 98 { out.add(8) }
+        else if x == 102 { out.add(12) }
+        else if x == 117 {
+            let cp = hex4(b, j, last)
+            if cp < 0 { return }
+            j += 4
+            if cp >= 55296 && cp <= 56319 && j + 6 <= last && b[j] == 92 && b[j + 1] == 117 {
+                let lo = hex4(b, j + 2, last)
+                if lo >= 56320 && lo <= 57343 {
+                    cp = 65536 + ((cp - 55296) << 10) + (lo - 56320)
+                    j += 6
+                }
+            }
+            if cp == 0 || (cp >= 55296 && cp <= 57343) { cp = 65533 }   // NUL and lone surrogates: U+FFFD
+            addUtf8(out, cp)
+        }
+        else { out.add(x) }
+    }
+}
+
+// ---------------------------------------------------------------- containment (@>) and key existence (?)
+
+constant MAX_DEPTH = 256
+
+function kindAt(b: Bytes, i: Integer): Integer {
+    let c = b[i]
+    if c == 123 { return 1 }          // object
+    if c == 91 { return 2 }           // array
+    if c == 34 { return 3 }           // string
+    return 4                          // number, true, false, null
+}
+
+// Is the JSON value b[as, ae) contained in a[ls, le) (PostgreSQL jsonb @>)? Objects: every member of the right
+// side is contained in the left member with the same key; arrays: every element of the right side is contained in
+// some element of the left side; scalars: equal. depth bounds nesting (deeper input is "not contained").
+public function contains(a: Bytes, ls: Integer, le: Integer, b: Bytes, rs: Integer, re: Integer): Boolean {
+    let i = skipWs(a, ls, le)
+    let j = skipWs(b, rs, re)
+    if i >= le || j >= re { return false }
+    return containsAt(a, i, le, b, j, re, 0)
+}
+
+function containsAt(a: Bytes, i: Integer, ae: Integer, b: Bytes, j: Integer, be: Integer, depth: Integer): Boolean {
+    if depth > MAX_DEPTH { return false }
+    let ka = kindAt(a, i)
+    let kb = kindAt(b, j)
+    if ka == 2 && kb != 2 && kb != 1 {
+        // a top-level array contains a scalar that is one of its elements (PostgreSQL rule)
+        return arrayHas(a, i, ae, b, j, be, depth)
+    }
+    if ka != kb { return false }
+    if ka == 1 {
+        // every member of b must be contained in a's member with the same key
+        let q = skipWs(b, j + 1, be)
+        if q < be && b[q] == 125 { return true }
+        while q < be {
+            if b[q] != 34 { return false }
+            let ke = stringEnd(b, q, be)
+            if ke < 0 { return false }
+            let key = Bytes()
+            unescapeInto(key, b, q, ke)
+            q = skipWs(b, ke, be)
+            if q >= be || b[q] != 58 { return false }
+            q = skipWs(b, q + 1, be)
+            let ve = valueEnd(b, q, be)
+            if ve < 0 { return false }
+            let ve2 = valueEnd(a, i, ae)
+            if ve2 < 0 { return false }
+            let at = find(a, i, ve2 - i, key, 0, key.length, false, 0)
+            if at < 0 { return false }
+            if !containsAt(a, at >> 32, (at >> 32) + (at & 4294967295), b, q, ve, depth + 1) { return false }
+            q = skipWs(b, ve, be)
+            if q < be && b[q] == 125 { return true }
+            if q >= be || b[q] != 44 { return false }
+            q = skipWs(b, q + 1, be)
+        }
+        return false
+    }
+    if ka == 2 {
+        let q = skipWs(b, j + 1, be)
+        if q < be && b[q] == 93 { return true }
+        while q < be {
+            let ve = valueEnd(b, q, be)
+            if ve < 0 { return false }
+            if !arrayHas(a, i, ae, b, q, ve, depth + 1) { return false }
+            q = skipWs(b, ve, be)
+            if q < be && b[q] == 93 { return true }
+            if q >= be || b[q] != 44 { return false }
+            q = skipWs(b, q + 1, be)
+        }
+        return false
+    }
+    return scalarEqual(a, i, ae, b, j, be)
+}
+
+// Does the array starting at a[i] have an element containing b[j, be)?
+function arrayHas(a: Bytes, i: Integer, ae: Integer, b: Bytes, j: Integer, be: Integer, depth: Integer): Boolean {
+    let p = skipWs(a, i + 1, ae)
+    if p < ae && a[p] == 93 { return false }
+    while p < ae {
+        let ve = valueEnd(a, p, ae)
+        if ve < 0 { return false }
+        let kb = kindAt(b, j)
+        let ke = kindAt(a, p)
+        if (ke == kb || (ke == 2 && kb == 4)) && ke != 2 || ke == 2 && kb == 2 || ke == 1 && kb == 1 {
+            if containsAt(a, p, ve, b, j, be, depth + 1) { return true }
+        }
+        p = skipWs(a, ve, ae)
+        if p < ae && a[p] == 93 { return false }
+        if p >= ae || a[p] != 44 { return false }
+        p = skipWs(a, p + 1, ae)
+    }
+    return false
+}
+
+function scalarEqual(a: Bytes, i: Integer, ae: Integer, b: Bytes, j: Integer, be: Integer): Boolean {
+    let ea = valueEnd(a, i, ae)
+    let eb = valueEnd(b, j, be)
+    if ea < 0 || eb < 0 { return false }
+    if a[i] == 34 {
+        let x = Bytes()
+        let y = Bytes()
+        unescapeInto(x, a, i, ea)
+        unescapeInto(y, b, j, eb)
+        return sameBytes(x, 0, x.length, y, 0, y.length)
+    }
+    if sameBytes(a, i, ea, b, j, eb) { return true }
+    // numbers compare by value (1.0 = 1 = 1e0)
+    let c = a[i]
+    if (c >= 48 && c <= 57) || c == 45 {
+        let fa = parseNumber(a, i, ea)
+        let fb = parseNumber(b, j, eb)
+        return fa == fb
+    }
+    return false
+}
+
+function sameBytes(a: Bytes, as: Integer, ae: Integer, b: Bytes, bs: Integer, be: Integer): Boolean {
+    if ae - as != be - bs { return false }
+    let k = 0
+    while k < ae - as {
+        if a[as + k] != b[bs + k] { return false }
+        k += 1
+    }
+    return true
+}
+
+// NaN when the text is not a number, so it equals nothing.
+function parseNumber(b: Bytes, s: Integer, e: Integer): Float {
+    let p = v.newParsed()
+    v.parseFloat(b, s, e - s, p)
+    if !p.ok { return 0.0 / 0.0 }
+    return p.f
+}
+
+// Does the object at b[off, off+len) have top-level key k (PostgreSQL jsonb ? text), or does the array have the
+// string element k?
+public function hasKey(b: Bytes, off: Integer, len: Integer, kb: Bytes, ko: Integer, kl: Integer): Boolean {
+    let end = off + len
+    let i = skipWs(b, off, end)
+    if i >= end { return false }
+    if b[i] == 123 { return find(b, off, len, kb, ko, kl, false, 0) >= 0 }
+    if b[i] != 91 { return false }
+    let p = skipWs(b, i + 1, end)
+    while p < end && b[p] != 93 {
+        let ve = valueEnd(b, p, end)
+        if ve < 0 { return false }
+        if b[p] == 34 && keyMatches(b, p, ve, kb, ko, kl) { return true }
+        p = skipWs(b, ve, end)
+        if p < end && b[p] == 44 { p = skipWs(b, p + 1, end) }
+    }
+    return false
+}

@@ -1,0 +1,621 @@
+// Dense vectors: vector (float4 elements, 4 bytes) and halfvec (IEEE half elements, 2 bytes), little-endian, the
+// dimension count is length / width. One implementation serves both; `half` picks the element width.
+// Arithmetic follows pgvector: distances accumulate in float4 (an overflow gives Infinity), results are checked
+// for overflow and underflow, and halfvec values are rounded to half precision.
+use "neodb-sdk" as sdk
+use "math" as math
+use "./half.min" as fp16
+
+public constant MAX_DIM = 16000
+constant FLT_MAX = 3.4028234663852886e38
+
+// Register everything for vector (half = false) or halfvec (half = true).
+public function register(x: sdk.Extension, half: Boolean) {
+    let t = "vector"
+    if half { t = "halfvec" }
+    let ty = x.type(t, function(call) { input(call, half) }, function(call) { output(call, half) })
+    ty.binary(function(call) { receive(call, half) }, function(call) { send(call, half) })
+    ty.modifier(function(call) { checkModifier(call, half) })
+    ty.modifierRange(1, MAX_DIM, "dimensions")
+    ty.ordering(function(call) { compareCall(call, half) })
+    let v2 = [t, t]
+    x.define("l2_distance", v2, "float8", function(call) { l2Distance(call, half) })
+    x.define(t + "_l2_squared_distance", v2, "float8", function(call) { l2Squared(call, half) })
+    x.define("inner_product", v2, "float8", function(call) { innerProduct(call, half) })
+    x.define(t + "_negative_inner_product", v2, "float8", function(call) { negativeInnerProduct(call, half) })
+    x.define("cosine_distance", v2, "float8", function(call) { cosineDistance(call, half) })
+    x.define("l1_distance", v2, "float8", function(call) { l1Distance(call, half) })
+    x.define("vector_dims", [t], "int4", function(call) { dims(call, half) })
+    if half {
+        x.define("l2_norm", [t], "float8", function(call) { norm(call, half) })
+    } else {
+        x.define("vector_norm", [t], "float8", function(call) { norm(call, half) })
+    }
+    x.define("l2_normalize", [t], t, function(call) { l2Normalize(call, half) })
+    x.define("binary_quantize", [t], "bit", function(call) { binaryQuantize(call, half) })
+    x.define("subvector", [t, "int4", "int4"], t, function(call) { subvector(call, half) })
+    x.define(t + "_add", v2, t, function(call) { elementwise(call, half, 0) })
+    x.define(t + "_sub", v2, t, function(call) { elementwise(call, half, 1) })
+    x.define(t + "_mul", v2, t, function(call) { elementwise(call, half, 2) })
+    x.define(t + "_concat", v2, t, function(call) { concat(call, half) })
+    x.define(t + "_lt", v2, "bool", function(call) { call.returnBoolean(compare(call, half) < 0) })
+    x.define(t + "_le", v2, "bool", function(call) { call.returnBoolean(compare(call, half) <= 0) })
+    x.define(t + "_eq", v2, "bool", function(call) { call.returnBoolean(compare(call, half) == 0) })
+    x.define(t + "_ne", v2, "bool", function(call) { call.returnBoolean(compare(call, half) != 0) })
+    x.define(t + "_ge", v2, "bool", function(call) { call.returnBoolean(compare(call, half) >= 0) })
+    x.define(t + "_gt", v2, "bool", function(call) { call.returnBoolean(compare(call, half) > 0) })
+    x.define(t + "_cmp", v2, "int4", function(call) { compareCall(call, half) })
+    x.operator("<->", t, t, "l2_distance")
+    x.operator("<#>", t, t, t + "_negative_inner_product")
+    x.operator("<=>", t, t, "cosine_distance")
+    x.operator("<+>", t, t, "l1_distance")
+    x.operator("+", t, t, t + "_add")
+    x.operator("-", t, t, t + "_sub")
+    x.operator("*", t, t, t + "_mul")
+    x.operator("||", t, t, t + "_concat")
+    x.operator("<", t, t, t + "_lt")
+    x.operator("<=", t, t, t + "_le")
+    x.operator("=", t, t, t + "_eq")
+    x.operator("<>", t, t, t + "_ne")
+    x.operator(">=", t, t, t + "_ge")
+    x.operator(">", t, t, t + "_gt")
+    x.aggregate("avg", t, t, function(call) { accumulate(call, half) }, function(call) { finish(call, half, true) })
+    x.aggregate("sum", t, t, function(call) { accumulate(call, half) }, function(call) { finish(call, half, false) })
+}
+
+// ---------------------------------------------------------------- elements
+
+function width(half: Boolean): Integer {
+    if half { return 2 }
+    return 4
+}
+
+function typeName(half: Boolean): Text {
+    if half { return "halfvec" }
+    return "vector"
+}
+
+function count(call: sdk.Call, i: Integer, half: Boolean): Integer { return call.length(i) / width(half) }
+
+function at(call: sdk.Call, i: Integer, k: Integer, half: Boolean): Float {
+    if half { return fp16.toFloat(call.uint16(i, k * 2)) }
+    return call.float32(i, k * 4)
+}
+
+global ROUND: Bytes = Bytes(4)
+
+// f rounded to float4.
+public function f32(f: Float): Float {
+    ROUND.setFloat32(0, f)
+    return ROUND.getFloat32(0)
+}
+
+// Append f as an element (float4 or half); false (with the error set) when it overflows the element type.
+function add(call: sdk.Call, out: Bytes, f: Float, half: Boolean, what: Text): Boolean {
+    if half {
+        let h = fp16.fromFloat(f)
+        if fp16.isInfinite(h) && f == f && f <= FLT_MAX && f >= -FLT_MAX {
+            if what == "" {
+                call.fail("22003", "value out of range: overflow")
+            } else {
+                call.fail("22003", "\"" + what + "\" is out of range for type halfvec")
+            }
+            return false
+        }
+        out.addUInt16(h)
+        return true
+    }
+    if f > FLT_MAX || f < -FLT_MAX {
+        call.fail("22003", "value out of range: overflow")
+        return false
+    }
+    out.addFloat32(f)
+    return true
+}
+
+function checkElement(call: sdk.Call, f: Float, half: Boolean): Boolean {
+    if f != f {
+        call.fail("22000", "NaN not allowed in " + typeName(half))
+        return false
+    }
+    if f > FLT_MAX || f < -FLT_MAX {
+        call.fail("22000", "infinite value not allowed in " + typeName(half))
+        return false
+    }
+    return true
+}
+
+function checkDims(call: sdk.Call, dim: Integer, half: Boolean) {
+    if dim < 1 {
+        call.fail("22000", typeName(half) + " must have at least 1 dimension")
+        return
+    }
+    if dim > MAX_DIM {
+        call.fail("54000", typeName(half) + " cannot have more than " + Text(MAX_DIM) + " dimensions")
+        return
+    }
+    if call.modifier >= 0 && dim != call.modifier {
+        call.fail("22000", "expected " + Text(call.modifier) + " dimensions, not " + Text(dim))
+    }
+}
+
+// ---------------------------------------------------------------- text and binary forms
+
+function isSpace(c: Integer): Boolean { return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 }
+
+public deterministic function input(call: sdk.Call, half: Boolean) {
+    let b = call.buffer(0)
+    let i = call.offset(0)
+    let end = i + call.length(0)
+    let bad = "invalid input syntax for type " + typeName(half) + ": \"" + call.text(0) + "\""
+    while i < end && isSpace(b[i]) { i += 1 }
+    if i >= end || b[i] != 91 {
+        call.fail("22P02", bad)
+        return
+    }
+    i += 1
+    while i < end && isSpace(b[i]) { i += 1 }
+    if i < end && b[i] == 93 {
+        call.fail("22000", typeName(half) + " must have at least 1 dimension")
+        return
+    }
+    let out = call.output
+    let parsed = sdk.newParsedFloat()
+    let dim = 0
+    while true {
+        while i < end && isSpace(b[i]) { i += 1 }
+        let start = i
+        while i < end && b[i] != 44 && b[i] != 93 && !isSpace(b[i]) { i += 1 }
+        if i == start {
+            call.fail("22P02", bad)
+            return
+        }
+        if dim == MAX_DIM {
+            call.fail("54000", typeName(half) + " cannot have more than " + Text(MAX_DIM) + " dimensions")
+            return
+        }
+        call.parseFloat4(b, start, i - start, parsed)
+        if !parsed.ok {
+            call.fail("22P02", bad)
+            return
+        }
+        // an underflow reads as zero (as strtof); an overflow is an error
+        if parsed.outOfRange && parsed.value != 0.0 {
+            call.fail("22003", "\"" + Text(b.slice(start, i)) + "\" is out of range for type " + typeName(half))
+            return
+        }
+        if !checkElement(call, parsed.value, half) { return }
+        if !add(call, out, parsed.value, half, Text(b.slice(start, i))) { return }
+        dim += 1
+        while i < end && isSpace(b[i]) { i += 1 }
+        if i >= end {
+            call.fail("22P02", bad)
+            return
+        }
+        if b[i] == 93 {
+            i += 1
+            break
+        }
+        if b[i] != 44 {
+            call.fail("22P02", bad)
+            return
+        }
+        i += 1
+    }
+    while i < end && isSpace(b[i]) { i += 1 }
+    if i != end {
+        call.fail("22P02", bad)
+        return
+    }
+    checkDims(call, dim, half)
+}
+
+public deterministic function output(call: sdk.Call, half: Boolean) {
+    let out = call.output
+    let n = count(call, 0, half)
+    out.add(91)
+    let i = 0
+    while i < n {
+        if i > 0 { out.add(44) }
+        call.addFloat4(out, at(call, 0, i, half))
+        i += 1
+    }
+    out.add(93)
+}
+
+// Wire format: int16 dim, int16 unused (0), the elements big-endian.
+deterministic function receive(call: sdk.Call, half: Boolean) {
+    let len = call.length(0)
+    if len < 4 {
+        call.fail("22P03", "insufficient data left in message")
+        return
+    }
+    let dim = call.byte(0, 0) * 256 + call.byte(0, 1)
+    let unused = call.byte(0, 2) * 256 + call.byte(0, 3)
+    let w = width(half)
+    if unused != 0 {
+        call.fail("22000", "expected unused to be 0, not " + Text(unused))
+        return
+    }
+    if len != 4 + dim * w {
+        call.fail("22P03", "insufficient data left in message")
+        return
+    }
+    let out = call.output
+    let i = 0
+    while i < dim {
+        let k = w - 1
+        while k >= 0 {
+            out.add(call.byte(0, 4 + i * w + k))
+            k -= 1
+        }
+        let f = 0.0
+        if half { f = fp16.toFloat(out.getUInt16(i * 2)) } else { f = out.getFloat32(i * 4) }
+        if !checkElement(call, f, half) { return }
+        i += 1
+    }
+    checkDims(call, dim, half)
+}
+
+deterministic function send(call: sdk.Call, half: Boolean) {
+    let out = call.output
+    let w = width(half)
+    let dim = call.length(0) / w
+    out.add(dim / 256)
+    out.add(dim % 256)
+    out.add(0)
+    out.add(0)
+    let i = 0
+    while i < dim {
+        let k = w - 1
+        while k >= 0 {
+            out.add(call.byte(0, i * w + k))
+            k -= 1
+        }
+        i += 1
+    }
+}
+
+deterministic function checkModifier(call: sdk.Call, half: Boolean) { checkDims(call, count(call, 0, half), half) }
+
+// ---------------------------------------------------------------- distances (float4 accumulation, like pgvector)
+
+function sameDims(call: sdk.Call, half: Boolean): Integer {
+    let a = count(call, 0, half)
+    let b = count(call, 1, half)
+    if a != b {
+        call.fail("22000", "different " + typeName(half) + " dimensions " + Text(a) + " and " + Text(b))
+        return -1
+    }
+    return a
+}
+
+// A float4 running total that overflowed is infinite.
+function overflowed(f: Float): Float {
+    if f > FLT_MAX { return 1.0 / 0.0 }
+    if f < -FLT_MAX { return -1.0 / 0.0 }
+    return f
+}
+
+function squared(call: sdk.Call, n: Integer, half: Boolean): Float {
+    let sum = 0.0
+    if half {
+        let i = 0
+        while i < n {
+            let d = at(call, 0, i, true) - at(call, 1, i, true)
+            sum += d * d
+            i += 1
+        }
+        return overflowed(sum)
+    }
+    let a = call.buffer(0)
+    let ao = call.offset(0)
+    let b = call.buffer(1)
+    let bo = call.offset(1)
+    let i = 0
+    while i < n {
+        let d = a.getFloat32(ao + i * 4) - b.getFloat32(bo + i * 4)
+        sum += d * d
+        i += 1
+    }
+    return overflowed(sum)
+}
+
+function dot(call: sdk.Call, n: Integer, half: Boolean): Float {
+    let sum = 0.0
+    if half {
+        let i = 0
+        while i < n {
+            sum += at(call, 0, i, true) * at(call, 1, i, true)
+            i += 1
+        }
+        return overflowed(sum)
+    }
+    let a = call.buffer(0)
+    let ao = call.offset(0)
+    let b = call.buffer(1)
+    let bo = call.offset(1)
+    let i = 0
+    while i < n {
+        sum += a.getFloat32(ao + i * 4) * b.getFloat32(bo + i * 4)
+        i += 1
+    }
+    return overflowed(sum)
+}
+
+public deterministic function l2Distance(call: sdk.Call, half: Boolean) {
+    let n = sameDims(call, half)
+    if n >= 0 { call.returnFloat(math.sqrt(squared(call, n, half))) }
+}
+
+deterministic function l2Squared(call: sdk.Call, half: Boolean) {
+    let n = sameDims(call, half)
+    if n >= 0 { call.returnFloat(squared(call, n, half)) }
+}
+
+deterministic function innerProduct(call: sdk.Call, half: Boolean) {
+    let n = sameDims(call, half)
+    if n >= 0 { call.returnFloat(dot(call, n, half)) }
+}
+
+deterministic function negativeInnerProduct(call: sdk.Call, half: Boolean) {
+    let n = sameDims(call, half)
+    if n >= 0 { call.returnFloat(-dot(call, n, half)) }
+}
+
+deterministic function cosineDistance(call: sdk.Call, half: Boolean) {
+    let n = sameDims(call, half)
+    if n < 0 { return }
+    let d = 0.0
+    let na = 0.0
+    let nb = 0.0
+    let i = 0
+    while i < n {
+        let x = at(call, 0, i, half)
+        let y = at(call, 1, i, half)
+        d += x * y
+        na += x * x
+        nb += y * y
+        i += 1
+    }
+    let similarity = overflowed(d) / math.sqrt(overflowed(na) * overflowed(nb))
+    // a zero or overflowing vector gives NaN, as in pgvector
+    if similarity != similarity {
+        call.returnFloat(similarity)
+        return
+    }
+    if similarity > 1.0 { similarity = 1.0 }
+    if similarity < -1.0 { similarity = -1.0 }
+    call.returnFloat(1.0 - similarity)
+}
+
+deterministic function l1Distance(call: sdk.Call, half: Boolean) {
+    let n = sameDims(call, half)
+    if n < 0 { return }
+    let sum = 0.0
+    let i = 0
+    while i < n {
+        let d = at(call, 0, i, half) - at(call, 1, i, half)
+        if d < 0.0 { d = -d }
+        sum += d
+        i += 1
+    }
+    call.returnFloat(overflowed(sum))
+}
+
+// ---------------------------------------------------------------- single-vector functions
+
+deterministic function dims(call: sdk.Call, half: Boolean) { call.returnInteger(count(call, 0, half)) }
+
+function sumSquares(call: sdk.Call, half: Boolean): Float {
+    let n = count(call, 0, half)
+    let sum = 0.0
+    let i = 0
+    while i < n {
+        let x = at(call, 0, i, half)
+        sum += x * x
+        i += 1
+    }
+    return sum
+}
+
+deterministic function norm(call: sdk.Call, half: Boolean) { call.returnFloat(math.sqrt(sumSquares(call, half))) }
+
+deterministic function l2Normalize(call: sdk.Call, half: Boolean) {
+    let n = count(call, 0, half)
+    let len = math.sqrt(sumSquares(call, half))
+    let out = call.output
+    let i = 0
+    while i < n {
+        let x = 0.0
+        if len > 0.0 { x = at(call, 0, i, half) / len }
+        if !add(call, out, x, half, "") { return }
+        i += 1
+    }
+}
+
+// bit i is set when element i is positive
+deterministic function binaryQuantize(call: sdk.Call, half: Boolean) {
+    let n = count(call, 0, half)
+    let out = call.output
+    out.addInt32(n)
+    let acc = 0
+    let i = 0
+    while i < n {
+        acc = acc * 2
+        if at(call, 0, i, half) > 0.0 { acc += 1 }
+        if i % 8 == 7 {
+            out.add(acc)
+            acc = 0
+        }
+        i += 1
+    }
+    if n % 8 != 0 {
+        let pad = 8 - n % 8
+        while pad > 0 {
+            acc = acc * 2
+            pad -= 1
+        }
+        out.add(acc)
+    }
+}
+
+// subvector(v, start, count): 1-based, like substring; the result keeps the part inside v.
+deterministic function subvector(call: sdk.Call, half: Boolean) {
+    let dim = count(call, 0, half)
+    let start = call.integer(1)
+    let n = call.integer(2)
+    if n < 1 {
+        call.fail("22000", typeName(half) + " must have at least 1 dimension")
+        return
+    }
+    let end = start + n
+    if start > dim - n { end = dim + 1 }
+    if start < 1 {
+        start = 1
+    } else if start > dim {
+        call.fail("22000", typeName(half) + " must have at least 1 dimension")
+        return
+    }
+    if end - start < 1 {
+        call.fail("22000", typeName(half) + " must have at least 1 dimension")
+        return
+    }
+    let out = call.output
+    let w = width(half)
+    let i = (start - 1) * w
+    while i < (end - 1) * w {
+        out.add(call.byte(0, i))
+        i += 1
+    }
+}
+
+// op 0 add, 1 subtract, 2 multiply (multiply also refuses an underflow to zero)
+deterministic function elementwise(call: sdk.Call, half: Boolean, op: Integer) {
+    let n = sameDims(call, half)
+    if n < 0 { return }
+    let out = call.output
+    let i = 0
+    while i < n {
+        let x = at(call, 0, i, half)
+        let y = at(call, 1, i, half)
+        let r = f32(x + y)
+        if op == 1 { r = f32(x - y) }
+        if op == 2 { r = f32(x * y) }
+        if op == 2 && x != 0.0 && y != 0.0 {
+            let zero = r == 0.0
+            if half { zero = fp16.toFloat(fp16.fromFloat(r)) == 0.0 }
+            if zero {
+                call.fail("22003", "value out of range: underflow")
+                return
+            }
+        }
+        if !add(call, out, r, half, "") { return }
+        i += 1
+    }
+}
+
+deterministic function concat(call: sdk.Call, half: Boolean) {
+    let a = count(call, 0, half)
+    let b = count(call, 1, half)
+    if a + b > MAX_DIM {
+        call.fail("54000", typeName(half) + " cannot have more than " + Text(MAX_DIM) + " dimensions")
+        return
+    }
+    let out = call.output
+    let i = 0
+    while i < call.length(0) {
+        out.add(call.byte(0, i))
+        i += 1
+    }
+    i = 0
+    while i < call.length(1) {
+        out.add(call.byte(1, i))
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------- ordering: element by element, then length
+
+function compare(call: sdk.Call, half: Boolean): Integer {
+    let a = count(call, 0, half)
+    let b = count(call, 1, half)
+    let n = a
+    if b < n { n = b }
+    let i = 0
+    while i < n {
+        let x = at(call, 0, i, half)
+        let y = at(call, 1, i, half)
+        if x < y { return -1 }
+        if x > y { return 1 }
+        i += 1
+    }
+    if a < b { return -1 }
+    if a > b { return 1 }
+    return 0
+}
+
+deterministic function compareCall(call: sdk.Call, half: Boolean) { call.returnInteger(compare(call, half)) }
+
+// ---------------------------------------------------------------- aggregates: state = float8 sums
+
+deterministic function accumulate(call: sdk.Call, half: Boolean) {
+    let n = count(call, 1, half)
+    let out = call.output
+    if call.isNull(0) {
+        let i = 0
+        while i < n {
+            out.addFloat64(at(call, 1, i, half))
+            i += 1
+        }
+        return
+    }
+    let m = call.length(0) / 8
+    if m != n {
+        call.fail("22000", "expected " + Text(m) + " dimensions, not " + Text(n))
+        return
+    }
+    let s = call.buffer(0)
+    let so = call.offset(0)
+    let i = 0
+    while i < n {
+        out.addFloat64(s.getFloat64(so + i * 8) + at(call, 1, i, half))
+        i += 1
+    }
+}
+
+deterministic function finish(call: sdk.Call, half: Boolean, divide: Boolean) {
+    let n = call.length(0) / 8
+    let rows = Float(call.integer(1))
+    let s = call.buffer(0)
+    let so = call.offset(0)
+    let out = call.output
+    let i = 0
+    while i < n {
+        let x = s.getFloat64(so + i * 8)
+        if divide { x = x / rows }
+        if !add(call, out, x, half, "") { return }
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------- casts between the dense types
+
+public function registerCasts(x: sdk.Extension) {
+    x.cast("vector", "halfvec", function(call) { convert(call, false, true) })
+    x.cast("halfvec", "vector", function(call) { convert(call, true, false) })
+}
+
+deterministic function convert(call: sdk.Call, fromHalf: Boolean, toHalf: Boolean) {
+    let n = count(call, 0, fromHalf)
+    let out = call.output
+    let i = 0
+    while i < n {
+        let f = at(call, 0, i, fromHalf)
+        let shown = Bytes()
+        if toHalf { call.addFloat4(shown, f) }
+        if !add(call, out, f, toHalf, Text(shown)) { return }
+        i += 1
+    }
+    checkDims(call, n, toHalf)
+}

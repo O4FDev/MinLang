@@ -1,0 +1,369 @@
+// LISTEN / NOTIFY and table change feeds. A notification is delivered only after the commit that sent it is
+// durable (the rule the COMMIT reply follows), so a listener never sees a change that a crash could take back.
+//
+// A channel named "<table>.changes" is a change feed: every committed INSERT, UPDATE and DELETE on that table
+// sends one notification whose payload is JSON, e.g. {"op":"update","table":"notes","row":{"id":1,"body":"hi"}}.
+// UPDATE and INSERT carry the committed row, DELETE the deleted row. COPY sends one {"op":"copy",...,"rows":N}.
+// Installed extensions' feed transforms (sdk Extension.feedTransform) see every change before it is queued and may
+// rewrite its JSON or drop it; they run at commit, in install order, before the change can reach any listener.
+use "./table.min" as tb
+use "./catalog.min" as cat
+use "./txn.min" as txn
+use "./dml.min" as dml
+use "./values.min" as v
+use "./exec.min" as ex
+use "./ext.min" as ext
+use "neodb-sdk" as sdk
+
+constant FEED_SUFFIX = ".changes"
+constant MAX_PAYLOAD = 7999    // PostgreSQL's limit for NOTIFY payloads (bytes); longer feed rows are cut to keys
+
+record Listener {
+    session: Integer
+    tag: Integer               // the server's connection token for this session
+    channels: List<Text>
+    inbox: Bytes               // NotificationResponse ('A') messages not yet sent
+    flagged: Boolean           // tag is in Hub.ready
+}
+
+record Note {
+    lsn: Integer
+    session: Integer
+    channel: Text
+    payload: Text
+}
+
+public record Hub {
+    private listeners: List<Listener>
+    private outbox: List<Note>      // committed, waiting for durability, in LSN order
+    private pending: List<Note>     // sent inside open transaction blocks
+    private ready: List<Integer>    // tags of listeners with undelivered messages
+    private feeds: Integer          // listened channels named "<table>.changes"
+    private call: List<sdk.Call>    // the feed-transform call, created on first use
+}
+
+public function newHub(): Hub {
+    return Hub { listeners: []; outbox: []; pending: []; ready: []; feeds: 0; call: [] }
+}
+
+public function hasListeners(h: Hub): Boolean { return h.listeners.length > 0 }
+public function hasReady(h: Hub): Boolean { return h.ready.length > 0 }
+
+function find(h: Hub, session: Integer): Integer {
+    let i = 0
+    while i < h.listeners.length {
+        if h.listeners[i].session == session { return i }
+        i += 1
+    }
+    return -1
+}
+
+function isFeed(channel: Text): Boolean {
+    return channel.length > FEED_SUFFIX.length && channel.slice(channel.length - FEED_SUFFIX.length, channel.length) == FEED_SUFFIX
+}
+
+public function listen(h: Hub, session: Integer, tag: Integer, channel: Text) {
+    let at = find(h, session)
+    if at < 0 {
+        h.listeners.add(Listener { session: session; tag: tag; channels: []; inbox: Bytes(); flagged: false })
+        at = h.listeners.length - 1
+    }
+    let l = h.listeners[at]
+    for ch in l.channels { if ch == channel { return } }
+    l.channels.add(channel)
+    if isFeed(channel) { h.feeds += 1 }
+}
+
+// channel "*" stops every channel of the session.
+public function unlisten(h: Hub, session: Integer, channel: Text) {
+    let at = find(h, session)
+    if at < 0 { return }
+    let l = h.listeners[at]
+    let keep: List<Text> = []
+    for ch in l.channels {
+        if channel == "*" || ch == channel {
+            if isFeed(ch) { h.feeds -= 1 }
+        } else {
+            keep.add(ch)
+        }
+    }
+    l.channels = keep
+    if keep.length == 0 && l.inbox.length == 0 { removeAt(h, at) }
+}
+
+function removeAt(h: Hub, at: Integer) {
+    let keep: List<Listener> = []
+    let i = 0
+    while i < h.listeners.length {
+        if i != at { keep.add(h.listeners[i]) }
+        i += 1
+    }
+    h.listeners = keep
+}
+
+// The session closed: forget its channels and any notifications it sent in an unfinished transaction.
+public function dropSession(h: Hub, session: Integer) {
+    rollback(h, session)
+    let at = find(h, session)
+    if at < 0 { return }
+    for ch in h.listeners[at].channels { if isFeed(ch) { h.feeds -= 1 } }
+    removeAt(h, at)
+}
+
+// NOTIFY: inside a transaction block it waits for COMMIT; otherwise it is delivered now.
+public function notify(h: Hub, session: Integer, channel: Text, payload: Text, inBlock: Boolean) {
+    let n = Note { lsn: 0; session: session; channel: channel; payload: payload }
+    if inBlock { h.pending.add(n) } else { deliver(h, n) }
+}
+
+public function rollback(h: Hub, session: Integer) {
+    if h.pending.length == 0 { return }
+    let keep: List<Note> = []
+    for n in h.pending { if n.session != session { keep.add(n) } }
+    h.pending = keep
+}
+
+// The session's transaction committed at lsn (0: nothing to wait for). Its NOTIFYs and the change-feed
+// notifications for the rows it wrote are delivered once the WAL is durable up to lsn.
+public function commit(h: Hub, c: cat.Catalog, tx: txn.Txn, session: Integer, lsn: Integer, durable: Integer) {
+    if h.feeds > 0 { feedChanges(h, c, tx, session, lsn) }
+    commitNotes(h, session, lsn, durable)
+}
+
+// A transaction block that wrote nothing committed: deliver its NOTIFYs.
+public function commitNotes(h: Hub, session: Integer, lsn: Integer, durable: Integer) {
+    if h.pending.length > 0 {
+        let keep: List<Note> = []
+        for n in h.pending {
+            if n.session == session {
+                n.lsn = lsn
+                h.outbox.add(n)
+            } else {
+                keep.add(n)
+            }
+        }
+        h.pending = keep
+    }
+    if h.outbox.length > 0 { release(h, durable) }
+}
+
+// The WAL is durable up to lsn: deliver everything committed at or below it.
+public function release(h: Hub, durable: Integer) {
+    if h.outbox.length == 0 { return }
+    let i = 0
+    while i < h.outbox.length && h.outbox[i].lsn <= durable {
+        deliver(h, h.outbox[i])
+        i += 1
+    }
+    if i == 0 { return }
+    let keep: List<Note> = []
+    while i < h.outbox.length {
+        keep.add(h.outbox[i])
+        i += 1
+    }
+    h.outbox = keep
+}
+
+// Tags of the connections that have notifications to send; each tag is reported once until its inbox is taken.
+public function takeReady(h: Hub): List<Integer> {
+    let r = h.ready
+    h.ready = []
+    return r
+}
+
+public function takeInbox(h: Hub, session: Integer): Bytes {
+    let at = find(h, session)
+    if at < 0 { return Bytes() }
+    let l = h.listeners[at]
+    let b = l.inbox
+    l.inbox = Bytes()
+    l.flagged = false
+    if l.channels.length == 0 { removeAt(h, at) }
+    return b
+}
+
+function deliver(h: Hub, n: Note) {
+    for l in h.listeners {
+        let hit = false
+        for ch in l.channels { if ch == n.channel { hit = true } }
+        if hit {
+            appendMessage(l.inbox, n.session, n.channel, n.payload)
+            if !l.flagged {
+                l.flagged = true
+                h.ready.add(l.tag)
+            }
+        }
+    }
+}
+
+// NotificationResponse: 'A', int32 length, int32 sender process id, channel, payload (C strings).
+function appendMessage(b: Bytes, pid: Integer, channel: Text, payload: Text) {
+    let start = b.length
+    b.add(65)
+    put32(b, 0)
+    put32(b, pid)
+    b.addBytes(Bytes(channel))
+    b.add(0)
+    b.addBytes(Bytes(payload))
+    b.add(0)
+    let len = b.length - start - 1
+    b[start + 1] = (len >> 24) & 255
+    b[start + 2] = (len >> 16) & 255
+    b[start + 3] = (len >> 8) & 255
+    b[start + 4] = len & 255
+}
+
+function put32(b: Bytes, x: Integer) {
+    b.add((x >> 24) & 255)
+    b.add((x >> 16) & 255)
+    b.add((x >> 8) & 255)
+    b.add(x & 255)
+}
+
+function listened(h: Hub, channel: Text): Boolean {
+    for l in h.listeners { for ch in l.channels { if ch == channel { return true } } }
+    return false
+}
+
+function feedChanges(h: Hub, c: cat.Catalog, tx: txn.Txn, session: Integer, lsn: Integer) {
+    let lastTable = -1
+    let lastRow = -1
+    let lastKind = -1
+    let i = 0
+    while i < tx.uCount {
+        let k = tx.uKind.getInt64(i * 8)
+        let kind = k & 15
+        let tid = tx.uTable.getInt64(i * 8)
+        let r = tx.uRow.getInt64(i * 8)
+        i += 1
+        if tid == lastTable && r == lastRow && kind == lastKind { continue }
+        lastTable = tid
+        lastRow = r
+        lastKind = kind
+        if tid < 0 || tid >= c.tables.length { continue }
+        let t = c.tables[tid]
+        if t.isTemp || t.chunk >= 0 { continue }
+        let channel = t.name + FEED_SUFFIX
+        if !listened(h, channel) { continue }
+        let payload = ""
+        if kind == txn.U_BULK {
+            payload = "{\"op\":\"copy\",\"table\":" + jsonString(t.name) + ",\"rows\":" + Text((k >> 8) - r) + "}"
+        } else {
+            let op = "insert"
+            if kind == txn.U_UPDATE { op = "update" }
+            if kind == txn.U_DELETE { op = "delete" }
+            payload = "{\"op\":\"" + op + "\",\"table\":" + jsonString(t.name) + ",\"row\":" + rowJson(t, r, false) + "}"
+            if Bytes(payload).length > MAX_PAYLOAD {
+                payload = "{\"op\":\"" + op + "\",\"table\":" + jsonString(t.name) + ",\"row\":" + rowJson(t, r, true) + ",\"cut\":true}"
+            }
+        }
+        payload = transform(h, c, t.name, payload)
+        if payload != "" { h.outbox.add(Note { lsn: lsn; session: session; channel: channel; payload: payload }) }
+    }
+}
+
+// Run the installed extensions' feed transforms over one change; "" means a transform dropped it.
+function transform(h: Hub, c: cat.Catalog, table: Text, payloadIn: Text): Text {
+    if c.extensions.length == 0 { return payloadIn }
+    let payload = payloadIn
+    for xi in c.extensions {
+        for f in ext.extension(xi).feedTransforms {
+            if h.call.length == 0 { h.call.add(ext.newCall(2, ex.extHost())) }
+            let call = h.call[0]
+            let tb0 = Bytes(table)
+            let pb = Bytes(payload)
+            call.nulls[0] = false
+            call.buffers[0] = tb0
+            call.offsets[0] = 0
+            call.lengths[0] = tb0.length
+            call.nulls[1] = false
+            call.buffers[1] = pb
+            call.offsets[1] = 0
+            call.lengths[1] = pb.length
+            call.begin()
+            call.output = Bytes()
+            f.body(call)
+            if call.failed {
+                // fail closed: listeners learn that a change happened, but see none of its data
+                return "{\"op\":\"transform_failed\",\"table\":" + jsonString(table) + ",\"transform\":" + jsonString(f.name) +
+                    ",\"error\":" + jsonString(call.failMessage) + "}"
+            }
+            if call.resultNull { return "" }
+            payload = Text(call.output)
+        }
+    }
+    return payload
+}
+
+// The row as a JSON object; keysOnly keeps just the primary key columns (payload limit).
+function rowJson(t: tb.Table, r: Integer, keysOnly: Boolean): Text {
+    let b = Bytes()
+    b.add(123)
+    let first = true
+    let ci = 0
+    while ci < t.cols.length {
+        let wanted = !keysOnly
+        if keysOnly { for pk in t.pkCols { if pk == ci { wanted = true } } }
+        if wanted && r < t.nrows {
+            let col = t.cols[ci]
+            if !first { b.add(44) }
+            first = false
+            b.addBytes(Bytes(jsonString(col.name)))
+            b.add(58)
+            b.addBytes(Bytes(cellJson(col, r)))
+        }
+        ci += 1
+    }
+    b.add(125)
+    return Text(b)
+}
+
+function cellJson(col: tb.Column, r: Integer): Text {
+    if tb.isNull(col, r) { return "null" }
+    let t = col.type
+    if t == v.T_BOOL {
+        if tb.getInt(col, r) != 0 { return "true" }
+        return "false"
+    }
+    let text = dml.cellText(col, r)
+    if v.isExtType(t) { return jsonString(text) }
+    if t == v.T_INT2 || t == v.T_INT4 || t == v.T_INT8 || t == v.T_OID || t == v.T_NUMERIC || t == v.T_FLOAT4 || t == v.T_FLOAT8 {
+        if text == "NaN" || text == "Infinity" || text == "-Infinity" { return jsonString(text) }
+        return text
+    }
+    return jsonString(text)
+}
+
+function jsonString(s: Text): Text {
+    let src = Bytes(s)
+    let b = Bytes()
+    b.add(34)
+    for c in src {
+        if c == 34 || c == 92 {
+            b.add(92)
+            b.add(c)
+        } else if c == 10 {
+            b.add(92)
+            b.add(110)
+        } else if c == 13 {
+            b.add(92)
+            b.add(114)
+        } else if c == 9 {
+            b.add(92)
+            b.add(116)
+        } else if c < 32 {
+            b.addBytes(Bytes("\\u00"))
+            b.add(hexDigit(c >> 4))
+            b.add(hexDigit(c & 15))
+        } else {
+            b.add(c)
+        }
+    }
+    b.add(34)
+    return Text(b)
+}
+
+function hexDigit(x: Integer): Integer {
+    if x < 10 { return 48 + x }
+    return 87 + x
+}

@@ -1,0 +1,4527 @@
+// Full-text search index over one text column (docs/r2/search.md). Row ids are neo-db's dense row positions.
+// Main segment: per chunk of 65,536 rows, per term one container (sorted 16-bit offsets, or a 1,024-word bitmap
+// with rank counts) followed by term frequencies (1 byte, 255 = see tfBig), a skip table and varint positions.
+// Rows written after their chunk was built live in a per-chunk delta mini-segment (same container format) until
+// the chunk is rebuilt. Visibility: rows a transaction touches become suspect and are settled at query time.
+use "math" as math
+use "../engine/values.min" as v
+use "../engine/table.min" as tb
+use "../engine/hashmap.min" as hm
+use "../engine/regex.min" as rx
+use "../../lib/dbio.min" as dbio
+use "./text.min" as tx
+use "./query.min" as qy
+
+public constant CHUNK_SHIFT = 16
+public constant CHUNK = 65536
+public constant WORDS = 1024
+public constant ARRAY_MAX = 4096
+constant BITMAP_BYTES = 12288    // 1,024 words + int32 rank before each word
+constant ENTRY = 16
+constant PROMOTE_AT = 4096
+// block-max: containers with at least BM_MIN postings store, per 512-row block, the block's largest BM25 term factor
+// tf(k1+1)/(tf + k1(1-b+b dl/A)) at the index's normAvgdl A, quantised up to 1/255 of (k1+1)
+constant BM_MIN = 64
+constant BM_BLOCKS = 128
+constant BM_SHIFT = 9
+
+// ---------------------------------------------------------------- dictionary
+
+public record Dict {
+    text: Bytes        // term bytes back to back
+    ends: Bytes        // int32 per term: end offset in text
+    hashes: Bytes      // int64 per term
+    slots: Bytes       // int32 per slot: term id + 1, 0 = empty
+    mask: Integer
+    count: Integer
+}
+
+function newDict(): Dict {
+    return Dict { text: Bytes(); ends: Bytes(); hashes: Bytes(); slots: Bytes(65536 * 4); mask: 65535; count: 0 }
+}
+
+public function termStart(d: Dict, id: Integer): Integer {
+    if id == 0 { return 0 }
+    return d.ends.getInt32((id - 1) * 4)
+}
+
+public function termEnd(d: Dict, id: Integer): Integer { return d.ends.getInt32(id * 4) }
+
+public function termText(d: Dict, id: Integer): Text { return Text(d.text.slice(termStart(d, id), termEnd(d, id))) }
+
+public function lookup(d: Dict, buf: Bytes, off: Integer, len: Integer): Integer {
+    let h = v.hashBytes(buf, off, len)
+    let i = h & d.mask
+    while true {
+        let s = d.slots.getInt32(i * 4)
+        if s == 0 { return -1 }
+        let id = s - 1
+        if d.hashes.getInt64(id * 8) == h {
+            let a = termStart(d, id)
+            if v.equalBytes(d.text, a, termEnd(d, id) - a, buf, off, len) { return id }
+        }
+        i = (i + 1) & d.mask
+    }
+}
+
+public function intern(d: Dict, buf: Bytes, off: Integer, len: Integer): Integer {
+    let h = v.hashBytes(buf, off, len)
+    let i = h & d.mask
+    while true {
+        let s = d.slots.getInt32(i * 4)
+        if s == 0 { break }
+        let id = s - 1
+        if d.hashes.getInt64(id * 8) == h {
+            let a = termStart(d, id)
+            if v.equalBytes(d.text, a, termEnd(d, id) - a, buf, off, len) { return id }
+        }
+        i = (i + 1) & d.mask
+    }
+    let id = d.count
+    let j = 0
+    while j + 8 <= len {
+        d.text.addInt64(buf.getInt64(off + j))
+        j += 8
+    }
+    while j < len {
+        d.text.add(buf[off + j])
+        j += 1
+    }
+    d.ends.addInt32(d.text.length)
+    d.hashes.addInt64(h)
+    d.slots.setInt32(i * 4, id + 1)
+    d.count = id + 1
+    if d.count * 2 > d.mask { growDict(d) }
+    return id
+}
+
+function growDict(d: Dict) {
+    let n = (d.mask + 1) * 2
+    d.slots = Bytes(n * 4)
+    d.mask = n - 1
+    let id = 0
+    while id < d.count {
+        let i = d.hashes.getInt64(id * 8) & d.mask
+        while d.slots.getInt32(i * 4) != 0 { i = (i + 1) & d.mask }
+        d.slots.setInt32(i * 4, id + 1)
+        id += 1
+    }
+}
+
+// ---------------------------------------------------------------- index
+
+record Delta {
+    terms: hm.IntMap   // term id -> container offset in arena (header: count, maxTf, minDl as int32s)
+    arena: Bytes
+    member: Bytes      // 1,024-word bitmap of the rows in this mini-segment
+    count: Integer
+}
+
+public record Index {
+    id: Integer
+    tableId: Integer
+    column: Integer
+    name: Text
+    stemmer: Integer
+    dict: Dict
+    df: Bytes          // int32 per term: counted rows containing it
+    dirStart: Bytes    // int32 per term: first directory entry
+    dirCount: Bytes    // int32 per term
+    dir: Bytes         // ENTRY bytes per entry: chunk, count, offset (int32), minDl (uint16), maxTf (uint8), 0
+    arenas: List<Bytes>
+    dl: Bytes          // uint16 per row: document length in tokens (65,535 = see dlBig)
+    dlBig: hm.IntMap
+    tfBig: hm.IntMap   // (term << 32 | row) -> tf, for tf >= 255
+    mainValid: Bytes   // bitmap: row's current content is in its main chunk and counted
+    inDelta: Bytes     // bitmap: row's content changed since its chunk was built
+    counted: Bytes     // bitmap: row is in the statistics (state 0, current content)
+    suspect: Bytes     // bitmap: row is on the suspect list
+    suspects: Bytes    // int64 rows to settle
+    deltas: List<Delta>
+    deltaDirty: Bytes  // per chunk
+    deltaCount: Bytes  // int32 per chunk: rows with inDelta
+    n: Integer         // counted rows
+    sumDl: Integer
+    capRows: Integer   // rows the per-row arrays cover
+    tk: tx.Tokens
+    tk2: tx.Tokens
+    sorted: Bytes      // int32 term ids in byte order (wildcards, fuzzy, ranges)
+    sortedCount: Integer
+    // build scratch
+    cnt: Bytes
+    start: Bytes
+    built: Boolean
+    oldPrint: hm.IntMap   // row -> fingerprint of the token sequence it had when an update began
+    facets: List<Facet>   // per-value row bitmaps of low-cardinality columns (GROUP BY over a search)
+    generation: Integer   // bumped by every full build (term ids change)
+    normAvgdl: Float      // average document length the block-max factors were computed with
+}
+
+public function newIndex(id: Integer, tableId: Integer, column: Integer, name: Text, stemmer: Integer): Index {
+    return Index {
+        id: id; tableId: tableId; column: column; name: name; stemmer: stemmer; dict: newDict()
+        df: Bytes(); dirStart: Bytes(); dirCount: Bytes(); dir: Bytes(); arenas: []
+        dl: Bytes(); dlBig: hm.newIntMap(16); tfBig: hm.newIntMap(16)
+        mainValid: Bytes(); inDelta: Bytes(); counted: Bytes(); suspect: Bytes(); suspects: Bytes()
+        deltas: []; deltaDirty: Bytes(); deltaCount: Bytes(); n: 0; sumDl: 0; capRows: 0
+        tk: tx.newTokens(stemmer); tk2: tx.newTokens(stemmer); sorted: Bytes(); sortedCount: -1
+        cnt: Bytes(); start: Bytes(); built: false; oldPrint: hm.newIntMap(16); facets: []; generation: 0; normAvgdl: 1.0
+    }
+}
+
+// ---- bit helpers over Bytes of 64-bit words
+
+public function popcount(x: Integer): Integer {
+    let a = wrappingSubtract(x, (x >> 1) & 0x5555555555555555)
+    let b = wrappingAdd(a & 0x3333333333333333, (a >> 2) & 0x3333333333333333)
+    let c = wrappingAdd(b, b >> 4) & 0x0F0F0F0F0F0F0F0F
+    return (wrappingMultiply(c, 0x0101010101010101) >> 56) & 255
+}
+
+function lowBit(i: Integer): Integer {
+    if i == 63 { return -9223372036854775807 - 1 }
+    return 1 << i
+}
+
+function getBit(b: Bytes, r: Integer): Boolean {
+    let w = r >> 6
+    if w * 8 >= b.length { return false }
+    return (b.getInt64(w * 8) & lowBit(r & 63)) != 0
+}
+
+function setBit(b: Bytes, r: Integer) {
+    let w = r >> 6
+    b.setInt64(w * 8, b.getInt64(w * 8) | lowBit(r & 63))
+}
+
+function clearBit(b: Bytes, r: Integer) {
+    let w = r >> 6
+    b.setInt64(w * 8, b.getInt64(w * 8) & ~lowBit(r & 63))
+}
+
+// Index of the lowest set bit of a non-zero word.
+function lowestBit(w: Integer): Integer { return popcount(wrappingSubtract(w & wrappingSubtract(0, w), 1)) }
+
+function nChunks(rows: Integer): Integer { return (rows + CHUNK - 1) >> CHUNK_SHIFT }
+
+// Grow the per-row and per-chunk arrays to cover `rows` rows.
+public function ensureRows(ix: Index, rows: Integer) {
+    if rows <= ix.capRows { return }
+    let cap = ix.capRows * 2
+    if cap < rows { cap = rows }
+    let chunks = nChunks(cap)
+    let words = chunks * WORDS
+    ix.dl.resize(cap * 2)
+    ix.mainValid.resize(words * 8)
+    ix.inDelta.resize(words * 8)
+    ix.counted.resize(words * 8)
+    ix.suspect.resize(words * 8)
+    while ix.deltas.length < chunks {
+        ix.deltas.add(Delta { terms: hm.newIntMap(16); arena: Bytes(); member: Bytes(); count: 0 })
+        ix.arenas.add(Bytes())
+    }
+    ix.deltaDirty.resize(chunks)
+    ix.deltaCount.resize(chunks * 4)
+    ix.capRows = cap
+}
+
+public function docLength(ix: Index, r: Integer): Integer {
+    let x = ix.dl.getUInt16(r * 2)
+    if x == 65535 { return hm.get(ix.dlBig, r, 65535) }
+    return x
+}
+
+function setDocLength(ix: Index, r: Integer, n: Integer) {
+    if n >= 65535 {
+        ix.dl.setUInt16(r * 2, 65535)
+        hm.put(ix.dlBig, r, n)
+    } else {
+        ix.dl.setUInt16(r * 2, n)
+    }
+}
+
+public function documentFrequency(ix: Index, term: Integer): Integer {
+    if term < 0 || term * 4 >= ix.df.length { return 0 }
+    return ix.df.getInt32(term * 4)
+}
+
+function ensureTerms(ix: Index) {
+    let need = ix.dict.count * 4
+    if ix.df.length < need {
+        let cap = ix.df.length * 2
+        if cap < need { cap = need }
+        if cap < 4096 { cap = 4096 }
+        ix.df.resize(cap)
+        ix.dirStart.resize(cap)
+        ix.dirCount.resize(cap)
+        ix.cnt.resize(cap)
+        ix.start.resize(cap)
+    }
+}
+
+// Tokenize the row's text (current content) into tk. Returns false for NULL.
+function tokenizeRow(ix: Index, t: tb.Table, r: Integer, tk: tx.Tokens): Boolean {
+    tx.clear(tk)
+    let c = t.cols[ix.column]
+    if tb.isNull(c, r) { return false }
+    tx.tokenize(tk, c.heap, tb.textOff(c, r), tb.textLen(c, r))
+    return true
+}
+
+// Add (sign 1) or remove (sign -1) the row's current content from the statistics.
+function countRow(ix: Index, t: tb.Table, r: Integer, sign: Integer) {
+    let tk = ix.tk2
+    if !tokenizeRow(ix, t, r, tk) {
+        if sign > 0 { setDocLength(ix, r, 0) }
+        return
+    }
+    if sign > 0 { setDocLength(ix, r, tk.count) }
+    ix.n += sign
+    ix.sumDl += sign * tk.count
+    // unique terms: mark with cnt as a seen flag (reset after)
+    let ids = Bytes()
+    let i = 0
+    while i < tk.count {
+        let a = tx.termStart(tk, i)
+        let id = intern(ix.dict, tk.terms, a, tx.termEnd(tk, i) - a)
+        ensureTerms(ix)
+        if ix.cnt.getInt32(id * 4) == 0 {
+            ix.cnt.setInt32(id * 4, 1)
+            ids.addInt32(id)
+        }
+        i += 1
+    }
+    i = 0
+    while i < ids.length / 4 {
+        let id = ids.getInt32(i * 4)
+        ix.cnt.setInt32(id * 4, 0)
+        ix.df.setInt32(id * 4, ix.df.getInt32(id * 4) + sign)
+        i += 1
+    }
+}
+
+// ---------------------------------------------------------------- write hooks
+
+// Fingerprint of a token sequence (term bytes and boundaries); never 0.
+function tokenPrint(tk: tx.Tokens): Integer {
+    let h = v.hashBytes(tk.terms, 0, tk.terms.length)
+    h = v.hashCombine(h, v.hashBytes(tk.ends, 0, tk.ends.length))
+    if h == 0 { h = 1 }
+    return h
+}
+
+// The row is about to change (or its state is): take it out of the statistics and the valid set.
+public function touchRow(ix: Index, t: tb.Table, r: Integer) {
+    if !ix.built { return }
+    ensureRows(ix, r + 1)
+    if getBit(ix.counted, r) {
+        countRow(ix, t, r, -1)
+        clearBit(ix.counted, r)
+        if !getBit(ix.inDelta, r) { hm.put(ix.oldPrint, r, tokenPrint(ix.tk2)) }
+    }
+    clearBit(ix.mainValid, r)
+    if getBit(ix.inDelta, r) { ix.deltaDirty[r >> CHUNK_SHIFT] = 1 }
+    if !getBit(ix.suspect, r) {
+        setBit(ix.suspect, r)
+        ix.suspects.addInt64(r)
+    }
+}
+
+// The row's indexed column has new content (insert, key-changing update, rollback, replay).
+public function insertRow(ix: Index, t: tb.Table, r: Integer) {
+    if !ix.built { return }
+    touchRow(ix, t, r)
+    // an update that leaves the token sequence unchanged (case, spacing, punctuation) keeps the row's postings
+    let old = hm.get(ix.oldPrint, r, 0)
+    if old != 0 {
+        hm.remove(ix.oldPrint, r)
+        if !getBit(ix.inDelta, r) && tokenizeRow(ix, t, r, ix.tk2) && tokenPrint(ix.tk2) == old { return }
+    }
+    // every version a row ever had is in the dictionary, so a before-image read by another session can be matched
+    if tokenizeRow(ix, t, r, ix.tk2) {
+        let tk = ix.tk2
+        let i = 0
+        while i < tk.count {
+            let a = tx.termStart(tk, i)
+            intern(ix.dict, tk.terms, a, tx.termEnd(tk, i) - a)
+            i += 1
+        }
+        ensureTerms(ix)
+    }
+    if !getBit(ix.inDelta, r) {
+        setBit(ix.inDelta, r)
+        let c = r >> CHUNK_SHIFT
+        ix.deltaCount.setInt32(c * 4, ix.deltaCount.getInt32(c * 4) + 1)
+    }
+    ix.deltaDirty[r >> CHUNK_SHIFT] = 1
+}
+
+// Rows [from, to) were touched by one bulk operation (COPY).
+public function touchRange(ix: Index, t: tb.Table, from: Integer, to: Integer) {
+    let r = from
+    while r < to {
+        touchRow(ix, t, r)
+        r += 1
+    }
+}
+
+// Settle suspect rows against the table's row states (call at the start of every search). Locked rows (open
+// transactions) stay suspect and are returned in `locked`.
+public function settle(ix: Index, t: tb.Table, locked: Bytes) {
+    locked.clear()
+    // an index whose table was empty or not loaded when it was created / recovered is built on first use
+    if !ix.built { build(ix, t) }
+    if ix.suspects.length > 0 {
+        let keep = Bytes()
+        let i = 0
+        let n = ix.suspects.length / 8
+        while i < n {
+            let r = ix.suspects.getInt64(i * 8)
+            i += 1
+            if r >= t.nrows {
+                clearBit(ix.suspect, r)
+                continue
+            }
+            let st = t.state[r]
+            if st == 0 {
+                countRow(ix, t, r, 1)
+                setBit(ix.counted, r)
+                for f in ix.facets { facetRow(f, t, r) }
+                if getBit(ix.inDelta, r) {
+                    ix.deltaDirty[r >> CHUNK_SHIFT] = 1
+                } else {
+                    setBit(ix.mainValid, r)
+                }
+                clearBit(ix.suspect, r)
+            } else if (st & tb.ST_LOCKED) == 0 {
+                clearBit(ix.suspect, r)
+            } else {
+                keep.addInt64(r)
+                locked.addInt64(r)
+            }
+        }
+        ix.suspects = keep
+    }
+    // promote chunks with large deltas, then rebuild dirty delta mini-segments
+    let chunks = nChunks(ix.capRows)
+    let promote: List<Integer> = []
+    let c = 0
+    while c < chunks {
+        if ix.deltaCount.getInt32(c * 4) > PROMOTE_AT { promote.add(c) }
+        c += 1
+    }
+    if promote.length > 0 { promoteChunks(ix, t, promote) }
+    c = 0
+    while c < chunks {
+        if ix.deltaDirty[c] != 0 { rebuildDelta(ix, t, c) }
+        c += 1
+    }
+}
+
+// ---------------------------------------------------------------- building
+
+// Build state for one inversion: (term, row offset << 32 | position) per token.
+record Inv {
+    tids: Bytes
+    rps: Bytes
+    touched: Bytes
+    sorted: Bytes
+    all: Bytes      // every token's term id of the chunk (multi-pass inversion)
+}
+
+global INV: Inv = Inv { tids: Bytes(); rps: Bytes(); touched: Bytes(); sorted: Bytes(); all: Bytes() }
+
+public function build(ix: Index, t: tb.Table) {
+    let d = newDict()
+    ix.dict = d
+    ix.df = Bytes()
+    ix.dirStart = Bytes()
+    ix.dirCount = Bytes()
+    ix.cnt = Bytes()
+    ix.start = Bytes()
+    ix.dir = Bytes()
+    ix.arenas = []
+    ix.deltas = []
+    ix.dl = Bytes()
+    ix.dlBig = hm.newIntMap(16)
+    ix.tfBig = hm.newIntMap(16)
+    ix.mainValid = Bytes()
+    ix.inDelta = Bytes()
+    ix.counted = Bytes()
+    ix.suspect = Bytes()
+    ix.suspects = Bytes()
+    ix.deltaDirty = Bytes()
+    ix.deltaCount = Bytes()
+    ix.n = 0
+    ix.sumDl = 0
+    ix.capRows = 0
+    ix.sortedCount = -1
+    ix.facets = []
+    ensureRows(ix, max(t.nrows, CHUNK))
+    ix.normAvgdl = sampleAvgdl(ix, t)
+    let pending = Bytes()
+    let chunks = nChunks(t.nrows)
+    let c = 0
+    while c < chunks {
+        buildChunk(ix, t, c, pending, true)
+        c += 1
+    }
+    mergeDirectory(ix, pending, [])
+    INV.tids = Bytes()
+    INV.rps = Bytes()
+    INV.touched = Bytes()
+    INV.sorted = Bytes()
+    dbio.releaseFreeMemory()
+    ix.built = true
+    ix.generation += 1
+}
+
+// Average document length over a sample of up to 4,096 rows (block-max factors are computed against it).
+function sampleAvgdl(ix: Index, t: tb.Table): Float {
+    let n = t.nrows
+    if n == 0 { return 1.0 }
+    let step = max(1, n / 4096)
+    let docs = 0
+    let toks = 0
+    let r = 0
+    while r < n {
+        if t.state[r] == 0 && tokenizeRow(ix, t, r, ix.tk2) {
+            docs += 1
+            toks += ix.tk2.count
+        }
+        r += step
+    }
+    if docs == 0 || toks == 0 { return 1.0 }
+    return Float(toks) / Float(docs)
+}
+
+public function termFactor(tf: Integer, dl: Integer, avgdl: Float): Float {
+    let ftf = Float(tfRep(tf))
+    return ftf * (K1 + 1.0) / (ftf + K1 * (1.0 - BM25_B + BM25_B * Float(dl) / avgdl))
+}
+
+// Rows of chunk c to invert: every row except dead unlocked ones (their content is never visible again).
+function chunkRows(ix: Index, t: tb.Table, c: Integer, rows: Bytes) {
+    rows.clear()
+    let lo = c << CHUNK_SHIFT
+    let hi = min(lo + CHUNK, t.nrows)
+    let r = lo
+    while r < hi {
+        let st = t.state[r]
+        if (st & tb.ST_DEAD) == 0 || (st & tb.ST_LOCKED) != 0 { rows.addInt64(r) }
+        r += 1
+    }
+}
+
+// Build main chunk c from the table. initial: also set statistics and validity (first build); otherwise the chunk is
+// being promoted (statistics unchanged; rows' validity moves from delta to main).
+function buildChunk(ix: Index, t: tb.Table, c: Integer, pending: Bytes, initial: Boolean) {
+    let rows = Bytes()
+    chunkRows(ix, t, c, rows)
+    let lo = c << CHUNK_SHIFT
+    let nr = rows.length / 8
+    if initial {
+        let i = 0
+        while i < nr {
+            let r = rows.getInt64(i * 8)
+            if t.state[r] == 0 {
+                setBit(ix.counted, r)
+                setBit(ix.mainValid, r)
+            } else {
+                setBit(ix.suspect, r)
+                ix.suspects.addInt64(r)
+            }
+            i += 1
+        }
+    }
+    let arena = Bytes()
+    invert(ix, t, rows, lo, arena, pending, c, initial, Delta { terms: hm.newIntMap(16); arena: Bytes(); member: Bytes(); count: 0 })
+    ix.arenas[c] = arena.slice(0, arena.length)   // exact size: growth leaves up to half the capacity unused
+    if initial {
+        let i = 0
+        while i < nr {
+            let r = rows.getInt64(i * 8)
+            if getBit(ix.counted, r) {
+                ix.n += 1
+                ix.sumDl += docLength(ix, r)
+            }
+            i += 1
+        }
+    }
+}
+
+// Invert `rows` (row ids in increasing order, all in the chunk starting at lo) into containers appended to arena.
+// pending != empty-mode: main (entries appended to pending as tid + entry); delta: containers registered in dt.
+function invert(ix: Index, t: tb.Table, rows: Bytes, lo: Integer, arena: Bytes, pending: Bytes, c: Integer,
+                initial: Boolean, dt: Delta) {
+    // Long documents make one chunk's (term, row, position) list large: split the terms into passes so the
+    // inversion buffers stay near INV_BUDGET tokens (each pass tokenizes the chunk again).
+    let nr = rows.length / 8
+    let textBytes = 0
+    let col = t.cols[ix.column]
+    let i = 0
+    while i < nr {
+        let r = rows.getInt64(i * 8)
+        if !tb.isNull(col, r) { textBytes += tb.textLen(col, r) }
+        i += 1
+    }
+    let passes = textBytes / 5 / INV_BUDGET + 1
+    let pass = 0
+    while pass < passes {
+        invertPass(ix, t, rows, lo, arena, pending, c, initial, dt, pass, passes)
+        pass += 1
+    }
+}
+
+constant INV_BUDGET = 16000000
+
+function invertPass(ix: Index, t: tb.Table, rows: Bytes, lo: Integer, arena: Bytes, pending: Bytes, c: Integer,
+                    initial: Boolean, dt: Delta, pass: Integer, passes: Integer) {
+    let inv = INV
+    inv.tids.clear()
+    inv.rps.clear()
+    let tk = ix.tk
+    let nr = rows.length / 8
+    let i = 0
+    if pass == 0 {
+        // tokenize once; with several passes keep every token's term id (4 bytes) for the later passes
+        if passes > 1 { inv.all.clear() }
+        while i < nr {
+            let r = rows.getInt64(i * 8)
+            if tokenizeRow(ix, t, r, tk) {
+                let k = 0
+                let off = (r - lo) << 32
+                while k < tk.count {
+                    let a = tx.termStart(tk, k)
+                    let id = intern(ix.dict, tk.terms, a, tx.termEnd(tk, k) - a)
+                    if passes > 1 { inv.all.addInt32(id) }
+                    if passes == 1 || id % passes == 0 {
+                        inv.tids.addInt32(id)
+                        inv.rps.addInt64(off | k)
+                    }
+                    k += 1
+                }
+                setDocLength(ix, r, tk.count)
+            } else {
+                setDocLength(ix, r, 0)
+            }
+            i += 1
+        }
+    } else {
+        let at = 0
+        while i < nr {
+            let r = rows.getInt64(i * 8)
+            let n = docLength(ix, r)
+            let off = (r - lo) << 32
+            let k = 0
+            while k < n {
+                let id = inv.all.getInt32((at + k) * 4)
+                if id % passes == pass {
+                    inv.tids.addInt32(id)
+                    inv.rps.addInt64(off | k)
+                }
+                k += 1
+            }
+            at += n
+            i += 1
+        }
+        if pass == passes - 1 { inv.all = Bytes() }
+    }
+    ensureTerms(ix)
+    // counting sort by term (stable: rows and positions stay in order)
+    let nt = inv.tids.length / 4
+    inv.touched.clear()
+    i = 0
+    while i < nt {
+        let id = inv.tids.getInt32(i * 4)
+        let x = ix.cnt.getInt32(id * 4)
+        if x == 0 { inv.touched.addInt32(id) }
+        ix.cnt.setInt32(id * 4, x + 1)
+        i += 1
+    }
+    let nu = inv.touched.length / 4
+    let pos = 0
+    i = 0
+    while i < nu {
+        let id = inv.touched.getInt32(i * 4)
+        ix.start.setInt32(id * 4, pos)
+        pos += ix.cnt.getInt32(id * 4)
+        i += 1
+    }
+    inv.sorted.resize(nt * 8)
+    i = 0
+    while i < nt {
+        let id = inv.tids.getInt32(i * 4)
+        let at = ix.start.getInt32(id * 4)
+        inv.sorted.setInt64(at * 8, inv.rps.getInt64(i * 8))
+        ix.start.setInt32(id * 4, at + 1)
+        i += 1
+    }
+    // emit one container per touched term
+    i = 0
+    while i < nu {
+        let id = inv.touched.getInt32(i * 4)
+        let count = ix.cnt.getInt32(id * 4)
+        let end = ix.start.getInt32(id * 4)
+        let from = end - count
+        ix.cnt.setInt32(id * 4, 0)
+        emitContainer(ix, id, inv.sorted, from, end, lo, arena, pending, c, initial, dt)
+        i += 1
+    }
+}
+
+function putUVarint(out: Bytes, x: Integer) {
+    let u = x
+    while u >= 128 {
+        out.add((u & 127) | 128)
+        u = u >> 7
+    }
+    out.add(u)
+}
+
+// Bytes written by builds (benchmarks): [docs, tf + block-max, positions + skips]
+global SIZES: List<Integer> = [0, 0, 0]
+
+public function sizes(i: Integer): Integer { return SIZES[i] }
+
+function emitContainer(ix: Index, id: Integer, s: Bytes, from: Integer, end: Integer, lo: Integer, arena: Bytes,
+                       pending: Bytes, c: Integer, initial: Boolean, dt: Delta) {
+    // distinct rows, max tf, min dl
+    let np = 0
+    let maxTf = 0
+    let minDl = 1000000000
+    let prevRow = -1
+    let tf = 0
+    let k = from
+    while k < end {
+        let row = s.getInt64(k * 8) >> 32
+        if row != prevRow {
+            if tf > maxTf { maxTf = tf }
+            np += 1
+            prevRow = row
+            tf = 0
+            let dl = docLength(ix, lo + row)
+            if dl < minDl { minDl = dl }
+        }
+        tf += 1
+        k += 1
+    }
+    if tf > maxTf { maxTf = tf }
+    let header = -1
+    if dt.member.length > 0 {
+        header = arena.length
+        arena.addInt32(np)
+        arena.addInt32(maxTf)
+        arena.addInt32(minDl)
+    }
+    let off = arena.length
+    if np >= ARRAY_MAX {
+        arena.resize(off + BITMAP_BYTES)
+        k = from
+        prevRow = -1
+        while k < end {
+            let row = s.getInt64(k * 8) >> 32
+            if row != prevRow {
+                let w = off + (row >> 6) * 8
+                arena.setInt64(w, arena.getInt64(w) | lowBit(row & 63))
+                prevRow = row
+            }
+            k += 1
+        }
+        let acc = 0
+        let w = 0
+        while w < WORDS {
+            arena.setInt32(off + 8192 + w * 4, acc)
+            acc += popcount(arena.getInt64(off + w * 8))
+            w += 1
+        }
+    } else {
+        k = from
+        prevRow = -1
+        while k < end {
+            let row = s.getInt64(k * 8) >> 32
+            if row != prevRow {
+                arena.addUInt16(row)
+                prevRow = row
+            }
+            k += 1
+        }
+    }
+    // term frequencies
+    k = from
+    prevRow = -1
+    tf = 0
+    let counted = 0
+    while k <= end {
+        let row = -1
+        if k < end { row = s.getInt64(k * 8) >> 32 }
+        if row != prevRow {
+            if prevRow >= 0 {
+                if tf >= 255 {
+                    arena.add(255)
+                    hm.put(ix.tfBig, (id << 32) | (lo + prevRow), tf)
+                } else {
+                    arena.add(tf)
+                }
+                if initial && getBit(ix.counted, lo + prevRow) { counted += 1 }
+            }
+            prevRow = row
+            tf = 0
+        }
+        tf += 1
+        k += 1
+    }
+    if counted > 0 { ix.df.setInt32(id * 4, ix.df.getInt32(id * 4) + counted) }
+    // block-max factors
+    if np >= BM_MIN {
+        let bmAt = arena.length
+        arena.resize(bmAt + BM_BLOCKS)
+        k = from
+        prevRow = -1
+        tf = 0
+        while k <= end {
+            let row = -1
+            if k < end { row = s.getInt64(k * 8) >> 32 }
+            if row != prevRow {
+                if prevRow >= 0 {
+                    let f = termFactor(tf, docLength(ix, lo + prevRow), ix.normAvgdl)
+                    let qf = Integer(f / (K1 + 1.0) * 255.0) + 1
+                    if qf > 255 { qf = 255 }
+                    let bi = bmAt + (prevRow >> BM_SHIFT)
+                    if qf > arena[bi] { arena[bi] = qf }
+                }
+                prevRow = row
+                tf = 0
+            }
+            tf += 1
+            k += 1
+        }
+    }
+    SIZES[0] = SIZES[0] + docsBytes(np)
+    SIZES[1] = SIZES[1] + np + bmBytes(np)
+    // skip table and positions
+    let nskip = (np + 15) / 16
+    let skipAt = arena.length
+    arena.resize(skipAt + nskip * 4)
+    let posStart = arena.length
+    k = from
+    prevRow = -1
+    let p = 0
+    let prevPos = 0
+    while k < end {
+        let x = s.getInt64(k * 8)
+        let row = x >> 32
+        let ps = x & 4294967295
+        if row != prevRow {
+            if (p & 15) == 0 { arena.setInt32(skipAt + (p >> 4) * 4, arena.length - posStart) }
+            p += 1
+            prevRow = row
+            prevPos = 0
+        }
+        putUVarint(arena, ps - prevPos)
+        prevPos = ps
+        k += 1
+    }
+    SIZES[2] = SIZES[2] + arena.length - skipAt
+    if header >= 0 {
+        hm.put(dt.terms, id, header)
+    } else {
+        pending.addInt32(id)
+        pending.addInt32(c)
+        pending.addInt32(np)
+        pending.addInt32(off)
+        pending.addUInt16(min(minDl, 65535))
+        pending.add(min(maxTf, 255))
+        pending.add(0)
+    }
+}
+
+// Rebuild the term directory: old entries (minus chunks in `drop`) merged with pending (tid + entry, in chunk order).
+function mergeDirectory(ix: Index, pending: Bytes, drop: List<Integer>) {
+    ensureTerms(ix)
+    let nt = ix.dict.count
+    let dropSet = Bytes(nChunks(ix.capRows) + 1)
+    for c in drop { dropSet[c] = 1 }
+    let cnt = Bytes(nt * 4)
+    let oldDir = ix.dir
+    let t = 0
+    while t < nt {
+        if t * 4 < ix.dirCount.length {
+            let s = ix.dirStart.getInt32(t * 4)
+            let n = ix.dirCount.getInt32(t * 4)
+            let k = 0
+            let keep = 0
+            while k < n {
+                if dropSet[oldDir.getInt32((s + k) * ENTRY)] == 0 { keep += 1 }
+                k += 1
+            }
+            cnt.setInt32(t * 4, keep)
+        }
+        t += 1
+    }
+    let np = pending.length / 20
+    let i = 0
+    while i < np {
+        let id = pending.getInt32(i * 20)
+        cnt.setInt32(id * 4, cnt.getInt32(id * 4) + 1)
+        i += 1
+    }
+    let starts = Bytes(nt * 4)
+    let total = 0
+    t = 0
+    while t < nt {
+        starts.setInt32(t * 4, total)
+        total += cnt.getInt32(t * 4)
+        t += 1
+    }
+    let nd = Bytes(total * ENTRY)
+    let fill = Bytes(nt * 4)
+    // old entries first, then pending ones; then sort each term's entries by chunk (insertion sort: mostly sorted)
+    t = 0
+    while t < nt {
+        if t * 4 < ix.dirCount.length {
+            let s = ix.dirStart.getInt32(t * 4)
+            let n = ix.dirCount.getInt32(t * 4)
+            let k = 0
+            while k < n {
+                let e = (s + k) * ENTRY
+                if dropSet[oldDir.getInt32(e)] == 0 {
+                    let at = (starts.getInt32(t * 4) + fill.getInt32(t * 4)) * ENTRY
+                    copyEntry(oldDir, e, nd, at)
+                    fill.setInt32(t * 4, fill.getInt32(t * 4) + 1)
+                }
+                k += 1
+            }
+        }
+        t += 1
+    }
+    let sortTerms = Bytes()
+    i = 0
+    while i < np {
+        let id = pending.getInt32(i * 20)
+        let at = (starts.getInt32(id * 4) + fill.getInt32(id * 4)) * ENTRY
+        copyEntry(pending, i * 20 + 4, nd, at)
+        if fill.getInt32(id * 4) > 0 && drop.length > 0 { sortTerms.addInt32(id) }
+        fill.setInt32(id * 4, fill.getInt32(id * 4) + 1)
+        i += 1
+    }
+    i = 0
+    while i < sortTerms.length / 4 {
+        let id = sortTerms.getInt32(i * 4)
+        sortEntries(nd, starts.getInt32(id * 4), cnt.getInt32(id * 4))
+        i += 1
+    }
+    ix.dir = nd
+    ix.dirStart = starts
+    ix.dirCount = cnt
+    ensureTermsAfterDir(ix)
+}
+
+function ensureTermsAfterDir(ix: Index) {
+    let need = ix.df.length
+    if ix.dirStart.length < need { ix.dirStart.resize(need) }
+    if ix.dirCount.length < need { ix.dirCount.resize(need) }
+}
+
+function copyEntry(a: Bytes, ao: Integer, b: Bytes, bo: Integer) {
+    b.setInt64(bo, a.getInt64(ao))
+    b.setInt64(bo + 8, a.getInt64(ao + 8))
+}
+
+function sortEntries(d: Bytes, s: Integer, n: Integer) {
+    let i = 1
+    let tmp = Bytes(ENTRY)
+    while i < n {
+        let j = i
+        while j > 0 && d.getInt32((s + j - 1) * ENTRY) > d.getInt32((s + j) * ENTRY) {
+            copyEntry(d, (s + j) * ENTRY, tmp, 0)
+            copyEntry(d, (s + j - 1) * ENTRY, d, (s + j) * ENTRY)
+            copyEntry(tmp, 0, d, (s + j - 1) * ENTRY)
+            j -= 1
+        }
+        i += 1
+    }
+}
+
+// Rebuild main chunks (their delta rows move into the main segment).
+function promoteChunks(ix: Index, t: tb.Table, chunks: List<Integer>) {
+    let pending = Bytes()
+    for c in chunks {
+        buildChunk(ix, t, c, pending, false)
+        let lo = c << CHUNK_SHIFT
+        let hi = min(lo + CHUNK, ix.capRows)
+        let w = lo >> 6
+        while w < (hi + 63) >> 6 {
+            let cw = ix.counted.getInt64(w * 8)
+            ix.mainValid.setInt64(w * 8, cw)
+            ix.inDelta.setInt64(w * 8, 0)
+            w += 1
+        }
+        ix.deltaCount.setInt32(c * 4, 0)
+        ix.deltaDirty[c] = 0
+        ix.deltas[c] = Delta { terms: hm.newIntMap(16); arena: Bytes(); member: Bytes(); count: 0 }
+    }
+    mergeDirectory(ix, pending, chunks)
+}
+
+// Rebuild chunk c's delta mini-segment from its counted delta rows.
+function rebuildDelta(ix: Index, t: tb.Table, c: Integer) {
+    ix.deltaDirty[c] = 0
+    let lo = c << CHUNK_SHIFT
+    let rows = Bytes()
+    let member = Bytes(WORDS * 8)
+    let w = 0
+    while w < WORDS {
+        let gw = (lo >> 6) + w
+        if gw * 8 < ix.inDelta.length {
+            let x = ix.inDelta.getInt64(gw * 8) & ix.counted.getInt64(gw * 8)
+            member.setInt64(w * 8, x)
+            while x != 0 {
+                let b = lowestBit(x)
+                rows.addInt64(lo + w * 64 + b)
+                x = x & wrappingSubtract(x, 1)
+            }
+        }
+        w += 1
+    }
+    let dt = Delta { terms: hm.newIntMap(64); arena: Bytes(); member: member; count: rows.length / 8 }
+    if dt.count > 0 { invert(ix, t, rows, lo, dt.arena, Bytes(), c, false, dt) }
+    ix.deltas[c] = dt
+}
+
+// ---------------------------------------------------------------- containers
+
+public record Cref {
+    arena: Bytes
+    off: Integer
+    count: Integer
+    maxTf: Integer
+    minDl: Integer
+    term: Integer
+    cursor: Integer    // array containers: index of the next posting to look at
+    tfOff: Integer     // offset of the term frequencies
+}
+
+function newCref(): Cref { return Cref { arena: Bytes(); off: 0; count: 0; maxTf: 0; minDl: 0; term: -1; cursor: 0; tfOff: 0 } }
+
+// Main container of term in chunk c (entries are scanned from *cur, which advances; chunks are visited in
+// increasing order by the callers that pass cur >= 0, otherwise binary search).
+function mainContainer(ix: Index, term: Integer, c: Integer, ref: Cref): Boolean {
+    if term < 0 || term * 4 >= ix.dirCount.length { return false }
+    let s = ix.dirStart.getInt32(term * 4)
+    let n = ix.dirCount.getInt32(term * 4)
+    let a = 0
+    let b = n
+    while a < b {
+        let m = (a + b) >> 1
+        if ix.dir.getInt32((s + m) * ENTRY) < c { a = m + 1 } else { b = m }
+    }
+    if a >= n { return false }
+    let e = (s + a) * ENTRY
+    if ix.dir.getInt32(e) != c { return false }
+    ref.arena = ix.arenas[c]
+    ref.count = ix.dir.getInt32(e + 4)
+    ref.off = ix.dir.getInt32(e + 8)
+    ref.minDl = ix.dir.getUInt16(e + 12)
+    ref.maxTf = ix.dir[e + 14]
+    ref.term = term
+    ref.cursor = 0
+    ref.tfOff = ref.off + docsBytes(ref.count)
+    return true
+}
+
+function deltaContainer(ix: Index, term: Integer, c: Integer, ref: Cref): Boolean {
+    let dt = ix.deltas[c]
+    if dt.count == 0 { return false }
+    let h = hm.get(dt.terms, term, -1)
+    if h < 0 { return false }
+    ref.arena = dt.arena
+    ref.count = dt.arena.getInt32(h)
+    ref.maxTf = min(dt.arena.getInt32(h + 4), 255)
+    ref.minDl = min(dt.arena.getInt32(h + 8), 65535)
+    ref.off = h + 12
+    ref.term = term
+    ref.cursor = 0
+    ref.tfOff = ref.off + docsBytes(ref.count)
+    return true
+}
+
+function container(ix: Index, term: Integer, c: Integer, delta: Boolean, ref: Cref): Boolean {
+    if delta { return deltaContainer(ix, term, c, ref) }
+    return mainContainer(ix, term, c, ref)
+}
+
+function bmBytes(count: Integer): Integer {
+    if count >= BM_MIN { return BM_BLOCKS }
+    return 0
+}
+
+function docsBytes(count: Integer): Integer {
+    if count >= ARRAY_MAX { return BITMAP_BYTES }
+    return count * 2
+}
+
+// OR the container's rows into bitmap bm (1,024 words).
+function orContainer(bm: Bytes, ref: Cref) {
+    let a = ref.arena
+    let o = ref.off
+    if ref.count >= ARRAY_MAX {
+        let w = 0
+        while w < WORDS {
+            bm.setInt64(w * 8, bm.getInt64(w * 8) | a.getInt64(o + w * 8))
+            w += 1
+        }
+        return
+    }
+    let i = 0
+    while i < ref.count {
+        let row = a.getUInt16(o + i * 2)
+        let w = (row >> 6) * 8
+        bm.setInt64(w, bm.getInt64(w) | lowBit(row & 63))
+        i += 1
+    }
+}
+
+// Rank of row offset `row` in the container, or -1 when absent. Array containers use the cursor (rows asked in
+// increasing order) with a binary-search fallback.
+function rankOf(ref: Cref, row: Integer): Integer {
+    let a = ref.arena
+    let o = ref.off
+    if ref.count >= ARRAY_MAX {
+        let w = row >> 6
+        let x = a.getInt64(o + w * 8)
+        if (x & lowBit(row & 63)) == 0 { return -1 }
+        let r = a.getInt32(o + 8192 + w * 4)
+        let below = row & 63
+        if below > 0 { r += popcount(x & wrappingSubtract(lowBit(below), 1)) }
+        return r
+    }
+    let i = ref.cursor
+    if i >= ref.count || a.getUInt16(o + i * 2) > row {
+        // rows are asked in increasing order: absent unless the cursor is already past an earlier row
+        if i == 0 || a.getUInt16(o + (i - 1) * 2) < row { return -1 }
+    }
+    if i < ref.count && a.getUInt16(o + i * 2) <= row && (i == 0 || a.getUInt16(o + (i - 1) * 2) < row) {
+        // gallop forward
+        let step = 1
+        while i + step < ref.count && a.getUInt16(o + (i + step) * 2) < row {
+            i += step
+            step = step * 2
+        }
+        while i < ref.count && a.getUInt16(o + i * 2) < row { i += 1 }
+    } else {
+        let lo = 0
+        let hi = ref.count
+        while lo < hi {
+            let m = (lo + hi) >> 1
+            if a.getUInt16(o + m * 2) < row { lo = m + 1 } else { hi = m }
+        }
+        i = lo
+    }
+    ref.cursor = i
+    if i < ref.count && a.getUInt16(o + i * 2) == row { return i }
+    return -1
+}
+
+function tfAt(ix: Index, ref: Cref, rank: Integer, row: Integer): Integer {
+    let x = ref.arena[ref.off + docsBytes(ref.count) + rank]
+    if x == 255 { return hm.get(ix.tfBig, (ref.term << 32) | row, 255) }
+    return x
+}
+
+// Append the positions of posting `rank` (absolute row `row`) to out as int32s.
+// Byte offset of posting `rank`'s positions in ref.arena.
+function positionsStart(ix: Index, ref: Cref, rank: Integer, row: Integer): Integer {
+    let a = ref.arena
+    let tfo = ref.off + docsBytes(ref.count)
+    let skipAt = tfo + ref.count + bmBytes(ref.count)
+    let nskip = (ref.count + 15) / 16
+    let posStart = skipAt + nskip * 4
+    let p = posStart + a.getInt32(skipAt + (rank >> 4) * 4)
+    let k = rank & 0x7FFFFFFFFFFFFFF0
+    while k < rank {
+        let tf = a[tfo + k]
+        if tf == 255 { tf = hm.get(ix.tfBig, (ref.term << 32) | (((row >> CHUNK_SHIFT) << CHUNK_SHIFT) + rowAtRank(ref, k)), 255) }
+        let j = 0
+        while j < tf {
+            while a[p] >= 128 { p += 1 }
+            p += 1
+            j += 1
+        }
+        k += 1
+    }
+    return p
+}
+
+function positionsAt(ix: Index, ref: Cref, rank: Integer, row: Integer, out: Bytes) {
+    let a = ref.arena
+    let tfo = ref.off + docsBytes(ref.count)
+    let skipAt = tfo + ref.count + bmBytes(ref.count)
+    let nskip = (ref.count + 15) / 16
+    let posStart = skipAt + nskip * 4
+    let p = posStart + a.getInt32(skipAt + (rank >> 4) * 4)
+    let k = rank & 0x7FFFFFFFFFFFFFF0
+    while k < rank {
+        let tf = a[tfo + k]
+        if tf == 255 { tf = hm.get(ix.tfBig, (ref.term << 32) | (((row >> CHUNK_SHIFT) << CHUNK_SHIFT) + rowAtRank(ref, k)), 255) }
+        let j = 0
+        while j < tf {
+            while a[p] >= 128 { p += 1 }
+            p += 1
+            j += 1
+        }
+        k += 1
+    }
+    let tf = tfAt(ix, ref, rank, row)
+    let prev = 0
+    let j = 0
+    while j < tf {
+        let u = 0
+        let shift = 0
+        while true {
+            let b = a[p]
+            p += 1
+            u = u | ((b & 127) << shift)
+            if b < 128 { break }
+            shift += 7
+        }
+        prev += u
+        out.addInt32(prev)
+        j += 1
+    }
+}
+
+// Absolute chunk offset of the posting at `rank` (only for tf overflow lookups; slow for bitmaps).
+function rowAtRank(ref: Cref, rank: Integer): Integer {
+    let a = ref.arena
+    let o = ref.off
+    if ref.count < ARRAY_MAX { return a.getUInt16(o + rank * 2) }
+    let k = 0
+    let seen = 0
+    let w = 0
+    while w < WORDS {
+        let x = a.getInt64(o + w * 8)
+        let pc = popcount(x)
+        if seen + pc > rank {
+            while x != 0 {
+                if seen == rank { return w * 64 + lowestBit(x) }
+                x = x & wrappingSubtract(x, 1)
+                seen += 1
+            }
+        }
+        seen += pc
+        w += 1
+    }
+    return k
+}
+
+// ---------------------------------------------------------------- compiled queries
+
+public constant K1 = 1.2
+public constant BM25_B = 0.75
+
+public record Compiled {
+    q: qy.Query
+    leafOf: List<Integer>      // per node: leaf index (Q_TERM / Q_MATCHES) or -1
+    leafUts: List<Bytes>       // per leaf: int32 indexes into the distinct-term table
+    exact: Bytes               // per node: 1 = the set-level result is exact (no positional check needed)
+    uts: Bytes                 // distinct term ids (int32)
+    utScore: Bytes             // per distinct term: 1 = contributes to the score
+    utBoost: List<Float>
+    utIdf: List<Float>
+    utLeaves: List<Bytes>      // per distinct term: int32 leaves that contain it
+    utOf: hm.IntMap            // term id -> distinct index
+    refs: List<Cref>           // per distinct term: its container in the current chunk
+    present: Bytes             // per distinct term: container present in the current chunk
+    bm: List<Bytes>            // per node: chunk bitmap scratch
+    spans: List<Bytes>         // per node: spans of the current document (int32 start, end)
+    leafPos: List<Bytes>       // per leaf: positions in the current document (sorted int32)
+    docTf: Bytes               // per distinct term: tf in the current document (token path)
+    positional: Boolean
+    err: Text
+    errPos: Integer
+    avgdl: Float
+    docs: Integer
+    tmp: Bytes
+    counters: Bytes
+    generation: Integer
+    dictCount: Integer
+    leafScore: List<Integer>   // per leaf: -2 every term scores, -1 none (expansions), else the one term id that scores
+    scoreOrder: List<Integer>  // scoring distinct terms in byte order (TIN sums per-term f32 scores in this order)
+    mult32: List<Float>        // per distinct term: f32(idf * weight)
+    dlf32: Float               // f32(k1 * b / avgdl)
+    tfs: Bytes                 // int32 per distinct term: tf in the row being scored
+    stamp: Bytes               // int64 per distinct term: row whose tf tfs holds (+1)
+    fastPhrase: Boolean        // root is a plain phrase of single-term words: streaming check (no full decode)
+    fpUts: Bytes               // int32 per phrase word: distinct term
+    fpOffs: Bytes              // int32 per phrase word: offset in the phrase (gaps counted)
+    fpPtr: Bytes               // int64 stream state per word: byte offset, words left, current position
+    fpLeft: Bytes
+    fpCur: Bytes
+    phraseLists: List<Bytes>   // phrase verification scratch
+    phraseGaps: List<Integer>
+    phraseScratch: List<Bytes>
+    wf: List<Float>            // per distinct term: weight * idf * (k1 + 1) (f64 pruning scores)
+    normA: Float               // k1 (1 - b)
+    normB: Float               // k1 b / avgdl
+}
+
+function emptyBitmap(): Bytes { return Bytes(WORDS * 8) }
+
+public function compile(ix: Index, text: Text): Compiled {
+    let q = qy.parse(text)
+    let cp = Compiled {
+        q: q; leafOf: []; leafUts: []; exact: Bytes(); uts: Bytes(); utScore: Bytes(); utBoost: []; utIdf: []
+        utLeaves: []; utOf: hm.newIntMap(16); refs: []; present: Bytes(); bm: []; spans: []; leafPos: []; docTf: Bytes()
+        positional: false; err: q.err; errPos: q.errPos; avgdl: 1.0; docs: 0; tmp: Bytes(); counters: Bytes(CHUNK)
+        generation: ix.generation; dictCount: ix.dict.count
+        leafScore: []; scoreOrder: []; mult32: []; dlf32: 0.0; tfs: Bytes(); stamp: Bytes(); fastPhrase: false; fpUts: Bytes(); fpOffs: Bytes(); fpPtr: Bytes(); fpLeft: Bytes(); fpCur: Bytes(); phraseLists: []; phraseGaps: []; phraseScratch: []; wf: []; normA: 0.0; normB: 0.0
+    }
+    if q.err != "" { return cp }
+    // resolve terms first (may add nodes), then size the per-node arrays
+    resolveTree(ix, cp, q.root)
+    if cp.err != "" { return cp }
+    tidyTree(cp, q.root)
+    if cp.err != "" { return cp }
+    let n = q.kind.length
+    let i = 0
+    while i < n {
+        if cp.leafOf.length <= i { cp.leafOf.add(-1) }
+        cp.bm.add(Bytes())
+        cp.spans.add(Bytes())
+        i += 1
+    }
+    cp.exact.resize(n)
+    markExact(cp, q.root)
+    cp.positional = cp.exact[q.root] == 0
+    detectFastPhrase(cp)
+    markScoring(cp, q.root, false, 1.0)
+    i = 0
+    while i < cp.uts.length / 4 {
+        cp.refs.add(newCref())
+        i += 1
+    }
+    cp.present.resize(cp.uts.length / 4)
+    cp.docTf.resize(cp.uts.length)
+    cp.tfs.resize(cp.uts.length)
+    cp.stamp.resize(cp.uts.length * 2)
+    // TIN adds per-term scores in the terms' byte order
+    let d = ix.dict
+    i = 0
+    while i < cp.uts.length / 4 {
+        if cp.utScore[i] != 0 { cp.scoreOrder.add(i) }
+        i += 1
+    }
+    let ut = cp.uts
+    cp.scoreOrder.sortBy(function(a: Integer, b: Integer): Integer { return compareTerms(d, ut.getInt32(a * 4), ut.getInt32(b * 4)) })
+    refreshStats(ix, cp)
+    return cp
+}
+
+// N, avgdl and idf from the current statistics (call after settle).
+public function refreshStats(ix: Index, cp: Compiled) {
+    cp.docs = ix.n
+    if ix.n > 0 { cp.avgdl = Float(ix.sumDl) / Float(ix.n) } else { cp.avgdl = 1.0 }
+    if cp.avgdl <= 0.0 { cp.avgdl = 1.0 }
+    cp.utIdf = []
+    cp.mult32 = []
+    let i = 0
+    while i < cp.uts.length / 4 {
+        let df = documentFrequency(ix, cp.uts.getInt32(i * 4))
+        let nn = Float(ix.n)
+        let d = Float(df)
+        let inner = 1.0 + (nn - d + 0.5) / (d + 0.5)
+        let idf = 0.0
+        if inner > 1.0 { idf = f32(math.log(inner)) }
+        cp.utIdf.add(idf)
+        cp.mult32.add(f32(idf * f32(cp.utBoost[i])))
+        i += 1
+    }
+    cp.dlf32 = f32(f32(f32(K1) * f32(BM25_B)) / f32(cp.avgdl))
+    cp.wf = []
+    i = 0
+    while i < cp.uts.length / 4 {
+        cp.wf.add(cp.utBoost[i] * cp.utIdf[i] * (K1 + 1.0))
+        i += 1
+    }
+    cp.normA = K1 * (1.0 - BM25_B)
+    cp.normB = K1 * BM25_B / cp.avgdl
+}
+
+// Phrases drop words that fold to nothing and leading/trailing gaps; * is not valid where spans are needed.
+function tidyTree(cp: Compiled, n: Integer) {
+    let q = cp.q
+    let k = q.kind[n]
+    if k == qy.Q_PHRASE {
+        let kept: List<Integer> = []
+        for x in q.kids[n] {
+            if !(q.kind[x] == qy.Q_NONE && (q.flags[x] & qy.QF_DROP) != 0) { kept.add(x) }
+        }
+        let lo = 0
+        let hi = kept.length
+        while lo < hi && q.kind[kept[lo]] == qy.Q_GAP { lo += 1 }
+        while hi > lo && q.kind[kept[hi - 1]] == qy.Q_GAP { hi -= 1 }
+        let trimmed: List<Integer> = []
+        let i = lo
+        while i < hi {
+            trimmed.add(kept[i])
+            i += 1
+        }
+        kept = trimmed
+        q.kids[n] = kept
+        if kept.length == 0 { q.kind[n] = qy.Q_NONE }
+        return
+    }
+    if k == qy.Q_THEN || k == qy.Q_NEAR || k == qy.Q_REL || k == qy.Q_INPOS || k == qy.Q_WITHIN {
+        let a = q.a[n]
+        if q.kind[a] == qy.Q_ALL || (k != qy.Q_INPOS && k != qy.Q_WITHIN && q.kind[q.b[n]] == qy.Q_ALL) {
+            cp.err = "* (match all) is not valid inside a span or positional operator"
+            return
+        }
+    }
+    if k == qy.Q_ANDNOT || k == qy.Q_THEN || k == qy.Q_NEAR || k == qy.Q_REL {
+        tidyTree(cp, q.a[n])
+        tidyTree(cp, q.b[n])
+        return
+    }
+    if k == qy.Q_WITHIN || k == qy.Q_INPOS || k == qy.Q_BOOST {
+        tidyTree(cp, q.a[n])
+        return
+    }
+    for x in q.kids[n] { tidyTree(cp, x) }
+}
+
+function setLeaf(cp: Compiled, n: Integer, terms: Bytes) {
+    while cp.leafOf.length <= n { cp.leafOf.add(-1) }
+    let leaf = cp.leafUts.length
+    cp.leafOf[n] = leaf
+    let us = Bytes()
+    let i = 0
+    while i < terms.length / 4 {
+        let id = terms.getInt32(i * 4)
+        let u = hm.get(cp.utOf, id, -1)
+        if u < 0 {
+            u = cp.uts.length / 4
+            cp.uts.addInt32(id)
+            cp.utScore.add(0)
+            cp.utBoost.add(0.0)
+            cp.utLeaves.add(Bytes())
+            hm.put(cp.utOf, id, u)
+        }
+        us.addInt32(u)
+        cp.utLeaves[u].addInt32(leaf)
+        i += 1
+    }
+    cp.leafUts.add(us)
+    cp.leafPos.add(Bytes())
+    cp.leafScore.add(-2)
+}
+
+function resolveTree(ix: Index, cp: Compiled, n: Integer) {
+    let q = cp.q
+    let k = q.kind[n]
+    if k == qy.Q_TERM {
+        resolveTerm(ix, cp, n)
+        return
+    }
+    if k == qy.Q_MATCHES {
+        let terms = Bytes()
+        let e = matchRegex(ix, q.text[n], terms)
+        if e != "" && cp.err == "" { cp.err = "MATCHES: " + e }
+        setLeaf(cp, n, terms)
+        cp.leafScore[cp.leafScore.length - 1] = -1
+        return
+    }
+    if k == qy.Q_ANDNOT || k == qy.Q_THEN || k == qy.Q_NEAR || k == qy.Q_REL {
+        resolveTree(ix, cp, q.a[n])
+        resolveTree(ix, cp, q.b[n])
+        return
+    }
+    if k == qy.Q_WITHIN || k == qy.Q_INPOS || k == qy.Q_BOOST {
+        resolveTree(ix, cp, q.a[n])
+        return
+    }
+    let i = 0
+    while i < q.kids[n].length {
+        resolveTree(ix, cp, q.kids[n][i])
+        i += 1
+    }
+}
+
+function resolveTerm(ix: Index, cp: Compiled, n: Integer) {
+    let q = cp.q
+    let f = q.flags[n]
+    let terms = Bytes()
+    let raw = Bytes(q.text[n])
+    // hyphenated wildcard / fuzzy terms are phrases of their parts (e-mail~1 = "e [mail~1]")
+    if (f & (qy.QF_WILD | qy.QF_FUZZY)) != 0 && (f & qy.QF_RANGE) == 0 && hasHyphen(raw) {
+        splitHyphenated(ix, cp, n, raw)
+        return
+    }
+    if (f & qy.QF_RANGE) != 0 {
+        rangeTerms(ix, foldPlain(ix, raw), foldPlain(ix, Bytes(q.text[q.c[n]])), terms)
+        setLeaf(cp, n, terms)
+        cp.leafScore[cp.leafScore.length - 1] = -1
+        return
+    }
+    if (f & qy.QF_WILD) != 0 {
+        wildTerms(ix, foldPlain(ix, raw), terms)
+        setLeaf(cp, n, terms)
+        cp.leafScore[cp.leafScore.length - 1] = -1
+        return
+    }
+    if (f & qy.QF_FUZZY) != 0 {
+        let key = foldPlain(ix, raw)
+        fuzzyTerms(ix, key, q.a[n], q.b[n], terms)
+        setLeaf(cp, n, terms)
+        cp.leafScore[cp.leafScore.length - 1] = lookup(ix.dict, key, 0, key.length)
+        return
+    }
+    if (f & qy.QF_CONTAINS) != 0 {
+        containsTerms(ix, foldPlain(ix, raw), terms)
+        setLeaf(cp, n, terms)
+        cp.leafScore[cp.leafScore.length - 1] = -1
+        return
+    }
+    let tk = ix.tk2
+    tx.clear(tk)
+    tx.tokenize(tk, raw, 0, raw.length)
+    let alnum = false
+    for b in tk.terms {
+        if b != 95 { alnum = true }
+    }
+    if (f & qy.QF_ESCAPED) != 0 && !alnum {
+        q.kind[n] = qy.Q_NONE
+        q.flags[n] = f | qy.QF_DROP
+        return
+    }
+    if tk.count == 0 {
+        q.kind[n] = qy.Q_NONE
+        return
+    }
+    if tk.count == 1 {
+        let id = lookup(ix.dict, tk.terms, 0, tx.termEnd(tk, 0))
+        if id >= 0 { terms.addInt32(id) }
+        setLeaf(cp, n, terms)
+        return
+    }
+    // several words (e-mail, U.S.A-style splits): a phrase of them
+    q.kind[n] = qy.Q_PHRASE
+    q.a[n] = 0
+    let i = 0
+    let ids: List<Integer> = []
+    while i < tk.count {
+        let a = tx.termStart(tk, i)
+        ids.add(lookup(ix.dict, tk.terms, a, tx.termEnd(tk, i) - a))
+        i += 1
+    }
+    for id in ids {
+        let m = qy.node(q, qy.Q_TERM, "")
+        let one = Bytes()
+        if id >= 0 { one.addInt32(id) }
+        setLeaf(cp, m, one)
+        q.kids[n].add(m)
+    }
+}
+
+function hasHyphen(b: Bytes): Boolean {
+    for x in b {
+        if x == 45 { return true }
+    }
+    return false
+}
+
+function splitHyphenated(ix: Index, cp: Compiled, n: Integer, raw: Bytes) {
+    let q = cp.q
+    let f = q.flags[n]
+    let fa = q.a[n]
+    let fb = q.b[n]
+    let parts: List<Bytes> = []
+    let curPart = Bytes()
+    for x in raw {
+        if x == 45 {
+            if curPart.length > 0 { parts.add(curPart) }
+            curPart = Bytes()
+        } else {
+            curPart.add(x)
+        }
+    }
+    if curPart.length > 0 { parts.add(curPart) }
+    q.kind[n] = qy.Q_PHRASE
+    q.a[n] = 0
+    q.flags[n] = 0
+    let i = 0
+    while i < parts.length {
+        let m = qy.node(q, qy.Q_TERM, Text(parts[i]))
+        if hasWildBytes(parts[i]) { q.flags[m] = qy.QF_WILD }
+        if (f & qy.QF_FUZZY) != 0 && i == parts.length - 1 {
+            q.flags[m] = q.flags[m] | qy.QF_FUZZY
+            q.a[m] = fa
+            q.b[m] = fb
+        }
+        q.kids[n].add(m)
+        resolveTerm(ix, cp, m)
+        i += 1
+    }
+}
+
+function hasWildBytes(b: Bytes): Boolean {
+    for x in b {
+        if x == 42 || x == 63 { return true }
+    }
+    return false
+}
+
+// Case/accent folding without stemming or splitting (wildcards, fuzzy terms, ranges).
+function foldPlain(ix: Index, raw: Bytes): Bytes {
+    let out = Bytes()
+    let tk = tx.newTokens(tx.STEM_NONE)
+    // fold word by word, keeping the punctuation (*, ?) between them
+    let i = 0
+    while i < raw.length {
+        let b = raw[i]
+        if b == 42 || b == 63 {
+            out.add(b)
+            i += 1
+        } else {
+            let j = i
+            while j < raw.length && raw[j] != 42 && raw[j] != 63 { j += 1 }
+            tx.clear(tk)
+            tx.tokenize(tk, raw, i, j - i)
+            let k = 0
+            while k < tk.count {
+                let a = tx.termStart(tk, k)
+                out.addBytes(tk.terms.slice(a, tx.termEnd(tk, k)))
+                k += 1
+            }
+            i = j
+        }
+    }
+    return out
+}
+
+// Term ids in byte order (built lazily; extended when the dictionary grew).
+function sortedTerms(ix: Index): Bytes {
+    if ix.sortedCount == ix.dict.count { return ix.sorted }
+    let n = ix.dict.count
+    let ids: List<Integer> = []
+    let i = 0
+    while i < n {
+        ids.add(i)
+        i += 1
+    }
+    let d = ix.dict
+    ids.sortBy(function(a: Integer, b: Integer): Integer { return compareTerms(d, a, b) })
+    let out = Bytes(n * 4)
+    i = 0
+    while i < n {
+        out.setInt32(i * 4, ids[i])
+        i += 1
+    }
+    ix.sorted = out
+    ix.sortedCount = n
+    return out
+}
+
+function compareTerms(d: Dict, a: Integer, b: Integer): Integer {
+    let as0 = termStart(d, a)
+    let bs0 = termStart(d, b)
+    return v.compareBytes(d.text, as0, termEnd(d, a) - as0, d.text, bs0, termEnd(d, b) - bs0)
+}
+
+function compareTermTo(d: Dict, id: Integer, key: Bytes): Integer {
+    let s = termStart(d, id)
+    return v.compareBytes(d.text, s, termEnd(d, id) - s, key, 0, key.length)
+}
+
+// First position in the sorted term list whose term is >= key.
+function lowerBound(ix: Index, key: Bytes): Integer {
+    let s = sortedTerms(ix)
+    let lo = 0
+    let hi = s.length / 4
+    while lo < hi {
+        let m = (lo + hi) >> 1
+        if compareTermTo(ix.dict, s.getInt32(m * 4), key) < 0 { lo = m + 1 } else { hi = m }
+    }
+    return lo
+}
+
+function hasPrefix(d: Dict, id: Integer, key: Bytes, plen: Integer): Boolean {
+    let s = termStart(d, id)
+    if termEnd(d, id) - s < plen { return false }
+    let i = 0
+    while i < plen {
+        if d.text[s + i] != key[i] { return false }
+        i += 1
+    }
+    return true
+}
+
+constant MAX_EXPANSION = 100000
+
+function rangeTerms(ix: Index, from: Bytes, to: Bytes, out: Bytes) {
+    let s = sortedTerms(ix)
+    let i = 0
+    if !(from.length == 1 && from[0] == 42) { i = lowerBound(ix, from) }
+    let open = to.length == 1 && to[0] == 42
+    let n = s.length / 4
+    while i < n && out.length / 4 < MAX_EXPANSION {
+        let id = s.getInt32(i * 4)
+        if !open && compareTermTo(ix.dict, id, to) > 0 { break }
+        out.addInt32(id)
+        i += 1
+    }
+}
+
+function globMatch(t: Bytes, ts: Integer, te: Integer, p: Bytes, ps: Integer): Boolean {
+    let ti = ts
+    let pi = ps
+    let star = -1
+    let mark = 0
+    while ti < te {
+        if pi < p.length && (p[pi] == 63 || p[pi] == t[ti]) {
+            if p[pi] == 63 {
+                // ? matches one character (skip a whole UTF-8 sequence)
+                ti += 1
+                while ti < te && (t[ti] & 192) == 128 { ti += 1 }
+            } else {
+                ti += 1
+            }
+            pi += 1
+        } else if pi < p.length && p[pi] == 42 {
+            star = pi
+            mark = ti
+            pi += 1
+        } else if star >= 0 {
+            pi = star + 1
+            mark += 1
+            ti = mark
+        } else {
+            return false
+        }
+    }
+    while pi < p.length && p[pi] == 42 { pi += 1 }
+    return pi == p.length
+}
+
+function wildTerms(ix: Index, pat: Bytes, out: Bytes) {
+    let plen = 0
+    while plen < pat.length && pat[plen] != 42 && pat[plen] != 63 { plen += 1 }
+    let d = ix.dict
+    if plen > 0 {
+        let prefix = pat.slice(0, plen)
+        let s = sortedTerms(ix)
+        let i = lowerBound(ix, prefix)
+        let n = s.length / 4
+        while i < n && out.length / 4 < MAX_EXPANSION {
+            let id = s.getInt32(i * 4)
+            if !hasPrefix(d, id, prefix, plen) { break }
+            if globMatch(d.text, termStart(d, id), termEnd(d, id), pat, 0) { out.addInt32(id) }
+            i += 1
+        }
+        return
+    }
+    let id = 0
+    while id < d.count && out.length / 4 < MAX_EXPANSION {
+        if globMatch(d.text, termStart(d, id), termEnd(d, id), pat, 0) { out.addInt32(id) }
+        id += 1
+    }
+}
+
+function containsTerms(ix: Index, key: Bytes, out: Bytes) {
+    let d = ix.dict
+    let id = 0
+    while id < d.count && out.length / 4 < MAX_EXPANSION {
+        let s = termStart(d, id)
+        let e = termEnd(d, id)
+        let i = s
+        while i + key.length <= e {
+            if v.equalBytes(d.text, i, key.length, key, 0, key.length) {
+                out.addInt32(id)
+                break
+            }
+            i += 1
+        }
+        id += 1
+    }
+}
+
+function matchRegex(ix: Index, pattern: Text, out: Bytes): Text {
+    let pb = Bytes(pattern)
+    let icase = false
+    let pat = pattern
+    if pb.length >= 4 && pb[0] == 40 && pb[1] == 63 && pb[2] == 105 && pb[3] == 41 {
+        icase = true
+        pat = Text(pb.slice(4, pb.length))
+    }
+    let re = rx.compile(Bytes("^(" + pat + ")$"), icase)
+    if !re.ok || re.op.length == 0 {
+        if re.err != "" { return re.err }
+        return "invalid regular expression"
+    }
+    let d = ix.dict
+    let id = 0
+    while id < d.count && out.length / 4 < MAX_EXPANSION {
+        let s = termStart(d, id)
+        if rx.search(re, d.text, s, termEnd(d, id) - s) { out.addInt32(id) }
+        id += 1
+    }
+    return ""
+}
+
+// Levenshtein distance of two byte strings, or > limit (early exit).
+function editDistance(a: Bytes, ao: Integer, al: Integer, b: Bytes, bo: Integer, bl: Integer, limit: Integer, row: Bytes): Integer {
+    if al - bl > limit || bl - al > limit { return limit + 1 }
+    row.resize((bl + 1) * 8)
+    let j = 0
+    while j <= bl {
+        row.setInt64(j * 8, j)
+        j += 1
+    }
+    let i = 1
+    while i <= al {
+        let prevDiag = row.getInt64(0)
+        row.setInt64(0, i)
+        let best = i
+        j = 1
+        while j <= bl {
+            let cost = 1
+            if a[ao + i - 1] == b[bo + j - 1] { cost = 0 }
+            let x = prevDiag + cost
+            let up = row.getInt64(j * 8) + 1
+            let left = row.getInt64((j - 1) * 8) + 1
+            if up < x { x = up }
+            if left < x { x = left }
+            prevDiag = row.getInt64(j * 8)
+            row.setInt64(j * 8, x)
+            if x < best { best = x }
+            j += 1
+        }
+        if best > limit { return limit + 1 }
+        i += 1
+    }
+    return row.getInt64(bl * 8)
+}
+
+function fuzzyTerms(ix: Index, key: Bytes, dist: Integer, prefix: Integer, out: Bytes) {
+    let d = ix.dict
+    let plen = min(prefix, key.length)
+    let row = Bytes()
+    let s = sortedTerms(ix)
+    let i = 0
+    let n = s.length / 4
+    if plen > 0 { i = lowerBound(ix, key.slice(0, plen)) }
+    while i < n && out.length / 4 < MAX_EXPANSION {
+        let id = s.getInt32(i * 4)
+        if plen > 0 && !hasPrefix(d, id, key, plen) { break }
+        let ts = termStart(d, id)
+        if editDistance(d.text, ts, termEnd(d, id) - ts, key, 0, key.length, dist, row) <= dist { out.addInt32(id) }
+        i += 1
+    }
+}
+
+// Exactness of the set-level evaluation (positional operators give supersets).
+function markExact(cp: Compiled, n: Integer) {
+    let q = cp.q
+    let k = q.kind[n]
+    let e = 1
+    if k == qy.Q_TERM || k == qy.Q_MATCHES || k == qy.Q_ALL || k == qy.Q_NONE || k == qy.Q_GAP {
+        e = 1
+    } else if k == qy.Q_AND || k == qy.Q_OR || k == qy.Q_ATLEAST {
+        for x in q.kids[n] {
+            markExact(cp, x)
+            if cp.exact[x] == 0 { e = 0 }
+        }
+    } else if k == qy.Q_ANDNOT {
+        markExact(cp, q.a[n])
+        markExact(cp, q.b[n])
+        if cp.exact[q.a[n]] == 0 || cp.exact[q.b[n]] == 0 { e = 0 }
+    } else if k == qy.Q_BOOST {
+        markExact(cp, q.a[n])
+        e = cp.exact[q.a[n]]
+    } else if k == qy.Q_PHRASE {
+        let words = 0
+        for x in q.kids[n] {
+            markExact(cp, x)
+            if q.kind[x] != qy.Q_GAP { words += 1 }
+        }
+        e = 0
+        if words == 1 && q.kids[n].length == 1 { e = 1 }
+    } else {
+        if k == qy.Q_THEN || k == qy.Q_NEAR || k == qy.Q_REL {
+            markExact(cp, q.a[n])
+            markExact(cp, q.b[n])
+        } else {
+            markExact(cp, q.a[n])
+        }
+        e = 0
+    }
+    cp.exact[n] = e
+}
+
+// Terms outside negations contribute to the score (boosts multiply).
+function markScoring(cp: Compiled, n: Integer, negated: Boolean, boost: Float) {
+    let q = cp.q
+    let k = q.kind[n]
+    let leaf = -1
+    if n < cp.leafOf.length { leaf = cp.leafOf[n] }
+    if leaf >= 0 {
+        if !negated && boost > 0.0 {
+            let mode = cp.leafScore[leaf]
+            let us = cp.leafUts[leaf]
+            let i = 0
+            while i < us.length / 4 {
+                let u = us.getInt32(i * 4)
+                if mode == -2 || (mode >= 0 && cp.uts.getInt32(u * 4) == mode) {
+                    cp.utScore[u] = 1
+                    cp.utBoost[u] = cp.utBoost[u] + boost
+                }
+                i += 1
+            }
+        }
+        return
+    }
+    if k == qy.Q_ANDNOT {
+        markScoring(cp, q.a[n], negated, boost)
+        markScoring(cp, q.b[n], true, boost)
+    } else if k == qy.Q_REL {
+        markScoring(cp, q.a[n], negated, boost)
+        markScoring(cp, q.b[n], negated || (q.flags[n] & qy.QF_NOT) != 0, boost)
+    } else if k == qy.Q_THEN || k == qy.Q_NEAR {
+        markScoring(cp, q.a[n], negated, boost)
+        markScoring(cp, q.b[n], negated, boost)
+    } else if k == qy.Q_WITHIN || k == qy.Q_INPOS {
+        markScoring(cp, q.a[n], negated, boost)
+    } else if k == qy.Q_BOOST {
+        markScoring(cp, q.a[n], negated, boost * q.f[n])
+    } else if k == qy.Q_ATLEAST && q.a[n] == 0 {
+        // AT LEAST 0 OF matches every row and scores nothing
+    } else {
+        for x in q.kids[n] { markScoring(cp, x, negated, boost) }
+    }
+}
+
+// ---------------------------------------------------------------- per-chunk set evaluation
+
+// Look up every distinct term's container in chunk c (main or delta).
+function loadChunk(ix: Index, cp: Compiled, c: Integer, delta: Boolean) {
+    let i = 0
+    let n = cp.uts.length / 4
+    while i < n {
+        if container(ix, cp.uts.getInt32(i * 4), c, delta, cp.refs[i]) { cp.present[i] = 1 } else { cp.present[i] = 0 }
+        i += 1
+    }
+}
+
+function scratch(cp: Compiled, n: Integer): Bytes {
+    let b = cp.bm[n]
+    if b.length == 0 {
+        b = emptyBitmap()
+        cp.bm[n] = b
+    }
+    return b
+}
+
+function zero(b: Bytes) {
+    let w = 0
+    while w < WORDS {
+        b.setInt64(w * 8, 0)
+        w += 1
+    }
+}
+
+function copyWords(dst: Bytes, src: Bytes) {
+    let w = 0
+    while w < WORDS {
+        dst.setInt64(w * 8, src.getInt64(w * 8))
+        w += 1
+    }
+}
+
+function andWords(dst: Bytes, src: Bytes): Boolean {
+    let any = 0
+    let w = 0
+    while w < WORDS {
+        let x = dst.getInt64(w * 8) & src.getInt64(w * 8)
+        dst.setInt64(w * 8, x)
+        any = any | x
+        w += 1
+    }
+    return any != 0
+}
+
+function andNotWords(dst: Bytes, src: Bytes): Boolean {
+    let any = 0
+    let w = 0
+    while w < WORDS {
+        let x = dst.getInt64(w * 8) & ~src.getInt64(w * 8)
+        dst.setInt64(w * 8, x)
+        any = any | x
+        w += 1
+    }
+    return any != 0
+}
+
+function orWords(dst: Bytes, src: Bytes) {
+    let w = 0
+    while w < WORDS {
+        dst.setInt64(w * 8, dst.getInt64(w * 8) | src.getInt64(w * 8))
+        w += 1
+    }
+}
+
+// AND the global bitmap words of chunk c into dst.
+function andGlobal(dst: Bytes, g: Bytes, c: Integer): Boolean {
+    let base = c * WORDS * 8
+    let any = 0
+    let w = 0
+    while w < WORDS {
+        let gi = base + w * 8
+        let x = 0
+        if gi < g.length { x = dst.getInt64(w * 8) & g.getInt64(gi) }
+        dst.setInt64(w * 8, x)
+        any = any | x
+        w += 1
+    }
+    return any != 0
+}
+
+function leafEmptyInChunk(cp: Compiled, leaf: Integer): Boolean {
+    let us = cp.leafUts[leaf]
+    let i = 0
+    while i < us.length / 4 {
+        if cp.present[us.getInt32(i * 4)] != 0 { return false }
+        i += 1
+    }
+    return true
+}
+
+// Can node n match anything in the current chunk (from which containers are present)?
+function mayMatch(cp: Compiled, n: Integer): Boolean {
+    let q = cp.q
+    let k = q.kind[n]
+    let leaf = -1
+    if n < cp.leafOf.length { leaf = cp.leafOf[n] }
+    if leaf >= 0 { return !leafEmptyInChunk(cp, leaf) }
+    if k == qy.Q_NONE || k == qy.Q_GAP { return false }
+    if k == qy.Q_ALL { return true }
+    if k == qy.Q_AND || k == qy.Q_PHRASE {
+        for x in q.kids[n] {
+            if q.kind[x] != qy.Q_GAP && !mayMatch(cp, x) { return false }
+        }
+        return true
+    }
+    if k == qy.Q_OR {
+        for x in q.kids[n] {
+            if mayMatch(cp, x) { return true }
+        }
+        return false
+    }
+    if k == qy.Q_ATLEAST {
+        let need = q.a[n]
+        if (q.flags[n] & qy.QF_PERCENT) != 0 { need = (need * q.kids[n].length + 99) / 100 }
+        if need <= 0 { return true }
+        let got = 0
+        for x in q.kids[n] {
+            if mayMatch(cp, x) { got += 1 }
+        }
+        return got >= need
+    }
+    if k == qy.Q_THEN || k == qy.Q_NEAR || (k == qy.Q_REL && (q.flags[n] & qy.QF_NOT) == 0) {
+        return mayMatch(cp, q.a[n]) && mayMatch(cp, q.b[n])
+    }
+    return mayMatch(cp, q.a[n])
+}
+
+function leafOfNode(cp: Compiled, n: Integer): Integer {
+    if n < cp.leafOf.length { return cp.leafOf[n] }
+    return -1
+}
+
+// Postings of a leaf in the current chunk (sum over its present containers).
+function leafCount(cp: Compiled, leaf: Integer): Integer {
+    let us = cp.leafUts[leaf]
+    let c = 0
+    let i = 0
+    while i < us.length / 4 {
+        let u = us.getInt32(i * 4)
+        if cp.present[u] != 0 { c += cp.refs[u].count }
+        i += 1
+    }
+    return c
+}
+
+// The single present container of a leaf, or -1 (none or several).
+function singleRef(cp: Compiled, leaf: Integer): Integer {
+    let us = cp.leafUts[leaf]
+    let found = -1
+    let i = 0
+    while i < us.length / 4 {
+        let u = us.getInt32(i * 4)
+        if cp.present[u] != 0 {
+            if found >= 0 { return -1 }
+            found = u
+        }
+        i += 1
+    }
+    return found
+}
+
+// Does the leaf hold chunk offset `row`? (Rows asked in increasing order use the array cursors.)
+function leafHas(cp: Compiled, leaf: Integer, row: Integer): Boolean {
+    let us = cp.leafUts[leaf]
+    let i = 0
+    while i < us.length / 4 {
+        let u = us.getInt32(i * 4)
+        if cp.present[u] != 0 && rankOf(cp.refs[u], row) >= 0 { return true }
+        i += 1
+    }
+    return false
+}
+
+// bm = the leaf's rows (union of its containers).
+function loadLeaf(cp: Compiled, leaf: Integer, bm: Bytes) {
+    let one = singleRef(cp, leaf)
+    if one >= 0 && cp.refs[one].count >= ARRAY_MAX {
+        let ref = cp.refs[one]
+        let w = 0
+        while w < WORDS {
+            bm.setInt64(w * 8, ref.arena.getInt64(ref.off + w * 8))
+            w += 1
+        }
+        return
+    }
+    zero(bm)
+    let us = cp.leafUts[leaf]
+    let i = 0
+    while i < us.length / 4 {
+        let u = us.getInt32(i * 4)
+        if cp.present[u] != 0 { orContainer(bm, cp.refs[u]) }
+        i += 1
+    }
+}
+
+// bm &= the leaf's rows; false when bm becomes empty.
+function andLeaf(cp: Compiled, leaf: Integer, bm: Bytes, tmp: Bytes): Boolean {
+    let one = singleRef(cp, leaf)
+    if one >= 0 && cp.refs[one].count >= ARRAY_MAX {
+        let ref = cp.refs[one]
+        let any = 0
+        let w = 0
+        while w < WORDS {
+            let x = bm.getInt64(w * 8) & ref.arena.getInt64(ref.off + w * 8)
+            bm.setInt64(w * 8, x)
+            any = any | x
+            w += 1
+        }
+        return any != 0
+    }
+    loadLeaf(cp, leaf, tmp)
+    return andWords(bm, tmp)
+}
+
+// Evaluate node n over the current chunk into its scratch bitmap; false when empty.
+function evalSet(cp: Compiled, n: Integer): Boolean {
+    let q = cp.q
+    let k = q.kind[n]
+    let bm = scratch(cp, n)
+    let leaf = leafOfNode(cp, n)
+    if leaf >= 0 {
+        if leafEmptyInChunk(cp, leaf) { return false }
+        loadLeaf(cp, leaf, bm)
+        return true
+    }
+    if k == qy.Q_NONE || k == qy.Q_GAP { return false }
+    if k == qy.Q_ALL {
+        let w = 0
+        while w < WORDS {
+            bm.setInt64(w * 8, -1)
+            w += 1
+        }
+        return true
+    }
+    if k == qy.Q_AND || k == qy.Q_PHRASE {
+        // leaves first, rarest first, straight from their containers; then the other kids
+        let leaves: List<Integer> = []
+        let others: List<Integer> = []
+        for x in q.kids[n] {
+            if q.kind[x] != qy.Q_GAP {
+                let l = leafOfNode(cp, x)
+                if l >= 0 {
+                    if leafEmptyInChunk(cp, l) { return false }
+                    leaves.add(l)
+                } else {
+                    others.add(x)
+                }
+            }
+        }
+        if leaves.length > 1 {
+            let counts: List<Integer> = []
+            for l in leaves { counts.add(leafCount(cp, l)) }
+            let order: List<Integer> = []
+            let i = 0
+            while i < leaves.length {
+                order.add(i)
+                i += 1
+            }
+            order.sortBy(function(a: Integer, b: Integer): Integer { return counts[a] - counts[b] })
+            let sortedLeaves: List<Integer> = []
+            for i2 in order { sortedLeaves.add(leaves[i2]) }
+            leaves = sortedLeaves
+        }
+        let first = true
+        if cp.tmp.length == 0 { cp.tmp = emptyBitmap() }
+        let rare = -1
+        if leaves.length >= 2 { rare = singleRef(cp, leaves[0]) }
+        if rare >= 0 && cp.refs[rare].count < ARRAY_MAX / 2 {
+            // rarest leaf is a short sorted list: probe the other leaves for each of its rows
+            zero(bm)
+            let ref = cp.refs[rare]
+            let any = false
+            let i = 0
+            while i < ref.count {
+                let row = ref.arena.getUInt16(ref.off + i * 2)
+                let ok = true
+                let j = 1
+                while j < leaves.length && ok {
+                    ok = leafHas(cp, leaves[j], row)
+                    j += 1
+                }
+                if ok {
+                    let w = (row >> 6) * 8
+                    bm.setInt64(w, bm.getInt64(w) | lowBit(row & 63))
+                    any = true
+                }
+                i += 1
+            }
+            if !any { return false }
+            first = false
+            leaves = []
+        }
+        for l in leaves {
+            if first {
+                loadLeaf(cp, l, bm)
+                first = false
+            } else if !andLeaf(cp, l, bm, cp.tmp) {
+                return false
+            }
+        }
+        for x in others {
+            if !evalSet(cp, x) { return false }
+            if first {
+                copyWords(bm, cp.bm[x])
+                first = false
+            } else if !andWords(bm, cp.bm[x]) {
+                return false
+            }
+        }
+        return !first
+    }
+    if k == qy.Q_OR {
+        let any = false
+        for x in q.kids[n] {
+            let l = leafOfNode(cp, x)
+            if l >= 0 {
+                if !leafEmptyInChunk(cp, l) {
+                    if !any {
+                        zero(bm)
+                        any = true
+                    }
+                    let us = cp.leafUts[l]
+                    let i = 0
+                    while i < us.length / 4 {
+                        let u = us.getInt32(i * 4)
+                        if cp.present[u] != 0 { orContainer(bm, cp.refs[u]) }
+                        i += 1
+                    }
+                }
+            } else if evalSet(cp, x) {
+                if !any {
+                    copyWords(bm, cp.bm[x])
+                    any = true
+                } else {
+                    orWords(bm, cp.bm[x])
+                }
+            }
+        }
+        return any
+    }
+    if k == qy.Q_ANDNOT {
+        if !evalSet(cp, q.a[n]) { return false }
+        copyWords(bm, cp.bm[q.a[n]])
+        if cp.exact[q.b[n]] != 0 && evalSet(cp, q.b[n]) { return andNotWords(bm, cp.bm[q.b[n]]) }
+        return true
+    }
+    if k == qy.Q_ATLEAST {
+        let kids = q.kids[n]
+        let need = q.a[n]
+        if (q.flags[n] & qy.QF_PERCENT) != 0 { need = (need * kids.length + 99) / 100 }
+        if need <= 0 {
+            let w0 = 0
+            while w0 < WORDS {
+                bm.setInt64(w0 * 8, -1)
+                w0 += 1
+            }
+            return true
+        }
+        if need > kids.length { return false }
+        let cnt = cp.counters
+        let w = 0
+        while w < CHUNK / 8 {
+            cnt.setInt64(w * 8, 0)
+            w += 1
+        }
+        let matched = 0
+        for x in kids {
+            if evalSet(cp, x) {
+                matched += 1
+                let b = cp.bm[x]
+                w = 0
+                while w < WORDS {
+                    let y = b.getInt64(w * 8)
+                    while y != 0 {
+                        let bit = lowestBit(y)
+                        let r = w * 64 + bit
+                        cnt[r] = cnt[r] + 1
+                        y = y & wrappingSubtract(y, 1)
+                    }
+                    w += 1
+                }
+            }
+        }
+        if matched < need { return false }
+        zero(bm)
+        let any = false
+        w = 0
+        while w < WORDS {
+            let x = 0
+            let i = 0
+            while i < 64 {
+                if cnt[w * 64 + i] >= need { x = x | lowBit(i) }
+                i += 1
+            }
+            if x != 0 {
+                bm.setInt64(w * 8, x)
+                any = true
+            }
+            w += 1
+        }
+        return any
+    }
+    if k == qy.Q_THEN || k == qy.Q_NEAR || (k == qy.Q_REL && (q.flags[n] & qy.QF_NOT) == 0) {
+        if !evalSet(cp, q.a[n]) || !evalSet(cp, q.b[n]) { return false }
+        copyWords(bm, cp.bm[q.a[n]])
+        return andWords(bm, cp.bm[q.b[n]])
+    }
+    // WITHIN, IN ..., BOOST, NOT relations: the left side (a superset unless BOOST of an exact node)
+    if !evalSet(cp, q.a[n]) { return false }
+    copyWords(bm, cp.bm[q.a[n]])
+    return true
+}
+
+// ---------------------------------------------------------------- per-document evaluation (spans)
+
+// Positions of every leaf for row offset `o` of the current chunk (containers loaded by loadChunk).
+function loadDoc(ix: Index, cp: Compiled, o: Integer, row: Integer) {
+    let nl = cp.leafUts.length
+    let l = 0
+    while l < nl {
+        cp.leafPos[l].clear()
+        l += 1
+    }
+    let i = 0
+    let n = cp.uts.length / 4
+    while i < n {
+        cp.docTf.setInt32(i * 4, 0)
+        if cp.present[i] != 0 {
+            let ref = cp.refs[i]
+            let rank = rankOf(ref, o)
+            if rank >= 0 {
+                let ls = cp.utLeaves[i]
+                let first = cp.leafPos[ls.getInt32(0)]
+                let before = first.length
+                positionsAt(ix, ref, rank, row, first)
+                cp.docTf.setInt32(i * 4, (first.length - before) / 4)
+                let j = 1
+                while j < ls.length / 4 {
+                    let other = cp.leafPos[ls.getInt32(j * 4)]
+                    other.addBytes(first.slice(before, first.length))
+                    j += 1
+                }
+            }
+        }
+        i += 1
+    }
+    l = 0
+    while l < nl {
+        if cp.leafUts[l].length > 4 { sortInt32(cp.leafPos[l]) }
+        l += 1
+    }
+}
+
+// Positions of every leaf from a tokenized document (locked rows, tests).
+function loadDocTokens(ix: Index, cp: Compiled, tk: tx.Tokens) {
+    let nl = cp.leafUts.length
+    let l = 0
+    while l < nl {
+        cp.leafPos[l].clear()
+        l += 1
+    }
+    let n = cp.uts.length / 4
+    let i = 0
+    while i < n {
+        cp.docTf.setInt32(i * 4, 0)
+        i += 1
+    }
+    let p = 0
+    while p < tk.count {
+        let a = tx.termStart(tk, p)
+        let id = lookup(ix.dict, tk.terms, a, tx.termEnd(tk, p) - a)
+        if id >= 0 {
+            let u = hm.get(cp.utOf, id, -1)
+            if u >= 0 {
+                cp.docTf.setInt32(u * 4, cp.docTf.getInt32(u * 4) + 1)
+                let ls = cp.utLeaves[u]
+                let j = 0
+                while j < ls.length / 4 {
+                    cp.leafPos[ls.getInt32(j * 4)].addInt32(p)
+                    j += 1
+                }
+            }
+        }
+        p += 1
+    }
+}
+
+function sortInt32(b: Bytes) {
+    let n = b.length / 4
+    let i = 1
+    while i < n {
+        let x = b.getInt32(i * 4)
+        let j = i
+        while j > 0 && b.getInt32((j - 1) * 4) > x {
+            b.setInt32(j * 4, b.getInt32((j - 1) * 4))
+            j -= 1
+        }
+        b.setInt32(j * 4, x)
+        i += 1
+    }
+}
+
+function containsSorted(b: Bytes, x: Integer): Boolean {
+    let lo = 0
+    let hi = b.length / 4
+    while lo < hi {
+        let m = (lo + hi) >> 1
+        let y = b.getInt32(m * 4)
+        if y == x { return true }
+        if y < x { lo = m + 1 } else { hi = m }
+    }
+    return false
+}
+
+// Spans as int32 (start, end) pairs, sorted by start then end.
+function addSpan(s: Bytes, a: Integer, b: Integer) {
+    s.addInt32(a)
+    s.addInt32(b)
+}
+
+function sortSpans(s: Bytes) {
+    let n = s.length / 8
+    let i = 1
+    while i < n {
+        let a = s.getInt32(i * 8)
+        let b = s.getInt32(i * 8 + 4)
+        let j = i
+        while j > 0 && (s.getInt32((j - 1) * 8) > a || (s.getInt32((j - 1) * 8) == a && s.getInt32((j - 1) * 8 + 4) > b)) {
+            s.setInt32(j * 8, s.getInt32((j - 1) * 8))
+            s.setInt32(j * 8 + 4, s.getInt32((j - 1) * 8 + 4))
+            j -= 1
+        }
+        s.setInt32(j * 8, a)
+        s.setInt32(j * 8 + 4, b)
+        i += 1
+    }
+}
+
+// Positions matched by a phrase item (a leaf or [alternatives]) into out.
+function itemPositions(cp: Compiled, x: Integer, out: Bytes) {
+    out.clear()
+    let q = cp.q
+    let leaf = -1
+    if x < cp.leafOf.length { leaf = cp.leafOf[x] }
+    if leaf >= 0 {
+        out.addBytes(cp.leafPos[leaf])
+        return
+    }
+    if q.kind[x] == qy.Q_OR {
+        for y0 in q.kids[x] {
+            let y = y0
+            while q.kind[y] == qy.Q_BOOST { y = q.a[y] }
+            let l2 = -1
+            if y < cp.leafOf.length { l2 = cp.leafOf[y] }
+            if l2 >= 0 { out.addBytes(cp.leafPos[l2]) }
+        }
+        sortInt32(out)
+    }
+}
+
+function evalSpans(cp: Compiled, n: Integer, dl: Integer): Boolean {
+    let q = cp.q
+    let k = q.kind[n]
+    let out = cp.spans[n]
+    out.clear()
+    let leaf = -1
+    if n < cp.leafOf.length { leaf = cp.leafOf[n] }
+    if leaf >= 0 {
+        let ps = cp.leafPos[leaf]
+        let i = 0
+        while i < ps.length / 4 {
+            let p = ps.getInt32(i * 4)
+            addSpan(out, p, p + 1)
+            i += 1
+        }
+        return out.length > 0
+    }
+    if k == qy.Q_NONE || k == qy.Q_GAP { return false }
+    if k == qy.Q_ALL {
+        addSpan(out, 0, max(dl, 1))
+        return true
+    }
+    if k == qy.Q_AND {
+        for x in q.kids[n] {
+            if !evalSpans(cp, x, dl) { return false }
+            out.addBytes(cp.spans[x])
+        }
+        sortSpans(out)
+        return true
+    }
+    if k == qy.Q_OR {
+        for x in q.kids[n] {
+            if evalSpans(cp, x, dl) { out.addBytes(cp.spans[x]) }
+        }
+        sortSpans(out)
+        return out.length > 0
+    }
+    if k == qy.Q_ANDNOT {
+        if !evalSpans(cp, q.a[n], dl) { return false }
+        if evalSpans(cp, q.b[n], dl) { return false }
+        out.addBytes(cp.spans[q.a[n]])
+        return true
+    }
+    if k == qy.Q_ATLEAST {
+        let need = q.a[n]
+        let kids = q.kids[n]
+        if (q.flags[n] & qy.QF_PERCENT) != 0 { need = (need * kids.length + 99) / 100 }
+        let got = 0
+        if need <= 0 { addSpan(out, 0, max(dl, 1)) }
+        for x in kids {
+            if evalSpans(cp, x, dl) {
+                got += 1
+                out.addBytes(cp.spans[x])
+            }
+        }
+        if got < need {
+            out.clear()
+            return false
+        }
+        sortSpans(out)
+        return true
+    }
+    if k == qy.Q_BOOST {
+        if !evalSpans(cp, q.a[n], dl) { return false }
+        out.addBytes(cp.spans[q.a[n]])
+        return true
+    }
+    if k == qy.Q_PHRASE { return phraseSpans(cp, n, out) }
+    if k == qy.Q_THEN || k == qy.Q_NEAR {
+        if !evalSpans(cp, q.a[n], dl) || !evalSpans(cp, q.b[n], dl) { return false }
+        let sa = cp.spans[q.a[n]]
+        let sb = cp.spans[q.b[n]]
+        let lim = q.c[n]
+        let i = 0
+        while i < sa.length / 8 {
+            let as0 = sa.getInt32(i * 8)
+            let ae = sa.getInt32(i * 8 + 4)
+            let j = 0
+            while j < sb.length / 8 {
+                let bs = sb.getInt32(j * 8)
+                let be = sb.getInt32(j * 8 + 4)
+                if bs >= ae && (lim < 0 || bs - ae <= lim) { addSpan(out, as0, be) }
+                if k == qy.Q_NEAR && as0 >= be && (lim < 0 || as0 - be <= lim) { addSpan(out, bs, ae) }
+                j += 1
+            }
+            i += 1
+        }
+        sortSpans(out)
+        return out.length > 0
+    }
+    if k == qy.Q_WITHIN {
+        let a = q.a[n]
+        let lim = q.c[n]
+        let ka = q.kind[a]
+        if ka == qy.Q_AND || ka == qy.Q_ATLEAST {
+            if !evalSpans(cp, a, dl) { return false }
+            withinWindows(cp, a, lim, out)
+            return out.length > 0
+        }
+        if !evalSpans(cp, a, dl) { return false }
+        let sa = cp.spans[a]
+        let i = 0
+        while i < sa.length / 8 {
+            let s0 = sa.getInt32(i * 8)
+            let e0 = sa.getInt32(i * 8 + 4)
+            if e0 - s0 <= lim { addSpan(out, s0, e0) }
+            i += 1
+        }
+        return out.length > 0
+    }
+    if k == qy.Q_INPOS { return inposSpans(cp, q.a[n], q.b[n], q.c[n], q.d[n], dl, out) }
+    if k == qy.Q_REL {
+        if !evalSpans(cp, q.a[n], dl) { return false }
+        let hasB = evalSpans(cp, q.b[n], dl)
+        let sa = cp.spans[q.a[n]]
+        let sb = cp.spans[q.b[n]]
+        let rel = q.c[n]
+        let negated = (q.flags[n] & qy.QF_NOT) != 0
+        let i = 0
+        while i < sa.length / 8 {
+            let as0 = sa.getInt32(i * 8)
+            let ae = sa.getInt32(i * 8 + 4)
+            let found = false
+            if hasB {
+                let j = 0
+                while j < sb.length / 8 && !found {
+                    let bs = sb.getInt32(j * 8)
+                    let be = sb.getInt32(j * 8 + 4)
+                    if rel == qy.REL_ENCLOSES { found = as0 <= bs && be <= ae }
+                    if rel == qy.REL_ENCLOSED_BY { found = bs <= as0 && ae <= be }
+                    if rel == qy.REL_OVERLAPPING { found = as0 < be && bs < ae }
+                    if rel == qy.REL_BEFORE { found = ae <= bs }
+                    if rel == qy.REL_AFTER { found = as0 >= be }
+                    j += 1
+                }
+            }
+            if found != negated { addSpan(out, as0, ae) }
+            i += 1
+        }
+        return out.length > 0
+    }
+    return false
+}
+
+function ceilPct(dl: Integer, x: Integer): Integer { return (dl * x + 99) / 100 }
+
+// Spans of node a that satisfy a positional filter; AND / OR / AT LEAST apply it to each operand.
+function inposSpans(cp: Compiled, a: Integer, mode: Integer, x: Integer, y: Integer, dl: Integer, out: Bytes): Boolean {
+    let q = cp.q
+    let k = q.kind[a]
+    if k == qy.Q_AND || k == qy.Q_OR || k == qy.Q_ATLEAST {
+        let need = q.kids[a].length
+        if k == qy.Q_OR { need = 1 }
+        if k == qy.Q_ATLEAST {
+            need = q.a[a]
+            if (q.flags[a] & qy.QF_PERCENT) != 0 { need = (need * q.kids[a].length + 99) / 100 }
+        }
+        let got = 0
+        for kid in q.kids[a] {
+            let sub = Bytes()
+            if inposSpans(cp, kid, mode, x, y, dl, sub) {
+                got += 1
+                out.addBytes(sub)
+            }
+        }
+        if got < need || got == 0 {
+            out.clear()
+            return false
+        }
+        sortSpans(out)
+        return true
+    }
+    if !evalSpans(cp, a, dl) { return false }
+    let sa = cp.spans[a]
+    let i = 0
+    while i < sa.length / 8 {
+        let s0 = sa.getInt32(i * 8)
+        let e0 = sa.getInt32(i * 8 + 4)
+        let ok = false
+        if mode == qy.IP_FIRST_WORDS { ok = e0 <= x }
+        if mode == qy.IP_LAST_WORDS { ok = s0 >= dl - x }
+        if mode == qy.IP_FIRST_PCT { ok = e0 <= ceilPct(dl, x) }
+        if mode == qy.IP_LAST_PCT { ok = s0 >= dl - ceilPct(dl, x) }
+        if mode == qy.IP_MIDDLE_PCT {
+            let fdl = Float(dl)
+            let band = fdl * Float(x) / 100.0
+            ok = Float(s0) >= (fdl - band) / 2.0 && Float(e0) <= (fdl + band) / 2.0
+        }
+        if mode == qy.IP_WORDS { ok = s0 >= x - 1 && e0 <= y }
+        if ok { addSpan(out, s0, e0) }
+        i += 1
+    }
+    return out.length > 0
+}
+
+// Windows of at most lim words that hold one span of every (matching) kid of an AND / AT LEAST node.
+function withinWindows(cp: Compiled, a: Integer, lim: Integer, out: Bytes) {
+    let q = cp.q
+    let kids: List<Integer> = []
+    for x in q.kids[a] {
+        if cp.spans[x].length > 0 { kids.add(x) }
+    }
+    let need = kids.length
+    if q.kind[a] == qy.Q_ATLEAST {
+        need = q.a[a]
+        if (q.flags[a] & qy.QF_PERCENT) != 0 { need = (need * q.kids[a].length + 99) / 100 }
+    }
+    // candidate window starts: every span start
+    let starts = cp.spans[a]
+    let i = 0
+    let ends = Bytes()
+    while i < starts.length / 8 {
+        let s0 = starts.getInt32(i * 8)
+        ends.clear()
+        for x in kids {
+            let sx = cp.spans[x]
+            let best = -1
+            let j = 0
+            while j < sx.length / 8 {
+                let xs = sx.getInt32(j * 8)
+                let xe = sx.getInt32(j * 8 + 4)
+                if xs >= s0 && (best < 0 || xe < best) { best = xe }
+                j += 1
+            }
+            if best >= 0 { ends.addInt32(best) }
+        }
+        if ends.length / 4 >= need && need > 0 {
+            sortInt32(ends)
+            let e0 = ends.getInt32((need - 1) * 4)
+            if e0 - s0 <= lim { addSpan(out, s0, e0) }
+        }
+        i += 1
+    }
+}
+
+function phraseSpans(cp: Compiled, n: Integer, out: Bytes): Boolean {
+    let q = cp.q
+    let items = q.kids[n]
+    let m = items.length
+    if m == 0 { return false }
+    let slop = q.a[n]
+    // positions per item: leaves use their position lists directly; [alternatives] are merged into scratch
+    let lists = cp.phraseLists
+    lists.clear()
+    let gap = cp.phraseGaps
+    gap.clear()
+    let si0 = 0
+    for x in items {
+        if q.kind[x] == qy.Q_GAP {
+            gap.add(1)
+            lists.add(EMPTY)
+        } else {
+            let leaf = -1
+            if x < cp.leafOf.length { leaf = cp.leafOf[x] }
+            let b = EMPTY
+            if leaf >= 0 {
+                b = cp.leafPos[leaf]
+            } else {
+                while cp.phraseScratch.length <= si0 { cp.phraseScratch.add(Bytes()) }
+                b = cp.phraseScratch[si0]
+                si0 += 1
+                itemPositions(cp, x, b)
+            }
+            if b.length == 0 { return false }
+            gap.add(0)
+            lists.add(b)
+        }
+    }
+    let firstOnly = n == q.root
+    let f = 0
+    while f < m && gap[f] != 0 { f += 1 }
+    if f == m { return false }
+    let firstList = lists[f]
+    let i = 0
+    while i < firstList.length / 4 {
+        let p0 = firstList.getInt32(i * 4)
+        let start = p0 - f
+        if start >= 0 {
+            if slop == 0 {
+                let ok = true
+                let j = f + 1
+                while j < m && ok {
+                    if gap[j] == 0 && !containsSorted(lists[j], start + j) { ok = false }
+                    j += 1
+                }
+                if ok {
+                    addSpan(out, start, start + m)
+                    if firstOnly { return true }
+                }
+            } else {
+                // in order, total extra distance <= slop (greedy earliest is optimal)
+                let used = 0
+                let prev = p0
+                let prevIdx = f
+                let ok = true
+                let j = f + 1
+                while j < m && ok {
+                    if gap[j] == 0 {
+                        let want = prev + (j - prevIdx)
+                        let lst = lists[j]
+                        let lo = 0
+                        let hi = lst.length / 4
+                        while lo < hi {
+                            let mid = (lo + hi) >> 1
+                            if lst.getInt32(mid * 4) < want { lo = mid + 1 } else { hi = mid }
+                        }
+                        if lo >= lst.length / 4 {
+                            ok = false
+                        } else {
+                            let got = lst.getInt32(lo * 4)
+                            used += got - want
+                            if used > slop { ok = false }
+                            prev = got
+                            prevIdx = j
+                        }
+                    }
+                    j += 1
+                }
+                if ok {
+                    addSpan(out, start, prev + (m - prevIdx))
+                    if firstOnly { return true }
+                }
+            }
+        }
+        i += 1
+    }
+    return out.length > 0
+}
+
+// ---------------------------------------------------------------- scoring
+
+global F32: Bytes = Bytes(4)
+global EMPTY: Bytes = Bytes()
+
+// Round to the nearest 32-bit float (TIN scores in f32).
+function f32(x: Float): Float {
+    F32.setFloat32(0, x)
+    return F32.getFloat32(0)
+}
+
+// TIN quantises term frequencies into 16 buckets; every count scores as its bucket's first count.
+global TF_REPS: List<Integer> = [1, 2, 3, 5, 10, 20, 41, 85, 177, 371, 777, 1626, 3405, 7132, 14938, 31288]
+
+public function tfRep(tf: Integer): Integer {
+    if tf <= 3 { return max(tf, 1) }
+    let i = 15
+    while TF_REPS[i] > tf { i -= 1 }
+    return TF_REPS[i]
+}
+
+// Fast f64 approximation of a term's score (pruning only; exactScore gives the real value).
+function bm25(cp: Compiled, u: Integer, tf: Integer, dl: Integer): Float {
+    let ftf = Float(tfRep(tf))
+    let norm = K1 * (1.0 - BM25_B + BM25_B * Float(dl) / cp.avgdl)
+    return cp.utBoost[u] * cp.utIdf[u] * ftf * (K1 + 1.0) / (ftf + norm)
+}
+
+// TIN's per-term score: f32 arithmetic in the production order.
+function termScore32(cp: Compiled, u: Integer, tf: Integer, dl: Integer): Float {
+    let rep = f32(Float(tfRep(tf)))
+    let num = f32(f32(cp.mult32[u] * rep) * f32(K1 + 1.0))
+    let dconst = f32(rep + f32(f32(K1) * f32(1.0 - BM25_B)))
+    let den = f32(dconst + f32(cp.dlf32 * Float(dl)))
+    return f32(num / den)
+}
+
+// Exact score from per-term frequencies (cp.tfs or cp.docTf), summed in f32 in the terms' byte order.
+function exactScore(cp: Compiled, tfs: Bytes, dl: Integer): Float {
+    let s = 0.0
+    for u in cp.scoreOrder {
+        let tf = tfs.getInt32(u * 4)
+        if tf > 0 { s = f32(s + termScore32(cp, u, tf, dl)) }
+    }
+    return s
+}
+
+// Upper bound of a term's contribution in a container (maxTf 255 = unbounded tf), with room for f32 rounding.
+function bound(cp: Compiled, u: Integer, maxTf: Integer, minDl: Integer): Float {
+    if maxTf >= 255 { return cp.utBoost[u] * cp.utIdf[u] * (K1 + 1.0) * 1.00001 }
+    return bm25(cp, u, maxTf, minDl) * 1.00001
+}
+
+// Score of the current document from cp.docTf (filled by loadDoc / loadDocTokens).
+function docScore(cp: Compiled, dl: Integer): Float { return exactScore(cp, cp.docTf, dl) }
+
+// Score of row r at chunk offset o from the loaded chunk, without positions.
+function rowScore(ix: Index, cp: Compiled, o: Integer, r: Integer): Float {
+    let dl = docLength(ix, r)
+    let i = 0
+    let n = cp.uts.length / 4
+    while i < n {
+        cp.tfs.setInt32(i * 4, 0)
+        if cp.utScore[i] != 0 && cp.present[i] != 0 {
+            let ref = cp.refs[i]
+            let rank = rankOf(ref, o)
+            if rank >= 0 { cp.tfs.setInt32(i * 4, tfAt(ix, ref, rank, r)) }
+        }
+        i += 1
+    }
+    return exactScore(cp, cp.tfs, dl)
+}
+
+// ---------------------------------------------------------------- searches
+
+// `visible(row, out)` appends the text a reader sees for a locked row and returns whether the row is visible.
+public record Reader {
+    visible: (Integer, Bytes) -> Boolean
+    accept: (Integer) -> Boolean
+}
+
+// Evaluate chunk c (main or delta) into bitmap `res`; false when nothing matches at the set level.
+function chunkCandidates(ix: Index, cp: Compiled, c: Integer, delta: Boolean, res: Bytes): Boolean {
+    loadChunk(ix, cp, c, delta)
+    let root = cp.q.root
+    if !mayMatch(cp, root) { return false }
+    if !evalSet(cp, root) { return false }
+    copyWords(res, cp.bm[root])
+    if delta { return andWords(res, ix.deltas[c].member) }
+    return andGlobal(res, ix.mainValid, c)
+}
+
+// Does row r (offset o in the loaded chunk) match? (Positional queries check spans; others are exact already.)
+function verify(ix: Index, cp: Compiled, o: Integer, r: Integer): Boolean {
+    if !cp.positional { return true }
+    if cp.fastPhrase { return phraseStream(ix, cp, o, r) }
+    loadDoc(ix, cp, o, r)
+    return evalSpans(cp, cp.q.root, docLength(ix, r))
+}
+
+// Match a locked row by its visible text; fills docTf for scoring. Returns -1 (no match) or the doc length.
+function lockedMatch(ix: Index, cp: Compiled, r: Integer, rd: Reader, buf: Bytes): Integer {
+    buf.clear()
+    if !rd.visible(r, buf) { return -1 }
+    let tk = ix.tk2
+    tx.clear(tk)
+    tx.tokenize(tk, buf, 0, buf.length)
+    loadDocTokens(ix, cp, tk)
+    if !evalSpans(cp, cp.q.root, tk.count) { return -1 }
+    return tk.count
+}
+
+public function count(ix: Index, t: tb.Table, cp: Compiled, rd: Reader): Integer {
+    let locked = Bytes()
+    settle(ix, t, locked)
+    refreshStats(ix, cp)
+    let res = emptyBitmap()
+    let total = 0
+    let chunks = nChunks(t.nrows)
+    // Plain-term AND/OR: the immutable main chunks are counted on every core; deltas and locked rows stay here.
+    let plan = flatPlan(cp)
+    let built = 0
+    if plan != 0 {
+        built = min(chunks, ix.arenas.length)
+        total += flatCountChunks(ix, cp, plan, built)
+    }
+    let c = 0
+    while c < chunks {
+        let pass = 0
+        if c < built { pass = 1 }
+        while pass < 2 {
+            let delta = pass == 1
+            if (!delta || ix.deltas[c].count > 0) && chunkCandidates(ix, cp, c, delta, res) {
+                if !cp.positional {
+                    let w = 0
+                    while w < WORDS {
+                        total += popcount(res.getInt64(w * 8))
+                        w += 1
+                    }
+                } else {
+                    let w = 0
+                    while w < WORDS {
+                        let x = res.getInt64(w * 8)
+                        while x != 0 {
+                            let o = w * 64 + lowestBit(x)
+                            if verify(ix, cp, o, (c << CHUNK_SHIFT) + o) { total += 1 }
+                            x = x & wrappingSubtract(x, 1)
+                        }
+                        w += 1
+                    }
+                }
+            }
+            pass += 1
+        }
+        c += 1
+    }
+    let buf = Bytes()
+    let i = 0
+    while i < locked.length / 8 {
+        if lockedMatch(ix, cp, locked.getInt64(i * 8), rd, buf) >= 0 { total += 1 }
+        i += 1
+    }
+    return total
+}
+
+// ---- parallel COUNT over main chunks (MINYAR_PARALLEL_THREADS picks the cores; default: all)
+
+// 1 = AND of single-term leaves, 2 = OR of leaves (union of their terms), 0 = use the general evaluator.
+function flatPlan(cp: Compiled): Integer {
+    if cp.positional { return 0 }
+    let q = cp.q
+    let root = q.root
+    if leafOfNode(cp, root) >= 0 { return 2 }
+    let k = q.kind[root]
+    if k != qy.Q_AND && k != qy.Q_OR { return 0 }
+    let kids = q.kids[root]
+    if kids.length == 0 { return 0 }
+    let i = 0
+    while i < kids.length {
+        let leaf = leafOfNode(cp, kids[i])
+        if leaf < 0 { return 0 }
+        if k == qy.Q_AND && cp.leafUts[leaf].length != 4 { return 0 }
+        i += 1
+    }
+    if k == qy.Q_AND { return 1 }
+    return 2
+}
+
+// Rows of the plan in main chunks 0..built, after the main-validity bitmap; chunks run in parallel.
+function flatCountChunks(ix: Index, cp: Compiled, plan: Integer, built: Integer): Integer {
+    let terms: List<Integer> = []
+    if plan == 1 {
+        let kids = cp.q.kids[cp.q.root]
+        let i = 0
+        while i < kids.length {
+            terms.add(cp.uts.getInt32(cp.leafUts[leafOfNode(cp, kids[i])].getInt32(0) * 4))
+            i += 1
+        }
+    } else {
+        let i = 0
+        while i < cp.uts.length / 4 {
+            terms.add(cp.uts.getInt32(i * 4))
+            i += 1
+        }
+    }
+    let n = terms.length
+    if n == 0 || built == 0 { return 0 }
+    let refs = flatRefs(ix, terms, built)
+    // one iteration per 512-row slice: the pool hands out 128 iterations at a time, so chunks alone would not spread
+    let slices = built * FLAT_SLICES
+    let counts: List<Integer> = []
+    let c = 0
+    while c < slices {
+        counts.add(0)
+        c += 1
+    }
+    let arenas = ix.arenas
+    let valid = ix.mainValid
+    let conj = plan == 1
+    parallel for slice in 0..slices {
+        let chunk = slice / FLAT_SLICES
+        counts[slice] = flatCount(arenas[chunk], refs, chunk * n * 2, n, conj, valid, chunk, slice % FLAT_SLICES * FLAT_WORDS)
+    }
+    let total = 0
+    c = 0
+    while c < slices {
+        total += counts[c]
+        c += 1
+    }
+    return total
+}
+
+constant FLAT_WORDS = 8
+constant FLAT_SLICES = 128
+
+// First index of a uint16 array container whose row is >= row.
+parallel function flatLower(a: Bytes, off: Integer, count: Integer, row: Integer): Integer {
+    let lo = 0
+    let hi = count
+    while lo < hi {
+        let m = (lo + hi) >> 1
+        if a.getUInt16(off + m * 2) < row { lo = m + 1 } else { hi = m }
+    }
+    return lo
+}
+
+// (offset, postings) of each term's main container per chunk 0..built; 0 postings = absent
+function flatRefs(ix: Index, terms: List<Integer>, built: Integer): List<Integer> {
+    let refs: List<Integer> = []
+    let ref = newCref()
+    let c = 0
+    while c < built {
+        let u = 0
+        while u < terms.length {
+            if mainContainer(ix, terms[u], c, ref) { refs.add(ref.off); refs.add(ref.count) } else { refs.add(0); refs.add(0) }
+            u += 1
+        }
+        c += 1
+    }
+    return refs
+}
+
+// Exact top k of a plain-term conjunction over the main chunks, pushed into h. Every core computes, per 64-row
+// word, the best f64 approximation of its rows' scores (the f32 TIN score is within 1e-6 of it); only words within
+// 1e-4 of the k-th best word, and words with tf >= 255 or very long documents, can hold a top-k row, and those are
+// scored exactly here. Returns the main chunks covered, or 0 (heap untouched) when the serial plan must run.
+function flatTopK(ix: Index, cp: Compiled, t: tb.Table, h: Heap, rd: Reader): Integer {
+    let built = min(nChunks(t.nrows), ix.arenas.length)
+    if built == 0 { return 0 }
+    let kids = cp.q.kids[cp.q.root]
+    let terms: List<Integer> = []
+    let weights: List<Float> = []
+    let i = 0
+    while i < kids.length {
+        let u = cp.leafUts[leafOfNode(cp, kids[i])].getInt32(0)
+        let id = cp.uts.getInt32(u * 4)
+        let wgt = 0.0
+        if cp.utScore[u] != 0 { wgt = cp.wf[u] }
+        let j = 0
+        while j < terms.length {
+            if terms[j] == id { wgt = 0.0 }
+            j += 1
+        }
+        terms.add(id)
+        weights.add(wgt)
+        i += 1
+    }
+    let n = terms.length
+    let refs = flatRefs(ix, terms, built)
+    let words = built * WORDS
+    let best: List<Float> = []
+    i = 0
+    while i < words {
+        best.add(0.0)
+        i += 1
+    }
+    let arenas = ix.arenas
+    let valid = ix.mainValid
+    let dls = ix.dl
+    let reps = TF_REPS
+    let normA = cp.normA
+    let normB = cp.normB
+    parallel for gw in 0..words {
+        let c = gw >> 10
+        best[gw] = flatBest(arenas[c], refs, c * n * 2, n, valid, dls, c, gw & 1023, weights, reps, normA, normB)
+    }
+    // the k-th best word among the exactly approximated ones (FLAT_ANY marks words that must be rescored anyway)
+    let k = h.k
+    let top: List<Float> = []
+    i = 0
+    while i < words {
+        let b = best[i]
+        if b >= 0.0 && b < FLAT_ANY && (top.length < k || b > top[top.length - 1]) {
+            if top.length < k { top.add(b) } else { top[top.length - 1] = b }
+            let j = top.length - 1
+            while j > 0 && top[j - 1] < top[j] {
+                let x = top[j - 1]
+                top[j - 1] = top[j]
+                top[j] = x
+                j -= 1
+            }
+        }
+        i += 1
+    }
+    let cut = 0.0
+    if top.length >= k { cut = top[k - 1] * 0.9999 }
+    let picked: List<Integer> = []
+    i = 0
+    while i < words {
+        if best[i] >= 0.0 && best[i] >= cut {
+            picked.add(i)
+            if picked.length > 4096 { return 0 }
+        }
+        i += 1
+    }
+    let res = emptyBitmap()
+    let loaded = -1
+    let found: List<Integer> = []
+    let scores: List<Float> = []
+    for gw in picked {
+        let c = gw >> 10
+        if c != loaded {
+            loaded = c
+            if !chunkCandidates(ix, cp, c, false, res) { zero(res) }
+        }
+        let wl = gw & 1023
+        let x = res.getInt64(wl * 8)
+        while x != 0 {
+            let o = wl * 64 + lowestBit(x)
+            x = x & wrappingSubtract(x, 1)
+            let r = (c << CHUNK_SHIFT) + o
+            if !rd.accept(r) { return 0 }
+            found.add(r)
+            scores.add(rowScore(ix, cp, o, r))
+        }
+    }
+    i = 0
+    while i < found.length {
+        if qualifies(h, scores[i], found[i]) { heapPush(h, scores[i], found[i]) }
+        i += 1
+    }
+    return built
+}
+
+constant FLAT_ANY = 1.0e300
+
+// Best approximate score among the conjunction's rows in word wl of chunk c (-1 = none, FLAT_ANY = rescore exactly).
+parallel function flatBest(a: Bytes, refs: List<Integer>, base: Integer, n: Integer, valid: Bytes, dls: Bytes, c: Integer,
+                           wl: Integer, weights: List<Float>, reps: List<Integer>, normA: Float, normB: Float): Float {
+    let x = flatValidWord(valid, c, wl)
+    let u = 0
+    while u < n && x != 0 {
+        let k = refs[base + u * 2 + 1]
+        if k == 0 { x = 0 } else { x = x & flatWordBits(a, refs[base + u * 2], k, wl) }
+        u += 1
+    }
+    let best = -1.0
+    while x != 0 {
+        let o = wl * 64 + flatOnes(wrappingSubtract(x & wrappingSubtract(0, x), 1))
+        x = x & wrappingSubtract(x, 1)
+        let r = c * CHUNK + o
+        if r * 2 + 2 > dls.length { return FLAT_ANY }
+        let dl = dls.getUInt16(r * 2)
+        if dl == 65535 { return FLAT_ANY }
+        let norm = normA + normB * Float(dl)
+        let s = 0.0
+        let v = 0
+        while v < n {
+            if weights[v] > 0.0 {
+                let tf = flatTf(a, refs[base + v * 2], refs[base + v * 2 + 1], o)
+                if tf == 255 { return FLAT_ANY }
+                let rep = tf
+                if tf > 3 {
+                    let ri = 15
+                    while reps[ri] > tf { ri -= 1 }
+                    rep = reps[ri]
+                }
+                let ftf = Float(rep)
+                s += weights[v] * ftf / (ftf + norm)
+            }
+            v += 1
+        }
+        if s > best { best = s }
+    }
+    return best
+}
+
+parallel function flatBit(b: Integer): Integer {
+    if b == 63 { return -9223372036854775807 - 1 }
+    return 1 << b
+}
+
+// Word wl (64 chunk offsets) of a container as a bit mask.
+parallel function flatWordBits(a: Bytes, off: Integer, count: Integer, wl: Integer): Integer {
+    if count >= ARRAY_MAX { return a.getInt64(off + wl * 8) }
+    let first = wl * 64
+    let lo = 0
+    let hi = count
+    while lo < hi {
+        let m = (lo + hi) >> 1
+        if a.getUInt16(off + m * 2) < first { lo = m + 1 } else { hi = m }
+    }
+    let x = 0
+    while lo < count && a.getUInt16(off + lo * 2) < first + 64 {
+        x = x | flatBit(a.getUInt16(off + lo * 2) & 63)
+        lo += 1
+    }
+    return x
+}
+
+// Term frequency byte of chunk offset o, which the container holds (255 = see tfBig).
+parallel function flatTf(a: Bytes, off: Integer, count: Integer, o: Integer): Integer {
+    if count >= ARRAY_MAX {
+        let w = o >> 6
+        let rank = a.getInt32(off + 8192 + w * 4) + flatOnes(a.getInt64(off + w * 8) & wrappingSubtract(flatBit(o & 63), 1))
+        return a[off + BITMAP_BYTES + rank]
+    }
+    let lo = 0
+    let hi = count
+    while lo < hi {
+        let m = (lo + hi) >> 1
+        if a.getUInt16(off + m * 2) < o { lo = m + 1 } else { hi = m }
+    }
+    return a[off + count * 2 + lo]
+}
+
+parallel function flatOnes(x: Integer): Integer {
+    let a = wrappingSubtract(x, (x >> 1) & 0x5555555555555555)
+    let b = wrappingAdd(a & 0x3333333333333333, (a >> 2) & 0x3333333333333333)
+    let c = wrappingAdd(b, b >> 4) & 0x0F0F0F0F0F0F0F0F
+    return (wrappingMultiply(c, 0x0101010101010101) >> 56) & 255
+}
+
+parallel function flatValidWord(valid: Bytes, c: Integer, w: Integer): Integer {
+    let gi = (c * WORDS + w) * 8
+    if gi < valid.length { return valid.getInt64(gi) }
+    return 0
+}
+
+// Does the container (array of uint16 row offsets, or 1,024-word bitmap) hold chunk offset row?
+parallel function flatHas(a: Bytes, off: Integer, count: Integer, row: Integer): Boolean {
+    if count == 0 { return false }
+    // mask form: the shift form `(x >> (row & 63)) & 1` is wrong at -O1/-O2 here (Minyar tests/miscompiles)
+    if count >= ARRAY_MAX { return (a.getInt64(off + (row >> 6) * 8) & flatBit(row & 63)) != 0 }
+    let lo = 0
+    let hi = count
+    while lo < hi {
+        let m = (lo + hi) >> 1
+        if a.getUInt16(off + m * 2) < row { lo = m + 1 } else { hi = m }
+    }
+    return lo < count && a.getUInt16(off + lo * 2) == row
+}
+
+// Rows of the plan in words w0 .. w0 + FLAT_WORDS of chunk c, after the main-validity bitmap.
+parallel function flatCount(a: Bytes, refs: List<Integer>, base: Integer, n: Integer, conj: Boolean, valid: Bytes, c: Integer, w0: Integer): Integer {
+    let total = 0
+    let first = w0 * 64
+    let after = first + FLAT_WORDS * 64
+    if conj {
+        let driver = -1
+        let least = 0
+        let u = 0
+        while u < n {
+            let k = refs[base + u * 2 + 1]
+            if k == 0 { return 0 }
+            if driver < 0 || k < least { driver = u; least = k }
+            u += 1
+        }
+        if least >= ARRAY_MAX {
+            let w = w0
+            while w < w0 + FLAT_WORDS {
+                let x = flatValidWord(valid, c, w)
+                let v = 0
+                while v < n && x != 0 {
+                    x = x & a.getInt64(refs[base + v * 2] + w * 8)
+                    v += 1
+                }
+                total += flatOnes(x)
+                w += 1
+            }
+            return total
+        }
+        let doff = refs[base + driver * 2]
+        let i = flatLower(a, doff, least, first)
+        while i < least && a.getUInt16(doff + i * 2) < after {
+            let row = a.getUInt16(doff + i * 2)
+            if (flatValidWord(valid, c, row >> 6) & flatBit(row & 63)) != 0 {
+                let all = true
+                let v = 0
+                while v < n && all {
+                    if v != driver { all = flatHas(a, refs[base + v * 2], refs[base + v * 2 + 1], row) }
+                    v += 1
+                }
+                if all { total += 1 }
+            }
+            i += 1
+        }
+        return total
+    }
+    // union: the slice's eight words are built term by term (bitmap words OR'ed, array rows set), then counted
+    let x0 = 0
+    let x1 = 0
+    let x2 = 0
+    let x3 = 0
+    let x4 = 0
+    let x5 = 0
+    let x6 = 0
+    let x7 = 0
+    let u = 0
+    while u < n {
+        let k = refs[base + u * 2 + 1]
+        let off = refs[base + u * 2]
+        if k >= ARRAY_MAX {
+            x0 = x0 | a.getInt64(off + w0 * 8)
+            x1 = x1 | a.getInt64(off + (w0 + 1) * 8)
+            x2 = x2 | a.getInt64(off + (w0 + 2) * 8)
+            x3 = x3 | a.getInt64(off + (w0 + 3) * 8)
+            x4 = x4 | a.getInt64(off + (w0 + 4) * 8)
+            x5 = x5 | a.getInt64(off + (w0 + 5) * 8)
+            x6 = x6 | a.getInt64(off + (w0 + 6) * 8)
+            x7 = x7 | a.getInt64(off + (w0 + 7) * 8)
+        } else if k > 0 {
+            let i = flatLower(a, off, k, first)
+            while i < k && a.getUInt16(off + i * 2) < after {
+                let b = a.getUInt16(off + i * 2) - first
+                let bit = flatBit(b & 63)
+                let j = b >> 6
+                if j == 0 { x0 = x0 | bit }
+                if j == 1 { x1 = x1 | bit }
+                if j == 2 { x2 = x2 | bit }
+                if j == 3 { x3 = x3 | bit }
+                if j == 4 { x4 = x4 | bit }
+                if j == 5 { x5 = x5 | bit }
+                if j == 6 { x6 = x6 | bit }
+                if j == 7 { x7 = x7 | bit }
+                i += 1
+            }
+        }
+        u += 1
+    }
+    total += flatOnes(x0 & flatValidWord(valid, c, w0)) + flatOnes(x1 & flatValidWord(valid, c, w0 + 1))
+    total += flatOnes(x2 & flatValidWord(valid, c, w0 + 2)) + flatOnes(x3 & flatValidWord(valid, c, w0 + 3))
+    total += flatOnes(x4 & flatValidWord(valid, c, w0 + 4)) + flatOnes(x5 & flatValidWord(valid, c, w0 + 5))
+    total += flatOnes(x6 & flatValidWord(valid, c, w0 + 6)) + flatOnes(x7 & flatValidWord(valid, c, w0 + 7))
+    return total
+}
+
+// Every matching row, in row order (int64s appended to out).
+public function rows(ix: Index, t: tb.Table, cp: Compiled, rd: Reader, out: Bytes) {
+    let locked = Bytes()
+    settle(ix, t, locked)
+    refreshStats(ix, cp)
+    let res = emptyBitmap()
+    let both = emptyBitmap()
+    let chunks = nChunks(t.nrows)
+    let c = 0
+    while c < chunks {
+        // main and delta rows are disjoint; verify each pass with its own containers, then merge in order
+        zero(both)
+        let pass = 0
+        while pass < 2 {
+            let delta = pass == 1
+            if (!delta || ix.deltas[c].count > 0) && chunkCandidates(ix, cp, c, delta, res) {
+                let w = 0
+                while w < WORDS {
+                    let x = res.getInt64(w * 8)
+                    let keep = x
+                    if cp.positional {
+                        while x != 0 {
+                            let b = lowestBit(x)
+                            let o = w * 64 + b
+                            if !verify(ix, cp, o, (c << CHUNK_SHIFT) + o) { keep = keep & ~lowBit(b) }
+                            x = x & wrappingSubtract(x, 1)
+                        }
+                    }
+                    both.setInt64(w * 8, both.getInt64(w * 8) | keep)
+                    w += 1
+                }
+            }
+            pass += 1
+        }
+        let w = 0
+        while w < WORDS {
+            let x = both.getInt64(w * 8)
+            while x != 0 {
+                out.addInt64((c << CHUNK_SHIFT) + w * 64 + lowestBit(x))
+                x = x & wrappingSubtract(x, 1)
+            }
+            w += 1
+        }
+        c += 1
+    }
+    if locked.length > 0 {
+        let buf = Bytes()
+        let any = false
+        let i = 0
+        while i < locked.length / 8 {
+            let r = locked.getInt64(i * 8)
+            if lockedMatch(ix, cp, r, rd, buf) >= 0 {
+                out.addInt64(r)
+                any = true
+            }
+            i += 1
+        }
+        if any { sortInt64(out) }
+    }
+}
+
+function sortInt64(b: Bytes) {
+    let n = b.length / 8
+    let xs: List<Integer> = []
+    let i = 0
+    while i < n {
+        xs.add(b.getInt64(i * 8))
+        i += 1
+    }
+    xs.sort()
+    i = 0
+    while i < n {
+        b.setInt64(i * 8, xs[i])
+        i += 1
+    }
+}
+
+// Score of one row (BM25 of the query's scoring terms), for rows produced by `rows` or a residual scan.
+public function scoreOf(ix: Index, t: tb.Table, cp: Compiled, r: Integer, rd: Reader): Float {
+    if r >= ix.capRows { return 0.0 }
+    if getBit(ix.counted, r) {
+        let c = r >> CHUNK_SHIFT
+        let delta = getBit(ix.inDelta, r)
+        let i = 0
+        let n = cp.uts.length / 4
+        while i < n {
+            if container(ix, cp.uts.getInt32(i * 4), c, delta, cp.refs[i]) { cp.present[i] = 1 } else { cp.present[i] = 0 }
+            i += 1
+        }
+        return rowScore(ix, cp, r - (c << CHUNK_SHIFT), r)
+    }
+    let buf = Bytes()
+    let dl = lockedMatch(ix, cp, r, rd, buf)
+    if dl < 0 { return 0.0 }
+    return docScore(cp, dl)
+}
+
+// ---- top-k (block-max MaxScore over chunks)
+
+// Order: higher score first, then lower id.
+function byScoreDesc(sa: Float, ia: Integer, sb: Float, ib: Integer): Integer {
+    if sa > sb { return -1 }
+    if sa < sb { return 1 }
+    if ia < ib { return -1 }
+    if ia > ib { return 1 }
+    return 0
+}
+
+record Heap {
+    scores: List<Float>
+    rows: List<Integer>
+    k: Integer
+}
+
+function worse(h: Heap, i: Integer, j: Integer): Boolean {
+    let a = h.scores[i]
+    let b = h.scores[j]
+    if a != b { return a < b }
+    return h.rows[i] > h.rows[j]
+}
+
+function heapSwap(h: Heap, i: Integer, j: Integer) {
+    let s = h.scores[i]
+    h.scores[i] = h.scores[j]
+    h.scores[j] = s
+    let r = h.rows[i]
+    h.rows[i] = h.rows[j]
+    h.rows[j] = r
+}
+
+function heapFull(h: Heap): Boolean { return h.rows.length >= h.k }
+
+// Would (score, row) enter the heap?
+function qualifies(h: Heap, score: Float, row: Integer): Boolean {
+    if !heapFull(h) { return true }
+    let s = h.scores[0]
+    if score != s { return score > s }
+    return row < h.rows[0]
+}
+
+function heapPush(h: Heap, score: Float, row: Integer) {
+    if !heapFull(h) {
+        h.scores.add(score)
+        h.rows.add(row)
+        let i = h.rows.length - 1
+        while i > 0 {
+            let p = (i - 1) / 2
+            if worse(h, i, p) {
+                heapSwap(h, i, p)
+                i = p
+            } else {
+                break
+            }
+        }
+        return
+    }
+    h.scores[0] = score
+    h.rows[0] = row
+    let i = 0
+    let n = h.rows.length
+    while true {
+        let l = i * 2 + 1
+        let r = l + 1
+        let m = i
+        if l < n && worse(h, l, m) { m = l }
+        if r < n && worse(h, r, m) { m = r }
+        if m == i { break }
+        heapSwap(h, i, m)
+        i = m
+    }
+}
+
+function threshold(h: Heap): Float {
+    if !heapFull(h) { return -1.0 }
+    return h.scores[0]
+}
+
+// Upper bound of any row's score in chunk c (containers loaded).
+function chunkBound(cp: Compiled): Float {
+    let s = 0.0
+    let i = 0
+    let n = cp.uts.length / 4
+    while i < n {
+        if cp.utScore[i] != 0 && cp.present[i] != 0 {
+            let ref = cp.refs[i]
+            s += bound(cp, i, ref.maxTf, ref.minDl)
+        }
+        i += 1
+    }
+    return s
+}
+
+// The k best rows by score (ties: lower row id first). rd.accept filters candidates (residual WHERE).
+public function topK(ix: Index, t: tb.Table, cp: Compiled, k: Integer, rd: Reader, outRows: Bytes, outScores: List<Float>) {
+    let locked = Bytes()
+    settle(ix, t, locked)
+    refreshStats(ix, cp)
+    let h = Heap { scores: []; rows: []; k: max(k, 1) }
+    // plain-term conjunctions: the main chunks' top k comes from every core; deltas and locked rows below
+    let mainDone = 0
+    if flatPlan(cp) == 1 { mainDone = flatTopK(ix, cp, t, h, rd) }
+    let nu = cp.uts.length / 4
+    // order chunks (main and delta) by their bound, best first
+    let chunks = nChunks(t.nrows)
+    let order: List<Integer> = []
+    let bounds: List<Float> = []
+    let c = 0
+    while c < chunks {
+        loadChunk(ix, cp, c, false)
+        order.add(c * 2)
+        bounds.add(chunkBound(cp))
+        if ix.deltas[c].count > 0 {
+            loadChunk(ix, cp, c, true)
+            order.add(c * 2 + 1)
+            bounds.add(chunkBound(cp))
+        }
+        c += 1
+    }
+    let idx: List<Integer> = []
+    let i = 0
+    while i < order.length {
+        idx.add(i)
+        i += 1
+    }
+    idx.sortBy(function(a: Integer, b: Integer): Integer { return byScoreDesc(bounds[a], order[a], bounds[b], order[b]) })
+    let res = emptyBitmap()
+    let ess = emptyBitmap()
+    let ubs: List<Float> = []
+    let contrib: List<Float> = []
+    let ui = 0
+    while ui < nu {
+        ubs.add(0.0)
+        contrib.add(0.0)
+        ui += 1
+    }
+    let bbs: List<Float> = []
+    ui = 0
+    while ui < nu {
+        bbs.add(0.0)
+        ui += 1
+    }
+    let bTerms: List<Integer> = []
+    let bRest: List<Float> = []
+    let bmul: List<Float> = []
+    ui = 0
+    while ui < nu {
+        bmul.add(0.0)
+        ui += 1
+    }
+    let ess8 = Bytes(64)
+    let blockRes = Bytes(64)
+    let accs = Bytes(512 * 8)
+    // the per-block score filter pays off only when candidate rows may lack some query terms
+    let rk = cp.q.kind[cp.q.root]
+    let disjunctive = rk == qy.Q_OR || rk == qy.Q_ATLEAST
+    let terms: List<Integer> = []      // scoring terms present in the chunk, by bound descending
+    let rest: List<Float> = []         // bound sum of terms[i + 1 ..]
+    // seed the heap from the best chunk's rows that hold its strongest term: a good threshold early
+    if mainDone == 0 && idx.length > 0 && heapSeed(ix, cp, order[idx[0]], res, ess, h, rd, ubs, terms) {
+        // rows already in the heap are skipped below
+    }
+    for j in idx {
+        let th = threshold(h)
+        if heapFull(h) && bounds[j] < th { break }
+        let cc = order[j] >> 1
+        let delta = (order[j] & 1) == 1
+        if !delta && cc < mainDone { continue }
+        WORK[0] = WORK[0] + 1
+        if !chunkCandidates(ix, cp, cc, delta, res) { continue }
+        chunkTerms(cp, ubs, terms, rest)
+        // MaxScore: terms whose bounds together stay below the threshold cannot make a row qualify alone
+        if heapFull(h) && terms.length > 0 {
+            let cut = terms.length
+            let sum = 0.0
+            while cut > 0 && (sum + ubs[terms[cut - 1]]) * 1.00001 < th {
+                sum += ubs[terms[cut - 1]]
+                cut -= 1
+            }
+            if cut == 0 { continue }
+            if cut < terms.length {
+                zero(ess)
+                let e = 0
+                while e < cut {
+                    orContainer(ess, cp.refs[terms[e]])
+                    e += 1
+                }
+                if !andWords(res, ess) { continue }
+            }
+        }
+        let base = cc << CHUNK_SHIFT
+        let scale = cp.avgdl / ix.normAvgdl
+        if scale < 1.0 { scale = 1.0 }
+        for u in terms { bmul[u] = (K1 + 1.0) / 255.0 * cp.utIdf[u] * cp.utBoost[u] * scale }
+        let blk = 0
+        while blk < BM_BLOCKS {
+            let w0 = blk * 8
+            let anyc = 0
+            let w = w0
+            while w < w0 + 8 {
+                anyc = anyc | res.getInt64(w * 8)
+                w += 1
+            }
+            if anyc == 0 {
+                blk += 1
+                continue
+            }
+            let useTerms = terms
+            let useRest = rest
+            let skip = false
+            if heapFull(h) && terms.length > 0 {
+                // block-max: bounds of every scoring term within this 512-row block
+                let th = threshold(h)
+                let sum = 0.0
+                for u in terms {
+                    let ref = cp.refs[u]
+                    let b = ubs[u]
+                    if ref.count >= BM_MIN {
+                        b = Float(ref.arena[ref.tfOff + ref.count + blk]) * bmul[u]
+                        if b > ubs[u] { b = ubs[u] }
+                    }
+                    bbs[u] = b
+                    sum += b
+                }
+                WORK[3] = WORK[3] + 1
+                if sum * 1.00001 < th {
+                    skip = true
+                } else {
+                    bTerms.clear()
+                    for u in terms {
+                        if bbs[u] > 0.0 {
+                            // insertion by bound, descending
+                            bTerms.add(u)
+                            let ti0 = bTerms.length - 1
+                            while ti0 > 0 && bbs[bTerms[ti0 - 1]] < bbs[u] {
+                                bTerms[ti0] = bTerms[ti0 - 1]
+                                ti0 -= 1
+                            }
+                            bTerms[ti0] = u
+                        }
+                    }
+                    bRest.clear()
+                    for u in bTerms { bRest.add(0.0) }
+                    let acc = 0.0
+                    let ti = bTerms.length - 1
+                    while ti >= 0 {
+                        bRest[ti] = acc
+                        acc += bbs[bTerms[ti]]
+                        ti -= 1
+                    }
+                    // non-essential tail: rows holding only those terms cannot reach the threshold
+                    let cut = bTerms.length
+                    let tail = 0.0
+                    while cut > 0 && (tail + bbs[bTerms[cut - 1]]) * 1.00001 < th {
+                        tail += bbs[bTerms[cut - 1]]
+                        cut -= 1
+                    }
+                    if cut == 0 {
+                        skip = true
+                    } else {
+                        if cut < bTerms.length {
+                            let e = 0
+                            while e < 8 {
+                                ess8.setInt64(e * 8, 0)
+                                e += 1
+                            }
+                            e = 0
+                            while e < cut {
+                                orBlock(ess8, cp.refs[bTerms[e]], w0)
+                                e += 1
+                            }
+                            let nc = 0
+                            w = 0
+                            while w < 8 {
+                                let bw = res.getInt64((w0 + w) * 8) & ess8.getInt64(w * 8)
+                                blockRes.setInt64(w * 8, bw)
+                                nc += popcount(bw)
+                                w += 1
+                            }
+                            // many candidates: add up the essential terms' scores term-at-a-time (sequential postings,
+                            // no per-row rank lookups) and keep rows whose partial score plus the rest can qualify
+                            if nc >= 16 && disjunctive {
+                                w = 0
+                                while w < 512 {
+                                    accs.setFloat64(w * 8, 0.0)
+                                    w += 1
+                                }
+                                e = 0
+                                while e < cut {
+                                    accBlock(ix, cp, bTerms[e], w0, base, blockRes, accs)
+                                    e += 1
+                                }
+                                // non-essential terms add their block bound only where they occur (WAND-style bound)
+                                e = cut
+                                while e < bTerms.length {
+                                    let ne = bTerms[e]
+                                    let z = 0
+                                    while z < 8 {
+                                        ess8.setInt64(z * 8, 0)
+                                        z += 1
+                                    }
+                                    orBlock(ess8, cp.refs[ne], w0)
+                                    let bb = bbs[ne]
+                                    z = 0
+                                    while z < 8 {
+                                        let x = ess8.getInt64(z * 8) & blockRes.getInt64(z * 8)
+                                        while x != 0 {
+                                            let off = (z * 64 + lowestBit(x)) * 8
+                                            accs.setFloat64(off, accs.getFloat64(off) + bb)
+                                            x = x & wrappingSubtract(x, 1)
+                                        }
+                                        z += 1
+                                    }
+                                    e += 1
+                                }
+                                w = 0
+                                while w < 8 {
+                                    let bw = blockRes.getInt64(w * 8)
+                                    let keep = bw
+                                    while bw != 0 {
+                                        let b = lowestBit(bw)
+                                        bw = bw & wrappingSubtract(bw, 1)
+                                        if accs.getFloat64((w * 64 + b) * 8) * 1.00001 < th { keep = keep & ~lowBit(b) }
+                                    }
+                                    blockRes.setInt64(w * 8, keep)
+                                    w += 1
+                                }
+                            }
+                        } else {
+                            w = 0
+                            while w < 8 {
+                                blockRes.setInt64(w * 8, res.getInt64((w0 + w) * 8))
+                                w += 1
+                            }
+                        }
+                        useTerms = bTerms
+                        useRest = bRest
+                    }
+                }
+            } else {
+                w = 0
+                while w < 8 {
+                    blockRes.setInt64(w * 8, res.getInt64((w0 + w) * 8))
+                    w += 1
+                }
+            }
+            if !skip {
+                WORK[4] = WORK[4] + 1
+                w = 0
+                while w < 8 {
+                    let x = blockRes.getInt64(w * 8)
+                    WORK[1] = WORK[1] + popcount(x)
+                    while x != 0 {
+                        let o = (w0 + w) * 64 + lowestBit(x)
+                        x = x & wrappingSubtract(x, 1)
+                        let r = base + o
+                        let s = scoreBounded(ix, cp, o, r, useTerms, useRest, contrib, h)
+                        if s >= 0.0 { WORK[2] = WORK[2] + 1 }
+                        if s >= 0.0 && qualifies(h, s, r) && !inHeap(h, r) {
+                            let ok = verify(ix, cp, o, r)
+                            if ok && rd.accept(r) { heapPush(h, s, r) }
+                        }
+                    }
+                    w += 1
+                }
+            }
+            blk += 1
+        }
+    }
+    let buf = Bytes()
+    i = 0
+    while i < locked.length / 8 {
+        let r = locked.getInt64(i * 8)
+        let dl = lockedMatch(ix, cp, r, rd, buf)
+        if dl >= 0 {
+            let s = docScore(cp, dl)
+            if qualifies(h, s, r) && rd.accept(r) { heapPush(h, s, r) }
+        }
+        i += 1
+    }
+    // drain best first
+    let n = h.rows.length
+    let ids: List<Integer> = []
+    i = 0
+    while i < n {
+        ids.add(i)
+        i += 1
+    }
+    ids.sortBy(function(a: Integer, b: Integer): Integer { return byScoreDesc(h.scores[a], h.rows[a], h.scores[b], h.rows[b]) })
+    for x in ids {
+        outRows.addInt64(h.rows[x])
+        outScores.add(h.scores[x])
+    }
+}
+
+// Work counters (benchmarks): [chunks visited, candidate rows, rows fully scored]
+global WORK: List<Integer> = [0, 0, 0, 0, 0, 0]
+
+public function work(i: Integer): Integer { return WORK[i] }
+
+// acc[o] += the term's f64 score for every row o of block w0 (8 words) that is set in mask.
+function accBlock(ix: Index, cp: Compiled, u: Integer, w0: Integer, base: Integer, mask: Bytes, acc: Bytes) {
+    let ref = cp.refs[u]
+    let a = ref.arena
+    let o = ref.off
+    let wf = cp.wf[u]
+    let first = w0 * 64
+    if ref.count >= ARRAY_MAX {
+        let rank = a.getInt32(o + 8192 + w0 * 4)
+        let w = 0
+        while w < 8 {
+            let x = a.getInt64(o + (w0 + w) * 8)
+            let m = mask.getInt64(w * 8)
+            while x != 0 {
+                let b = lowestBit(x)
+                x = x & wrappingSubtract(x, 1)
+                if (m & lowBit(b)) != 0 {
+                    let off = w * 64 + b
+                    let r = base + first + off
+                    let tf = a[ref.tfOff + rank]
+                    if tf == 255 { tf = hm.get(ix.tfBig, (ref.term << 32) | r, 255) }
+                    let dl = ix.dl.getUInt16(r * 2)
+                    if dl == 65535 { dl = docLength(ix, r) }
+                    let ftf = Float(tf)
+                    if tf > 3 { ftf = Float(tfRep(tf)) }
+                    acc.setFloat64(off * 8, acc.getFloat64(off * 8) + wf * ftf / (ftf + cp.normA + cp.normB * Float(dl)))
+                }
+                rank += 1
+            }
+            w += 1
+        }
+        return
+    }
+    let lo = 0
+    let hi = ref.count
+    while lo < hi {
+        let mid = (lo + hi) >> 1
+        if a.getUInt16(o + mid * 2) < first { lo = mid + 1 } else { hi = mid }
+    }
+    let limit = first + 512
+    while lo < ref.count {
+        let row = a.getUInt16(o + lo * 2)
+        if row >= limit { break }
+        let off = row - first
+        if (mask.getInt64((off >> 6) * 8) & lowBit(off & 63)) != 0 {
+            let r = base + row
+            let tf = a[ref.tfOff + lo]
+            if tf == 255 { tf = hm.get(ix.tfBig, (ref.term << 32) | r, 255) }
+            let dl = ix.dl.getUInt16(r * 2)
+            if dl == 65535 { dl = docLength(ix, r) }
+            let ftf = Float(tf)
+            if tf > 3 { ftf = Float(tfRep(tf)) }
+            acc.setFloat64(off * 8, acc.getFloat64(off * 8) + wf * ftf / (ftf + cp.normA + cp.normB * Float(dl)))
+        }
+        lo += 1
+    }
+}
+
+// OR the container's rows in words [w0, w0 + 8) into the 8-word bitmap dst.
+function orBlock(dst: Bytes, ref: Cref, w0: Integer) {
+    let a = ref.arena
+    let o = ref.off
+    if ref.count >= ARRAY_MAX {
+        let w = 0
+        while w < 8 {
+            dst.setInt64(w * 8, dst.getInt64(w * 8) | a.getInt64(o + (w0 + w) * 8))
+            w += 1
+        }
+        return
+    }
+    let lo = 0
+    let hi = ref.count
+    let first = w0 * 64
+    while lo < hi {
+        let m = (lo + hi) >> 1
+        if a.getUInt16(o + m * 2) < first { lo = m + 1 } else { hi = m }
+    }
+    let limit = first + 512
+    while lo < ref.count {
+        let row = a.getUInt16(o + lo * 2)
+        if row >= limit { break }
+        let w = ((row - first) >> 6) * 8
+        dst.setInt64(w, dst.getInt64(w) | lowBit(row & 63))
+        lo += 1
+    }
+}
+
+function inHeap(h: Heap, r: Integer): Boolean {
+    for x in h.rows {
+        if x == r { return true }
+    }
+    return false
+}
+
+// Scoring terms present in the loaded chunk, by bound descending; rest[i] = sum of bounds after terms[i].
+function chunkTerms(cp: Compiled, ubs: List<Float>, terms: List<Integer>, rest: List<Float>) {
+    terms.clear()
+    rest.clear()
+    let nu = cp.uts.length / 4
+    let u = 0
+    while u < nu {
+        if cp.utScore[u] != 0 && cp.present[u] != 0 {
+            let ref = cp.refs[u]
+            ubs[u] = bound(cp, u, ref.maxTf, ref.minDl)
+            terms.add(u)
+        }
+        u += 1
+    }
+    terms.sortBy(function(a: Integer, b: Integer): Integer { return byScoreDesc(ubs[a], a, ubs[b], b) })
+    let i = 0
+    while i < terms.length {
+        rest.add(0.0)
+        i += 1
+    }
+    let acc = 0.0
+    i = terms.length - 1
+    while i >= 0 {
+        rest[i] = acc
+        acc += ubs[terms[i]]
+        i -= 1
+    }
+}
+
+// Exact score of row r, or -1.0 as soon as it cannot reach the heap's threshold. The sum is taken in the canonical
+// term order so scores are identical however a row is reached.
+function scoreBounded(ix: Index, cp: Compiled, o: Integer, r: Integer, terms: List<Integer>, rest: List<Float>,
+                      contrib: List<Float>, h: Heap): Float {
+    let dl = ix.dl.getUInt16(r * 2)
+    if dl == 65535 { dl = docLength(ix, r) }
+    let norm = cp.normA + cp.normB * Float(dl)
+    let full = heapFull(h)
+    let th = 0.0
+    if full { th = h.scores[0] }
+    let partial = 0.0
+    let tfs = cp.tfs
+    let stamp = cp.stamp
+    let n = terms.length
+    let i = 0
+    while i < n {
+        let u = terms[i]
+        let ref = cp.refs[u]
+        let rank = rankOf(ref, o)
+        if rank >= 0 {
+            let tf = ref.arena[ref.tfOff + rank]
+            if tf == 255 { tf = hm.get(ix.tfBig, (ref.term << 32) | r, 255) }
+            tfs.setInt32(u * 4, tf)
+            stamp.setInt64(u * 8, r + 1)
+            let ftf = Float(tf)
+            if tf > 3 { ftf = Float(tfRep(tf)) }
+            partial += cp.wf[u] * ftf / (ftf + norm)
+        }
+        if full && (partial + rest[i]) * 1.00001 < th { return -1.0 }
+        i += 1
+    }
+    // exact TIN score over the terms present in this row, in byte order
+    let s = 0.0
+    for u in cp.scoreOrder {
+        if stamp.getInt64(u * 8) == r + 1 { s = f32(s + termScore32(cp, u, tfs.getInt32(u * 4), dl)) }
+    }
+    return s
+}
+
+// Fill the heap from chunk entry `oc` (order code): rows holding its strongest scoring term.
+function heapSeed(ix: Index, cp: Compiled, oc: Integer, res: Bytes, tmp: Bytes, h: Heap, rd: Reader, ubs: List<Float>,
+                  terms: List<Integer>): Boolean {
+    let cc = oc >> 1
+    let delta = (oc & 1) == 1
+    if !chunkCandidates(ix, cp, cc, delta, res) { return false }
+    let rest: List<Float> = []
+    chunkTerms(cp, ubs, terms, rest)
+    if terms.length == 0 { return false }
+    zero(tmp)
+    orContainer(tmp, cp.refs[terms[0]])
+    if !andWords(res, tmp) { return false }
+    let contrib: List<Float> = []
+    let u = 0
+    while u < cp.uts.length / 4 {
+        contrib.add(0.0)
+        u += 1
+    }
+    let none = Heap { scores: []; rows: []; k: 1000000000 }
+    let base = cc << CHUNK_SHIFT
+    let w = 0
+    while w < WORDS {
+        let x = res.getInt64(w * 8)
+        while x != 0 {
+            let o = w * 64 + lowestBit(x)
+            x = x & wrappingSubtract(x, 1)
+            let r = base + o
+            let s = scoreBounded(ix, cp, o, r, terms, rest, contrib, none)
+            if qualifies(h, s, r) {
+                let ok = verify(ix, cp, o, r)
+                if ok && rd.accept(r) { heapPush(h, s, r) }
+            }
+        }
+        w += 1
+    }
+    return true
+}
+
+// Reference evaluation of one document text, independent of the containers (tests and EXPLAIN checks):
+// -1.0 when it does not match, else its BM25 score under the current statistics.
+public function referenceScore(ix: Index, cp: Compiled, buf: Bytes, off: Integer, len: Integer): Float {
+    let tk = ix.tk2
+    tx.clear(tk)
+    tx.tokenize(tk, buf, off, len)
+    loadDocTokens(ix, cp, tk)
+    if !evalSpans(cp, cp.q.root, tk.count) { return -1.0 }
+    return docScore(cp, tk.count)
+}
+
+public function prepare(ix: Index, t: tb.Table, cp: Compiled) {
+    let locked = Bytes()
+    settle(ix, t, locked)
+    refreshStats(ix, cp)
+}
+
+// Is a compiled query still valid for the index (same term ids, no new terms it might name)?
+public function current(ix: Index, cp: Compiled): Boolean {
+    return cp.generation == ix.generation && cp.dictCount == ix.dict.count
+}
+
+// The text with every token that is a scoring query term wrapped in <b>...</b>.
+public function highlight(ix: Index, cp: Compiled, buf: Bytes, off: Integer, len: Integer, out: Bytes) {
+    let tk = tx.newTokens(ix.stemmer)
+    tk.withSource = true
+    tx.tokenize(tk, buf, off, len)
+    let at = off
+    let i = 0
+    while i < tk.count {
+        let a = tx.termStart(tk, i)
+        let id = lookup(ix.dict, tk.terms, a, tx.termEnd(tk, i) - a)
+        let u = -1
+        if id >= 0 { u = hm.get(cp.utOf, id, -1) }
+        if u >= 0 && cp.utScore[u] != 0 {
+            let from = tk.srcFrom.getInt32(i * 4)
+            let to = tk.srcTo.getInt32(i * 4)
+            out.addBytes(buf.slice(at, from))
+            out.addBytes(Bytes("<b>"))
+            out.addBytes(buf.slice(from, to))
+            out.addBytes(Bytes("</b>"))
+            at = to
+        }
+        i += 1
+    }
+    out.addBytes(buf.slice(at, off + len))
+}
+
+public function settleIndex(ix: Index, t: tb.Table) {
+    let locked = Bytes()
+    settle(ix, t, locked)
+}
+
+// ---------------------------------------------------------------- facets
+// A facet keeps, for one low-cardinality column of the indexed table, a bitmap of the rows holding each value.
+// GROUP BY col over a search is then, per chunk, popcount(search result AND value bitmap). Rows whose value
+// changes are suspect rows of the index (every write goes through txn.addUndo) and are re-read when settled.
+
+constant FACET_MAX = 64
+
+record Facet {
+    column: Integer
+    disabled: Boolean
+    keys: hm.IntMap        // integer value or text hash -> value index
+    reps: List<Integer>    // per value: a row that held it when the value was first seen
+    bits: List<Bytes>      // per value: bitmap over rows
+    nulls: Bytes           // rows whose value is NULL
+    rowValue: Bytes        // int16 per row: value index, -1 none, -2 NULL
+    cap: Integer
+}
+
+function facetGrow(f: Facet, rows: Integer) {
+    if rows <= f.cap { return }
+    let cap = max(rows, f.cap * 2)
+    let words = nChunks(cap) * WORDS
+    for b in f.bits { b.resize(words * 8) }
+    f.nulls.resize(words * 8)
+    let old = f.rowValue.length / 2
+    f.rowValue.resize(cap * 2)
+    let r = old
+    while r < cap {
+        f.rowValue.setInt16(r * 2, -1)
+        r += 1
+    }
+    f.cap = cap
+}
+
+// Value index of row r's column value (creating it), -2 for NULL, -3 when the facet must be disabled.
+function facetValue(f: Facet, t: tb.Table, r: Integer): Integer {
+    let c = t.cols[f.column]
+    if tb.isNull(c, r) { return -2 }
+    let key = 0
+    let isText = v.isTextType(c.type)
+    if isText {
+        key = v.hashBytes(c.heap, tb.textOff(c, r), tb.textLen(c, r))
+    } else if c.type == v.T_FLOAT8 || c.type == v.T_FLOAT4 || c.width == 16 || c.perRowScale || c.type == v.T_NUMERIC {
+        return -3
+    } else {
+        key = tb.getInt(c, r)
+    }
+    let vi = hm.get(f.keys, key, -1)
+    if vi >= 0 {
+        if isText {
+            let q = f.reps[vi]
+            if !v.equalBytes(c.heap, tb.textOff(c, q), tb.textLen(c, q), c.heap, tb.textOff(c, r), tb.textLen(c, r)) { return -3 }
+        }
+        return vi
+    }
+    if f.reps.length >= FACET_MAX { return -3 }
+    vi = f.reps.length
+    hm.put(f.keys, key, vi)
+    f.reps.add(r)
+    f.bits.add(Bytes(nChunks(f.cap) * WORDS * 8))
+    return vi
+}
+
+// Re-read row r's value into the facet's bitmaps.
+function facetRow(f: Facet, t: tb.Table, r: Integer) {
+    if f.disabled { return }
+    facetGrow(f, r + 1)
+    let old = f.rowValue.getInt16(r * 2)
+    if old >= 0 { clearBit(f.bits[old], r) }
+    if old == -2 { clearBit(f.nulls, r) }
+    let vi = facetValue(f, t, r)
+    if vi == -3 {
+        f.disabled = true
+        return
+    }
+    if vi == -2 { setBit(f.nulls, r) } else { setBit(f.bits[vi], r) }
+    f.rowValue.setInt16(r * 2, vi)
+}
+
+function facetFor(ix: Index, t: tb.Table, column: Integer): Facet {
+    for f in ix.facets {
+        if f.column == column {
+            facetGrow(f, t.nrows)
+            return f
+        }
+    }
+    let f = Facet { column: column; disabled: false; keys: hm.newIntMap(16); reps: []; bits: []; nulls: Bytes()
+                    rowValue: Bytes(); cap: 0 }
+    facetGrow(f, max(t.nrows, 1))
+    let r = 0
+    while r < t.nrows && !f.disabled {
+        let st = t.state[r]
+        if (st & tb.ST_DEAD) == 0 || (st & tb.ST_LOCKED) != 0 { facetRow(f, t, r) }
+        r += 1
+    }
+    ix.facets.add(f)
+    return f
+}
+
+// Counts of the search result per value of `column` from bitmaps. False when the facet cannot answer (too many
+// values, unsupported type, positional query, or matching rows locked by open transactions): use the row path.
+// reps / counts: one entry per value with a non-zero count (rep = a row holding the value); NULL as rep of a NULL row.
+public function facetCounts(ix: Index, t: tb.Table, cp: Compiled, column: Integer, rd: Reader, reps: List<Integer>,
+                            counts: List<Integer>): Boolean {
+    let locked = Bytes()
+    settle(ix, t, locked)
+    refreshStats(ix, cp)
+    if cp.positional || locked.length > 0 { return false }
+    let f = facetFor(ix, t, column)
+    if f.disabled { return false }
+    let nv = f.reps.length
+    let tot: List<Integer> = []
+    let rep: List<Integer> = []      // per value: a row of the search result holding it
+    let i = 0
+    while i <= nv {
+        tot.add(0)
+        rep.add(-1)
+        i += 1
+    }
+    let res = emptyBitmap()
+    let chunks = nChunks(t.nrows)
+    let c = 0
+    while c < chunks {
+        let pass = 0
+        while pass < 2 {
+            let delta = pass == 1
+            if (!delta || ix.deltas[c].count > 0) && chunkCandidates(ix, cp, c, delta, res) {
+                let base = c * WORDS * 8
+                let vi = 0
+                while vi <= nv {
+                    let b = f.nulls
+                    if vi < nv { b = f.bits[vi] }
+                    let n = 0
+                    let w = 0
+                    while w < WORDS {
+                        let x = res.getInt64(w * 8) & b.getInt64(base + w * 8)
+                        if x != 0 {
+                            n += popcount(x)
+                            if rep[vi] < 0 { rep[vi] = (c << CHUNK_SHIFT) + w * 64 + lowestBit(x) }
+                        }
+                        w += 1
+                    }
+                    tot[vi] = tot[vi] + n
+                    vi += 1
+                }
+            }
+            pass += 1
+        }
+        c += 1
+    }
+    i = 0
+    while i <= nv {
+        if tot[i] > 0 {
+            reps.add(rep[i])
+            counts.add(tot[i])
+        }
+        i += 1
+    }
+    return true
+}
+
+
+// ---------------------------------------------------------------- persistence at clean shutdown
+// After close's final checkpoint the index is written next to the snapshot, tagged with the checkpoint LSN. A later
+// open loads it instead of rebuilding only when the snapshot has that LSN and no WAL was replayed after it (the
+// table is then exactly the checkpointed one); any other case (crash, newer checkpoint, a short or foreign file)
+// rebuilds from the table. The file is derived state: deleting it only costs a rebuild.
+
+constant FILE_MAGIC = 0x4E454F5352434831   // "NEOSRCH1"
+constant FILE_VERSION = 2       // 2: words need a letter or digit; superscript digits are words of their own
+constant HEADER_WORDS = 20
+
+function blobs(ix: Index): List<Bytes> {
+    return [ix.dict.text, ix.dict.ends, ix.dict.hashes, ix.dict.slots, ix.df, ix.dirStart, ix.dirCount, ix.dir, ix.dl,
+            ix.dlBig.keys, ix.dlBig.vals, ix.tfBig.keys, ix.tfBig.vals, ix.mainValid, ix.inDelta, ix.counted, ix.suspect,
+            ix.suspects, ix.deltaCount]
+}
+
+function writeAll(fd: Integer, b: Bytes, at: Integer): Boolean {
+    let done = 0
+    while done < b.length {
+        let n = dbio.pwrite(fd, b, done, min(b.length - done, 1 << 26), at + done)
+        if n <= 0 { return false }
+        done += n
+    }
+    return true
+}
+
+function readAll(fd: Integer, at: Integer, len: Integer, out: Bytes): Boolean {
+    let done = 0
+    while done < len {
+        let n = dbio.preadAppend(fd, at + done, out, min(len - done, 1 << 26))
+        if n <= 0 { return false }
+        done += n
+    }
+    return true
+}
+
+// Write the index to path (atomically: temporary file, sync, rename, directory sync). False on any I/O error.
+public function save(ix: Index, t: tb.Table, dir: Text, path: Text, lsn: Integer): Boolean {
+    if !ix.built { return false }
+    let tmp = path + ".tmp"
+    let fd = dbio.open(tmp, dbio.OPEN_WRITE | dbio.OPEN_CREATE | dbio.OPEN_TRUNCATE)
+    if fd < 0 { return false }
+    let h = Bytes()
+    let fields = [FILE_MAGIC, FILE_VERSION, lsn, t.nrows, t.id, ix.column, ix.stemmer, ix.dict.count, ix.dict.mask, ix.n,
+                  ix.sumDl, ix.capRows, ix.dlBig.mask, ix.dlBig.count, ix.tfBig.mask, ix.tfBig.count, ix.arenas.length, 0, 0, 0]
+    for x in fields { h.addInt64(x) }
+    h.setFloat64(17 * 8, ix.normAvgdl)
+    let ok = writeAll(fd, h, 0)
+    let at = h.length
+    let lens = Bytes()
+    for b in blobs(ix) { lens.addInt64(b.length) }
+    for b in ix.arenas { lens.addInt64(b.length) }
+    ok = ok && writeAll(fd, lens, at)
+    at += lens.length
+    for b in blobs(ix) {
+        ok = ok && writeAll(fd, b, at)
+        at += b.length
+    }
+    for b in ix.arenas {
+        ok = ok && writeAll(fd, b, at)
+        at += b.length
+    }
+    ok = ok && dbio.fsync(fd) == 0
+    dbio.close(fd)
+    if !ok {
+        dbio.unlink(tmp)
+        return false
+    }
+    if dbio.rename(tmp, path) != 0 { return false }
+    dbio.fsyncDir(dir)
+    return true
+}
+
+// Load the index from path if it was written for this checkpoint LSN and table; false = build it instead.
+public function load(ix: Index, t: tb.Table, path: Text, lsn: Integer): Boolean {
+    if lsn < 0 || dbio.pathSize(path) < HEADER_WORDS * 8 { return false }
+    let fd = dbio.open(path, dbio.OPEN_READ)
+    if fd < 0 { return false }
+    let ok = loadFrom(ix, t, fd, lsn)
+    dbio.close(fd)
+    return ok
+}
+
+function loadFrom(ix: Index, t: tb.Table, fd: Integer, lsn: Integer): Boolean {
+    let h = Bytes()
+    if !readAll(fd, 0, HEADER_WORDS * 8, h) { return false }
+    let w = function(i: Integer): Integer { return h.getInt64(i * 8) }
+    if w(0) != FILE_MAGIC || w(1) != FILE_VERSION || w(2) != lsn || w(3) != t.nrows || w(4) != t.id || w(5) != ix.column ||
+       w(6) != ix.stemmer {
+        return false
+    }
+    let nblobs = blobs(ix).length
+    let narenas = w(16)
+    if narenas < 0 || narenas > 1000000 { return false }
+    let lens = Bytes()
+    if !readAll(fd, HEADER_WORDS * 8, (nblobs + narenas) * 8, lens) { return false }
+    let at = HEADER_WORDS * 8 + lens.length
+    let parts: List<Bytes> = []
+    let i = 0
+    while i < nblobs + narenas {
+        let len = lens.getInt64(i * 8)
+        let b = Bytes()
+        if len < 0 || (len > 0 && !readAll(fd, at, len, b)) { return false }
+        parts.add(b)
+        at += len
+        i += 1
+    }
+    // install
+    ix.dict = Dict { text: parts[0]; ends: parts[1]; hashes: parts[2]; slots: parts[3]; mask: w(8); count: w(7) }
+    ix.df = parts[4]
+    ix.dirStart = parts[5]
+    ix.dirCount = parts[6]
+    ix.dir = parts[7]
+    ix.dl = parts[8]
+    ix.dlBig = hm.IntMap { keys: parts[9]; vals: parts[10]; mask: w(12); count: w(13) }
+    ix.tfBig = hm.IntMap { keys: parts[11]; vals: parts[12]; mask: w(14); count: w(15) }
+    ix.mainValid = parts[13]
+    ix.inDelta = parts[14]
+    ix.counted = parts[15]
+    ix.suspect = parts[16]
+    ix.suspects = parts[17]
+    ix.deltaCount = parts[18]
+    ix.arenas = []
+    i = 0
+    while i < narenas {
+        ix.arenas.add(parts[nblobs + i])
+        i += 1
+    }
+    ix.n = w(9)
+    ix.sumDl = w(10)
+    ix.capRows = w(11)
+    ix.normAvgdl = h.getFloat64(17 * 8)
+    ix.cnt = Bytes(ix.df.length)
+    ix.start = Bytes(ix.df.length)
+    ix.deltas = []
+    ix.deltaDirty = Bytes(narenas)
+    i = 0
+    while i < narenas {
+        ix.deltas.add(Delta { terms: hm.newIntMap(16); arena: Bytes(); member: Bytes(); count: 0 })
+        if i * 4 < ix.deltaCount.length && ix.deltaCount.getInt32(i * 4) > 0 { ix.deltaDirty[i] = 1 }
+        i += 1
+    }
+    ix.oldPrint = hm.newIntMap(16)
+    ix.facets = []
+    ix.sorted = Bytes()
+    ix.sortedCount = -1
+    ix.built = true
+    ix.generation += 1
+    return true
+}
+
+// ---------------------------------------------------------------- streaming phrase check
+// For a root phrase without slop whose words are single terms: decode the rarest word's positions one at a time and
+// advance the other words' position streams only as far as needed; stop at the first match.
+
+function detectFastPhrase(cp: Compiled) {
+    cp.fastPhrase = false
+    let q = cp.q
+    let n = q.root
+    if q.kind[n] != qy.Q_PHRASE || q.a[n] != 0 { return }
+    let uts = Bytes()
+    let offs = Bytes()
+    let j = 0
+    for x in q.kids[n] {
+        if q.kind[x] == qy.Q_GAP {
+            j += 1
+            continue
+        }
+        let leaf = -1
+        if x < cp.leafOf.length { leaf = cp.leafOf[x] }
+        if leaf < 0 || cp.leafUts[leaf].length != 4 { return }
+        uts.addInt32(cp.leafUts[leaf].getInt32(0))
+        offs.addInt32(j)
+        j += 1
+    }
+    if uts.length < 8 { return }
+    cp.fastPhrase = true
+    cp.fpUts = uts
+    cp.fpOffs = offs
+    cp.fpPtr = Bytes(uts.length * 2)
+    cp.fpLeft = Bytes(uts.length * 2)
+    cp.fpCur = Bytes(uts.length * 2)
+}
+
+// Next position of word i's stream (fpCur), false when it has none left.
+function streamNext(cp: Compiled, i: Integer): Boolean {
+    let left = cp.fpLeft.getInt64(i * 8)
+    if left == 0 { return false }
+    let a = cp.refs[cp.fpUts.getInt32(i * 4)].arena
+    let p = cp.fpPtr.getInt64(i * 8)
+    let u = 0
+    let shift = 0
+    while true {
+        let b = a[p]
+        p += 1
+        u = u | ((b & 127) << shift)
+        if b < 128 { break }
+        shift += 7
+    }
+    let cur = cp.fpCur.getInt64(i * 8)
+    if cur < 0 { cur = 0 }
+    cp.fpCur.setInt64(i * 8, cur + u)
+    cp.fpPtr.setInt64(i * 8, p)
+    cp.fpLeft.setInt64(i * 8, left - 1)
+    return true
+}
+
+function phraseStream(ix: Index, cp: Compiled, o: Integer, r: Integer): Boolean {
+    let n = cp.fpUts.length / 4
+    let driver = -1
+    let best = 0
+    let i = 0
+    while i < n {
+        let u = cp.fpUts.getInt32(i * 4)
+        if cp.present[u] == 0 { return false }
+        let ref = cp.refs[u]
+        let rank = rankOf(ref, o)
+        if rank < 0 { return false }
+        let tf = tfAt(ix, ref, rank, r)
+        cp.fpPtr.setInt64(i * 8, positionsStart(ix, ref, rank, r))
+        cp.fpLeft.setInt64(i * 8, tf)
+        cp.fpCur.setInt64(i * 8, -1)
+        if driver < 0 || tf < best {
+            driver = i
+            best = tf
+        }
+        i += 1
+    }
+    let doff = cp.fpOffs.getInt32(driver * 4)
+    while streamNext(cp, driver) {
+        let start = cp.fpCur.getInt64(driver * 8) - doff
+        if start >= 0 {
+            let ok = true
+            let k = 0
+            while k < n && ok {
+                if k != driver {
+                    let target = start + cp.fpOffs.getInt32(k * 4)
+                    while cp.fpCur.getInt64(k * 8) < target {
+                        if !streamNext(cp, k) { return false }
+                    }
+                    if cp.fpCur.getInt64(k * 8) != target { ok = false }
+                }
+                k += 1
+            }
+            if ok { return true }
+        }
+    }
+    return false
+}

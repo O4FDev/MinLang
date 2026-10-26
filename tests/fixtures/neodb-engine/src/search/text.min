@@ -1,0 +1,380 @@
+// Tokenizer for full-text search. Words follow Unicode word boundaries (UAX #29, simplified): runs of letters,
+// digits and `_`; `'`, `.` and `:` join letters (don't, e.g, a:b), `.` `,` `;` and `'` join digits (3.14, 1,000);
+// combining marks stay inside a word; hyphens and other punctuation split. Han/Hiragana characters and emoji are
+// one-character terms. Terms are case- and accent-folded (Latin-1, Latin Extended-A, Greek, Cyrillic, fullwidth
+// ASCII) and optionally stemmed (Snowball English). Positions are 0-based token indexes.
+use "./stem.min" as stem
+
+constant C_SEP = 0
+constant C_AL = 1       // letter
+constant C_NU = 2       // digit
+constant C_ENL = 3      // ExtendNumLet: _
+constant C_ML = 4       // MidLetter: :
+constant C_MNL = 5      // MidNumLet: . '
+constant C_MN = 6       // MidNum: , ;
+constant C_EXT = 7      // Extend / Format: combining marks, ZWJ, variation selectors (no output)
+constant C_ONE = 8      // a term on its own (ideograph, emoji)
+
+public constant STEM_NONE = 0
+public constant STEM_EN = 1
+
+global ASCII_CLASS: Bytes = asciiClasses()
+global LATIN_A: Bytes = Bytes("AaAaAaCcCcCcCcDdDdEeEeEeEeEeGgGgGgGgHhHhIiIiIiIiIiJjJjKkkLlLlLlLlLlNnNnNnnNnOoOoOoOoRrRrRrSsSsSsSsTtTtTtUuUuUuUuUuUuWwYyYZzZzZzs")
+global LATIN1: Bytes = Bytes("aaaaaaAceeeeiiiiDnooooo*ouuuuyTsaaaaaaAceeeeiiiidnooooo/ouuuuyTy")
+
+function asciiClasses(): Bytes {
+    let t = Bytes(128)
+    let c = 48
+    while c <= 57 {
+        t[c] = C_NU
+        c += 1
+    }
+    c = 65
+    while c <= 90 {
+        t[c] = C_AL
+        t[c + 32] = C_AL
+        c += 1
+    }
+    t[95] = C_ENL
+    t[58] = C_ML
+    t[46] = C_MNL
+    t[39] = C_MNL
+    t[44] = C_MN
+    t[59] = C_MN
+    return t
+}
+
+public record Tokens {
+    terms: Bytes       // folded (and stemmed) bytes of every token, back to back
+    ends: Bytes        // int32 per token: end of its bytes in terms (start = previous end)
+    srcFrom: Bytes     // int32 per token: byte range of the word in the source (when withSource)
+    srcTo: Bytes
+    count: Integer
+    stemmer: Integer
+    withSource: Boolean
+    word: Bytes        // scratch: the current word, folded
+}
+
+public function newTokens(stemmer: Integer): Tokens {
+    return Tokens { terms: Bytes(); ends: Bytes(); srcFrom: Bytes(); srcTo: Bytes(); count: 0; stemmer: stemmer
+                    withSource: false; word: Bytes() }
+}
+
+public function clear(tk: Tokens) {
+    tk.terms.clear()
+    tk.ends.clear()
+    tk.srcFrom.clear()
+    tk.srcTo.clear()
+    tk.count = 0
+}
+
+public function termStart(tk: Tokens, i: Integer): Integer {
+    if i == 0 { return 0 }
+    return tk.ends.getInt32((i - 1) * 4)
+}
+
+public function termEnd(tk: Tokens, i: Integer): Integer { return tk.ends.getInt32(i * 4) }
+
+function emit(tk: Tokens, from: Integer, to: Integer) {
+    let w = tk.word
+    // a word needs a letter or digit: a run of connectors such as "_" alone is not a token
+    let k = 0
+    while k < w.length && w[k] == 95 { k += 1 }
+    if k == w.length {
+        w.clear()
+        return
+    }
+
+    if tk.stemmer == STEM_EN {
+        stem.stemEnglish(w, 0, w.length, tk.terms)
+    } else {
+        tk.terms.addBytes(w)
+    }
+    tk.ends.addInt32(tk.terms.length)
+    if tk.withSource {
+        tk.srcFrom.addInt32(from)
+        tk.srcTo.addInt32(to)
+    }
+    tk.count += 1
+    w.clear()
+}
+
+// Decoded character: class, code point and its UTF-8 length.
+record Ch {
+    cls: Integer
+    cp: Integer
+    n: Integer
+}
+
+// Decode the character at i (< end) and classify it.
+function decode(src: Bytes, i: Integer, end: Integer, ch: Ch) {
+    let b = src[i]
+    if b < 128 {
+        ch.cp = b
+        ch.n = 1
+        ch.cls = ASCII_CLASS[b]
+        return
+    }
+    let cp = 0
+    let n = 1
+    if b >= 240 && i + 3 <= end - 1 {
+        cp = ((b & 7) << 18) | ((src[i + 1] & 63) << 12) | ((src[i + 2] & 63) << 6) | (src[i + 3] & 63)
+        n = 4
+    } else if b >= 224 && i + 2 <= end - 1 {
+        cp = ((b & 15) << 12) | ((src[i + 1] & 63) << 6) | (src[i + 2] & 63)
+        n = 3
+    } else if b >= 192 && i + 1 <= end - 1 {
+        cp = ((b & 31) << 6) | (src[i + 1] & 63)
+        n = 2
+    } else {
+        ch.cp = 0xFFFD
+        ch.n = 1
+        ch.cls = C_SEP
+        return
+    }
+    ch.cp = cp
+    ch.n = n
+    ch.cls = classify(cp)
+}
+
+function classify(cp: Integer): Integer {
+    if cp < 0x0300 {
+        if cp == 0xAA || cp == 0xB5 || cp == 0xBA { return C_AL }
+        // superscript digits and vulgar fractions: Word_Break Other but numeric, so each is a word of its own
+        if cp == 0xB2 || cp == 0xB3 || cp == 0xB9 || (cp >= 0xBC && cp <= 0xBE) { return C_ONE }
+        if cp == 0xB7 { return C_ML }
+        if cp < 0xC0 || cp == 0xD7 || cp == 0xF7 { return C_SEP }
+        return C_AL
+    }
+    if cp <= 0x036F { return C_EXT }
+    if cp < 0x2000 {
+        if cp == 0x037E || cp == 0x0589 || cp == 0x060C || cp == 0x060D || cp == 0x066C { return C_MN }
+        if cp == 0x0387 || cp == 0x05F4 { return C_ML }
+        if cp >= 0x0483 && cp <= 0x0489 { return C_EXT }
+        if cp >= 0x0591 && cp <= 0x05C7 { return C_EXT }
+        if cp >= 0x0610 && cp <= 0x061A { return C_EXT }
+        if cp >= 0x064B && cp <= 0x065F { return C_EXT }
+        if cp >= 0x0660 && cp <= 0x0669 { return C_NU }
+        if cp >= 0x06F0 && cp <= 0x06F9 { return C_NU }
+        if cp >= 0x0966 && cp <= 0x096F { return C_NU }
+        if cp == 0x05BE || (cp >= 0x055A && cp <= 0x055F) || (cp >= 0x0600 && cp <= 0x060F) || cp == 0x061B || cp == 0x061F ||
+           (cp >= 0x066A && cp <= 0x066D) || cp == 0x06D4 || cp == 0x0964 || cp == 0x0965 || cp == 0x0E2F || cp == 0x0E5A || cp == 0x0E5B {
+            return C_SEP
+        }
+        if (cp >= 0x0900 && cp <= 0x0903) || (cp >= 0x093A && cp <= 0x094F) || (cp >= 0x0951 && cp <= 0x0957) || cp == 0x0962 || cp == 0x0963 {
+            return C_EXT
+        }
+        if cp >= 0x1AB0 && cp <= 0x1AFF { return C_EXT }
+        if cp >= 0x1DC0 && cp <= 0x1DFF { return C_EXT }
+        return C_AL
+    }
+    if cp <= 0x206F {
+        if cp == 0x200C || cp == 0x200D || cp == 0x2060 || cp == 0x200B { return C_EXT }
+        if cp == 0x2018 || cp == 0x2019 || cp == 0x2024 { return C_MNL }
+        if cp == 0x2027 { return C_ML }
+        if cp == 0x2044 { return C_MN }
+        if cp == 0x203F || cp == 0x2040 || cp == 0x2054 { return C_ENL }
+        return C_SEP
+    }
+    if cp >= 0x20D0 && cp <= 0x20FF { return C_EXT }
+    if cp < 0x2100 { return C_SEP }      // super/subscripts, currency
+    if cp >= 0x2190 && cp <= 0x25FF { return C_SEP }     // arrows, math, technical, boxes, shapes
+    if cp >= 0x2600 && cp <= 0x27BF { return C_ONE }     // misc symbols, dingbats (emoji)
+    if cp >= 0x27C0 && cp <= 0x2BFF {
+        if cp >= 0x2B00 { return C_ONE }
+        return C_SEP
+    }
+    if cp >= 0x2E00 && cp <= 0x2E7F { return C_SEP }
+    if cp >= 0x3000 && cp <= 0x303F {
+        if cp == 0x3005 { return C_AL }
+        return C_SEP
+    }
+    if cp >= 0x3040 && cp <= 0x309F { return C_ONE }     // hiragana
+    if cp >= 0x3400 && cp <= 0x4DBF { return C_ONE }     // CJK extension A
+    if cp >= 0x4E00 && cp <= 0x9FFF { return C_ONE }     // CJK unified ideographs
+    if cp >= 0xF900 && cp <= 0xFAFF { return C_ONE }
+    if cp >= 0xFE00 && cp <= 0xFE0F { return C_EXT }     // variation selectors
+    if cp >= 0xFE10 && cp <= 0xFE6F {
+        if cp == 0xFE13 || cp == 0xFE55 { return C_ML }
+        if cp == 0xFE52 { return C_MNL }
+        if cp == 0xFE10 || cp == 0xFE14 || cp == 0xFE50 || cp == 0xFE54 { return C_MN }
+        if cp == 0xFE33 || cp == 0xFE34 || cp == 0xFE4D || cp == 0xFE4E || cp == 0xFE4F { return C_ENL }
+        if cp >= 0xFE20 && cp <= 0xFE2F { return C_EXT }
+        return C_SEP
+    }
+    if cp == 0xFEFF { return C_EXT }
+    if cp >= 0xFF01 && cp <= 0xFF5E { return ASCII_CLASS[cp - 0xFEE0] }   // fullwidth ASCII
+    if cp >= 0xFF5F && cp <= 0xFF65 { return C_SEP }
+    if cp >= 0xFFF0 && cp <= 0xFFFF { return C_SEP }
+    if cp >= 0x1F3FB && cp <= 0x1F3FF { return C_EXT }   // skin tone modifiers
+    if cp >= 0x1F000 && cp <= 0x1FAFF { return C_ONE }   // emoji and pictographs
+    if cp >= 0xE0000 && cp <= 0xE007F { return C_EXT }   // tags
+    if cp >= 0x20000 && cp <= 0x3FFFF { return C_ONE }   // CJK extensions B..
+    return C_AL
+}
+
+function addUtf8(out: Bytes, cp: Integer) {
+    if cp < 0x80 {
+        out.add(cp)
+    } else if cp < 0x800 {
+        out.add(0xC0 | (cp >> 6))
+        out.add(0x80 | (cp & 63))
+    } else if cp < 0x10000 {
+        out.add(0xE0 | (cp >> 12))
+        out.add(0x80 | ((cp >> 6) & 63))
+        out.add(0x80 | (cp & 63))
+    } else {
+        out.add(0xF0 | (cp >> 18))
+        out.add(0x80 | ((cp >> 12) & 63))
+        out.add(0x80 | ((cp >> 6) & 63))
+        out.add(0x80 | (cp & 63))
+    }
+}
+
+// Append the case- and accent-folded form of a word character.
+function foldAppend(out: Bytes, cp: Integer) {
+    if cp < 0x80 {
+        if cp >= 65 && cp <= 90 { out.add(cp + 32) } else { out.add(cp) }
+        return
+    }
+    if cp >= 0xC0 && cp <= 0xFF {
+        let base = LATIN1[cp - 0xC0]
+        if base == 65 {                       // Æ æ
+            out.add(97)
+            out.add(101)
+        } else if base == 84 {                // Þ þ
+            out.add(116)
+            out.add(104)
+        } else if cp == 0xDF {                // ß
+            out.add(115)
+            out.add(115)
+        } else if base == 68 {                // Ð ð
+            out.add(100)
+        } else {
+            out.add(base)
+        }
+        return
+    }
+    if cp >= 0x100 && cp <= 0x17F {
+        if cp == 0x132 || cp == 0x133 {
+            out.add(105)
+            out.add(106)
+            return
+        }
+        if cp == 0x152 || cp == 0x153 {
+            out.add(111)
+            out.add(101)
+            return
+        }
+        let base = LATIN_A[cp - 0x100]
+        if base >= 65 && base <= 90 { base += 32 }
+        out.add(base)
+        return
+    }
+    if cp >= 0x370 && cp <= 0x3FF {
+        let g = cp
+        if g >= 0x391 && g <= 0x3A9 { g += 32 }
+        if g == 0x386 || g == 0x3AC { g = 0x3B1 }
+        if g == 0x388 || g == 0x3AD { g = 0x3B5 }
+        if g == 0x389 || g == 0x3AE { g = 0x3B7 }
+        if g == 0x38A || g == 0x3AF || g == 0x3CA || g == 0x390 { g = 0x3B9 }
+        if g == 0x38C || g == 0x3CC { g = 0x3BF }
+        if g == 0x38E || g == 0x3CD || g == 0x3CB || g == 0x3B0 { g = 0x3C5 }
+        if g == 0x38F || g == 0x3CE { g = 0x3C9 }
+        if g == 0x3C2 { g = 0x3C3 }
+        addUtf8(out, g)
+        return
+    }
+    if cp >= 0x400 && cp <= 0x42F {
+        if cp >= 0x410 { addUtf8(out, cp + 32) } else { addUtf8(out, cp + 80) }
+        return
+    }
+    if cp >= 0x1E00 && cp <= 0x1EFF {        // Latin Extended Additional: lower case (even = upper)
+        if (cp & 1) == 0 { addUtf8(out, cp + 1) } else { addUtf8(out, cp) }
+        return
+    }
+    if cp >= 0xFF01 && cp <= 0xFF5E {
+        foldAppend(out, cp - 0xFEE0)
+        return
+    }
+    addUtf8(out, cp)
+}
+
+// Tokenize src[off, off + len) and append the tokens to tk (call clear first for a fresh list).
+public function tokenize(tk: Tokens, src: Bytes, off: Integer, len: Integer) {
+    let end = off + len
+    let ch = Ch { cls: 0; cp: 0; n: 0 }
+    let nx = Ch { cls: 0; cp: 0; n: 0 }
+    let i = off
+    let inWord = false
+    let wordFrom = 0
+    let last = C_SEP          // class of the last letter/digit/_ in the current word
+    let w = tk.word
+    w.clear()
+    while i < end {
+        let b = src[i]
+        let cls = 0
+        let n = 1
+        let cp = b
+        if b < 128 {
+            cls = ASCII_CLASS[b]
+            // fast path: ASCII letters and digits
+            if cls == C_AL || cls == C_NU {
+                if !inWord {
+                    inWord = true
+                    wordFrom = i
+                }
+                if b >= 65 && b <= 90 { w.add(b + 32) } else { w.add(b) }
+                last = cls
+                i += 1
+                continue
+            }
+        } else {
+            decode(src, i, end, ch)
+            cls = ch.cls
+            n = ch.n
+            cp = ch.cp
+        }
+        if cls == C_AL || cls == C_NU || cls == C_ENL {
+            if !inWord {
+                inWord = true
+                wordFrom = i
+            }
+            foldAppend(w, cp)
+            last = cls
+        } else if cls == C_EXT {
+            // combining marks and joiners stay in the word and are folded away
+        } else if (cls == C_ML || cls == C_MNL || cls == C_MN) && inWord && i + n < end {
+            decode(src, i + n, end, nx)
+            let joins = false
+            if (last == C_AL) && nx.cls == C_AL && (cls == C_ML || cls == C_MNL) { joins = true }
+            if (last == C_NU) && nx.cls == C_NU && (cls == C_MN || cls == C_MNL) { joins = true }
+            if joins {
+                if cp == 0x2019 || cp == 0x2018 || cp == 0xFF07 { w.add(39) } else { foldAppend(w, cp) }
+            } else {
+                emit(tk, wordFrom, i)
+                inWord = false
+                last = C_SEP
+            }
+        } else {
+            if inWord {
+                emit(tk, wordFrom, i)
+                inWord = false
+                last = C_SEP
+            }
+            if cls == C_ONE {
+                addUtf8(w, cp)
+                emit(tk, i, i + n)
+            }
+        }
+        i += n
+    }
+    if inWord { emit(tk, wordFrom, end) }
+}
+
+// Tokenize one query word (a TINQL term): the same folding and stemming as documents, but the whole input is one
+// term unless it splits into several words (then the caller treats them as a phrase).
+public function foldTerm(tk: Tokens, src: Bytes, off: Integer, len: Integer) {
+    clear(tk)
+    tokenize(tk, src, off, len)
+}

@@ -1,0 +1,544 @@
+// sparsevec: sparse vectors, pgvector-compatible. Stored as int32 dim, int32 nnz, nnz int32 indices (0-based,
+// ascending), nnz float32 values, little-endian. Text form: {1:1.5,3:2}/5 (1-based indices).
+use "neodb-sdk" as sdk
+use "math" as math
+use "./dense.min" as dense
+use "./half.min" as fp16
+
+constant MAX_DIM = 1000000000
+constant MAX_NNZ = 16000
+
+public function register(x: sdk.Extension) {
+    let s = x.type("sparsevec", function(call) { sparseIn(call) }, function(call) { sparseOut(call) })
+    s.binary(function(call) { sparseRecv(call) }, function(call) { sparseSend(call) })
+    s.modifier(function(call) { sparseCheck(call) })
+    s.modifierRange(1, MAX_DIM, "dimensions")
+    s.ordering(function(call) { call.returnInteger(compare(call)) })
+    let v2 = ["sparsevec", "sparsevec"]
+    x.define("sparsevec_lt", v2, "bool", function(call) { call.returnBoolean(compare(call) < 0) })
+    x.define("sparsevec_le", v2, "bool", function(call) { call.returnBoolean(compare(call) <= 0) })
+    x.define("sparsevec_eq", v2, "bool", function(call) { call.returnBoolean(compare(call) == 0) })
+    x.define("sparsevec_ne", v2, "bool", function(call) { call.returnBoolean(compare(call) != 0) })
+    x.define("sparsevec_ge", v2, "bool", function(call) { call.returnBoolean(compare(call) >= 0) })
+    x.define("sparsevec_gt", v2, "bool", function(call) { call.returnBoolean(compare(call) > 0) })
+    x.define("sparsevec_cmp", v2, "int4", function(call) { call.returnInteger(compare(call)) })
+    x.operator("<", "sparsevec", "sparsevec", "sparsevec_lt")
+    x.operator("<=", "sparsevec", "sparsevec", "sparsevec_le")
+    x.operator("=", "sparsevec", "sparsevec", "sparsevec_eq")
+    x.operator("<>", "sparsevec", "sparsevec", "sparsevec_ne")
+    x.operator(">=", "sparsevec", "sparsevec", "sparsevec_ge")
+    x.operator(">", "sparsevec", "sparsevec", "sparsevec_gt")
+    x.define("l2_normalize", ["sparsevec"], "sparsevec", function(call) { l2Normalize(call) })
+    x.define("sparsevec_l2_squared_distance", v2, "float8", function(call) { l2Squared(call) })
+    x.define("l2_distance", ["sparsevec", "sparsevec"], "float8", function(call) { l2Distance(call) })
+    x.define("inner_product", ["sparsevec", "sparsevec"], "float8", function(call) { innerProduct(call) })
+    x.define("sparsevec_negative_inner_product", ["sparsevec", "sparsevec"], "float8", function(call) { negativeInnerProduct(call) })
+    x.define("cosine_distance", ["sparsevec", "sparsevec"], "float8", function(call) { cosineDistance(call) })
+    x.define("l1_distance", ["sparsevec", "sparsevec"], "float8", function(call) { l1Distance(call) })
+    x.define("l2_norm", ["sparsevec"], "float8", function(call) { norm(call) })
+    x.operator("<->", "sparsevec", "sparsevec", "l2_distance")
+    x.operator("<#>", "sparsevec", "sparsevec", "sparsevec_negative_inner_product")
+    x.operator("<=>", "sparsevec", "sparsevec", "cosine_distance")
+    x.operator("<+>", "sparsevec", "sparsevec", "l1_distance")
+}
+
+function dim(call: sdk.Call, i: Integer): Integer { return call.int32(i, 0) }
+function nnz(call: sdk.Call, i: Integer): Integer { return call.int32(i, 4) }
+function index(call: sdk.Call, i: Integer, k: Integer): Integer { return call.int32(i, 8 + k * 4) }
+function value(call: sdk.Call, i: Integer, k: Integer): Float { return call.float32(i, 8 + nnz(call, i) * 4 + k * 4) }
+
+function checkDims(call: sdk.Call, d: Integer) {
+    if call.modifier >= 0 && d != call.modifier {
+        call.fail("22000", "expected " + Text(call.modifier) + " dimensions, not " + Text(d))
+    }
+}
+
+function isSpace(c: Integer): Boolean { return c == 32 || c == 9 || c == 10 || c == 13 || c == 11 || c == 12 }
+
+// Store dim + (index, value) pairs: sorted by index, zeros dropped, duplicates refused.
+function store(call: sdk.Call, d: Integer, indices: List<Integer>, values: List<Float>) {
+    let order: List<Integer> = []
+    let i = 0
+    while i < indices.length {
+        order.add(i)
+        i += 1
+    }
+    // insertion sort by index (nnz is at most 16,000 and inputs are usually already sorted)
+    i = 1
+    while i < order.length {
+        let j = i
+        while j > 0 && indices[order[j - 1]] > indices[order[j]] {
+            let t = order[j]
+            order[j] = order[j - 1]
+            order[j - 1] = t
+            j -= 1
+        }
+        i += 1
+    }
+    i = 1
+    while i < order.length {
+        if indices[order[i]] == indices[order[i - 1]] {
+            call.fail("22000", "sparsevec indices must not contain duplicates")
+            return
+        }
+        i += 1
+    }
+    let kept = 0
+    for k in order {
+        if values[k] != 0.0 { kept += 1 }
+    }
+    let out = call.output
+    out.addInt32(d)
+    out.addInt32(kept)
+    for k in order {
+        if values[k] != 0.0 { out.addInt32(indices[k]) }
+    }
+    for k in order {
+        if values[k] != 0.0 { out.addFloat32(values[k]) }
+    }
+}
+
+function readInt(b: Bytes, start: Integer, end: Integer): Integer {
+    let neg = false
+    let i = start
+    if i < end && (b[i] == 45 || b[i] == 43) {
+        neg = b[i] == 45
+        i += 1
+    }
+    if i >= end { return -9223372036854775807 }
+    let x = 0
+    while i < end {
+        if b[i] < 48 || b[i] > 57 { return -9223372036854775807 }
+        if x < 100000000000 { x = x * 10 + (b[i] - 48) }
+        i += 1
+    }
+    if neg { return -x }
+    return x
+}
+
+deterministic function sparseIn(call: sdk.Call) {
+    let b = call.buffer(0)
+    let i = call.offset(0)
+    let end = i + call.length(0)
+    let bad = "invalid input syntax for type sparsevec: \"" + call.text(0) + "\""
+    let indices: List<Integer> = []
+    let values: List<Float> = []
+    let parsed = sdk.newParsedFloat()
+    while i < end && isSpace(b[i]) { i += 1 }
+    if i >= end || b[i] != 123 {
+        call.fail("22P02", bad)
+        return
+    }
+    i += 1
+    while i < end && isSpace(b[i]) { i += 1 }
+    if i < end && b[i] == 125 {
+        i += 1
+    } else {
+        while true {
+            while i < end && isSpace(b[i]) { i += 1 }
+            let s = i
+            while i < end && b[i] != 58 && !isSpace(b[i]) { i += 1 }
+            let idx = readInt(b, s, i)
+            while i < end && isSpace(b[i]) { i += 1 }
+            if idx == -9223372036854775807 || i >= end || b[i] != 58 {
+                call.fail("22P02", bad)
+                return
+            }
+            i += 1
+            while i < end && isSpace(b[i]) { i += 1 }
+            let vs = i
+            while i < end && b[i] != 44 && b[i] != 125 && !isSpace(b[i]) { i += 1 }
+            call.parseFloat4(b, vs, i - vs, parsed)
+            if !parsed.ok {
+                call.fail("22P02", bad)
+                return
+            }
+            if parsed.outOfRange {
+                call.fail("22003", "\"" + Text(b.slice(vs, i)) + "\" is out of range for type sparsevec")
+                return
+            }
+            let f = parsed.value
+            if f != f {
+                call.fail("22000", "NaN not allowed in sparsevec")
+                return
+            }
+            if f > 3.4028234663852886e38 || f < -3.4028234663852886e38 {
+                call.fail("22000", "infinite value not allowed in sparsevec")
+                return
+            }
+            if indices.length == MAX_NNZ {
+                call.fail("54000", "sparsevec cannot have more than " + Text(MAX_NNZ) + " non-zero elements")
+                return
+            }
+            indices.add(idx - 1)
+            values.add(f)
+            while i < end && isSpace(b[i]) { i += 1 }
+            if i >= end {
+                call.fail("22P02", bad)
+                return
+            }
+            if b[i] == 125 {
+                i += 1
+                break
+            }
+            if b[i] != 44 {
+                call.fail("22P02", bad)
+                return
+            }
+            i += 1
+        }
+    }
+    while i < end && isSpace(b[i]) { i += 1 }
+    if i >= end || b[i] != 47 {
+        call.fail("22P02", bad)
+        return
+    }
+    i += 1
+    while i < end && isSpace(b[i]) { i += 1 }
+    let ds = i
+    while i < end && !isSpace(b[i]) { i += 1 }
+    let d = readInt(b, ds, i)
+    while i < end && isSpace(b[i]) { i += 1 }
+    if d == -9223372036854775807 || i != end {
+        call.fail("22P02", bad)
+        return
+    }
+    if d < 1 {
+        call.fail("22000", "sparsevec must have at least 1 dimension")
+        return
+    }
+    if d > MAX_DIM {
+        call.fail("54000", "sparsevec cannot have more than " + Text(MAX_DIM) + " dimensions")
+        return
+    }
+    for idx in indices {
+        if idx < 0 {
+            call.fail("22000", "index must be greater than zero")
+            return
+        }
+        if idx >= d {
+            call.fail("22000", "index must be less than or equal to dimensions")
+            return
+        }
+    }
+    store(call, d, indices, values)
+    checkDims(call, d)
+}
+
+deterministic function sparseOut(call: sdk.Call) {
+    let out = call.output
+    let n = nnz(call, 0)
+    out.add(123)
+    let k = 0
+    while k < n {
+        if k > 0 { out.add(44) }
+        out.addBytes(Bytes(Text(index(call, 0, k) + 1)))
+        out.add(58)
+        call.addFloat4(out, value(call, 0, k))
+        k += 1
+    }
+    out.add(125)
+    out.add(47)
+    out.addBytes(Bytes(Text(dim(call, 0))))
+}
+
+function be32(call: sdk.Call, at: Integer): Integer {
+    let x = ((call.byte(0, at) * 256 + call.byte(0, at + 1)) * 256 + call.byte(0, at + 2)) * 256 + call.byte(0, at + 3)
+    if x >= 2147483648 { x -= 4294967296 }
+    return x
+}
+
+function addBe32(out: Bytes, x: Integer) {
+    let u = x
+    if u < 0 { u += 4294967296 }
+    out.add((u / 16777216) % 256)
+    out.add((u / 65536) % 256)
+    out.add((u / 256) % 256)
+    out.add(u % 256)
+}
+
+// Wire format: int32 dim, int32 nnz, int32 unused, nnz int32 indices (0-based), nnz float4, big-endian.
+deterministic function sparseRecv(call: sdk.Call) {
+    let len = call.length(0)
+    if len < 12 {
+        call.fail("22P03", "insufficient data left in message")
+        return
+    }
+    let d = be32(call, 0)
+    let n = be32(call, 4)
+    if d < 1 {
+        call.fail("22000", "sparsevec must have at least 1 dimension")
+        return
+    }
+    if n < 0 || n > MAX_NNZ || len != 12 + n * 8 {
+        call.fail("22P03", "insufficient data left in message")
+        return
+    }
+    let indices: List<Integer> = []
+    let values: List<Float> = []
+    let scratch = Bytes(4)
+    let k = 0
+    while k < n {
+        let idx = be32(call, 12 + k * 4)
+        if idx < 0 || idx >= d {
+            call.fail("22000", "index out of bounds")
+            return
+        }
+        indices.add(idx)
+        let at = 12 + n * 4 + k * 4
+        scratch[0] = call.byte(0, at + 3)
+        scratch[1] = call.byte(0, at + 2)
+        scratch[2] = call.byte(0, at + 1)
+        scratch[3] = call.byte(0, at)
+        values.add(scratch.getFloat32(0))
+        k += 1
+    }
+    store(call, d, indices, values)
+    checkDims(call, d)
+}
+
+deterministic function sparseSend(call: sdk.Call) {
+    let out = call.output
+    let n = nnz(call, 0)
+    addBe32(out, dim(call, 0))
+    addBe32(out, n)
+    addBe32(out, 0)
+    let k = 0
+    while k < n {
+        addBe32(out, index(call, 0, k))
+        k += 1
+    }
+    k = 0
+    while k < n {
+        let at = 8 + n * 4 + k * 4
+        out.add(call.byte(0, at + 3))
+        out.add(call.byte(0, at + 2))
+        out.add(call.byte(0, at + 1))
+        out.add(call.byte(0, at))
+        k += 1
+    }
+}
+
+deterministic function sparseCheck(call: sdk.Call) { checkDims(call, dim(call, 0)) }
+
+// ---------------------------------------------------------------- distances (merge over the two index lists)
+
+function sameDims(call: sdk.Call): Boolean {
+    if dim(call, 0) != dim(call, 1) {
+        call.fail("22000", "different sparsevec dimensions " + Text(dim(call, 0)) + " and " + Text(dim(call, 1)))
+        return false
+    }
+    return true
+}
+
+// mode 0: squared l2, 1: dot product, 2: l1
+function merge(call: sdk.Call, mode: Integer): Float {
+    let na = nnz(call, 0)
+    let nb = nnz(call, 1)
+    let i = 0
+    let j = 0
+    let sum = 0.0
+    while i < na || j < nb {
+        let ia = 2147483647
+        let ib = 2147483647
+        if i < na { ia = index(call, 0, i) }
+        if j < nb { ib = index(call, 1, j) }
+        let x = 0.0
+        let y = 0.0
+        if ia <= ib {
+            x = value(call, 0, i)
+            i += 1
+        }
+        if ib <= ia {
+            y = value(call, 1, j)
+            j += 1
+        }
+        if mode == 0 { sum += (x - y) * (x - y) }
+        if mode == 1 { sum += x * y }
+        if mode == 2 {
+            let d = x - y
+            if d < 0.0 { d = -d }
+            sum += d
+        }
+    }
+    return sum
+}
+
+function squaredNorm(call: sdk.Call, i: Integer): Float {
+    let n = nnz(call, i)
+    let sum = 0.0
+    let k = 0
+    while k < n {
+        let x = value(call, i, k)
+        sum += x * x
+        k += 1
+    }
+    return sum
+}
+
+function overflowed(f: Float): Float {
+    if f > 3.4028234663852886e38 { return 1.0 / 0.0 }
+    if f < -3.4028234663852886e38 { return -1.0 / 0.0 }
+    return f
+}
+
+deterministic function l2Distance(call: sdk.Call) {
+    if sameDims(call) { call.returnFloat(math.sqrt(overflowed(merge(call, 0)))) }
+}
+
+deterministic function l2Squared(call: sdk.Call) {
+    if sameDims(call) { call.returnFloat(overflowed(merge(call, 0))) }
+}
+
+deterministic function l2Normalize(call: sdk.Call) {
+    let n = nnz(call, 0)
+    let len = math.sqrt(squaredNorm(call, 0))
+    let indices: List<Integer> = []
+    let values: List<Float> = []
+    let k = 0
+    while k < n {
+        indices.add(index(call, 0, k))
+        let x = 0.0
+        if len > 0.0 { x = dense.f32(value(call, 0, k) / len) }
+        values.add(x)
+        k += 1
+    }
+    store(call, dim(call, 0), indices, values)
+}
+
+// pgvector's order: values index by index (an element present on one side only compares with the other's zero),
+// then the dimension count.
+function compare(call: sdk.Call): Integer {
+    let na = nnz(call, 0)
+    let nb = nnz(call, 1)
+    let n = na
+    if nb < n { n = nb }
+    let i = 0
+    while i < n {
+        let ia = index(call, 0, i)
+        let ib = index(call, 1, i)
+        let x = value(call, 0, i)
+        let y = value(call, 1, i)
+        if ia < ib {
+            if x < 0.0 { return -1 }
+            return 1
+        }
+        if ia > ib {
+            if y < 0.0 { return 1 }
+            return -1
+        }
+        if x < y { return -1 }
+        if x > y { return 1 }
+        i += 1
+    }
+    if na < nb && index(call, 1, n) < dim(call, 0) {
+        if value(call, 1, n) < 0.0 { return 1 }
+        return -1
+    }
+    if na > nb && index(call, 0, n) < dim(call, 1) {
+        if value(call, 0, n) < 0.0 { return -1 }
+        return 1
+    }
+    if dim(call, 0) < dim(call, 1) { return -1 }
+    if dim(call, 0) > dim(call, 1) { return 1 }
+    return 0
+}
+
+// ---------------------------------------------------------------- casts to and from the dense types
+
+public function registerCasts(x: sdk.Extension) {
+    x.cast("vector", "sparsevec", function(call) { fromDense(call, false) })
+    x.cast("halfvec", "sparsevec", function(call) { fromDense(call, true) })
+    x.cast("sparsevec", "vector", function(call) { toDense(call, false) })
+    x.cast("sparsevec", "halfvec", function(call) { toDense(call, true) })
+}
+
+deterministic function fromDense(call: sdk.Call, half: Boolean) {
+    let w = 4
+    if half { w = 2 }
+    let d = call.length(0) / w
+    let indices: List<Integer> = []
+    let values: List<Float> = []
+    let k = 0
+    while k < d {
+        let f = 0.0
+        if half { f = fp16.toFloat(call.uint16(0, k * 2)) } else { f = call.float32(0, k * 4) }
+        if f != 0.0 {
+            if indices.length == MAX_NNZ {
+                call.fail("54000", "sparsevec cannot have more than " + Text(MAX_NNZ) + " non-zero elements")
+                return
+            }
+            indices.add(k)
+            values.add(f)
+        }
+        k += 1
+    }
+    store(call, d, indices, values)
+    checkDims(call, d)
+}
+
+deterministic function toDense(call: sdk.Call, half: Boolean) {
+    let d = dim(call, 0)
+    let name = "vector"
+    if half { name = "halfvec" }
+    if d > 16000 {
+        call.fail("54000", name + " cannot have more than 16000 dimensions")
+        return
+    }
+    let elements: List<Float> = []
+    let k = 0
+    while k < d {
+        elements.add(0.0)
+        k += 1
+    }
+    let n = nnz(call, 0)
+    k = 0
+    while k < n {
+        elements[index(call, 0, k)] = value(call, 0, k)
+        k += 1
+    }
+    let out = call.output
+    for f in elements {
+        if half {
+            let h = fp16.fromFloat(f)
+            if fp16.isInfinite(h) {
+                let shown = Bytes()
+                call.addFloat4(shown, f)
+                call.fail("22003", "\"" + Text(shown) + "\" is out of range for type halfvec")
+                return
+            }
+            out.addUInt16(h)
+        } else {
+            out.addFloat32(f)
+        }
+    }
+    if call.modifier >= 0 && d != call.modifier {
+        call.fail("22000", "expected " + Text(call.modifier) + " dimensions, not " + Text(d))
+    }
+}
+
+deterministic function innerProduct(call: sdk.Call) {
+    if sameDims(call) { call.returnFloat(overflowed(merge(call, 1))) }
+}
+
+deterministic function negativeInnerProduct(call: sdk.Call) {
+    if sameDims(call) { call.returnFloat(-overflowed(merge(call, 1))) }
+}
+
+deterministic function cosineDistance(call: sdk.Call) {
+    if !sameDims(call) { return }
+    let s = overflowed(merge(call, 1)) / math.sqrt(overflowed(squaredNorm(call, 0)) * overflowed(squaredNorm(call, 1)))
+    if s != s {
+        call.returnFloat(s)
+        return
+    }
+    if s > 1.0 { s = 1.0 }
+    if s < -1.0 { s = -1.0 }
+    call.returnFloat(1.0 - s)
+}
+
+deterministic function l1Distance(call: sdk.Call) {
+    if sameDims(call) { call.returnFloat(overflowed(merge(call, 2))) }
+}
+
+deterministic function norm(call: sdk.Call) { call.returnFloat(math.sqrt(squaredNorm(call, 0))) }

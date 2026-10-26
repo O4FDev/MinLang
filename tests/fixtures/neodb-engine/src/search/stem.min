@@ -1,0 +1,550 @@
+// Snowball English (Porter2) stemmer, following algorithms/english.sbl from snowballstem.org
+// (exceptional forms, apostrophes, Y marking, R1/R2 with the gener/commun/arsen/... prefixes, steps 0–5).
+// Byte-level and allocation-free: the word is copied into `out` and stemmed in place there.
+// Suffixes are compared as packed big-endian Integers ("ing" = 0x696e67), so a test is one mask and compare.
+
+// ---------------------------------------------------------------- packed strings
+
+constant M2 = 0xffff
+constant M3 = 0xffffff
+constant M4 = 0xffffffff
+constant M5 = 0xffffffffff
+constant M6 = 0xffffffffffff
+constant M7 = 0xffffffffffffff
+
+constant S_SSES = 0x73736573 // "sses"
+constant S_IED = 0x696564 // "ied"
+constant S_IES = 0x696573 // "ies"
+constant S_US = 0x7573 // "us"
+constant S_SS = 0x7373 // "ss"
+constant S_APOS_S = 0x2773 // "'s"
+constant S_APOS_S_APOS = 0x277327 // "'s'"
+constant S_EED = 0x656564 // "eed"
+constant S_EEDLY = 0x6565646c79 // "eedly"
+constant S_ED = 0x6564 // "ed"
+constant S_EDLY = 0x65646c79 // "edly"
+constant S_ING = 0x696e67 // "ing"
+constant S_INGLY = 0x696e676c79 // "ingly"
+constant S_PROC = 0x70726f63 // "proc"
+constant S_EXC = 0x657863 // "exc"
+constant S_SUCC = 0x73756363 // "succ"
+constant S_INN = 0x696e6e // "inn"
+constant S_OUT = 0x6f7574 // "out"
+constant S_CANN = 0x63616e6e // "cann"
+constant S_HERR = 0x68657272 // "herr"
+constant S_EARR = 0x65617272 // "earr"
+constant S_EVEN = 0x6576656e // "even"
+constant S_AT = 0x6174 // "at"
+constant S_BL = 0x626c // "bl"
+constant S_IZ = 0x697a // "iz"
+constant S_TIONAL = 0x74696f6e616c // "tional"
+constant S_ENCI = 0x656e6369 // "enci"
+constant S_ANCI = 0x616e6369 // "anci"
+constant S_ABLI = 0x61626c69 // "abli"
+constant S_ENTLI = 0x656e746c69 // "entli"
+constant S_IZER = 0x697a6572 // "izer"
+constant S_IZATION = 0x697a6174696f6e // "ization"
+constant S_ATIONAL = 0x6174696f6e616c // "ational"
+constant S_ATION = 0x6174696f6e // "ation"
+constant S_ATOR = 0x61746f72 // "ator"
+constant S_ALISM = 0x616c69736d // "alism"
+constant S_ALITI = 0x616c697469 // "aliti"
+constant S_ALLI = 0x616c6c69 // "alli"
+constant S_FULNESS = 0x66756c6e657373 // "fulness"
+constant S_OUSLI = 0x6f75736c69 // "ousli"
+constant S_OUSNESS = 0x6f75736e657373 // "ousness"
+constant S_IVENESS = 0x6976656e657373 // "iveness"
+constant S_IVITI = 0x6976697469 // "iviti"
+constant S_BILITI = 0x62696c697469 // "biliti"
+constant S_BLI = 0x626c69 // "bli"
+constant S_OGIST = 0x6f67697374 // "ogist"
+constant S_OGI = 0x6f6769 // "ogi"
+constant S_FULLI = 0x66756c6c69 // "fulli"
+constant S_LESSLI = 0x6c6573736c69 // "lessli"
+constant S_LI = 0x6c69 // "li"
+constant S_ALIZE = 0x616c697a65 // "alize"
+constant S_ICATE = 0x6963617465 // "icate"
+constant S_ICITI = 0x6963697469 // "iciti"
+constant S_ICAL = 0x6963616c // "ical"
+constant S_FUL = 0x66756c // "ful"
+constant S_NESS = 0x6e657373 // "ness"
+constant S_ATIVE = 0x6174697665 // "ative"
+constant S_AL = 0x616c // "al"
+constant S_ANCE = 0x616e6365 // "ance"
+constant S_ENCE = 0x656e6365 // "ence"
+constant S_ER = 0x6572 // "er"
+constant S_IC = 0x6963 // "ic"
+constant S_ABLE = 0x61626c65 // "able"
+constant S_IBLE = 0x69626c65 // "ible"
+constant S_ANT = 0x616e74 // "ant"
+constant S_EMENT = 0x656d656e74 // "ement"
+constant S_MENT = 0x6d656e74 // "ment"
+constant S_ENT = 0x656e74 // "ent"
+constant S_ISM = 0x69736d // "ism"
+constant S_ATE = 0x617465 // "ate"
+constant S_ITI = 0x697469 // "iti"
+constant S_OUS = 0x6f7573 // "ous"
+constant S_IVE = 0x697665 // "ive"
+constant S_IZE = 0x697a65 // "ize"
+constant S_ION = 0x696f6e // "ion"
+constant S_TION = 0x74696f6e // "tion"
+constant S_SKIS = 0x736b6973 // "skis"
+constant S_SKIES = 0x736b696573 // "skies"
+constant S_IDLY = 0x69646c79 // "idly"
+constant S_GENTLY = 0x67656e746c79 // "gently"
+constant S_UGLY = 0x75676c79 // "ugly"
+constant S_EARLY = 0x6561726c79 // "early"
+constant S_ONLY = 0x6f6e6c79 // "only"
+constant S_SINGLY = 0x73696e676c79 // "singly"
+constant S_SKY = 0x736b79 // "sky"
+constant S_NEWS = 0x6e657773 // "news"
+constant S_HOWE = 0x686f7765 // "howe"
+constant S_ATLAS = 0x61746c6173 // "atlas"
+constant S_COSMOS = 0x636f736d6f73 // "cosmos"
+constant S_BIAS = 0x62696173 // "bias"
+constant S_ANDES = 0x616e646573 // "andes"
+constant S_GENER = 0x67656e6572 // "gener"
+constant S_COMMUN = 0x636f6d6d756e // "commun"
+constant S_ARSEN = 0x617273656e // "arsen"
+constant S_PAST = 0x70617374 // "past"
+constant S_UNIVERS = 0x756e6976657273 // "univers"
+constant S_LATER = 0x6c61746572 // "later"
+constant S_EMERG = 0x656d657267 // "emerg"
+constant S_ORGAN = 0x6f7267616e // "organ"
+constant S_INTER = 0x696e746572 // "inter"
+
+constant R_BLE = 0x626c65 // "ble"
+constant R_OG = 0x6f67 // "og"
+constant R_LESS = 0x6c657373 // "less"
+constant R_I = 0x69 // "i"
+constant R_IE = 0x6965 // "ie"
+constant R_EE = 0x6565 // "ee"
+constant R_E = 0x65 // "e"
+constant R_SKI = 0x736b69 // "ski"
+constant R_IDL = 0x69646c // "idl"
+constant R_GENTL = 0x67656e746c // "gentl"
+constant R_UGLI = 0x75676c69 // "ugli"
+constant R_EARLI = 0x6561726c69 // "earli"
+constant R_ONLI = 0x6f6e6c69 // "onli"
+constant R_SINGL = 0x73696e676c // "singl"
+
+constant CH_APOS = 39
+constant CH_UPPER_Y = 89
+constant CH_A = 97
+constant CH_E = 101
+constant CH_I = 105
+constant CH_L = 108
+constant CH_O = 111
+constant CH_S = 115
+constant CH_T = 116
+constant CH_W = 119
+constant CH_X = 120
+constant CH_Y = 121
+constant CH_Z = 122
+
+// Bit (c - 'a') set for a e i o u y.
+constant VOWELS = 0x1104111
+// Bit (c - 'a') set for c d e g h k m n r t, the letters that may precede a deleted "li".
+constant VALID_LI = 0xa34dc
+// Bit (c - 'a') set for b d f g m n p r t, the doubles undone after deleting "ed"/"ing".
+constant DOUBLES = 0xab06a
+
+// ---------------------------------------------------------------- byte helpers
+
+// The word is w[b .. b + n); positions below are relative to b.
+
+function isVowel(c: Integer): Boolean {
+    if c < CH_A || c > CH_Z { return false }
+    return ((VOWELS >> (c - CH_A)) & 1) == 1
+}
+
+function inSet(c: Integer, set: Integer): Boolean {
+    if c < CH_A || c > CH_Z { return false }
+    return ((set >> (c - CH_A)) & 1) == 1
+}
+
+// Packs w[from .. to) big-endian; to - from must be at most 7.
+function pack(w: Bytes, b: Integer, from: Integer, to: Integer): Integer {
+    let t = 0
+    let i = from
+    while i < to {
+        t = (t << 8) | w[b + i]
+        i += 1
+    }
+    return t
+}
+
+// The last (up to) seven bytes of w[0 .. n), packed. A suffix of length k matches when (tail & Mk) == key:
+// keys have no zero bytes, so a word shorter than k never matches.
+function tail(w: Bytes, b: Integer, n: Integer): Integer {
+    if n > 7 { return pack(w, b, n - 7, n) }
+    return pack(w, b, 0, n)
+}
+
+// The whole of w[0 .. n) packed, or 0 when it is longer than seven bytes.
+function whole(w: Bytes, b: Integer, n: Integer): Integer {
+    if n > 7 { return 0 }
+    return pack(w, b, 0, n)
+}
+
+// Writes the packed string `key` at position s and returns the new length s + key length.
+function put(w: Bytes, b: Integer, s: Integer, key: Integer): Integer {
+    let k = 0
+    let x = key
+    while x != 0 {
+        k += 1
+        x = x >> 8
+    }
+    let i = s + k
+    x = key
+    while x != 0 {
+        i -= 1
+        w[b + i] = x & 255
+        x = x >> 8
+    }
+    return s + k
+}
+
+function hasVowelBefore(w: Bytes, b: Integer, end: Integer): Boolean {
+    let i = 0
+    while i < end {
+        if isVowel(w[b + i]) { return true }
+        i += 1
+    }
+    return false
+}
+
+// shortv at position c: (non-v_WXY v non-v) or (non-v v at the start) or "past", read backwards from c.
+function shortSyllable(w: Bytes, b: Integer, c: Integer): Boolean {
+    if c >= 3 {
+        let last = w[b + c - 1]
+        if !isVowel(last) && last != CH_W && last != CH_X && last != CH_UPPER_Y && isVowel(w[b + c - 2]) && !isVowel(w[b + c - 3]) {
+            return true
+        }
+    }
+    if c == 2 && isVowel(w[b]) && !isVowel(w[b + 1]) { return true }
+    return c >= 4 && pack(w, b, c - 4, c) == S_PAST
+}
+
+// ---------------------------------------------------------------- steps (each returns the new length)
+
+// Exceptional forms; -1 when the word is not one of them.
+function exception1(w: Bytes, b: Integer, n: Integer): Integer {
+    if n > 6 { return -1 }
+    let x = pack(w, b, 0, n)
+    if x == S_SKIS { return put(w, b, 0, R_SKI) }
+    if x == S_SKIES { return put(w, b, 0, S_SKY) }
+    if x == S_IDLY { return put(w, b, 0, R_IDL) }
+    if x == S_GENTLY { return put(w, b, 0, R_GENTL) }
+    if x == S_UGLY { return put(w, b, 0, R_UGLI) }
+    if x == S_EARLY { return put(w, b, 0, R_EARLI) }
+    if x == S_ONLY { return put(w, b, 0, R_ONLI) }
+    if x == S_SINGLY { return put(w, b, 0, R_SINGL) }
+    if x == S_SKY || x == S_NEWS || x == S_HOWE || x == S_ATLAS || x == S_COSMOS || x == S_BIAS || x == S_ANDES {
+        return n
+    }
+    return -1
+}
+
+function step1a(w: Bytes, b: Integer, n0: Integer): Integer {
+    let n = n0
+    let t = tail(w, b, n)
+    if (t & M3) == S_APOS_S_APOS {
+        n -= 3
+    } else if (t & M2) == S_APOS_S {
+        n -= 2
+    } else if (t & 255) == CH_APOS {
+        n -= 1
+    }
+    if n != n0 { t = tail(w, b, n) }
+    if (t & M4) == S_SSES { return n - 2 }
+    if (t & M3) == S_IED || (t & M3) == S_IES {
+        let s = n - 3
+        if s >= 2 { return put(w, b, s, R_I) }
+        return put(w, b, s, R_IE)
+    }
+    if (t & M2) == S_US || (t & M2) == S_SS { return n }
+    if (t & 255) == CH_S {
+        // next gopast v: a vowel somewhere before the letter preceding the s
+        if hasVowelBefore(w, b, n - 2) { return n - 1 }
+    }
+    return n
+}
+
+function step1b(w: Bytes, b: Integer, n: Integer, p1: Integer): Integer {
+    let t = tail(w, b, n)
+    let s = -1
+    if (t & M5) == S_EEDLY {
+        return eed(w, b, n, n - 5, p1)
+    } else if (t & M5) == S_INGLY {
+        s = n - 5
+    } else if (t & M4) == S_EDLY {
+        s = n - 4
+    } else if (t & M3) == S_EED {
+        return eed(w, b, n, n - 3, p1)
+    } else if (t & M3) == S_ING {
+        s = n - 3
+        if s >= 1 && w[b + s - 1] == CH_Y {
+            // dying -> die, lying -> lie, tying -> tie, vying -> vie
+            if s == 2 && !isVowel(w[b]) { return put(w, b, 1, R_IE) }
+        } else if s <= 4 {
+            let x = pack(w, b, 0, s)
+            if x == S_INN || x == S_OUT || x == S_CANN || x == S_HERR || x == S_EARR || x == S_EVEN { return n }
+        }
+    } else if (t & M2) == S_ED {
+        s = n - 2
+    } else {
+        return n
+    }
+    // delete "ed", "edly", "ing", "ingly" when the part before contains a vowel
+    if !hasVowelBefore(w, b, s) { return n }
+    let m = s
+    let u = tail(w, b, m) & M2
+    if u == S_AT || u == S_BL || u == S_IZ { return put(w, b, m, R_E) }
+    if m >= 2 && (u & 255) == (u >> 8) && inSet(u & 255, DOUBLES) {
+        if m == 3 && (w[b] == CH_A || w[b] == CH_E || w[b] == CH_O) { return m }
+        return m - 1
+    }
+    if p1 == m && shortSyllable(w, b, m) { return put(w, b, m, R_E) }
+    return m
+}
+
+function eed(w: Bytes, b: Integer, n: Integer, s: Integer, p1: Integer): Integer {
+    if p1 > s { return n }
+    if s <= 4 {
+        let x = pack(w, b, 0, s)
+        if x == S_PROC || x == S_EXC || x == S_SUCC { return n }
+    }
+    return put(w, b, s, R_EE)
+}
+
+function step1c(w: Bytes, b: Integer, n: Integer) {
+    if n < 3 { return }
+    let c = w[b + n - 1]
+    if (c == CH_Y || c == CH_UPPER_Y) && !isVowel(w[b + n - 2]) { w[b + n - 1] = CH_I }
+}
+
+function step2(w: Bytes, b: Integer, n: Integer, p1: Integer): Integer {
+    let t = tail(w, b, n)
+    let last = t & 255
+    if last == CH_L {
+        if (t & M7) == S_ATIONAL { return r1(w, b, n, 7, p1, S_ATE) }
+        if (t & M6) == S_TIONAL { return r1(w, b, n, 6, p1, S_TION) }
+    } else if last == CH_I {
+        if (t & M6) == S_BILITI { return r1(w, b, n, 6, p1, R_BLE) }
+        if (t & M6) == S_LESSLI { return r1(w, b, n, 6, p1, R_LESS) }
+        if (t & M5) == S_ENTLI { return r1(w, b, n, 5, p1, S_ENT) }
+        if (t & M5) == S_ALITI { return r1(w, b, n, 5, p1, S_AL) }
+        if (t & M5) == S_OUSLI { return r1(w, b, n, 5, p1, S_OUS) }
+        if (t & M5) == S_IVITI { return r1(w, b, n, 5, p1, S_IVE) }
+        if (t & M5) == S_FULLI { return r1(w, b, n, 5, p1, S_FUL) }
+        if (t & M4) == S_ENCI { return r1(w, b, n, 4, p1, S_ENCE) }
+        if (t & M4) == S_ANCI { return r1(w, b, n, 4, p1, S_ANCE) }
+        if (t & M4) == S_ABLI { return r1(w, b, n, 4, p1, S_ABLE) }
+        if (t & M4) == S_ALLI { return r1(w, b, n, 4, p1, S_AL) }
+        if (t & M3) == S_BLI { return r1(w, b, n, 3, p1, R_BLE) }
+        if (t & M3) == S_OGI {
+            if p1 <= n - 3 && ((t >> 24) & 255) == CH_L { return put(w, b, n - 3, R_OG) }
+            return n
+        }
+        if (t & M2) == S_LI {
+            if p1 <= n - 2 && inSet((t >> 16) & 255, VALID_LI) { return n - 2 }
+            return n
+        }
+    } else if last == 114 { // r
+        if (t & M4) == S_IZER { return r1(w, b, n, 4, p1, S_IZE) }
+        if (t & M4) == S_ATOR { return r1(w, b, n, 4, p1, S_ATE) }
+    } else if last == 110 { // n
+        if (t & M7) == S_IZATION { return r1(w, b, n, 7, p1, S_IZE) }
+        if (t & M5) == S_ATION { return r1(w, b, n, 5, p1, S_ATE) }
+    } else if last == 109 { // m
+        if (t & M5) == S_ALISM { return r1(w, b, n, 5, p1, S_AL) }
+    } else if last == CH_S {
+        if (t & M7) == S_FULNESS { return r1(w, b, n, 7, p1, S_FUL) }
+        if (t & M7) == S_OUSNESS { return r1(w, b, n, 7, p1, S_OUS) }
+        if (t & M7) == S_IVENESS { return r1(w, b, n, 7, p1, S_IVE) }
+    } else if last == CH_T {
+        if (t & M5) == S_OGIST { return r1(w, b, n, 5, p1, R_OG) }
+    }
+    return n
+}
+
+// Replaces the k-byte suffix with `key` when the suffix starts in the region beginning at p.
+function r1(w: Bytes, b: Integer, n: Integer, k: Integer, p: Integer, key: Integer): Integer {
+    if p > n - k { return n }
+    return put(w, b, n - k, key)
+}
+
+// Deletes the k-byte suffix when it starts in the region beginning at p.
+function cut(n: Integer, k: Integer, p: Integer): Integer {
+    if p > n - k { return n }
+    return n - k
+}
+
+function step3(w: Bytes, b: Integer, n: Integer, p1: Integer, p2: Integer): Integer {
+    let t = tail(w, b, n)
+    let last = t & 255
+    if last == CH_L {
+        if (t & M7) == S_ATIONAL { return r1(w, b, n, 7, p1, S_ATE) }
+        if (t & M6) == S_TIONAL { return r1(w, b, n, 6, p1, S_TION) }
+        if (t & M4) == S_ICAL { return r1(w, b, n, 4, p1, S_IC) }
+        if (t & M3) == S_FUL { return cut(n, 3, p1) }
+    } else if last == CH_E {
+        if (t & M5) == S_ALIZE { return r1(w, b, n, 5, p1, S_AL) }
+        if (t & M5) == S_ICATE { return r1(w, b, n, 5, p1, S_IC) }
+        if (t & M5) == S_ATIVE {
+            if p1 <= n - 5 && p2 <= n - 5 { return n - 5 }
+            return n
+        }
+    } else if last == CH_I {
+        if (t & M5) == S_ICITI { return r1(w, b, n, 5, p1, S_IC) }
+    } else if last == CH_S {
+        if (t & M4) == S_NESS { return cut(n, 4, p1) }
+    }
+    return n
+}
+
+function step4(w: Bytes, b: Integer, n: Integer, p2: Integer): Integer {
+    let t = tail(w, b, n)
+    let last = t & 255
+    if last == CH_E {
+        if (t & M4) == S_ANCE || (t & M4) == S_ENCE || (t & M4) == S_ABLE || (t & M4) == S_IBLE { return cut(n, 4, p2) }
+        if (t & M3) == S_ATE || (t & M3) == S_IVE || (t & M3) == S_IZE { return cut(n, 3, p2) }
+    } else if last == CH_T {
+        if (t & M5) == S_EMENT { return cut(n, 5, p2) }
+        if (t & M4) == S_MENT { return cut(n, 4, p2) }
+        if (t & M3) == S_ANT || (t & M3) == S_ENT { return cut(n, 3, p2) }
+    } else if last == CH_L {
+        if (t & M2) == S_AL { return cut(n, 2, p2) }
+    } else if last == 114 { // r
+        if (t & M2) == S_ER { return cut(n, 2, p2) }
+    } else if last == 99 { // c
+        if (t & M2) == S_IC { return cut(n, 2, p2) }
+    } else if last == 109 { // m
+        if (t & M3) == S_ISM { return cut(n, 3, p2) }
+    } else if last == CH_I {
+        if (t & M3) == S_ITI { return cut(n, 3, p2) }
+    } else if last == CH_S {
+        if (t & M3) == S_OUS { return cut(n, 3, p2) }
+    } else if last == 110 { // n
+        if (t & M3) == S_ION {
+            let before = (t >> 24) & 255
+            if p2 <= n - 3 && (before == CH_S || before == CH_T) { return n - 3 }
+        }
+    }
+    return n
+}
+
+function step5(w: Bytes, b: Integer, n: Integer, p1: Integer, p2: Integer): Integer {
+    if n < 1 { return n }
+    let s = n - 1
+    let c = w[b + s]
+    if c == CH_E {
+        if p2 <= s || (p1 <= s && !shortSyllable(w, b, s)) { return s }
+    } else if c == CH_L {
+        if p2 <= s && s >= 1 && w[b + s - 1] == CH_L { return s }
+    }
+    return n
+}
+
+// Position after the first vowel-then-non-vowel at or after `from`, or n when there is none.
+function regionAfter(w: Bytes, b: Integer, n: Integer, from: Integer): Integer {
+    let i = from
+    while i < n && !isVowel(w[b + i]) { i += 1 }
+    i += 1
+    while i < n && isVowel(w[b + i]) { i += 1 }
+    if i >= n { return n }
+    return i + 1
+}
+
+// R1 start: after a special prefix, else after the first vowel-then-non-vowel.
+function region1(w: Bytes, b: Integer, n: Integer): Integer {
+    let c = w[b]
+    if c == 103 { // g
+        if n >= 5 && pack(w, b, 0, 5) == S_GENER { return 5 }
+    } else if c == 99 { // c
+        if n >= 6 && pack(w, b, 0, 6) == S_COMMUN { return 6 }
+    } else if c == CH_A {
+        if n >= 5 && pack(w, b, 0, 5) == S_ARSEN { return 5 }
+    } else if c == 112 { // p
+        if n >= 4 && pack(w, b, 0, 4) == S_PAST { return 4 }
+    } else if c == 117 { // u
+        if n >= 7 && pack(w, b, 0, 7) == S_UNIVERS { return 7 }
+    } else if c == CH_L {
+        if n >= 5 && pack(w, b, 0, 5) == S_LATER { return 5 }
+    } else if c == CH_E {
+        if n >= 5 && pack(w, b, 0, 5) == S_EMERG { return 5 }
+    } else if c == CH_O {
+        if n >= 5 && pack(w, b, 0, 5) == S_ORGAN { return 5 }
+    } else if c == CH_I {
+        if n >= 5 && pack(w, b, 0, 5) == S_INTER { return 5 }
+    }
+    return regionAfter(w, b, n, 0)
+}
+
+// ---------------------------------------------------------------- entry point
+
+// Appends the Porter2 stem of buf[off .. off + len) to out (out is not cleared). The word must already be
+// lower-cased; words containing anything other than ASCII a-z and apostrophes are copied unchanged.
+public function stemEnglish(buf: Bytes, off: Integer, len: Integer, out: Bytes) {
+    let b = out.length
+    let plain = true
+    let i = 0
+    while i < len {
+        let c = buf[off + i]
+        if (c < CH_A || c > CH_Z) && c != CH_APOS { plain = false }
+        out.add(c)
+        i += 1
+    }
+    if !plain || len < 3 { return }
+    let w = out
+    let n = exception1(w, b, len)
+    if n >= 0 {
+        w.resize(b + n)
+        return
+    }
+    n = len
+    // prelude: drop one leading apostrophe, then mark consonant-y as Y
+    if w[b] == CH_APOS {
+        i = 1
+        while i < n {
+            w[b + i - 1] = w[b + i]
+            i += 1
+        }
+        n -= 1
+    }
+    let marked = false
+    if n > 0 && w[b] == CH_Y {
+        w[b] = CH_UPPER_Y
+        marked = true
+    }
+    i = 1
+    while i < n {
+        if w[b + i] == CH_Y && isVowel(w[b + i - 1]) {
+            w[b + i] = CH_UPPER_Y
+            marked = true
+        }
+        i += 1
+    }
+    let p1 = n
+    let p2 = n
+    if n > 0 {
+        p1 = region1(w, b, n)
+        if p1 < n { p2 = regionAfter(w, b, n, p1) }
+    }
+    n = step1a(w, b, n)
+    n = step1b(w, b, n, p1)
+    step1c(w, b, n)
+    n = step2(w, b, n, p1)
+    n = step3(w, b, n, p1, p2)
+    n = step4(w, b, n, p2)
+    n = step5(w, b, n, p1, p2)
+    if marked {
+        i = 0
+        while i < n {
+            if w[b + i] == CH_UPPER_Y { w[b + i] = CH_Y }
+            i += 1
+        }
+    }
+    w.resize(b + n)
+}

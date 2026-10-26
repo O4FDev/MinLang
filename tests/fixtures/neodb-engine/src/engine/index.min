@@ -560,6 +560,10 @@ public function ordRemove(ix: OrdIndex, t: tb.Table, r: Integer): Boolean {
     return false
 }
 
+// Merge the delta into the main run. Each delta row finds its place by galloping from the previous place, and the
+// main rows in between are copied without comparing them: about nb * log(na / nb) key comparisons instead of
+// na + nb, which matters because a comparison decodes key columns and main runs reach millions of rows
+// (TPC-C order_line: an every-4096-inserts full compare cost ~600 comparisons per insert and 100+ ms stalls).
 public function ordMerge(ix: OrdIndex, t: tb.Table) {
     let a = ix.main
     let b = ix.delta
@@ -568,28 +572,52 @@ public function ordMerge(ix: OrdIndex, t: tb.Table) {
     let out = Bytes()
     let i = 0
     let j = 0
-    while i < na && j < nb {
-        let x = a.getInt64(i * 8)
-        let y = b.getInt64(j * 8)
-        if cmpRows(t, ix.cols, x, y) <= 0 {
-            out.addInt64(x)
-            i += 1
-        } else {
-            out.addInt64(y)
-            j += 1
-        }
-    }
-    while i < na {
-        out.addInt64(a.getInt64(i * 8))
-        i += 1
-    }
     while j < nb {
-        out.addInt64(b.getInt64(j * 8))
+        let y = b.getInt64(j * 8)
+        let p = gallop(t, ix.cols, a, i, na, y)
+        copyRun(out, a, i, p)
+        out.addInt64(y)
+        i = p
         j += 1
     }
+    copyRun(out, a, i, na)
     ix.main = out
     ix.delta = Bytes()
     freshOrdSegs(ix)
+}
+
+// First position p in [from, n) with run[p] > r (rows are totally ordered by key, then row id), searching
+// 1, 2, 4, ... positions ahead of from and then bisecting the last step.
+function gallop(t: tb.Table, cols: List<Integer>, run: Bytes, from: Integer, n: Integer, r: Integer): Integer {
+    if from >= n || cmpRows(t, cols, run.getInt64(from * 8), r) > 0 { return from }
+    let lo = from
+    let step = 1
+    let hi = from + 1
+    while hi < n && cmpRows(t, cols, run.getInt64(hi * 8), r) <= 0 {
+        lo = hi
+        step = step * 2
+        hi = lo + step
+    }
+    if hi > n { hi = n }
+    let x = lo + 1
+    let y = hi
+    while x < y {
+        let mid = (x + y) / 2
+        if cmpRows(t, cols, run.getInt64(mid * 8), r) <= 0 { x = mid + 1 } else { y = mid }
+    }
+    return x
+}
+
+function copyRun(out: Bytes, run: Bytes, from: Integer, to: Integer) {
+    if to - from >= 32 {
+        out.addBytes(run.slice(from * 8, to * 8))
+        return
+    }
+    let k = from
+    while k < to {
+        out.addInt64(run.getInt64(k * 8))
+        k += 1
+    }
 }
 
 public function ordBuild(ix: OrdIndex, t: tb.Table) {

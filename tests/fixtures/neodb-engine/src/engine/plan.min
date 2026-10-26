@@ -7,6 +7,8 @@ use "./index.min" as ix
 use "./catalog.min" as cat
 use "./exec.min" as ex
 use "./pgcatalog.min" as pgc
+use "./ext.min" as ext
+use "../search/index.min" as si
 
 public constant SK_SELECT = 1
 public constant SK_INSERT = 2
@@ -100,7 +102,13 @@ record PC {
     // CTEs
     cteName: List<Text>
     cteAst: List<Integer>
+    cteRec: List<Boolean>       // declared under WITH RECURSIVE
     cteCount: Integer
+    // working tables of recursive CTEs being compiled (the recursive term reads the previous iteration's rows)
+    workName: List<Text>
+    workTi: List<Integer>
+    workTable: List<tb.Table>
+    workCount: Integer
     err: Boolean
     errCode: Text
     errMsg: Text
@@ -167,7 +175,7 @@ function planStatementOver(c: cat.Catalog, views: ViewCache, env: ex.Env, tree: 
     let pc = PC {
         p: p; st: st; a: tree; c: c; ranges: []; rCount: 0; level: 0; minRef: 1000000
         aggActive: false; aggLevel: -1; aggSlot: -1; groupAst: []; groupNodes: []; aggAst: []; collecting: false
-        cteName: []; cteAst: []; cteCount: 0; err: false; errCode: ""; errMsg: ""; errPos: -1
+        cteName: []; cteAst: []; cteRec: []; cteCount: 0; workName: []; workTi: []; workTable: []; workCount: 0; err: false; errCode: ""; errMsg: ""; errPos: -1
         tgtNames: []; tgtAst: []; slotLevel: []; views: views; noTrack: false; suppressConst: 0
         targetOverride: override; targetAlias: alias; routeRoot: routeRoot
         srfAst: -1; srfSlot: -1; srfKind: 0; winSlot: -1; winTable: tb.newTable(-1, ""); winEval: []; winSpec: []
@@ -267,14 +275,22 @@ public function typeFromName(name: Text): Integer {
     if name == "time" { return v.T_TIME }
     if name == "oid" { return v.T_OID }
     if name == "regclass" { return v.T_REGCLASS }
+    if name == "regtype" { return v.T_REGTYPE }
     if name == "json" || name == "jsonb" || name == "uuid" || name == "xml" || name == "citext" { return v.T_TEXT }
     return -1
+}
+
+// A built-in type, or a type of an extension installed in this database; -1 if neither.
+public function typeInCatalog(c: cat.Catalog, name: Text): Integer {
+    let t = typeFromName(name)
+    if t >= 0 { return t }
+    return ext.findType(c.extensions, name)
 }
 
 // Type of a K_TYPENAME node; fills typmod into pc via return pair (type, typmod) encoded: type + typmod * 256
 function typeOfTypename(pc: PC, tn: Integer): Integer {
     let name = ast.text(pc.a, tn)
-    let t = typeFromName(name)
+    let t = typeInCatalog(pc.c, name)
     if t < 0 {
         perr(pc, "42704", "type \"" + name + "\" does not exist", posOf(pc, tn))
         return v.T_TEXT
@@ -285,7 +301,13 @@ function typeOfTypename(pc: PC, tn: Integer): Integer {
 function typmodOfTypename(pc: PC, tn: Integer): Integer {
     let name = ast.text(pc.a, tn)
     let mods = ast.items(pc.a, ast.child(pc.a, tn, 0))
-    let t = typeFromName(name)
+    let t = typeInCatalog(pc.c, name)
+    if v.isExtType(t) && mods.length >= 1 {
+        pin(pc, mods[0])
+        let problem = extTypmodError(t, mods.length, pc.a.nodes[mods[0]].intValue)
+        if problem != "" { perr(pc, "22023", problem, posOf(pc, tn)) }
+        return pc.a.nodes[mods[0]].intValue
+    }
     if t == v.T_VARCHAR || t == v.T_BPCHAR {
         if mods.length >= 1 {
             pin(pc, mods[0])
@@ -360,7 +382,7 @@ public function commonType(a: Integer, b: Integer): Integer {
     if (a == v.T_DATE && (b == v.T_TIMESTAMP || b == v.T_TIMESTAMPTZ)) { return b }
     if (b == v.T_DATE && (a == v.T_TIMESTAMP || a == v.T_TIMESTAMPTZ)) { return a }
     if (a == v.T_TIMESTAMP && b == v.T_TIMESTAMPTZ) || (b == v.T_TIMESTAMP && a == v.T_TIMESTAMPTZ) { return v.T_TIMESTAMPTZ }
-    if (a == v.T_OID && b == v.T_REGCLASS) || (a == v.T_REGCLASS && b == v.T_OID) { return v.T_OID }
+    if (a == v.T_OID && (b == v.T_REGCLASS || b == v.T_REGTYPE)) || ((a == v.T_REGCLASS || a == v.T_REGTYPE) && b == v.T_OID) { return v.T_OID }
     return -1
 }
 
@@ -391,6 +413,18 @@ function coerce(pc: PC, n: Integer, to: Integer, typmod: Integer, explicit: Bool
         return lc
     }
     if isNullConst(pc, n) { return nullConst(pc, to) }
+    if v.isExtType(from) || v.isExtType(to) {
+        // extension types convert to and from text (the type's input and output) and along declared casts
+        let declared = from != to && findExtCast(pc, from, to) >= 0
+        if !declared && ((from != to && v.isExtType(from) && v.isExtType(to)) || (v.isExtType(from) && !v.isTextType(to)) || (v.isExtType(to) && !v.isTextType(from))) {
+            // report and keep the node: callers index with it, and the recorded error stops planning
+            perr(pc, "42846", "cannot cast type " + v.typeName(from) + " to " + v.typeName(to), -1)
+            return n
+        }
+        let x = 0
+        if explicit { x = 1 }
+        return ex.addExpr(p, ex.EX_CAST, to, n, x, typmod, 0)
+    }
     // same class without typmod: no cast needed for ints/text family
     let fc = ex.classOf(from)
     let tc = ex.classOf(to)
@@ -688,7 +722,29 @@ function twoArgAggKind(name: Text): Integer {
 function isAggCall(pc: PC, id: Integer): Boolean {
     if ast.kind(pc.a, id) != ast.K_FUNC_CALL { return false }
     if ast.child(pc.a, id, 3) >= 0 { return false }
-    return isAggName(ast.text(pc.a, id))
+    return isAggName(ast.text(pc.a, id)) || extAggNamed(pc, ast.text(pc.a, id))
+}
+
+// An aggregate of an extension installed in this database is called `name`.
+function extAggNamed(pc: PC, name: Text): Boolean {
+    let i = 0
+    while i < ext.aggCount() {
+        let g = ext.agg(i)
+        if g.def.name == name && ext.isInstalled(pc.c.extensions, g.ext) { return true }
+        i += 1
+    }
+    return false
+}
+
+// The installed extension aggregate `name` over arguments of type t (ext.agg index), or -1.
+function findExtAgg(pc: PC, name: Text, t: Integer): Integer {
+    let i = 0
+    while i < ext.aggCount() {
+        let g = ext.agg(i)
+        if g.def.name == name && ext.isInstalled(pc.c.extensions, g.ext) && extSignatureType(pc, g.def.argument) == t { return i }
+        i += 1
+    }
+    return -1
 }
 
 // Compile an expression in the current scope.
@@ -1023,6 +1079,14 @@ function opSymbol(op: Integer): Text {
     if op == ast.OP_MUL { return "*" }
     if op == ast.OP_DIV { return "/" }
     if op == ast.OP_MOD { return "%" }
+    if op == ast.OP_POW { return "^" }
+    if op == ast.OP_CONCAT { return "||" }
+    if op == ast.OP_BIT_AND { return "&" }
+    if op == ast.OP_BIT_OR { return "|" }
+    if op == ast.OP_BIT_XOR { return "#" }
+    if op == ast.OP_SHL { return "<<" }
+    if op == ast.OP_SHR { return ">>" }
+    if op == ast.OP_REGEX { return "~" }
     return "?"
 }
 
@@ -1054,6 +1118,15 @@ function compileBinary(pc: PC, id: Integer): Integer {
     let l = compileExpr(pc, nd.children[0])
     let r = compileExpr(pc, nd.children[1])
     if pc.err { return -1 }
+    if op == ast.OP_OTHER && nd.text == "==>" { return compileSearchPred(pc, l, r, nd.position) }
+    let xlt = p.et[l]
+    let xrt = p.et[r]
+    if v.isExtType(xlt) || v.isExtType(xrt) || (op == ast.OP_OTHER && xlt == v.T_UNKNOWN && xrt == v.T_UNKNOWN) {
+        let sym = nd.text
+        if op != ast.OP_OTHER { sym = opSymbol(op) }
+        let xo = compileExtOp(pc, sym, l, r, nd.position)
+        if xo != -2 { return xo }
+    }
     if op >= ast.OP_EQ && op <= ast.OP_GE { return makeCmp(pc, op, l, r, nd.position) }
     if op == ast.OP_IS_DISTINCT_FROM || op == ast.OP_IS_NOT_DISTINCT_FROM {
         let c = makeCmpCore(pc, ast.OP_EQ, l, r, nd.position)
@@ -1089,6 +1162,22 @@ function compileBinary(pc: PC, id: Integer): Integer {
         if op == ast.OP_NOT_REGEX || op == ast.OP_NOT_REGEX_I { f = f | 1 }
         if op == ast.OP_REGEX_I || op == ast.OP_NOT_REGEX_I { f = f | 2 }
         return ex.addExpr(p, ex.EX_REGEX, v.T_BOOL, coerceText(pc, l), coerceText(pc, r), f, 0)
+    }
+    if op == ast.OP_OTHER && (nd.text == "->" || nd.text == "->>") {
+        // json/jsonb are stored as text: -> returns the member's JSON text, ->> its text value (JSON null -> NULL)
+        if isNullConst(pc, l) || isNullConst(pc, r) { return nullConst(pc, v.T_TEXT) }
+        let f = 0
+        if nd.text == "->>" { f = f | 1 }
+        let rt = p.et[r]
+        if rt == v.T_INT2 || rt == v.T_INT4 || rt == v.T_INT8 { f = f | 2 } else { r = coerceText(pc, r) }
+        return ex.addExpr(p, ex.EX_JSON, v.T_TEXT, coerceText(pc, l), r, f, 0)
+    }
+    if op == ast.OP_OTHER && (nd.text == "@>" || nd.text == "?") && (v.isTextType(p.et[l]) || p.et[l] == v.T_UNKNOWN) {
+        // jsonb containment and top-level key existence on json text
+        if isNullConst(pc, l) || isNullConst(pc, r) { return nullConst(pc, v.T_BOOL) }
+        let f = 1
+        if nd.text == "?" { f = 2 }
+        return ex.addExpr(p, ex.EX_JSONOP, v.T_BOOL, coerceText(pc, l), coerceText(pc, r), f, 0)
     }
     if op == ast.OP_OTHER && (nd.text == "~~" || nd.text == "!~~" || nd.text == "~~*" || nd.text == "!~~*") {
         let f = 0
@@ -1418,6 +1507,10 @@ function compileFunc(pc: PC, id: Integer): Integer {
         return -1
     }
     if ast.child(pc.a, id, 3) >= 0 { return compileWindowCall(pc, id) }
+    let schemaNode = ast.child(pc.a, id, 0)
+    if schemaNode >= 0 && (pc.a.nodes[schemaNode].text == "tin" || pc.a.nodes[schemaNode].text == "search") {
+        return compileSearchFunc(pc, id, name)
+    }
     let catf = compileCatFunc(pc, id, name)
     if catf != -2 { return catf }
     let rawArgs = ast.items(pc.a, ast.child(pc.a, id, 1))
@@ -1489,6 +1582,17 @@ function compileFunc(pc: PC, id: Integer): Integer {
             return textConst(pc, pc.a.nodes[rawArgs[1]].text)
         }
         return textConst(pc, "")
+    }
+    if name == "pg_advisory_unlock_all" {
+        // advisory locks are not implemented, so there is never one to release (asyncpg's pool reset calls this)
+        return textConst(pc, "")
+    }
+    if name == "to_regtype" {
+        // the type's oid, or NULL when no such type exists (ed = 1: a missing name gives NULL, not an error)
+        let args = fnArgs(pc, id)
+        if pc.err { return -1 }
+        if args.length != 1 { return badArgs(pc, name, id) }
+        return ex.addExpr(p, ex.EX_CAST, v.T_REGTYPE, coerceText(pc, args[0]), 1, -1, 1)
     }
     if name == "pg_typeof" {
         let args = fnArgs(pc, id)
@@ -1675,8 +1779,166 @@ function compileFunc(pc: PC, id: Integer): Integer {
     }
     let sfn = compileStrFunc(pc, id, name, args)
     if sfn != -2 { return sfn }
+    let xfn = compileExtFunc(pc, name, args, nd.position)
+    if xfn != -2 { return xfn }
     perr(pc, "42883", "function " + name + "() does not exist", nd.position)
     return -1
+}
+
+// ---------------------------------------------------------------- extension functions and operators
+
+// A cast declared by an installed extension from type `from` to type `to` (ext.castAt index), or -1.
+function findExtCast(pc: PC, from: Integer, to: Integer): Integer {
+    let i = 0
+    while i < ext.castCount() {
+        let c = ext.castAt(i)
+        if ext.isInstalled(pc.c.extensions, c.ext) {
+            if !c.resolved { ext.resolveCast(c, extSignatureType(pc, c.def.from), extSignatureType(pc, c.def.to)) }
+            if c.from == from && c.to == to { return i }
+        }
+        i += 1
+    }
+    return -1
+}
+
+// "" or the error for extension type t declared with `count` modifiers, the first being `value`.
+public function extTypmodError(t: Integer, count: Integer, value: Integer): Text {
+    if !v.isExtType(t) || count == 0 { return "" }
+    if count > 1 { return "invalid type modifier" }
+    let d = ext.typeDef(t)
+    if d.modifierWhat == "" { return "" }
+    if value < d.modifierMin { return d.modifierWhat + " for type " + d.name + " must be at least " + Text(d.modifierMin) }
+    if value > d.modifierMax { return d.modifierWhat + " for type " + d.name + " cannot exceed " + Text(d.modifierMax) }
+    return ""
+}
+
+// Engine type id of an SDK signature type name ("float8", "int4", "vector", ...), or -1.
+function extSignatureType(pc: PC, name: Text): Integer {
+    if name == "float8" { return v.T_FLOAT8 }
+    if name == "float4" { return v.T_FLOAT4 }
+    if name == "int4" { return v.T_INT4 }
+    if name == "int8" { return v.T_INT8 }
+    if name == "int2" { return v.T_INT2 }
+    if name == "bool" { return v.T_BOOL }
+    if name == "text" { return v.T_TEXT }
+    if name == "bytea" { return v.T_BYTEA }
+    return ext.findAnyType(name)
+}
+
+function resolveExtFn(pc: PC, f: ext.Fn) {
+    if f.resolved { return }
+    f.argTypes = []
+    for an in f.def.arguments { f.argTypes.add(extSignatureType(pc, an)) }
+    f.result = extSignatureType(pc, f.def.result)
+    f.resolved = true
+}
+
+// Can an argument of type `have` be passed for a parameter of type `want` (exactly, as an unknown literal,
+// or by implicit numeric widening)?
+function extArgFits(have: Integer, want: Integer): Boolean {
+    if have == want || have == v.T_UNKNOWN { return true }
+    if v.isExtType(have) || v.isExtType(want) { return false }
+    if v.isIntType(have) && (v.isIntType(want) || want == v.T_FLOAT8 || want == v.T_FLOAT4) { return numRank(have) <= numRank(want) || want == v.T_FLOAT8 || want == v.T_FLOAT4 }
+    if have == v.T_FLOAT4 && want == v.T_FLOAT8 { return true }
+    if v.isTextType(have) && v.isTextType(want) && !v.isExtType(have) { return want == v.T_TEXT }
+    return false
+}
+
+// Call of installed extension function fi on compiled args (already checked to fit).
+function extCall(pc: PC, fi: Integer, args: List<Integer>): Integer {
+    let p = pc.p
+    let f = ext.fn(fi)
+    let i = 0
+    while i < args.length {
+        args[i] = coerce(pc, args[i], f.argTypes[i], -1, false)
+        i += 1
+    }
+    if pc.err { return -1 }
+    for a in args {
+        if isNullConst(pc, a) { return nullConst(pc, f.result) }
+    }
+    let start = ex.addArgs(p, args)
+    return ex.addExpr(p, ex.EX_EXTFN, f.result, start, args.length, fi, ex.addCall(p, args.length))
+}
+
+function extFnText(name: Text, types: List<Integer>): Text {
+    let s = name + "("
+    let i = 0
+    while i < types.length {
+        if i > 0 { s = s + ", " }
+        s = s + v.typeName(types[i])
+        i += 1
+    }
+    return s + ")"
+}
+
+// Function of an extension installed in this database. -2 when no installed extension has a function `name`.
+function compileExtFunc(pc: PC, name: Text, args: List<Integer>, pos: Integer): Integer {
+    let p = pc.p
+    let named = false
+    let best = -1
+    let exact = -1
+    let i = 0
+    while i < ext.fnCount() {
+        let f = ext.fn(i)
+        if f.def.name == name && ext.isInstalled(pc.c.extensions, f.ext) {
+            named = true
+            resolveExtFn(pc, f)
+            if f.argTypes.length == args.length {
+                let fits = true
+                let same = true
+                let j = 0
+                while j < args.length {
+                    if !extArgFits(p.et[args[j]], f.argTypes[j]) { fits = false }
+                    if p.et[args[j]] != f.argTypes[j] { same = false }
+                    j += 1
+                }
+                if fits && best < 0 { best = i }
+                if fits && same && exact < 0 { exact = i }
+            }
+        }
+        i += 1
+    }
+    if !named { return -2 }
+    if exact >= 0 { best = exact }
+    if best < 0 {
+        let types: List<Integer> = []
+        for a in args { types.add(p.et[a]) }
+        perr(pc, "42883", "function " + extFnText(name, types) + " does not exist", pos)
+        return -1
+    }
+    return extCall(pc, best, args)
+}
+
+// Operator of an installed extension. -2 when none has `sym` for these operand types.
+function compileExtOp(pc: PC, sym: Text, l: Integer, r: Integer, pos: Integer): Integer {
+    let p = pc.p
+    let lt = p.et[l]
+    let rt = p.et[r]
+    let best = -1
+    let exact = -1
+    let i = 0
+    while i < ext.opCount() {
+        let o = ext.op(i)
+        if o.def.symbol == sym && ext.isInstalled(pc.c.extensions, o.ext) {
+            let f = ext.fn(o.fn)
+            resolveExtFn(pc, f)
+            if extArgFits(lt, f.argTypes[0]) && extArgFits(rt, f.argTypes[1]) {
+                if best < 0 { best = i }
+                if lt == f.argTypes[0] && rt == f.argTypes[1] && exact < 0 { exact = i }
+            }
+        }
+        i += 1
+    }
+    if exact >= 0 { best = exact }
+    if best < 0 {
+        if v.isExtType(lt) || v.isExtType(rt) {
+            perr(pc, "42883", "operator does not exist: " + v.typeName(lt) + " " + sym + " " + v.typeName(rt), pos)
+            return -1
+        }
+        return -2
+    }
+    return extCall(pc, ext.op(best).fn, [l, r])
 }
 
 // String / bytea functions evaluated by ex.evalStrFunc. Returns -2 when `name` is not one of them.
@@ -1732,6 +1994,10 @@ function compileStrFunc(pc: PC, id: Integer, name: Text, args: List<Integer>): I
         if name == "sha384" { bits = 384 }
         if name == "sha512" { bits = 512 }
         return strFuncNode(pc, ex.FN_SHA, v.T_BYTEA, args, bits)
+    }
+    if name == "pg_notify" {
+        if n != 2 { return badArgs(pc, name, id) }
+        return strFuncNode(pc, ex.FN_PG_NOTIFY, v.T_TEXT, [coerceText(pc, args[0]), coerceText(pc, args[1])], 0)
     }
     if name == "md5" {
         if n != 1 { return badArgs(pc, name, id) }
@@ -1900,12 +2166,9 @@ function compileQuery(pc: PC, q: Integer): QResult {
     let saveCte = pc.cteCount
     let withN = ast.child(pc.a, q, ast.Q_WITH)
     if withN >= 0 {
-        if ast.hasFlag(pc.a, withN, ast.F_RECURSIVE) {
-            perr(pc, "0A000", "WITH RECURSIVE is not supported", posOf(pc, withN))
-            return emptyResult()
-        }
+        let recursive = ast.hasFlag(pc.a, withN, ast.F_RECURSIVE)
         for cte in ast.items(pc.a, ast.child(pc.a, withN, 0)) {
-            addCte(pc, pc.a.nodes[cte].text, cte)
+            addCte(pc, pc.a.nodes[cte].text, cte, recursive)
         }
     }
     let r = emptyResult()
@@ -1922,15 +2185,46 @@ function compileQuery(pc: PC, q: Integer): QResult {
     return r
 }
 
-function addCte(pc: PC, name: Text, id: Integer) {
+function addCte(pc: PC, name: Text, id: Integer, recursive: Boolean) {
     if pc.cteCount < pc.cteName.length {
         pc.cteName[pc.cteCount] = name
         pc.cteAst[pc.cteCount] = id
+        pc.cteRec[pc.cteCount] = recursive
     } else {
         pc.cteName.add(name)
         pc.cteAst.add(id)
+        pc.cteRec.add(recursive)
     }
     pc.cteCount += 1
+}
+
+function cteIsRecursive(pc: PC, name: Text): Boolean {
+    let i = pc.cteCount - 1
+    while i >= 0 {
+        if pc.cteName[i] == name { return pc.cteRec[i] }
+        i -= 1
+    }
+    return false
+}
+
+function findWork(pc: PC, name: Text): Integer {
+    let i = pc.workCount - 1
+    while i >= 0 {
+        if pc.workName[i] == name { return i }
+        i -= 1
+    }
+    return -1
+}
+
+// Does the subtree at n contain a reference to relation `name` (the recursive term reading its own CTE)?
+function refersTo(pc: PC, n: Integer, name: Text, depth: Integer): Boolean {
+    if n < 0 || depth > 200 { return false }
+    let nd = pc.a.nodes[n]
+    if ast.kind(pc.a, n) == ast.K_TABLE_REF && nd.text == name && ast.child(pc.a, n, 0) < 0 { return true }
+    for c in nd.children {
+        if refersTo(pc, c, name, depth + 1) { return true }
+    }
+    return false
 }
 
 function findCte(pc: PC, name: Text): Integer {
@@ -2104,6 +2398,11 @@ function addSort(pc: PC, r: QResult, keys: List<Integer>, desc: List<Integer>, n
     let blk = ex.listBlock(p, spec)
     let mi = ex.addMap(p)
     let op = ex.addOp(p, ex.O_SORT, r.root, ti, slot, 0, blk, mi)
+    // ORDER BY tin.score(ctid) DESC [LIMIT k] over a search scan: the scan can produce the k best rows itself
+    if p.ok[r.root] == ex.O_SEARCH && keys.length == 1 && desc[0] != 0 && p.ek[keys[0]] == ex.EX_SEARCH_SCORE &&
+       p.ec[keys[0]] == p.ob[r.root] {
+        p.searches[p.ob[r.root]].sortable = true
+    }
     let out = emptyResult()
     out.root = op
     i = 0
@@ -2364,6 +2663,91 @@ function splitAnd(pc: PC, id: Integer, out: List<Integer>) {
         return
     }
     out.add(id)
+    if nd.kind == ast.K_BINARY_OP && nd.op == ast.OP_OR { addCommonOrConjuncts(pc, id, out) }
+}
+
+// (A AND X) OR (A AND Y) implies A, so A can also be used on its own (a join key or index condition hidden in every
+// branch, as in TPC-H Q19); the OR stays, so the result is unchanged, NULLs included. Only simple comparisons and IN
+// lists over columns and literals are lifted (nothing that could run a function or subquery twice).
+function addCommonOrConjuncts(pc: PC, id: Integer, out: List<Integer>) {
+    let branches: List<Integer> = []
+    flattenOr(pc, id, branches, 0)
+    if branches.length < 2 || branches.length > 64 { return }
+    let first: List<Integer> = []
+    plainConjuncts(pc, branches[0], first, 0)
+    for c in first {
+        if !liftable(pc, c, 0) { continue }
+        let everywhere = true
+        let b = 1
+        while b < branches.length && everywhere {
+            let conj: List<Integer> = []
+            plainConjuncts(pc, branches[b], conj, 0)
+            let found = false
+            for d in conj { if !found && sameExprTree(pc, c, d, 0) { found = true } }
+            if !found { everywhere = false }
+            b += 1
+        }
+        if everywhere { out.add(c) }
+    }
+}
+
+function flattenOr(pc: PC, id: Integer, out: List<Integer>, depth: Integer) {
+    let nd = pc.a.nodes[id]
+    if depth < 64 && nd.kind == ast.K_BINARY_OP && nd.op == ast.OP_OR {
+        flattenOr(pc, nd.children[0], out, depth + 1)
+        flattenOr(pc, nd.children[1], out, depth + 1)
+        return
+    }
+    out.add(id)
+}
+
+function plainConjuncts(pc: PC, id: Integer, out: List<Integer>, depth: Integer) {
+    let nd = pc.a.nodes[id]
+    if depth < 64 && nd.kind == ast.K_BINARY_OP && nd.op == ast.OP_AND {
+        plainConjuncts(pc, nd.children[0], out, depth + 1)
+        plainConjuncts(pc, nd.children[1], out, depth + 1)
+        return
+    }
+    out.add(id)
+}
+
+function liftable(pc: PC, id: Integer, depth: Integer): Boolean {
+    if id < 0 || depth > 16 { return false }
+    let nd = pc.a.nodes[id]
+    let k = nd.kind
+    if k == ast.K_COLUMN_REF || k == ast.K_INT_LIT || k == ast.K_NUM_LIT || k == ast.K_STR_LIT || k == ast.K_BOOL_LIT || k == ast.K_PARAM {
+        return true
+    }
+    if k == ast.K_BINARY_OP {
+        let op = nd.op
+        if !((op >= ast.OP_EQ && op <= ast.OP_GE) || (op >= ast.OP_ADD && op <= ast.OP_SUB)) { return false }
+        return liftable(pc, nd.children[0], depth + 1) && liftable(pc, nd.children[1], depth + 1)
+    }
+    if k == ast.K_IN_LIST {
+        if !liftable(pc, nd.children[0], depth + 1) { return false }
+        for v in ast.items(pc.a, nd.children[1]) { if !liftable(pc, v, depth + 1) { return false } }
+        return true
+    }
+    if k == ast.K_BETWEEN {
+        return liftable(pc, nd.children[0], depth + 1) && liftable(pc, nd.children[1], depth + 1) && liftable(pc, nd.children[2], depth + 1)
+    }
+    return false
+}
+
+// Strict structural equality of two expression subtrees (positions ignored; qualifiers must match exactly).
+function sameExprTree(pc: PC, x: Integer, y: Integer, depth: Integer): Boolean {
+    if x == y { return true }
+    if x < 0 || y < 0 || depth > 32 { return false }
+    let a = pc.a.nodes[x]
+    let b = pc.a.nodes[y]
+    if a.kind != b.kind || a.op != b.op || a.text != b.text || a.intValue != b.intValue || a.flags != b.flags { return false }
+    if a.children.length != b.children.length { return false }
+    let i = 0
+    while i < a.children.length {
+        if !sameExprTree(pc, a.children[i], b.children[i], depth + 1) { return false }
+        i += 1
+    }
+    return true
 }
 
 function compileFromItem(pc: PC, id: Integer, leaves: List<Leaf>, conjAst: List<Integer>) {
@@ -2376,7 +2760,20 @@ function compileFromItem(pc: PC, id: Integer, leaves: List<Leaf>, conjAst: List<
         let aliasNode = ast.child(a, id, 1)
         let alias = name
         if aliasNode >= 0 { alias = a.nodes[aliasNode].text }
+        let wi = findWork(pc, name)
+        if wi >= 0 && ast.child(a, id, 0) < 0 {
+            compileWorkScan(pc, wi, alias, aliasColumns(pc, aliasNode), leaves)
+            return
+        }
         let cteId = findCte(pc, name)
+        if cteId >= 0 && ast.child(a, id, 0) < 0 && cteIsRecursive(pc, name) {
+            let rq = ast.child(a, cteId, 0)
+            let rn = a.nodes[rq]
+            if ast.kind(a, rq) == ast.K_SET_OP && rn.op == ast.SETOP_UNION && refersTo(pc, rn.children[ast.Q_RIGHT], name, 0) {
+                compileRecursive(pc, cteId, alias, aliasColumns(pc, aliasNode), leaves)
+                return
+            }
+        }
         if cteId >= 0 && ast.child(a, id, 0) < 0 {
             let q = ast.child(a, cteId, 0)
             let colNames = aliasColumns(pc, aliasNode)
@@ -2564,6 +2961,130 @@ function addUsingConjuncts(pc: PC, id: Integer, rightStart: Integer, conjAst: Li
         conjAst.add(-(c + 2))
         r.hidden[rc] = true
     }
+}
+
+// WITH RECURSIVE name AS (anchor UNION [ALL] recursive): O_REC runs the anchor once, then the recursive term over
+// the previous iteration's rows (a working table bound to `name`) until an iteration adds nothing; UNION drops rows
+// already produced. The result is scanned like a materialized derived table.
+function compileRecursive(pc: PC, cteId: Integer, alias: Text, colNamesIn: List<Text>, leaves: List<Leaf>) {
+    let a = pc.a
+    let p = pc.p
+    let name = a.nodes[cteId].text
+    let q = ast.child(a, cteId, 0)
+    let nd = a.nodes[q]
+    let colNames = colNamesIn
+    if colNames.length == 0 {
+        for n in ast.items(a, ast.child(a, cteId, 1)) { colNames.add(a.nodes[n].text) }
+    }
+    let saveAgg = pc.aggActive
+    pc.aggActive = false
+    pc.level += 1
+    let saveR = pc.rCount
+    let saveMin = pc.minRef
+    pc.minRef = 1000000
+    let left = compileQuery(pc, nd.children[ast.Q_LEFT])
+    pc.rCount = saveR
+    if pc.err {
+        pc.level -= 1
+        pc.minRef = saveMin
+        pc.aggActive = saveAgg
+        return
+    }
+    let nc = left.exprs.length
+    if colNames.length > nc {
+        perr(pc, "42P10", "WITH query \"" + name + "\" has " + Text(nc) + " columns available but " + Text(colNames.length) + " columns specified", -1)
+        return
+    }
+    let res = tb.newTable(-1, alias)
+    let work = tb.newTable(-1, name)
+    let nxt = tb.newTable(-1, name)
+    res.isTemp = true
+    work.isTemp = true
+    nxt.isTemp = true
+    let i = 0
+    while i < nc {
+        let e = left.exprs[i]
+        if p.et[e] == v.T_UNKNOWN {
+            e = coerce(pc, e, v.T_TEXT, -1, false)
+            left.exprs[i] = e
+        }
+        let nm = left.names[i]
+        if i < colNames.length { nm = colNames[i] }
+        tb.addColumn(res, tb.newColumn(nm, p.et[e], -1, false))
+        tb.addColumn(work, tb.newColumn(nm, p.et[e], -1, false))
+        tb.addColumn(nxt, tb.newColumn(nm, p.et[e], -1, false))
+        i += 1
+    }
+    let resTi = ex.addTemp(p, res)
+    let workTi = ex.addTemp(p, work)
+    let nextTi = ex.addTemp(p, nxt)
+    if pc.workCount < pc.workName.length {
+        pc.workName[pc.workCount] = name
+        pc.workTi[pc.workCount] = workTi
+        pc.workTable[pc.workCount] = work
+    } else {
+        pc.workName.add(name)
+        pc.workTi.add(workTi)
+        pc.workTable.add(work)
+    }
+    pc.workCount += 1
+    let right = compileQuery(pc, nd.children[ast.Q_RIGHT])
+    pc.workCount -= 1
+    pc.rCount = saveR
+    pc.level -= 1
+    pc.minRef = saveMin
+    pc.aggActive = saveAgg
+    if pc.err { return }
+    if right.exprs.length != nc {
+        perr(pc, "42601", "each UNION query must have the same number of columns", nd.position)
+        return
+    }
+    i = 0
+    while i < nc {
+        right.exprs[i] = coerce(pc, right.exprs[i], p.et[left.exprs[i]], -1, false)
+        if pc.err { return }
+        i += 1
+    }
+    let all = 0
+    if (nd.flags & ast.F_ALL) != 0 { all = 1 }
+    let spec: List<Integer> = [nc, right.root, all, nextTi]
+    for e in left.exprs { spec.add(e) }
+    for e in right.exprs { spec.add(e) }
+    let blk = ex.listBlock(p, spec)
+    let slot = newSlot(pc, res)
+    let op = ex.addOp(p, ex.O_REC, left.root, resTi, slot, workTi, blk, 0)
+    let rg = Range { name: alias; slot: slot; level: pc.level; tableId: -1; cols: []; types: []; mods: []; hidden: [] }
+    i = 0
+    while i < nc {
+        rg.cols.add(res.cols[i].name)
+        rg.types.add(v.sqlType(res.cols[i].type))
+        rg.mods.add(-1)
+        rg.hidden.add(false)
+        i += 1
+    }
+    pushRange(pc, rg)
+    leaves.add(Leaf { op: op; slot: -1; tableId: -1; slots: [slot]; outer: false })
+}
+
+// The recursive term's reference to its own CTE: a scan of the working table (the rows the last iteration added).
+function compileWorkScan(pc: PC, wi: Integer, alias: Text, colNames: List<Text>, leaves: List<Leaf>) {
+    let p = pc.p
+    let t = pc.workTable[wi]
+    let slot = newSlot(pc, t)
+    let op = ex.addOp(p, ex.O_TEMPSCAN, -1, pc.workTi[wi], slot, -1, 0, 0)
+    let rg = Range { name: alias; slot: slot; level: pc.level; tableId: -1; cols: []; types: []; mods: []; hidden: [] }
+    let i = 0
+    while i < t.cols.length {
+        let nm = t.cols[i].name
+        if i < colNames.length { nm = colNames[i] }
+        rg.cols.add(nm)
+        rg.types.add(v.sqlType(t.cols[i].type))
+        rg.mods.add(-1)
+        rg.hidden.add(false)
+        i += 1
+    }
+    pushRange(pc, rg)
+    leaves.add(Leaf { op: op; slot: -1; tableId: -1; slots: [slot]; outer: false })
 }
 
 function compileDerived(pc: PC, q: Integer, alias: Text, colNames: List<Text>, leaves: List<Leaf>) {
@@ -3034,6 +3555,18 @@ function accessPath(pc: PC, leaves: List<Leaf>, li: Integer, conjs: List<Integer
             let blk = ex.listBlock(pc.p, spec)
             let key = keyIndex(pc, keyExprs.length)
             return ex.addOp(pc.p, ex.O_HASHEQ, slot, hid, andChain(pc, fs), blk, key, 0)
+        }
+    }
+    // 1b. full-text search: col ==> 'query' drives the scan (src/search/index.min); other conjuncts filter
+    for ci in mine {
+        let sn = conjs[ci]
+        if pc.p.ek[sn] == ex.EX_SEARCH && pc.p.searches[pc.p.ec[sn]].slot == slot {
+            let fs: List<Integer> = []
+            for cj in mine {
+                if cj != ci { fs.add(conjs[cj]) }
+                used[cj] = true
+            }
+            return ex.addOp(pc.p, ex.O_SEARCH, slot, pc.p.ec[sn], andChain(pc, fs), 0, 0, 0)
         }
     }
     // 2. ordered index: equalities on a prefix of its columns, then an optional range on the next column
@@ -3631,7 +4164,17 @@ function compileSelectInner(pc: PC, q: Integer): QResult {
             let at = v.T_INT8
             if arg >= 0 { at = p.et[arg] }
             let rt = v.T_INT8
-            if kind == ex.AG_SUM {
+            let extAgg = -1
+            // an extension aggregate for this name and type wins; count and any_value work on every type
+            if arg >= 0 && !twoArg && (v.isExtType(at) || !isAggName(an.text)) && kind != ex.AG_COUNT && kind != ex.AG_ANY_VALUE {
+                extAgg = findExtAgg(pc, an.text, at)
+                if extAgg < 0 {
+                    perr(pc, "42883", "function " + an.text + "(" + v.typeName(at) + ") does not exist", an.position)
+                    return emptyResult()
+                }
+                kind = ex.AG_EXT
+                rt = extSignatureType(pc, ext.agg(extAgg).def.result)
+            } else if kind == ex.AG_SUM {
                 if at == v.T_INT2 || at == v.T_INT4 { rt = v.T_INT8 }
                 else if at == v.T_INT8 || at == v.T_NUMERIC { rt = v.T_NUMERIC }
                 else if at == v.T_FLOAT4 { rt = v.T_FLOAT4 }
@@ -3700,8 +4243,13 @@ function compileSelectInner(pc: PC, q: Integer): QResult {
             spec.add(filt)
             spec.add(extra)
             spec.add(dtiSlot)
-            spec.add(arg2)
-            spec.add(rcol)
+            if kind == ex.AG_EXT {
+                spec.add(ex.addCall(p, 2))
+                spec.add(extAgg)
+            } else {
+                spec.add(arg2)
+                spec.add(rcol)
+            }
         }
         pc.collecting = false
         i = 0
@@ -4305,7 +4853,7 @@ function registerWith(pc: PC, withN: Integer) {
             perr(pc, "0A000", "data-modifying statements in WITH are not supported", posOf(pc, cte))
             return
         }
-        addCte(pc, pc.a.nodes[cte].text, cte)
+        addCte(pc, pc.a.nodes[cte].text, cte, false)
     }
 }
 
@@ -5347,4 +5895,180 @@ function compileCatFunc(pc: PC, id: Integer, name: Text): Integer {
         return mkFunc(pc, ex.FN_REL_SIZE, v.T_INT8, [coerce(pc, args[0], v.T_REGCLASS, -1, false)])
     }
     return -2
+}
+
+// ---------------------------------------------------------------- EXPLAIN
+
+// The plan of `st` as indented lines, PostgreSQL EXPLAIN style (no costs).
+public function explainLines(c: cat.Catalog, st: Stmt): List<Text> {
+    let out: List<Text> = []
+    let depth = 0
+    if st.kind == SK_INSERT || st.kind == SK_UPDATE || st.kind == SK_DELETE {
+        let verb = "Insert"
+        if st.kind == SK_UPDATE { verb = "Update" }
+        if st.kind == SK_DELETE { verb = "Delete" }
+        let name = ""
+        if st.tableId >= 0 && st.tableId < c.tables.length { name = c.tables[st.tableId].name }
+        out.add(verb + " on " + name)
+        depth = 1
+    }
+    if st.root >= 0 {
+        explainOp(c, st.p, st.root, depth, out)
+    } else if st.kind == SK_INSERT {
+        explainLine(out, 1, "Values (" + v.intText(st.nRows) + " rows)")
+    } else if depth == 0 {
+        out.add("Result")
+    }
+    return out
+}
+
+function explainLine(out: List<Text>, depth: Integer, s: Text) {
+    let pad = ""
+    let i = 1
+    while i < depth {
+        pad = pad + "      "
+        i += 1
+    }
+    if depth > 0 { pad = pad + "  ->  " }
+    out.add(pad + s)
+}
+
+function slotName(p: ex.Plan, slot: Integer): Text {
+    if slot >= 0 && slot < p.slotBase.length { return p.slotBase[slot].name }
+    return "?"
+}
+
+function withFilter(s: Text, cond: Integer): Text {
+    if cond >= 0 { return s + " (filtered)" }
+    return s
+}
+
+function explainOp(c: cat.Catalog, p: ex.Plan, o: Integer, depth: Integer, out: List<Text>) {
+    if o < 0 || o >= p.ok.length { return }
+    let k = p.ok[o]
+    if k == ex.O_SCAN {
+        explainLine(out, depth, withFilter("Seq Scan on " + slotName(p, p.oa[o]), p.oc[o]))
+    } else if k == ex.O_HASHEQ {
+        explainLine(out, depth, withFilter("Index Scan using " + c.hashIdx[p.ob[o]].name + " on " + slotName(p, p.oa[o]), p.oc[o]))
+    } else if k == ex.O_RANGE {
+        explainLine(out, depth, withFilter("Index Range Scan using " + c.ordIdx[p.ob[o]].name + " on " + slotName(p, p.oa[o]), p.oc[o]))
+    } else if k == ex.O_SEARCH {
+        let ss = p.searches[p.ob[o]]
+        let how = "Search Scan"
+        if ss.sortable { how = "Search Top-K Scan (exact BM25, block-max)" }
+        explainLine(out, depth, withFilter(how + " using " + c.searchIdx[ss.index].name + " on " + slotName(p, p.oa[o]), p.oc[o]))
+    } else if k == ex.O_FILTER {
+        explainLine(out, depth, "Filter")
+        explainOp(c, p, p.oa[o], depth + 1, out)
+    } else if k == ex.O_NL {
+        let s = "Nested Loop"
+        if p.od[o] == 1 { s = "Nested Loop Left Join" }
+        explainLine(out, depth, withFilter(s, p.oc[o]))
+        explainOp(c, p, p.oa[o], depth + 1, out)
+        explainOp(c, p, p.ob[o], depth + 1, out)
+    } else if k == ex.O_HASHJ {
+        let s = "Hash Join"
+        if p.od[o] == 1 { s = "Hash Left Join" }
+        explainLine(out, depth, withFilter(s, p.oc[o]))
+        explainOp(c, p, p.oa[o], depth + 1, out)
+        explainLine(out, depth + 1, "Hash")
+        explainOp(c, p, p.ob[o], depth + 2, out)
+    } else if k == ex.O_AGG {
+        explainLine(out, depth, "Aggregate")
+        explainOp(c, p, p.oa[o], depth + 1, out)
+    } else if k == ex.O_SORT {
+        explainLine(out, depth, "Sort")
+        explainOp(c, p, p.oa[o], depth + 1, out)
+    } else if k == ex.O_LIMIT {
+        explainLine(out, depth, "Limit")
+        explainOp(c, p, p.oa[o], depth + 1, out)
+    } else if k == ex.O_DISTINCT {
+        explainLine(out, depth, "Unique")
+        explainOp(c, p, p.oa[o], depth + 1, out)
+    } else if k == ex.O_WINDOW {
+        explainLine(out, depth, "WindowAgg")
+        explainOp(c, p, p.oa[o], depth + 1, out)
+    } else if k == ex.O_MAT {
+        explainLine(out, depth, "Materialize")
+        explainOp(c, p, p.oa[o], depth + 1, out)
+    } else if k == ex.O_SETOP {
+        let kind = p.od[o] & 255
+        let s = "Union"
+        if kind == 2 { s = "Intersect" }
+        if kind == 3 { s = "Except" }
+        if (p.od[o] & 256) != 0 { s = s + " All" }
+        explainLine(out, depth, s)
+        explainOp(c, p, p.oa[o], depth + 1, out)
+        let blk = p.oe[o]
+        explainOp(c, p, p.olist[blk + 1 + p.olist[blk]], depth + 1, out)
+    } else if k == ex.O_REC {
+        explainLine(out, depth, "Recursive Union")
+        explainOp(c, p, p.oa[o], depth + 1, out)
+        explainOp(c, p, p.olist[p.oe[o] + 1], depth + 1, out)
+    } else if k == ex.O_TEMPSCAN {
+        explainLine(out, depth, withFilter("WorkTable Scan", p.od[o]))
+    } else if k == ex.O_VALUES {
+        explainLine(out, depth, "Values Scan")
+    } else if k == ex.O_SERIES {
+        explainLine(out, depth, "Function Scan on generate_series")
+    } else if k == ex.O_ONE {
+        explainLine(out, depth, "Result")
+    } else if k == ex.O_APPEND {
+        explainLine(out, depth, "Append")
+    } else if k == ex.O_CATALOG {
+        explainLine(out, depth, "Catalog Scan on " + slotName(p, p.oa[o]))
+    } else if k == ex.O_SRF {
+        explainLine(out, depth, "Function Scan")
+    } else {
+        explainLine(out, depth, "Operator " + v.intText(k))
+    }
+}
+
+// ---------------------------------------------------------------- full-text search (src/search/index.min)
+
+// col ==> 'TINQL query'
+function compileSearchPred(pc: PC, l: Integer, r: Integer, pos: Integer): Integer {
+    let p = pc.p
+    if p.ek[l] != ex.EX_COL {
+        perr(pc, "42883", "the left side of ==> must be a column with a tin index", pos)
+        return -1
+    }
+    let slot = p.ea[l]
+    let t = p.slotBase[slot]
+    let sid = -1
+    if t.id >= 0 { sid = cat.findSearchIndexOn(pc.c, t, p.eb[l]) }
+    if sid < 0 {
+        let cn = t.cols[p.eb[l]].name
+        perr(pc, "42704", "column \"" + cn + "\" has no tin index; create one with CREATE INDEX ON " + t.name + " USING tin (" + cn + ")", pos)
+        return -1
+    }
+    let q = coerceText(pc, r)
+    let st = ex.addSearch(p, sid, slot, q)
+    return ex.addExpr(p, ex.EX_SEARCH, v.T_BOOL, l, q, st, 0)
+}
+
+// tin.score(ctid), tin.full_score(ctid), tin.highlight(col) and the search.* spellings
+function compileSearchFunc(pc: PC, id: Integer, name: Text): Integer {
+    let p = pc.p
+    let nd = pc.a.nodes[id]
+    if p.searches.length == 0 {
+        perr(pc, "42883", "tin." + name + "() needs a ==> condition in the same query", nd.position)
+        return -1
+    }
+    let st = p.searches.length - 1
+    if name == "score" || name == "full_score" || name == "max_score" || name == "bm25" {
+        return ex.addExpr(p, ex.EX_SEARCH_SCORE, v.T_FLOAT8, -1, -1, st, 0)
+    }
+    if name == "highlight" || name == "snippet" {
+        let rawArgs = ast.items(pc.a, ast.child(pc.a, id, 1))
+        if rawArgs.length == 0 {
+            perr(pc, "42883", "tin." + name + "() needs the text column as its argument", nd.position)
+            return -1
+        }
+        let a0 = compileExpr(pc, rawArgs[0])
+        if a0 < 0 { return -1 }
+        return ex.addExpr(p, ex.EX_SEARCH_HL, v.T_TEXT, coerceText(pc, a0), -1, st, 0)
+    }
+    perr(pc, "42883", "function tin." + name + " does not exist", nd.position)
+    return -1
 }

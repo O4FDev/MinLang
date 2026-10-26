@@ -292,13 +292,19 @@ function openFile(table: crc.Table, dataDir: Text, s: util.NamedLsn): Opened {
     let dirCrc = header.getUInt32(32)
     let count = header.getUInt32(36)
     let dirOffset = header.getInt64(48)
-    let ok = crc.of(table, copy) == storedHeaderCrc && header.getUInt32(8) == VERSION && lsn == s.lsn &&
-             length >= 0 && dirOffset == HEADER_BYTES + length &&
-             size == dirOffset + count * DIRECTORY_ENTRY_BYTES
+    let ok = crc.of(table, copy) == storedHeaderCrc && header.getUInt32(8) == VERSION && lsn == s.lsn && length >= 0
+    if ok {
+        // Subtract from the validated file size before adding untrusted metadata.
+        ok = length <= size - HEADER_BYTES && dirOffset == HEADER_BYTES + length
+    }
+    let directoryBytes = count * DIRECTORY_ENTRY_BYTES
+    if ok {
+        ok = dirOffset <= size && directoryBytes <= size - dirOffset && size - dirOffset == directoryBytes
+    }
     let directory = Bytes()
     if ok {
-        directory = dbio.pread(fd, dirOffset, count * DIRECTORY_ENTRY_BYTES)
-        ok = directory.length == count * DIRECTORY_ENTRY_BYTES && crc.of(table, directory) == dirCrc
+        directory = dbio.pread(fd, dirOffset, directoryBytes)
+        ok = directory.length == directoryBytes && crc.of(table, directory) == dirCrc
     }
     if ok {
         // entries must tile the payload exactly
@@ -306,8 +312,11 @@ function openFile(table: crc.Table, dataDir: Text, s: util.NamedLsn): Opened {
         for i in 0..count {
             let off = directory.getInt64(i * DIRECTORY_ENTRY_BYTES)
             let len = directory.getInt64(i * DIRECTORY_ENTRY_BYTES + 8)
-            if off != expect || len < 0 { ok = false }
-            expect = off + len
+            if off != expect || len < 0 || off > dirOffset || len > dirOffset - off {
+                ok = false
+            } else {
+                expect = off + len
+            }
         }
         if expect != dirOffset { ok = false }
     }

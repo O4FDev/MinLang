@@ -106,6 +106,7 @@ public record Table {
     checks: List<Text>         // CHECK constraint SQL (unused for now)
     chunk: Integer             // snapshot chunk holding this table's data when not yet loaded, else -1
     paged: List<Paged>         // not loaded, answering point lookups from its persisted image (row 0 = stand-in)
+    searchIds: List<Integer>   // full-text search indexes (src/search/index.min registry ids)
 }
 
 // Where a persisted buffer's pieces are in the data file.
@@ -151,7 +152,7 @@ public function newColumn(name: Text, type: Integer, typmod: Integer, notNull: B
 public function newTable(id: Integer, name: Text): Table {
     return Table {
         id: id; name: name; cols: []; nrows: 0; state: Bytes(); live: 0; lockedCount: 0
-        hashIds: []; ordIds: []; pkCols: []; serial: 0; isTemp: false; checks: []; chunk: -1; paged: []
+        hashIds: []; ordIds: []; pkCols: []; serial: 0; isTemp: false; checks: []; chunk: -1; paged: []; searchIds: []
     }
 }
 
@@ -203,6 +204,20 @@ public function reserveRow(t: Table, state: Integer): Integer {
     t.nrows = r + 1
     if (state & ST_DEAD) == 0 { t.live += 1 }
     return r
+}
+
+// Undo the last reserveRow (scratch tables only: its text bytes stay in the heap until truncate).
+public function dropLastRow(t: Table) {
+    let r = t.nrows - 1
+    if r < 0 { return }
+    for c in t.cols {
+        c.data.resize(c.data.length - c.width)
+        if c.perRowScale { c.scales.resize(c.scales.length - 1) }
+        if c.nulls.length > 0 { clearNull(c, r) }
+    }
+    if (t.state[r] & ST_DEAD) == 0 { t.live -= 1 }
+    t.state.resize(r)
+    t.nrows = r
 }
 
 // Ensure rows [0, n) exist (used by WAL replay). New rows are dead.

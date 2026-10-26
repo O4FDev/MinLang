@@ -1,0 +1,628 @@
+// neodb-sdk: everything a neo-db extension sees.
+//
+// An extension is a Minyar library with one public function that describes it:
+//
+//     public function extension(): sdk.Extension {
+//         let x = sdk.extension("vector", "0.8.0", "vector data type and distance operators")
+//         x.type("vector", parseVector, formatVector)
+//         x.define("l2_distance", ["vector", "vector"], "float8", l2Distance)
+//         x.operator("<->", "vector", "vector", "l2_distance")
+//         return x
+//     }
+//
+// Types are named the way SQL names them ("float8", "int4", "text", "bool", "bytea", or an extension type).
+// Every callback has the same shape, (Call) -> Nothing: it reads its arguments from the Call and sets one result.
+// neo-db owns one Call per expression and reuses it, so calling an extension function allocates nothing.
+
+// ---------------------------------------------------------------- a call
+
+public record Call {
+    count: Integer             // number of arguments
+    nulls: List<Boolean>
+    integers: List<Integer>    // int2/int4/int8/bool/date arguments
+    floats: List<Float>        // float4/float8 arguments
+    buffers: List<Bytes>       // text, bytea and extension-type arguments: a view (buffer, offset, length)
+    offsets: List<Integer>
+    lengths: List<Integer>
+    modifier: Integer          // type modifier for input and modifier callbacks (vector(3) -> 3), else -1
+    output: Bytes              // append the result bytes of text, bytea and extension-type results here
+    resultNull: Boolean
+    resultInteger: Integer
+    resultFloat: Float
+    failed: Boolean
+    failCode: Text
+    failMessage: Text
+    host: Host
+}
+
+public function newCall(arguments: Integer, host: Host): Call {
+    let c = Call {
+        count: arguments; nulls: []; integers: []; floats: []; buffers: []; offsets: []; lengths: []
+        modifier: -1; output: Bytes(); resultNull: false; resultInteger: 0; resultFloat: 0.0
+        failed: false; failCode: ""; failMessage: ""; host: host
+    }
+    let empty = Bytes()
+    let i = 0
+    while i < arguments {
+        c.nulls.add(false)
+        c.integers.add(0)
+        c.floats.add(0.0)
+        c.buffers.add(empty)
+        c.offsets.add(0)
+        c.lengths.add(0)
+        i += 1
+    }
+    return c
+}
+
+// Engine side: reset the result before each call (the engine sets output to the buffer the result goes to).
+public function Call.begin() {
+    self.resultNull = false
+    self.resultInteger = 0
+    self.resultFloat = 0.0
+    self.failed = false
+}
+
+public function Call.isNull(i: Integer): Boolean { return self.nulls[i] }
+public function Call.integer(i: Integer): Integer { return self.integers[i] }
+public function Call.float(i: Integer): Float { return self.floats[i] }
+public function Call.boolean(i: Integer): Boolean { return self.integers[i] != 0 }
+
+// Byte view of a text, bytea or extension-type argument. Read it in place; copy with text() or bytes().
+public function Call.buffer(i: Integer): Bytes { return self.buffers[i] }
+public function Call.offset(i: Integer): Integer { return self.offsets[i] }
+public function Call.length(i: Integer): Integer { return self.lengths[i] }
+public function Call.byte(i: Integer, at: Integer): Integer { return self.buffers[i][self.offsets[i] + at] }
+public function Call.float32(i: Integer, at: Integer): Float { return self.buffers[i].getFloat32(self.offsets[i] + at) }
+public function Call.int32(i: Integer, at: Integer): Integer { return self.buffers[i].getInt32(self.offsets[i] + at) }
+public function Call.uint16(i: Integer, at: Integer): Integer { return self.buffers[i].getUInt16(self.offsets[i] + at) }
+public function Call.bytes(i: Integer): Bytes {
+    return self.buffers[i].slice(self.offsets[i], self.offsets[i] + self.lengths[i])
+}
+public function Call.text(i: Integer): Text { return Text(self.bytes(i)) }
+
+public function Call.returnNull() { self.resultNull = true }
+public function Call.returnInteger(x: Integer) { self.resultInteger = x }
+public function Call.returnBoolean(b: Boolean) {
+    if b { self.resultInteger = 1 } else { self.resultInteger = 0 }
+}
+public function Call.returnFloat(f: Float) { self.resultFloat = f }
+public function Call.returnText(t: Text) { self.output.addBytes(Bytes(t)) }
+// For byte results, append to call.output; never read or shorten it (it may already hold earlier output).
+
+// Stop the statement with a Postgres error: sqlstate (e.g. "22P02") and message.
+public function Call.fail(code: Text, message: Text) {
+    if self.failed { return }
+    self.failed = true
+    self.failCode = code
+    self.failMessage = message
+}
+
+// ---------------------------------------------------------------- what an extension declares
+
+public record TypeDef {
+    name: Text
+    input: (Call) -> Nothing       // text (argument 0, modifier in call.modifier) -> stored bytes
+    output: (Call) -> Nothing      // stored bytes -> text
+    receive: (Call) -> Nothing     // binary wire format -> stored bytes
+    send: (Call) -> Nothing        // stored bytes -> binary wire format
+    check: (Call) -> Nothing       // enforce a type modifier on a stored value (vector(3)); call.modifier >= 0
+    hasBinary: Boolean
+    hasCheck: Boolean
+    category: Text                 // pg_type.typcategory ("U" user-defined)
+    oid: Integer                   // a fixed pg_type oid (core Postgres types), or 0: neo-db assigns one
+    arrayOid: Integer
+    compare: (Call) -> Nothing     // ORDER BY: arguments 0 and 1, result -1, 0 or 1 (returnInteger)
+    hasCompare: Boolean
+    modifierMin: Integer           // accepted type modifier range, e.g. vector(1) .. vector(16000)
+    modifierMax: Integer
+    modifierWhat: Text             // what the modifier counts, for errors ("dimensions")
+}
+
+// A conversion from one type to another (CAST, ::), e.g. vector -> halfvec. The body reads argument 0 and
+// sets the result; call.modifier is the target's type modifier (or -1).
+public record CastDef {
+    from: Text
+    to: Text
+    body: (Call) -> Nothing
+}
+
+public record FunctionDef {
+    name: Text
+    arguments: List<Text>
+    result: Text
+    body: (Call) -> Nothing
+    volatile: Boolean
+}
+
+public record OperatorDef {
+    symbol: Text
+    left: Text
+    right: Text
+    implementation: Text           // a function of this extension taking (left, right)
+}
+
+// Aggregate: state is the result type's bytes (or a float/integer), stepped once per non-null input.
+public record AggregateDef {
+    name: Text
+    argument: Text
+    result: Text
+    step: (Call) -> Nothing        // argument 0: state so far (null on the first row), argument 1: input; result: new state
+    finish: (Call) -> Nothing      // argument 0: final state, argument 1: number of rows stepped (int8); result: value
+}
+
+// Change-feed transform: argument 0 is the table name, argument 1 the change as JSON text
+// ({"op":"insert","table":...,"new":{...}}). Return the (possibly rewritten) JSON text, or null to drop the change.
+public record FeedTransformDef {
+    name: Text
+    body: (Call) -> Nothing
+}
+
+public record Extension {
+    name: Text
+    version: Text
+    comment: Text
+    builtin: Boolean               // part of neo-db's own SQL surface: always installed, not listed as an extension
+    types: List<TypeDef>
+    functions: List<FunctionDef>
+    operators: List<OperatorDef>
+    casts: List<CastDef>
+    aggregates: List<AggregateDef>
+    feedTransforms: List<FeedTransformDef>
+}
+
+public function extension(name: Text, version: Text, comment: Text): Extension {
+    return Extension { name: name; version: version; comment: comment; builtin: false; types: []; functions: []
+                       operators: []; casts: []; aggregates: []; feedTransforms: [] }
+}
+
+// neo-db's own core types and functions use the same SDK: a built-in is always installed in every database.
+public function builtin(name: Text, comment: Text): Extension {
+    let x = extension(name, "1.0", comment)
+    x.builtin = true
+    return x
+}
+
+function nothing(call: Call) {}
+
+// A base type stored as bytes. input parses text, output formats it.
+public function Extension.type(name: Text, input: (Call) -> Nothing, output: (Call) -> Nothing): TypeDef {
+    let t = TypeDef { name: name; input: input; output: output; receive: function(call) { nothing(call) }
+                      send: function(call) { nothing(call) }; check: function(call) { nothing(call) }
+                      hasBinary: false; hasCheck: false; category: "U"; oid: 0; arrayOid: 0
+                      compare: function(call) { nothing(call) }; hasCompare: false; modifierMin: 0; modifierMax: 2147483647
+                      modifierWhat: "" }
+    self.types.add(t)
+    return t
+}
+
+// Binary wire format (COPY BINARY, binary parameters and results).
+public function TypeDef.binary(receive: (Call) -> Nothing, send: (Call) -> Nothing) {
+    self.receive = receive
+    self.send = send
+    self.hasBinary = true
+}
+
+// Sort order for ORDER BY (otherwise values sort by their stored bytes).
+public function TypeDef.ordering(compare: (Call) -> Nothing) {
+    self.compare = compare
+    self.hasCompare = true
+}
+
+// Accepted type modifiers: vector(n) with min <= n <= max; `what` names n in errors ("dimensions").
+public function TypeDef.modifierRange(min: Integer, max: Integer, what: Text) {
+    self.modifierMin = min
+    self.modifierMax = max
+    self.modifierWhat = what
+}
+
+// The pg_type oids Postgres itself uses for this type (built-in extensions that supply core types).
+public function TypeDef.postgresOids(oid: Integer, arrayOid: Integer, category: Text) {
+    self.oid = oid
+    self.arrayOid = arrayOid
+    self.category = category
+}
+
+// Type modifier check, e.g. vector(3): called when a value is stored into a column with a modifier.
+public function TypeDef.modifier(check: (Call) -> Nothing) {
+    self.check = check
+    self.hasCheck = true
+}
+
+// A function whose result depends only on its arguments (IMMUTABLE, PARALLEL SAFE). Mark the body
+// `deterministic function` so the compiler proves it never reaches the host.
+public function Extension.define(name: Text, arguments: List<Text>, result: Text, body: (Call) -> Nothing) {
+    self.functions.add(FunctionDef { name: name; arguments: arguments; result: result; body: body; volatile: false })
+}
+
+// A function that may read the clock, random numbers or other host state (VOLATILE).
+public function Extension.defineVolatile(name: Text, arguments: List<Text>, result: Text, body: (Call) -> Nothing) {
+    self.functions.add(FunctionDef { name: name; arguments: arguments; result: result; body: body; volatile: true })
+}
+
+public function Extension.operator(symbol: Text, left: Text, right: Text, implementation: Text) {
+    self.operators.add(OperatorDef { symbol: symbol; left: left; right: right; implementation: implementation })
+}
+
+public function Extension.cast(from: Text, to: Text, body: (Call) -> Nothing) {
+    self.casts.add(CastDef { from: from; to: to; body: body })
+}
+
+public function Extension.aggregate(name: Text, argument: Text, result: Text, step: (Call) -> Nothing, finish: (Call) -> Nothing) {
+    self.aggregates.add(AggregateDef { name: name; argument: argument; result: result; step: step; finish: finish })
+}
+
+public function Extension.feedTransform(name: Text, body: (Call) -> Nothing) {
+    self.feedTransforms.add(FeedTransformDef { name: name; body: body })
+}
+
+// ---------------------------------------------------------------- number text, the Postgres way
+
+// Float parsing and printing that match Postgres exactly (float4in/float8in, float4out/float8out), supplied
+// by the host so extensions and core types print the same digits.
+public record Host {
+    addFloat: (Bytes, Float, Boolean) -> Nothing                          // out, value, isFloat4
+    parseFloat: (Bytes, Integer, Integer, Boolean, ParsedFloat) -> Nothing // bytes, offset, length, isFloat4, result
+    clock: () -> Integer                                                  // wall clock, microseconds since 1970
+    random: (Integer) -> Bytes                                            // that many unpredictable bytes
+}
+
+// The host's clock and randomness. Volatile functions use these instead of the system clock or the random
+// module, so neo-db can simulate them (minyar sim) and every universe stays reproducible.
+public function Call.clockMicros(): Integer { return self.host.clock() }
+public function Call.randomBytes(count: Integer): Bytes { return self.host.random(count) }
+
+public record ParsedFloat {
+    value: Float
+    ok: Boolean            // false: not a number
+    outOfRange: Boolean    // overflowed, or a nonzero value rounded to zero
+}
+
+public function newParsedFloat(): ParsedFloat { return ParsedFloat { value: 0.0; ok: false; outOfRange: false } }
+
+// Append f as Postgres prints a real (float4) or a double precision (float8).
+public function Call.addFloat4(out: Bytes, f: Float) { self.host.addFloat(out, f, true) }
+public function Call.addFloat8(out: Bytes, f: Float) { self.host.addFloat(out, f, false) }
+
+// Parse b[offset, offset + length) as Postgres reads a real / double precision.
+public function Call.parseFloat4(b: Bytes, offset: Integer, length: Integer, result: ParsedFloat) {
+    self.host.parseFloat(b, offset, length, true, result)
+}
+public function Call.parseFloat8(b: Bytes, offset: Integer, length: Integer, result: ParsedFloat) {
+    self.host.parseFloat(b, offset, length, false, result)
+}
+
+// ---------------------------------------------------------------- change feeds
+
+// One change-feed event as a feed transform receives it (argument 1), e.g.
+// {"op":"update","table":"users","row":{"id":7,"email":"ada@example.com"}}. Read and change its row, then
+// return change.json(); or call.returnNull() to drop the event.
+public record Change {
+    op: Text                 // insert, update, delete or copy
+    table: Text
+    columns: List<Text>      // row column names, in order (empty for copy)
+    values: List<Text>       // their values as JSON text: strings keep their quotes, null is null
+    rest: Text               // members after the row, e.g. ,"cut":true (or the whole tail of a copy event)
+    valid: Boolean           // false when the payload is not a change event; json() then returns it unchanged
+    original: Text
+}
+
+public function Call.change(): Change { return parseChange(self.text(1)) }
+
+// The column's value as JSON text, or "" when the row has no such column.
+public function Change.value(column: Text): Text {
+    let i = 0
+    while i < self.columns.length {
+        if self.columns[i] == column { return self.values[i] }
+        i += 1
+    }
+    return ""
+}
+
+// The column's text value: a JSON string decoded, a number or true/false as written, "" for null or no column.
+public function Change.text(column: Text): Text {
+    let v = self.value(column)
+    if v == "" || v == "null" { return "" }
+    if Bytes(v)[0] != 34 { return v }
+    let s = Scan { b: Bytes(v); i: 0; ok: true }
+    return readString(s)
+}
+
+// Add a column to the row (a JSON value, e.g. quote("text") or "42"); replaces it if the row already has it.
+public function Change.add(column: Text, jsonValue: Text) {
+    if self.value(column) != "" {
+        self.set(column, jsonValue)
+        return
+    }
+    self.columns.add(column)
+    self.values.add(jsonValue)
+}
+
+public function Change.set(column: Text, jsonValue: Text) {
+    let i = 0
+    while i < self.columns.length {
+        if self.columns[i] == column { self.values[i] = jsonValue }
+        i += 1
+    }
+}
+
+public function Change.setText(column: Text, text: Text) { self.set(column, quote(text)) }
+
+public function Change.remove(column: Text) {
+    let names: List<Text> = []
+    let vals: List<Text> = []
+    let i = 0
+    while i < self.columns.length {
+        if self.columns[i] != column {
+            names.add(self.columns[i])
+            vals.add(self.values[i])
+        }
+        i += 1
+    }
+    self.columns = names
+    self.values = vals
+}
+
+public function Change.json(): Text {
+    if !self.valid { return self.original }
+    let b = Bytes()
+    b.addBytes(Bytes("{\"op\":" + quote(self.op) + ",\"table\":" + quote(self.table)))
+    if self.op != "copy" {
+        b.addBytes(Bytes(",\"row\":{"))
+        let i = 0
+        while i < self.columns.length {
+            if i > 0 { b.add(44) }
+            b.addBytes(Bytes(quote(self.columns[i])))
+            b.add(58)
+            b.addBytes(Bytes(self.values[i]))
+            i += 1
+        }
+        b.add(125)
+    }
+    b.addBytes(Bytes(self.rest))
+    b.add(125)
+    return Text(b)
+}
+
+// A JSON string literal for t.
+public function quote(t: Text): Text {
+    let b = Bytes()
+    b.add(34)
+    let hex = Bytes("0123456789abcdef")
+    for c in Bytes(t) {
+        if c == 34 || c == 92 {
+            b.add(92)
+            b.add(c)
+        } else if c < 32 {
+            b.addBytes(Bytes("\\u00"))
+            b.add(hex[c / 16])
+            b.add(hex[c % 16])
+        } else {
+            b.add(c)
+        }
+    }
+    b.add(34)
+    return Text(b)
+}
+
+record Scan {
+    b: Bytes
+    i: Integer
+    ok: Boolean
+}
+
+// End (exclusive) of the JSON string starting at s.i (a quote), or -1.
+function stringEnd(s: Scan): Integer {
+    let i = s.i + 1
+    while i < s.b.length {
+        if s.b[i] == 92 {
+            i += 2
+        } else if s.b[i] == 34 {
+            return i + 1
+        } else {
+            i += 1
+        }
+    }
+    return -1
+}
+
+// Decoded text of the JSON string at s.i; advances past it.
+function readString(s: Scan): Text {
+    let end = stringEnd(s)
+    if end < 0 || s.b[s.i] != 34 {
+        s.ok = false
+        return ""
+    }
+    let out = Bytes()
+    let i = s.i + 1
+    while i < end - 1 {
+        let c = s.b[i]
+        if c == 92 && i + 1 < end - 1 {
+            let d = s.b[i + 1]
+            if d == 110 { out.add(10) }
+            else if d == 116 { out.add(9) }
+            else if d == 114 { out.add(13) }
+            else if d == 98 { out.add(8) }
+            else if d == 102 { out.add(12) }
+            else if d == 117 && i + 5 < end {
+                // \u00XX (the escapes neo-db writes); other code points are kept escaped
+                let v = hexValue(s.b, i + 2)
+                if v >= 0 && v < 128 {
+                    out.add(v)
+                } else {
+                    out.addBytes(s.b.slice(i, i + 6))
+                }
+                i += 4
+            } else { out.add(d) }
+            i += 2
+        } else {
+            out.add(c)
+            i += 1
+        }
+    }
+    s.i = end
+    return Text(out)
+}
+
+function hexValue(b: Bytes, at: Integer): Integer {
+    let v = 0
+    let k = 0
+    while k < 4 {
+        let c = b[at + k]
+        let d = -1
+        if c >= 48 && c <= 57 { d = c - 48 }
+        if c >= 97 && c <= 102 { d = c - 87 }
+        if c >= 65 && c <= 70 { d = c - 55 }
+        if d < 0 { return -1 }
+        v = v * 16 + d
+        k += 1
+    }
+    return v
+}
+
+function expect(s: Scan, c: Integer) {
+    if s.i < s.b.length && s.b[s.i] == c {
+        s.i += 1
+    } else {
+        s.ok = false
+    }
+}
+
+// Raw JSON text of the scalar value at s.i (string, number, true, false, null); advances past it.
+function readScalar(s: Scan): Text {
+    let start = s.i
+    if s.i < s.b.length && s.b[s.i] == 34 {
+        let end = stringEnd(s)
+        if end < 0 {
+            s.ok = false
+            return ""
+        }
+        s.i = end
+    } else {
+        while s.i < s.b.length && s.b[s.i] != 44 && s.b[s.i] != 125 { s.i += 1 }
+    }
+    if s.i == start { s.ok = false }
+    return Text(s.b.slice(start, s.i))
+}
+
+public function parseChange(payload: Text): Change {
+    let c = Change { op: ""; table: ""; columns: []; values: []; rest: ""; valid: false; original: payload }
+    let s = Scan { b: Bytes(payload); i: 0; ok: true }
+    let n = s.b.length
+    if n < 2 || s.b[n - 1] != 125 { return c }
+    expect(s, 123)
+    if !s.ok || readString(s) != "op" { return c }
+    expect(s, 58)
+    c.op = readString(s)
+    expect(s, 44)
+    if !s.ok || readString(s) != "table" { return c }
+    expect(s, 58)
+    c.table = readString(s)
+    if !s.ok { return c }
+    if c.op != "copy" {
+        expect(s, 44)
+        if !s.ok || readString(s) != "row" { return c }
+        expect(s, 58)
+        expect(s, 123)
+        while s.ok && s.i < n && s.b[s.i] != 125 {
+            if c.columns.length > 0 { expect(s, 44) }
+            let name = readString(s)
+            expect(s, 58)
+            let value = readScalar(s)
+            c.columns.add(name)
+            c.values.add(value)
+        }
+        expect(s, 125)
+    }
+    if !s.ok || s.i > n - 1 { return c }
+    c.rest = Text(s.b.slice(s.i, n - 1))
+    c.valid = true
+    return c
+}
+
+// ---------------------------------------------------------------- testing an extension without neo-db
+
+// A Call for unit tests: Minyar's own float text, clock 0, zero "random" bytes. Fill arguments with set*,
+// run a function with extension.run(name, call), then read resultText(), resultInteger or resultFloat.
+public function testCall(arguments: Integer): Call {
+    let host = Host {
+        addFloat: function(out, f, isFloat4) { out.addBytes(Bytes(Text(f))) }
+        parseFloat: function(b, o, l, isFloat4, r) { testParse(b, o, l, r) }
+        clock: function() { return 0 }
+        random: function(count) { return Bytes(count) }
+    }
+    return newCall(arguments, host)
+}
+
+function testParse(b: Bytes, o: Integer, l: Integer, r: ParsedFloat) {
+    r.ok = false
+    r.outOfRange = false
+    let t = Text(b.slice(o, o + l))
+    let neg = t.startsWith("-")
+    if neg { t = t.slice(1, t.length) }
+    let parts = t.split(".")
+    if parts.length > 2 || t.length == 0 { return }
+    let value = 0.0
+    for c in Bytes(parts[0]) {
+        if c < 48 || c > 57 { return }
+        value = value * 10.0 + Float(c - 48)
+    }
+    if parts.length == 2 {
+        let scale = 1.0
+        for c in Bytes(parts[1]) {
+            if c < 48 || c > 57 { return }
+            scale = scale / 10.0
+            value = value + Float(c - 48) * scale
+        }
+    }
+    if neg { value = -value }
+    r.value = value
+    r.ok = true
+}
+
+public function Call.setNull(i: Integer) { self.nulls[i] = true }
+public function Call.setInteger(i: Integer, x: Integer) {
+    self.nulls[i] = false
+    self.integers[i] = x
+}
+public function Call.setFloat(i: Integer, f: Float) {
+    self.nulls[i] = false
+    self.floats[i] = f
+}
+public function Call.setBytes(i: Integer, b: Bytes) {
+    self.nulls[i] = false
+    self.buffers[i] = b
+    self.offsets[i] = 0
+    self.lengths[i] = b.length
+}
+public function Call.setText(i: Integer, t: Text) { self.setBytes(i, Bytes(t)) }
+public function Call.resultText(): Text { return Text(self.output) }
+
+// Run this extension's function `name` (the first one with that name) on call; false when there is none.
+public function Extension.run(name: Text, call: Call): Boolean {
+    for f in self.functions {
+        if f.name == name {
+            call.begin()
+            call.output = Bytes()
+            f.body(call)
+            return true
+        }
+    }
+    return false
+}
+
+// Run this extension's feed transforms on one change, as neo-db does; "" when one of them drops it.
+public function Extension.transform(table: Text, payload: Text): Text {
+    let result = payload
+    for f in self.feedTransforms {
+        let call = testCall(2)
+        call.setText(0, table)
+        call.setText(1, result)
+        call.begin()
+        call.output = Bytes()
+        f.body(call)
+        if call.failed || call.resultNull { return "" }
+        result = call.resultText()
+    }
+    return result
+}

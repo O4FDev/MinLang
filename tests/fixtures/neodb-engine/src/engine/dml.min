@@ -59,7 +59,7 @@ public function bindParams(st: pl.Stmt, params: List<Bytes>, nulls: List<Boolean
             let t = p.et[n]
             if fmt == 1 {
                 bindBinary(p, n, t, b)
-            } else {
+            } else if !ex.rejectInvalidUtf8(p, b) {
                 ex.parseInto(p, b, 0, b.length, false, n, t, -1, 0)
             }
             if p.err { return false }
@@ -69,7 +69,11 @@ public function bindParams(st: pl.Stmt, params: List<Bytes>, nulls: List<Boolean
     return true
 }
 
-function bindBinary(p: ex.Plan, n: Integer, t: Integer, b: Bytes) {
+public function bindBinary(p: ex.Plan, n: Integer, t: Integer, b: Bytes) {
+    if v.isExtType(t) {
+        ex.extReceive(p, b, n, t, -1)
+        return
+    }
     let len = b.length
     if t == v.T_INT4 || t == v.T_DATE || t == v.T_OID {
         if len == 4 {
@@ -240,6 +244,7 @@ public function encodeRow(st: pl.Stmt, formats: List<Integer>, out: Bytes) {
 public function runSelect(st: pl.Stmt, formats: List<Integer>, run: Run) {
     let p = st.p
     let root = st.root
+    ex.newExecution()
     ex.open(p, root)
     while ex.next(p, root) {
         encodeRow(st, formats, run.rowData)
@@ -340,6 +345,7 @@ public function cellText(c: tb.Column, r: Integer): Text {
     if tb.isNull(c, r) { return "null" }
     let b = Bytes()
     let t = c.type
+    if v.isExtType(t) { return ex.extText(t, c.heap, tb.textOff(c, r), tb.textLen(c, r)) }
     if v.isTextType(t) {
         b.addBytes(c.heap.slice(tb.textOff(c, r), tb.textOff(c, r) + tb.textLen(c, r)))
     } else if t == v.T_FLOAT8 || t == v.T_FLOAT4 {
@@ -477,6 +483,7 @@ public function runInsert(st: pl.Stmt, c: cat.Catalog, tm: txn.TxnMgr, tx: txn.T
     }
     // INSERT ... SELECT: materialize source first (the source may read the target)
     let root = st.root
+    ex.newExecution()
     ex.open(p, root)
     let buf = tb.newTable(-1, "insbuf")
     buf.isTemp = true
@@ -771,6 +778,7 @@ function collectTargets(st: pl.Stmt, tm: txn.TxnMgr, me: Integer, t: tb.Table, r
         tb.truncate(p.temps[st.fromBuf])
     }
     if root < 0 { return true }
+    ex.newExecution()
     ex.open(p, root)
     while ex.next(p, root) {
         let r = p.slotRow[slot]

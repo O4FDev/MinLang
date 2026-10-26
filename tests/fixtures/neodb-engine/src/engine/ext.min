@@ -1,0 +1,256 @@
+// Extensions compiled into this build (src/extensions.min) and the registry the engine resolves them through.
+// An extension is *available* when it is compiled in and *installed* in a database by CREATE EXTENSION
+// (Catalog.extensions). Extension types are engine type ids TYPE_BASE + pg_type oid, i.e. values.T_PGTEXT + oid,
+// so they store, hash and compare as byte strings; their text and binary forms go through the extension.
+//
+// OIDs are stable without a catalog: each extension owns a block of 1024 OIDs chosen by its name
+// (OID_BASE + (fnv1a(name) mod 20000) * 1024): types at 0..63 (type, then its array type), functions at
+// 64..767, operators at 768..1023. Two compiled-in extensions sharing a block stop the build's startup.
+use "neodb-sdk" as sdk
+use "../extensions.min" as available
+
+public constant TYPE_BASE = 1000
+public constant OID_BASE = 9000000
+public constant OID_SPAN = 20480000
+
+public record Ty {
+    ext: Integer
+    def: sdk.TypeDef
+    oid: Integer
+    arrayOid: Integer
+}
+
+public record Fn {
+    ext: Integer
+    def: sdk.FunctionDef
+    oid: Integer
+    argTypes: List<Integer>    // engine type ids, filled by the planner on first use (resolved)
+    result: Integer
+    resolved: Boolean
+}
+
+public record Op {
+    ext: Integer
+    def: sdk.OperatorDef
+    oid: Integer
+    fn: Integer                // index into fns
+}
+
+public record Cast {
+    ext: Integer
+    def: sdk.CastDef
+    from: Integer              // engine type ids, resolved on first use
+    to: Integer
+    resolved: Boolean
+}
+
+public record Agg {
+    ext: Integer
+    def: sdk.AggregateDef
+    oid: Integer
+}
+
+public record Registry {
+    fixed: List<Integer>               // engine type ids of types with fixed (core Postgres) oids
+    exts: List<sdk.Extension>
+    bases: List<Integer>
+    types: List<Ty>
+    fns: List<Fn>
+    ops: List<Op>
+    casts: List<Cast>
+    aggs: List<Agg>
+}
+
+global REG: Registry = build()
+
+function fnv1a(t: Text): Integer {
+    let h = 2166136261
+    for c in Bytes(t) {
+        h = h ^ c
+        h = (h * 16777619) % 4294967296
+    }
+    return h
+}
+
+function build(): Registry {
+    let r = Registry { fixed: []; exts: []; bases: []; types: []; fns: []; ops: []; casts: []; aggs: [] }
+    for x in available.available() {
+        let e = r.exts.length
+        let base = OID_BASE + (fnv1a(x.name) % 20000) * 1024
+        for b in r.bases {
+            if b == base { fail("extension " + x.name + " shares its OID block with another extension; rename one") }
+        }
+        if x.types.length > 32 || x.functions.length + x.aggregates.length > 704 || x.operators.length > 256 {
+            fail("extension " + x.name + " declares more types, functions or operators than its OID block holds")
+        }
+        r.exts.add(x)
+        r.bases.add(base)
+        let i = 0
+        for t in x.types {
+            if t.oid > 0 {
+                r.types.add(Ty { ext: e; def: t; oid: t.oid; arrayOid: t.arrayOid })
+                r.fixed.add(TYPE_BASE + t.oid)
+            } else {
+                r.types.add(Ty { ext: e; def: t; oid: base + i * 2; arrayOid: base + i * 2 + 1 })
+            }
+            i += 1
+        }
+        i = 0
+        for f in x.functions {
+            r.fns.add(Fn { ext: e; def: f; oid: base + 64 + i; argTypes: []; result: 0; resolved: false })
+            i += 1
+        }
+        for k in x.casts { r.casts.add(Cast { ext: e; def: k; from: 0; to: 0; resolved: false }) }
+        for a in x.aggregates {
+            r.aggs.add(Agg { ext: e; def: a; oid: base + 64 + i })
+            i += 1
+        }
+        i = 0
+        for o in x.operators {
+            let fi = -1
+            let j = 0
+            while j < r.fns.length {
+                let f = r.fns[j]
+                if f.ext == e && f.def.name == o.implementation && f.def.arguments.length == 2 &&
+                    f.def.arguments[0] == o.left && f.def.arguments[1] == o.right { fi = j }
+                j += 1
+            }
+            if fi < 0 { fail("extension " + x.name + ": operator " + o.symbol + " names a missing function " + o.implementation) }
+            r.ops.add(Op { ext: e; def: o; oid: base + 768 + i; fn: fi })
+            i += 1
+        }
+    }
+    return r
+}
+
+public function registry(): Registry { return REG }
+
+// ---------------------------------------------------------------- extensions
+
+public function extensionCount(): Integer { return REG.exts.length }
+public function extension(i: Integer): sdk.Extension { return REG.exts[i] }
+
+// An extension CREATE EXTENSION can install (built-ins are always installed and not found here).
+public function findExtension(name: Text): Integer {
+    let i = 0
+    while i < REG.exts.length {
+        if REG.exts[i].name == name && !REG.exts[i].builtin { return i }
+        i += 1
+    }
+    return -1
+}
+
+// pg_extension.oid of extension i: the first OID of its block.
+public function extensionOid(i: Integer): Integer { return REG.bases[i] }
+
+public function availableNames(): Text {
+    let s = ""
+    for x in REG.exts {
+        if !x.builtin {
+            if s != "" { s = s + ", " }
+            s = s + x.name
+        }
+    }
+    return s
+}
+
+public function isInstalled(installed: List<Integer>, e: Integer): Boolean {
+    if REG.exts[e].builtin { return true }
+    for i in installed {
+        if i == e { return true }
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- types
+
+public function isExtType(t: Integer): Boolean {
+    if t <= TYPE_BASE { return false }
+    if t >= TYPE_BASE + OID_BASE { return t < TYPE_BASE + OID_BASE + OID_SPAN }
+    for f in REG.fixed {
+        if f == t { return true }
+    }
+    return false
+}
+
+public function isBuiltin(e: Integer): Boolean { return REG.exts[e].builtin }
+
+// Position in the type table, or -1 (also for an extension array type).
+public function typeAt(t: Integer): Integer {
+    if !isExtType(t) { return -1 }
+    let oid = t - TYPE_BASE
+    let i = 0
+    let n = REG.types.length
+    while i < n {
+        if REG.types[i].oid == oid { return i }
+        i += 1
+    }
+    return -1
+}
+
+public function typeDef(t: Integer): sdk.TypeDef { return REG.types[typeAt(t)].def }
+
+public function typeName(t: Integer): Text {
+    let i = typeAt(t)
+    if i < 0 { return "unknown" }
+    return REG.types[i].def.name
+}
+
+public function typeExt(t: Integer): Integer {
+    let i = typeAt(t)
+    if i < 0 { return -1 }
+    return REG.types[i].ext
+}
+
+// Engine type id of the extension type called `name` among the installed extensions, or -1.
+public function findType(installed: List<Integer>, name: Text): Integer {
+    for ty in REG.types {
+        if ty.def.name == name && isInstalled(installed, ty.ext) { return TYPE_BASE + ty.oid }
+    }
+    return -1
+}
+
+// pg_type oid of the array type of the installed extension type `name` ("_vector" names it too), or -1.
+public function findArrayOid(installed: List<Integer>, name: Text): Integer {
+    for ty in REG.types {
+        if (ty.def.name + "[]" == name || "_" + ty.def.name == name) && isInstalled(installed, ty.ext) { return ty.arrayOid }
+    }
+    return -1
+}
+
+// Name of an installed extension array type by oid ("vector[]"), or "".
+public function arrayTypeName(installed: List<Integer>, oid: Integer): Text {
+    for ty in REG.types {
+        if ty.arrayOid == oid && isInstalled(installed, ty.ext) { return ty.def.name + "[]" }
+    }
+    return ""
+}
+
+// Same, ignoring installation (an available extension's type, for error messages).
+public function findAnyType(name: Text): Integer {
+    for ty in REG.types {
+        if ty.def.name == name { return TYPE_BASE + ty.oid }
+    }
+    return -1
+}
+
+// ---------------------------------------------------------------- functions and operators
+
+public function fnCount(): Integer { return REG.fns.length }
+public function fn(i: Integer): Fn { return REG.fns[i] }
+public function opCount(): Integer { return REG.ops.length }
+public function op(i: Integer): Op { return REG.ops[i] }
+public function aggCount(): Integer { return REG.aggs.length }
+public function castCount(): Integer { return REG.casts.length }
+public function castAt(i: Integer): Cast { return REG.casts[i] }
+
+// Resolve a cast's type names against the registry (built-in SQL names are resolved by the caller's table).
+public function resolveCast(c: Cast, from: Integer, to: Integer) {
+    c.from = from
+    c.to = to
+    c.resolved = true
+}
+public function agg(i: Integer): Agg { return REG.aggs[i] }
+
+// Calls to an extension function or type callback: one Call per expression node, reused for every row.
+public function newCall(arguments: Integer, host: sdk.Host): sdk.Call { return sdk.newCall(arguments, host) }

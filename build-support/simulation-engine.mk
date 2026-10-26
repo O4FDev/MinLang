@@ -3,6 +3,11 @@
 SIMULATION_ENGINE_INPUTS = $(wildcard tests/fixtures/neodb-engine/src/engine/*.min) \
 	$(wildcard tests/fixtures/neodb-engine/src/sql/*.min) \
 	$(wildcard tests/fixtures/neodb-engine/src/storage/*.min) \
+	$(wildcard tests/fixtures/neodb-engine/src/search/*.min) \
+	$(wildcard tests/fixtures/neodb-engine/src/builtin/*.min) \
+	tests/fixtures/neodb-engine/src/extensions.min \
+	$(wildcard tests/fixtures/neodb-engine/sdk/src/*.min) \
+	$(wildcard tests/fixtures/neodb-engine/extensions/*/src/*.min) \
 	tests/fixtures/neodb-engine/source-pins.json tests/fixtures/neodb-engine/lib/dbio.min \
 	tests/simulation-engine-probe.min
 build/tooling/tests/simulation-engine.ll: tests/frontend-fixtures.min

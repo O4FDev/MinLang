@@ -95,7 +95,7 @@ public function tokenize(sql: Text): Tokens {
 }
 
 // Offset of the first byte that is not valid UTF-8, or -1.
-function invalidUtf8At(src: Bytes): Integer {
+public function invalidUtf8At(src: Bytes): Integer {
     let i = 0
     let n = src.length
     while i < n {
@@ -698,6 +698,34 @@ function scanString(lx: Lex, s: Integer, escapes: Boolean, flags: Integer) {
                         lx.i += 1
                         count += 1
                     }
+                    if v >= 55296 && v <= 56319 {
+                        // a high surrogate must be followed by \uXXXX (or \UXXXXXXXX) holding the low half
+                        let lo = -1
+                        if lx.i + 1 < n && src[lx.i] == 92 && (src[lx.i + 1] == 117 || src[lx.i + 1] == 85) {
+                            let w2 = 4
+                            if src[lx.i + 1] == 85 { w2 = 8 }
+                            let k = lx.i + 2
+                            let x = 0
+                            let got = 0
+                            while got < w2 && k < n && digitValue(src[k]) >= 0 {
+                                x = x * 16 + digitValue(src[k])
+                                k += 1
+                                got += 1
+                            }
+                            if got == w2 && x >= 56320 && x <= 57343 {
+                                lo = x
+                                lx.i = k
+                            }
+                        }
+                        if lo < 0 {
+                            lexError(lx, "invalid Unicode surrogate pair at or near \"" + slice(lx, lx.i, min(n, lx.i + 10)) + "\"", lx.i)
+                            return
+                        }
+                        v = 65536 + ((v - 55296) << 10) + (lo - 56320)
+                    } else if (v >= 56320 && v <= 57343) || v > 1114111 || v == 0 {
+                        lexError(lx, "invalid Unicode escape value at or near \"" + slice(lx, lx.i, min(n, lx.i + 10)) + "\"", lx.i)
+                        return
+                    }
                     addUtf8(buf, v)
                 } else {
                     buf.add(e)
@@ -720,6 +748,15 @@ function scanString(lx: Lex, s: Integer, escapes: Boolean, flags: Integer) {
             continue
         }
         break
+    }
+    // \x and octal escapes can spell bytes that are not UTF-8: reject them as PostgreSQL does
+    let bad = invalidUtf8At(buf)
+    if bad >= 0 {
+        let hex = "0123456789abcdef"
+        lexError(lx, "invalid byte sequence for encoding \"UTF8\": 0x" + hex.slice(buf[bad] >> 4, (buf[bad] >> 4) + 1) +
+            hex.slice(buf[bad] & 15, (buf[bad] & 15) + 1), s)
+        lx.toks.errorState = "22021"
+        return
     }
     push(lx, T_STR, 0, 0, s, lx.i, 0, flagsOut, addText(lx, Text(buf)))
 }

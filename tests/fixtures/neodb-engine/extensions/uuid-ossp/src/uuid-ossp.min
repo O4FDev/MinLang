@@ -1,0 +1,117 @@
+// uuid-ossp for neo-db: the ten functions of Postgres's uuid-ossp extension, written against neodb-sdk.
+// uuid values are text in neo-db, so every function takes and returns text in the canonical 8-4-4-4-12 form.
+use "neodb-sdk" as sdk
+use "./hash.min" as hash
+
+public function extension(): sdk.Extension {
+    let x = sdk.extension("uuid-ossp", "1.1", "generate universally unique identifiers (UUIDs)")
+    x.define("uuid_nil", [], "text", function(call) { call.returnText("00000000-0000-0000-0000-000000000000") })
+    x.define("uuid_ns_dns", [], "text", function(call) { call.returnText("6ba7b810-9dad-11d1-80b4-00c04fd430c8") })
+    x.define("uuid_ns_url", [], "text", function(call) { call.returnText("6ba7b811-9dad-11d1-80b4-00c04fd430c8") })
+    x.define("uuid_ns_oid", [], "text", function(call) { call.returnText("6ba7b812-9dad-11d1-80b4-00c04fd430c8") })
+    x.define("uuid_ns_x500", [], "text", function(call) { call.returnText("6ba7b814-9dad-11d1-80b4-00c04fd430c8") })
+    x.define("uuid_generate_v3", ["text", "text"], "text", function(call) { nameBased(call, 3) })
+    x.define("uuid_generate_v5", ["text", "text"], "text", function(call) { nameBased(call, 5) })
+    x.defineVolatile("uuid_generate_v4", [], "text", function(call) { randomBased(call) })
+    x.defineVolatile("uuid_generate_v1", [], "text", function(call) { timeBased(call) })
+    x.defineVolatile("uuid_generate_v1mc", [], "text", function(call) { timeBased(call) })
+    return x
+}
+
+function hexDigit(c: Integer): Integer {
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    if c >= 65 && c <= 70 { return c - 55 }
+    return -1
+}
+
+// 16 bytes of a uuid's text form (hyphens and braces ignored, like uuid_in), or empty on bad input.
+function parse(call: sdk.Call, i: Integer): Bytes {
+    let out = Bytes()
+    let k = 0
+    let hi = -1
+    while k < call.length(i) {
+        let c = call.byte(i, k)
+        if c != 45 && c != 123 && c != 125 {
+            let d = hexDigit(c)
+            if d < 0 { return Bytes() }
+            if hi < 0 {
+                hi = d
+            } else {
+                out.add(hi * 16 + d)
+                hi = -1
+            }
+        }
+        k += 1
+    }
+    if out.length != 16 || hi >= 0 { return Bytes() }
+    return out
+}
+
+function format(call: sdk.Call, b: Bytes) {
+    let digits = Bytes("0123456789abcdef")
+    let out = call.output
+    let i = 0
+    while i < 16 {
+        if i == 4 || i == 6 || i == 8 || i == 10 { out.add(45) }
+        out.add(digits[b[i] / 16])
+        out.add(digits[b[i] % 16])
+        i += 1
+    }
+}
+
+function stamp(b: Bytes, version: Integer) {
+    b[6] = (b[6] % 16) + version * 16
+    b[8] = (b[8] % 64) + 128
+}
+
+// v3 (MD5) and v5 (SHA-1) of namespace + name.
+deterministic function nameBased(call: sdk.Call, version: Integer) {
+    let ns = parse(call, 0)
+    if ns.length == 0 {
+        call.fail("22P02", "invalid input syntax for type uuid: \"" + call.text(0) + "\"")
+        return
+    }
+    let data = Bytes()
+    data.addBytes(ns)
+    data.addBytes(call.bytes(1))
+    let digest = hash.md5(data)
+    if version == 5 { digest = hash.sha1(data) }
+    let b = digest.slice(0, 16)
+    stamp(b, version)
+    format(call, b)
+}
+
+function randomBased(call: sdk.Call) {
+    let b = call.randomBytes(16)
+    stamp(b, 4)
+    format(call, b)
+}
+
+// Time-based: 60-bit count of 100 ns intervals since 1582-10-15, random clock sequence, random multicast node.
+function timeBased(call: sdk.Call) {
+    let t = call.clockMicros() * 10 + 122192928000000000
+    let r = call.randomBytes(8)
+    let b = Bytes(16)
+    let low = t % 4294967296
+    let mid = (t / 4294967296) % 65536
+    let high = (t / 281474976710656) % 4096
+    b[0] = (low / 16777216) % 256
+    b[1] = (low / 65536) % 256
+    b[2] = (low / 256) % 256
+    b[3] = low % 256
+    b[4] = mid / 256
+    b[5] = mid % 256
+    b[6] = high / 256
+    b[7] = high % 256
+    b[8] = r[0]
+    b[9] = r[1]
+    let i = 10
+    while i < 16 {
+        b[i] = r[i - 8]
+        i += 1
+    }
+    b[10] = b[10] | 1
+    stamp(b, 1)
+    format(call, b)
+}

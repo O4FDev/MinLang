@@ -1,0 +1,105 @@
+// The Postgres bit(n) type, written as a built-in extension: neo-db's own core types use the same SDK as
+// third-party extensions. Stored as int32 bit count (little-endian) followed by the bits, most significant first.
+use "neodb-sdk" as sdk
+
+public function extension(): sdk.Extension {
+    let x = sdk.builtin("bit", "fixed-length bit strings")
+    let bit = x.type("bit", function(call) { bitIn(call) }, function(call) { bitOut(call) })
+    bit.postgresOids(1560, 1561, "V")
+    bit.binary(function(call) { bitRecv(call) }, function(call) { bitSend(call) })
+    bit.modifier(function(call) { bitCheck(call) })
+    return x
+}
+
+function bits(call: sdk.Call): Integer { return call.int32(0, 0) }
+
+function checkLength(call: sdk.Call, n: Integer) {
+    if call.modifier >= 0 && n != call.modifier {
+        call.fail("22026", "bit string length " + Text(n) + " does not match type bit(" + Text(call.modifier) + ")")
+    }
+}
+
+deterministic function bitIn(call: sdk.Call) {
+    let n = call.length(0)
+    let out = call.output
+    out.addInt32(n)
+    let acc = 0
+    let i = 0
+    while i < n {
+        let c = call.byte(0, i)
+        if c != 48 && c != 49 {
+            call.fail("22P02", "\"" + Text(call.bytes(0).slice(i, i + 1)) + "\" is not a valid binary digit")
+            return
+        }
+        acc = acc * 2 + (c - 48)
+        if i % 8 == 7 {
+            out.add(acc)
+            acc = 0
+        }
+        i += 1
+    }
+    if n % 8 != 0 {
+        let pad = 8 - n % 8
+        while pad > 0 {
+            acc = acc * 2
+            pad -= 1
+        }
+        out.add(acc)
+    }
+    checkLength(call, n)
+}
+
+deterministic function bitOut(call: sdk.Call) {
+    let n = bits(call)
+    let out = call.output
+    let i = 0
+    while i < n {
+        let byte = call.byte(0, 4 + i / 8)
+        let shift = 7 - i % 8
+        let b = byte
+        while shift > 0 {
+            b = b / 2
+            shift -= 1
+        }
+        out.add(48 + b % 2)
+        i += 1
+    }
+}
+
+// Wire format: int32 bit count (big-endian), then the bit bytes.
+deterministic function bitRecv(call: sdk.Call) {
+    let len = call.length(0)
+    if len < 4 {
+        call.fail("22P03", "insufficient data left in message")
+        return
+    }
+    let n = ((call.byte(0, 0) * 256 + call.byte(0, 1)) * 256 + call.byte(0, 2)) * 256 + call.byte(0, 3)
+    if n < 0 || len != 4 + (n + 7) / 8 {
+        call.fail("22P03", "invalid length in external bit string")
+        return
+    }
+    let out = call.output
+    out.addInt32(n)
+    let i = 4
+    while i < len {
+        out.add(call.byte(0, i))
+        i += 1
+    }
+    checkLength(call, n)
+}
+
+deterministic function bitSend(call: sdk.Call) {
+    let n = bits(call)
+    let out = call.output
+    out.add((n / 16777216) % 256)
+    out.add((n / 65536) % 256)
+    out.add((n / 256) % 256)
+    out.add(n % 256)
+    let i = 4
+    while i < call.length(0) {
+        out.add(call.byte(0, i))
+        i += 1
+    }
+}
+
+deterministic function bitCheck(call: sdk.Call) { checkLength(call, bits(call)) }
