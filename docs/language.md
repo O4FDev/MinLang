@@ -1659,6 +1659,27 @@ let callbacks = [handler.apply]
 print(callbacks[0](10))  // 12
 ```
 
+A top-level function's name, read without calling it, is a callable value of
+its own type. There is no wrapper to write:
+
+```minyar
+function double(value: Integer): Integer { return value * 2 }
+function apply(f: (Integer) -> Integer, value: Integer): Integer { return f(value) }
+print(apply(double, 21))        // 42
+function descending(a: Integer, b: Integer): Integer { return b - a }
+print([3, 1, 2].sortedBy(descending)[0])   // 3
+```
+
+Imported functions work the same way (`registry.define("total", sdk.first)`).
+The value captures nothing, so it costs one small allocation, like an
+anonymous function without captures, and calls forward directly to the
+function. If the function's type differs from the one the place needs, the
+error names both types. A local or parameter with the same name hides the
+function, as for calls. `main`, thread entries and interrupt handlers cannot be
+values. Generic functions are instantiated by calls, so pass a concrete wrapper
+instead. Under `--incremental`, a program that reads a function as a value uses
+the ordinary full frontend.
+
 Without a contextual callable type, anonymous parameters need annotations and
 an omitted return type means `Nothing`. The earlier
 `Callback<ArgumentTypes..., ReturnType>` spelling remains accepted for source

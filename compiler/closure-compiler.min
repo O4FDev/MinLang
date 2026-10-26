@@ -660,3 +660,441 @@ function finishCallbackGraph(returns: List<Integer>, counts: List<Integer>, fiel
         }
     }
 }
+
+// A top-level function named where a value is expected becomes a callback:
+// `register("f", f)` instead of `register("f", function(call) { f(call) })`.
+// The callback record holds a forwarding function and the creator's domain;
+// it has no environment. These helpers find such names before declarations
+// are typed, so the callback feature and each signature exist in time.
+// scopeDepths[0] counts the live bindings; binding n is names[n], depths[n + 1].
+function functionValueBinder(scopeNames: List<Text>, scopeDepths: List<Integer>, name: Text, depth: Integer) {
+    let count = scopeDepths[0]
+    if count < scopeNames.length { scopeNames[count] = name; scopeDepths[count + 1] = depth } else { scopeNames.add(name); scopeDepths.add(depth) }
+    scopeDepths[0] = count + 1
+}
+
+function functionValueShadowed(scopeNames: List<Text>, scopeDepths: List<Integer>, name: Text, insideDeclaration: Boolean): Boolean {
+    let index = scopeDepths[0] - 1
+    while index >= 0 {
+        if scopeNames[index] == name && (!insideDeclaration || scopeDepths[index + 1] > 0) { return true }
+        index = index - 1
+    }
+    return false
+}
+
+// Parameters of the function header whose '(' is at `open` belong to its body.
+function functionValueParameters(kinds: List<Integer>, texts: List<Text>, open: Integer, scopeNames: List<Text>, scopeDepths: List<Integer>, depth: Integer): Integer {
+    let position = open + 1
+    let round = 1
+    while kinds[position] != 0 && round > 0 {
+        if kinds[position] == 4 && texts[position] == "(" { round = round + 1 }
+        if kinds[position] == 4 && texts[position] == ")" { round = round - 1 }
+        if round == 1 && kinds[position] == 1 && (texts[position - 1] == "(" || texts[position - 1] == ",") { functionValueBinder(scopeNames, scopeDepths, texts[position], depth) }
+        position = position + 1
+    }
+    return position
+}
+
+// Whether the identifier at `position` is read as a value rather than called,
+// declared, selected as a member or named by a builtin that takes a function name.
+function functionValuePosition(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    if kinds[position + 1] == 4 && (texts[position + 1] == "(" || texts[position + 1] == ":") { return false }
+    // A keyword such as `record Name` or `native "library"`, never a value.
+    if kinds[position + 1] == 1 || kinds[position + 1] == 3 { return false }
+    if position == 0 { return true }
+    let previous = texts[position - 1]
+    if previous == "." || previous == "function" || previous == "let" || previous == "constant" || previous == "global" || previous == "for" || previous == "as" { return false }
+    if previous == "(" && position >= 2 {
+        let builtin = texts[position - 2]
+        if builtin == "parallelEntry" || builtin == "startThread" || builtin == "startThreadResult" { return false }
+    }
+    return true
+}
+
+// Declaration nodes of the functions that some expression uses as a value.
+// Block scopes, parameters, `let`/`for` bindings and pattern payloads shadow
+// function names; a binding the scan does not model can only add a
+// declaration (costing the callback feature), never hide a real use. A
+// module's code names its own functions unqualified, so an unqualified name
+// matches only declarations from the same source file.
+function functionValueDeclarations(tree: SyntaxTree, kinds: List<Integer>, texts: List<Text>, lines: SourceMap): List<Integer> {
+    let used: List<Integer> = []
+    if tree.functionValueUses.length == 0 { return used }
+    let names: List<Text> = []
+    let declared: List<Text> = []
+    let paths: List<Integer> = []
+    let nameKinds: List<Integer> = []
+    let nodes: List<Integer> = []
+    let declaration = 0
+    while declaration < tree.declarations.length {
+        let node = tree.declarations[declaration]
+        let start = tree.nodes[node].start
+        if tree.nodes[node].kind == 1 && kinds[start + 1] == 1 && texts[start + 2] == "(" && !resultPrefix(texts[start + 1], "minyar_generic_function_") {
+            names.add(readableDeclarationName(texts[start + 1]))
+            declared.add(texts[start + 1])
+            paths.add(functionValuePath(lines, start + 1))
+            nameKinds.add(1)
+            nodes.add(node)
+        }
+        declaration = declaration + 1
+    }
+    if names.length == 0 { return used }
+    let lookup = buildDeclarationIndex(names, nameKinds)
+    let rawLookup = buildDeclarationIndex(declared, nameKinds)
+    // Most names that match a function are locals or parameters elsewhere.
+    // prepareSyntaxIndexes noted each possible use; only the declarations that
+    // hold one, and top-level statements, need their scopes modelled.
+    let needed: List<Boolean> = []
+    while needed.length < tree.declarations.length { needed.add(false) }
+    let possible = false
+    let cursor = 0
+    let use = 0
+    while use < tree.functionValueUses.length {
+        let position = tree.functionValueUses[use]
+        let text = texts[position]
+        let qualified = text[0] == '"' || resultPrefix(text, "minyar_module_")
+        if (!qualified && findIndexedSymbol(lookup, names, nameKinds, text, 1) >= 0) || (qualified && findIndexedSymbol(rawLookup, declared, nameKinds, text, 1) >= 0) {
+            possible = true
+            while cursor < tree.declarations.length && tree.nodes[tree.declarations[cursor]].end <= position { cursor = cursor + 1 }
+            if cursor < tree.declarations.length && tree.nodes[tree.declarations[cursor]].start <= position { needed[cursor] = true }
+        }
+        use = use + 1
+    }
+    if !possible { return used }
+    // Most identifiers are locals: one table read by length and first and
+    // last characters skips them. Flag 1 marks `function`, flag 2 a possible
+    // function name.
+    let filter: List<Integer> = []
+    while filter.length < 16384 { filter.add(0) }
+    filter[functionValueFilterSlot("function", 16384)] = 1
+    let index = 0
+    while index < names.length {
+        let slot = functionValueFilterSlot(names[index], 16384)
+        if filter[slot] < 2 { filter[slot] = filter[slot] + 2 }
+        slot = functionValueFilterSlot(declared[index], 16384)
+        if filter[slot] < 2 { filter[slot] = filter[slot] + 2 }
+        index = index + 1
+    }
+    // Declarations sharing a readable name, as a chain from the indexed one.
+    let nextSame: List<Integer> = []
+    let lastSame: List<Integer> = []
+    index = 0
+    while index < names.length { nextSame.add(-1); lastSame.add(index); index = index + 1 }
+    index = 0
+    while index < names.length {
+        let first = findIndexedSymbol(lookup, names, nameKinds, names[index], 1)
+        if first != index {
+            nextSame[lastSame[first]] = index
+            lastSame[first] = index
+        }
+        index = index + 1
+    }
+    cursor = 0
+    let position = 0
+    let marked: List<Boolean> = []
+    while marked.length < names.length { marked.add(false) }
+    // Bindings matter only when they share a function's name.
+    let scopeNames: List<Text> = []
+    let scopeDepths: List<Integer> = [0]
+    let pendingName = ""
+    let pendingDepth = -1
+    let depth = 0
+    let insideDeclaration = false
+    while kinds[position] != 0 {
+        let kind = kinds[position]
+        if kind == 1 {
+            let text = texts[position]
+            let flags = filter[functionValueFilterSlot(text, 16384)]
+            if flags % 2 == 1 && text == "function" && texts[position + 1] == "(" {
+                position = functionValueParameters(kinds, texts, position + 1, scopeNames, scopeDepths, depth + 1) - 1
+            } else if flags % 2 == 1 && text == "function" && kinds[position + 1] == 1 && texts[position + 2] == "(" {
+                if depth == 0 {
+                    insideDeclaration = true
+                    while cursor < tree.declarations.length && tree.nodes[tree.declarations[cursor]].start < position { cursor = cursor + 1 }
+                }
+                if depth == 0 && cursor < tree.declarations.length && tree.nodes[tree.declarations[cursor]].start == position && !needed[cursor] {
+                    // No possible use inside: skip the whole declaration.
+                    position = tree.nodes[tree.declarations[cursor]].end - 1
+                    insideDeclaration = false
+                } else {
+                    position = functionValueParameters(kinds, texts, position + 2, scopeNames, scopeDepths, depth + 1) - 1
+                }
+            } else if flags >= 2 {
+                let qualified = text[0] == '"' || resultPrefix(text, "minyar_module_")
+                let candidate = -1
+                if qualified { candidate = findIndexedSymbol(rawLookup, declared, nameKinds, text, 1) } else { candidate = findIndexedSymbol(lookup, names, nameKinds, text, 1) }
+                let previous = ""
+                if position > 0 { previous = texts[position - 1] }
+                if candidate < 0 {
+                } else if previous == "let" || previous == "constant" {
+                    pendingName = text
+                    pendingDepth = depth
+                } else if previous == "for" {
+                    functionValueBinder(scopeNames, scopeDepths, text, depth + 1)
+                } else if functionValuePatternAt(kinds, texts, position) {
+                    functionValueBinder(scopeNames, scopeDepths, text, depth + 1)
+                } else if qualified {
+                    // An imported function, already qualified by the module pass.
+                    if functionValuePosition(kinds, texts, position) && !marked[candidate] {
+                        marked[candidate] = true
+                        used.add(nodes[candidate])
+                    }
+                } else if functionValuePosition(kinds, texts, position) && !functionValueShadowed(scopeNames, scopeDepths, text, insideDeclaration) {
+                    let path = functionValuePath(lines, position)
+                    while candidate >= 0 {
+                        if !marked[candidate] && (declared[candidate] == text || paths[candidate] == path) {
+                            marked[candidate] = true
+                            used.add(nodes[candidate])
+                        }
+                        candidate = nextSame[candidate]
+                    }
+                }
+            }
+        } else if kind == 4 {
+            let text = texts[position]
+            if text.length == 1 {
+                let character = text[0]
+                if character == '{' {
+                    depth = depth + 1
+                } else if character == '}' {
+                    if depth > 0 {
+                        depth = depth - 1
+                        while scopeDepths[0] > 0 && scopeDepths[scopeDepths[0]] > depth { scopeDepths[0] = scopeDepths[0] - 1 }
+                        if pendingDepth > depth { pendingDepth = -1 }
+                        if depth == 0 { insideDeclaration = false }
+                    }
+                    if pendingDepth == depth {
+                        functionValueBinder(scopeNames, scopeDepths, pendingName, depth)
+                        pendingDepth = -1
+                    }
+                }
+            }
+        } else if kind == 6 && pendingDepth == depth {
+            functionValueBinder(scopeNames, scopeDepths, pendingName, depth)
+            pendingDepth = -1
+        }
+        position = position + 1
+    }
+    return used
+}
+
+// Possible function-name slots for prepareSyntaxIndexes, or an empty List
+// when the tree declares no function.
+function functionValueNameFilter(tree: SyntaxTree, kinds: List<Integer>, texts: List<Text>): List<Boolean> {
+    let filter: List<Boolean> = []
+    let functions = 0
+    let declaration = 0
+    while declaration < tree.declarations.length {
+        if tree.nodes[tree.declarations[declaration]].kind == 1 { functions = functions + 1 }
+        declaration = declaration + 1
+    }
+    if functions == 0 { return filter }
+    // Small programs get a small table: filling it is part of every compile.
+    let size = 16384
+    if functions < 64 { size = 1024 }
+    while filter.length < size { filter.add(false) }
+    declaration = 0
+    while declaration < tree.declarations.length {
+        let start = tree.nodes[tree.declarations[declaration]].start
+        if tree.nodes[tree.declarations[declaration]].kind == 1 && kinds[start + 1] == 1 && texts[start + 2] == "(" {
+            filter[functionValueFilterSlot(texts[start + 1], size)] = true
+            filter[functionValueFilterSlot(readableDeclarationName(texts[start + 1]), size)] = true
+        }
+        declaration = declaration + 1
+    }
+    return filter
+}
+
+// Length and first and last characters: module-qualified function names
+// share their first characters, so the last one keeps locals apart.
+function functionValueFilterSlot(name: Text, size: Integer): Integer {
+    if name.length == 0 { return 0 }
+    if size == 1024 { return (name.length % 4) * 256 + (Integer(name[0]) % 16) * 16 + Integer(name[name.length - 1]) % 16 }
+    return (name.length % 16) * 1024 + (Integer(name[0]) % 32) * 32 + Integer(name[name.length - 1]) % 32
+}
+
+function functionValuePath(lines: SourceMap, position: Integer): Integer {
+    if position < lines.pathIndices.length { return lines.pathIndices[position] }
+    return 0
+}
+
+// A payload binding in a match arm's or an `is` pattern: `Case(name)`,
+// `Some(Some(name))`, or a whole-value arm `name { ... }` / `name where ...`.
+// Callers ask only for names that are also functions, so looking back is rare.
+function functionValuePatternAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    let previous = texts[position - 1]
+    let next = texts[position + 1]
+    let payload = (previous == "(" || previous == ",") && (next == ")" || next == ",")
+    if !payload && next != "{" && next != "where" { return false }
+    // Inside parentheses, an `is` before them on the same line makes a pattern.
+    let cursor = position - 1
+    let round = 0
+    while cursor > 0 && kinds[cursor] != 6 && !(kinds[cursor] == 4 && (texts[cursor] == "{" || texts[cursor] == "}")) {
+        if kinds[cursor] == 4 && texts[cursor] == ")" { round = round + 1 }
+        if kinds[cursor] == 4 && texts[cursor] == "(" { round = round - 1 }
+        if kinds[cursor] == 1 && texts[cursor] == "is" && round <= 0 { return true }
+        cursor = cursor - 1
+    }
+    // A match arm: the enclosing block opens with `match subject {`.
+    let depth = 0
+    cursor = position - 1
+    while cursor > 0 {
+        if kinds[cursor] == 4 && texts[cursor] == "}" { depth = depth + 1 }
+        if kinds[cursor] == 4 && texts[cursor] == "{" {
+            if depth == 0 {
+                let start = cursor - 1
+                while start > 0 && kinds[start] != 6 && !(kinds[start] == 4 && (texts[start] == "{" || texts[start] == "}")) {
+                    if kinds[start] == 1 && texts[start] == "match" { return true }
+                    start = start - 1
+                }
+                return false
+            }
+            depth = depth - 1
+        }
+        cursor = cursor - 1
+    }
+    return false
+}
+
+// Register the callback signature of every function used as a value. Runs
+// after prepareCallbackSymbols, before declarations are typed.
+function prepareFunctionValueSymbols(tree: SyntaxTree, kinds: List<Integer>, texts: List<Text>, lines: SourceMap, names: List<Text>, symbols: List<Integer>, locations: List<Text>, returns: List<Integer>, counts: List<Integer>, declarations: List<Integer>) {
+    let index = 0
+    while index < declarations.length {
+        let start = tree.nodes[declarations[index]].start
+        let cursor: List<Integer> = [start + 3]
+        let types: List<Integer> = []
+        while !tokenIs(kinds, texts, cursor, ")") {
+            if kinds[cursor[0]] != 1 { failAtToken(lines, cursor[0], "expected a parameter name") }
+            cursor[0] = cursor[0] + 1
+            expectToken(kinds, texts, lines, cursor, ":")
+            types.add(takeValueType(kinds, texts, lines, cursor, names, symbols))
+            if tokenIs(kinds, texts, cursor, ",") { cursor[0] = cursor[0] + 1 }
+        }
+        cursor[0] = cursor[0] + 1
+        let result = 5
+        if tokenIs(kinds, texts, cursor, ":") {
+            cursor[0] = cursor[0] + 1
+            result = takeType(kinds, texts, lines, cursor, names, symbols)
+        }
+        types.add(result)
+        registerCallbackType(types, names, symbols)
+        index = index + 1
+    }
+    while counts.length < names.length {
+        counts.add(0)
+        returns.add(0)
+        locations.add("private callback signature")
+    }
+}
+
+function functionValueSignature(context: CompilerContext, types: List<Integer>): Text {
+    let pieces: List<Text> = ["("]
+    let index = 0
+    while index + 1 < types.length {
+        if index > 0 { pieces.add(", ") }
+        pieces.add(diagnosticType(context, types[index]))
+        index = index + 1
+    }
+    pieces.add(") -> " + diagnosticType(context, types[types.length - 1]))
+    return joinText(pieces)
+}
+
+// One forwarding function per callee and module: `(environment, arguments)`
+// to the callee's ordinary ABI. It owns nothing, so it needs no frame.
+function functionValueThunk(context: CompilerContext, globals: List<Text>, function: Integer, types: List<Integer>): Text {
+    let callee = context.functionIRNames[function]
+    let bare = callee
+    if bare.length >= 2 && bare[0] == '"' { bare = bare.slice(1, bare.length - 1) }
+    let thunk = "\".minyar.value|" + bare + "\""
+    let marker = "; minyar-function-value: " + bare + "\n"
+    if findText(globals, marker) >= 0 { return thunk }
+    globals.add(marker)
+    let origin = context.syntax.nodes[context.syntax.symbolNodes[function]].start + 1
+    let parts: List<Text> = []
+    emitDebugOrigin(parts, context.tokenLines, origin, "function")
+    let result = types[types.length - 1]
+    parts.add("define internal " + llvmReturnType(result) + " @" + thunk + "(ptr %environment")
+    let parameter = 0
+    while parameter + 1 < types.length {
+        parts.add(", " + llvmType(types[parameter]) + " %argument." + Text(parameter))
+        parameter = parameter + 1
+    }
+    parts.add(") uwtable {\nentry:\n  ")
+    if result != 5 { parts.add("%result = ") }
+    parts.add("call " + llvmReturnType(result) + " @" + callee + "(")
+    parameter = 0
+    while parameter + 1 < types.length {
+        if parameter > 0 { parts.add(", ") }
+        parts.add(llvmType(types[parameter]) + " %argument." + Text(parameter))
+        parameter = parameter + 1
+    }
+    parts.add(")\n")
+    if result == 5 { parts.add("  ret void\n") } else { parts.add("  ret " + llvmType(result) + " %result\n") }
+    parts.add("}\n\n")
+    // No runtime trace row: a stack trace shows the function's own frame once.
+    globals.add(joinText(parts))
+    return thunk
+}
+
+// A module's own functions keep their unqualified names in its code until
+// they are called, so a value read finds them through its source file.
+function functionValueSymbol(context: CompilerContext, position: Integer, name: Text): Integer {
+    let function = findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name)
+    if function >= 0 { return function }
+    let symbol = 0
+    while symbol < context.functionNames.length {
+        if context.symbolKinds[symbol] == 1 && !resultPrefix(context.functionNames[symbol], "minyar_generic_function_") && readableDeclarationName(context.functionNames[symbol]) == name && diagnosticSameModule(context, symbol, position) { return symbol }
+        symbol = symbol + 1
+    }
+    return -1
+}
+
+function parseFunctionValue(context: CompilerContext, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, function: Integer): Text {
+    let tokenLines = context.tokenLines
+    let functionNames = context.functionNames
+    let counts = context.functionParameterCounts
+    let position = state[0]
+    let name = functionNames[function]
+    let readable = readableDeclarationName(name)
+    let span = sourceSpan(tokenLines, tokenLines.inputPath, position, position + 1)
+    if name == "main" { failDiagnostic(span, "the executable entry main cannot be used as a value", "", "move the shared work into another function and pass that function") }
+    let declaration = context.syntax.symbolNodes[function]
+    if declaration >= 0 && isInterruptFunctionAt(context.tokenKinds, context.tokenTexts, context.syntax.nodes[declaration].start) {
+        failDiagnostic(span, "interrupt handler '" + readable + "' cannot be used as a value", "", "the hardware calls interrupt handlers; pass an ordinary function instead")
+    }
+    if findText(globals, "; minyar-thread-entry: " + name + "\n") >= 0 {
+        failDiagnostic(span, "thread entry '" + readable + "' cannot be used as a value", "", "start it with startThread(" + readable + ", ...)")
+    }
+    let types: List<Integer> = []
+    let first = functionParameterOffset(counts, function)
+    let parameter = 0
+    while parameter < counts[function] {
+        types.add(context.functionParameterTypes[first + parameter])
+        parameter = parameter + 1
+    }
+    types.add(context.functionReturnTypes[function])
+    let expected = resultType[0]
+    if isCallbackType(expected, functionNames) && callbackSignatureName(types) != functionNames[recordTypeIndex(expected)] {
+        let wanted = callbackSignatureTypes(functionNames[recordTypeIndex(expected)])
+        let help = "pass a function of that type, or adapt this one in an anonymous function"
+        if wanted.length != types.length { help = "this place calls it with " + Text(wanted.length - 1) + " argument(s); " + help }
+        failDiagnostic(span, "function '" + readable + "' has type " + functionValueSignature(context, types) + ", but this place needs " + functionValueSignature(context, wanted), "", help)
+    }
+    let signature = findSymbol(functionNames, context.symbolKinds, callbackSignatureName(types), 4)
+    if signature < 0 || (state[15] % 2) == 0 { failDiagnostic(span, "function '" + readable + "' cannot be used as a value here", "", "pass it as an anonymous function: function(...) { " + readable + "(...) }") }
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "indirect", "function value", "unreviewed") }
+    let thunk = functionValueThunk(context, globals, function, types)
+    let callback = valueName(textState, newTemporary(state))
+    output.add("  " + callback + " = call ptr @minyar_record_new_scalar(i64 3)\n")
+    let owner = keepReference(output, state, callback, 1000 + signature)
+    let code = valueAsListSlot(output, textState, state, "@" + thunk, 8)
+    output.add("  call void @minyar_record_set_scalar(ptr " + callback + ", i64 0, i64 " + code + ")\n")
+    let domain = valueName(textState, newTemporary(state))
+    output.add("  " + domain + " = call i64 @minyar_callback_domain()\n")
+    output.add("  call void @minyar_record_set_scalar(ptr " + callback + ", i64 2, i64 " + domain + ")\n")
+    state[0] = position + 1
+    setType(resultType, 1000 + signature)
+    markOwner(resultType, owner)
+    return callback
+}

@@ -26,6 +26,7 @@ record SyntaxTree {
     active: Integer
     lastValue: Integer
     topLevel: Boolean
+    functionValueUses: List<Integer>
 }
 
 record SourceSpan {
@@ -302,7 +303,8 @@ function newSyntaxTree(sources: SourceMap, file: Text, tokenCount: Integer): Syn
     let declarations: List<Integer> = []
     let symbolNodes: List<Integer> = []
     let callFreeIndexes: List<Boolean> = []
-    let tree = SyntaxTree { nodes: nodes, declarations: declarations, symbolNodes: symbolNodes, callFreeIndexes: callFreeIndexes, sources: sources, file: file, active: 0, lastValue: -1, topLevel: false }
+    let functionValueUses: List<Integer> = []
+    let tree = SyntaxTree { nodes: nodes, declarations: declarations, symbolNodes: symbolNodes, callFreeIndexes: callFreeIndexes, sources: sources, file: file, active: 0, lastValue: -1, topLevel: false, functionValueUses: functionValueUses }
     appendSyntaxNode(tree, 0, 0, tokenCount, -1, 5, -1)
     return tree
 }
@@ -418,15 +420,28 @@ function bindSyntaxDeclarations(tree: SyntaxTree, tokens: List<Integer>, texts: 
 
 // Record lexical ownership lookahead once, before the emitting parser needs it.
 // A closing ']' followed by '(' counts as a call, matching callAt's contract.
+// The same pass notes identifiers that may name a declared function as a value
+// (see functionValueDeclarations); a table read by length and first character
+// keeps that to a few instructions per identifier.
 function prepareSyntaxIndexes(tree: SyntaxTree, kinds: List<Integer>, texts: List<Text>) {
     let openings: List<Integer> = []
     let callStarts: List<Integer> = []
+    // After the module pass, only a program it saw reading a function as a
+    // value needs the filter (features 512 and 128).
+    let features = tree.sources.features
+    let filter: List<Boolean> = []
+    if features / 512 % 2 == 0 || features / 128 % 2 != 0 { filter = functionValueNameFilter(tree, kinds, texts) }
+    let valueNames = filter.length > 0
     let depth = 0
     let calls = 0
     let position = 0
     while position < kinds.length {
         tree.callFreeIndexes.add(false)
         if position + 1 < kinds.length && callAt(kinds, texts, position) { calls = calls + 1 }
+        if valueNames && kinds[position] == 1 {
+            let text = texts[position]
+            if text.length > 0 && filter[functionValueFilterSlot(text, filter.length)] && functionValuePosition(kinds, texts, position) { tree.functionValueUses.add(position) }
+        }
         if kinds[position] == 4 {
             if texts[position] == "[" {
                 if depth == openings.length { openings.add(position); callStarts.add(calls) }
@@ -448,7 +463,6 @@ function syntaxIndexHasNoCalls(tree: SyntaxTree, position: Integer): Boolean {
 
 function parseSyntaxDeclarations(kinds: List<Integer>, texts: List<Text>, sources: SourceMap, file: Text, starts: List<Integer>, ends: List<Integer>): SyntaxTree {
     let tree = newSyntaxTree(sources, file, kinds.length - 1)
-    prepareSyntaxIndexes(tree, kinds, texts)
     if starts.length > 0 {
         let scanned = 0
         let declaration = 0
@@ -460,6 +474,7 @@ function parseSyntaxDeclarations(kinds: List<Integer>, texts: List<Text>, source
             }
             scanned = scanned + 1
         }
+        prepareSyntaxIndexes(tree, kinds, texts)
         return tree
     }
     let cursor: List<Integer> = [0]
@@ -472,6 +487,7 @@ function parseSyntaxDeclarations(kinds: List<Integer>, texts: List<Text>, source
         addSyntaxDeclaration(tree, kinds, texts, start, cursor[0])
         skipTerminators(kinds, cursor)
     }
+    prepareSyntaxIndexes(tree, kinds, texts)
     return tree
 }
 
