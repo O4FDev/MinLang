@@ -222,7 +222,8 @@ both endpoints of traced ownership operations use the physical payload type.
   made a user call or called a runtime operation that can release a holder
   (List slot, record field or Map value stores). If and while conditions
   settle on their own; pattern conditions, and statements containing nested
-  statements, always take the count. `--scope-owners` keeps the borrows: its lowering derives
+  statements, always take the count. A count taken this way is still released
+  by that statement's cleanup, like any other temporary. `--scope-owners` keeps the borrows: its lowering derives
   scope cells from them.
   A block's `let name = local[index]` binding (the root local not reassigned in
   the block) borrows its element like a parameter. A hidden guard owner is
