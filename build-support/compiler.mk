@@ -67,10 +67,17 @@ COMPILER_SOURCES = build/choice-builtins.min build/capability-builtins.min \
 
 COMPILER_LIBRARY_SOURCES = library/io.min library/process.min library/errors.min library/text.min
 
-build/compiler.min: $(COMPILER_LIBRARY_SOURCES) $(COMPILER_SOURCES) build-support/compiler.mk | build
-	cat $(COMPILER_SOURCES) > $@.tmp
-	awk '/^function [[:alnum:]_]+\(/ { name = $$0; sub(/^function /, "", name); sub(/\(.*/, "", name); if (seen[name]++) { print "duplicate compiler function" > "/dev/stderr"; exit 1 } }' $@.tmp
-	@if cmp -s "$@.tmp" "$@"; then rm "$@.tmp"; else mv "$@.tmp" "$@"; fi
+# The source list is a prerequisite through build/compiler-sources.list, rewritten (with a private temporary, so
+# concurrent makes never share a name) only when the list itself changes: editing a check recipe in this file does not
+# rebuild the compiler. build/compiler.min is always published when remade; a target that kept an older mtime than
+# its prerequisites would look stale to every later make, `make -q` and check-in-parallel's shared builds.
+COMPILER_SOURCE_LIST := $(shell mkdir -p build && list=build/compiler-sources.list && temporary=$$(mktemp "$$list.XXXXXXXX") && \
+	printf '%s\n' $(COMPILER_SOURCES) > "$$temporary" && { cmp -s "$$temporary" "$$list" && rm -f "$$temporary" || mv -f "$$temporary" "$$list"; } && echo "$$list")
+build/compiler.min: $(COMPILER_LIBRARY_SOURCES) $(COMPILER_SOURCES) $(COMPILER_SOURCE_LIST) | build
+	@set -e; temporary=$$(mktemp "$@.tmp.XXXXXXXX"); trap 'rm -f "$$temporary"' 0; \
+	cat $(COMPILER_SOURCES) > "$$temporary"; \
+	awk '/^function [[:alnum:]_]+\(/ { name = $$0; sub(/^function /, "", name); sub(/\(.*/, "", name); if (seen[name]++) { print "duplicate compiler function" > "/dev/stderr"; exit 1 } }' "$$temporary"; \
+	mv -f "$$temporary" "$@"
 
 build/stage0: bootstrap/stage0.c vendor/stb_ds.h build/.toolchain.json | build
 	"$(CC)" $(CPPFLAGS) $(CFLAGS) $< -o $@
