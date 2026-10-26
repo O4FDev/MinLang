@@ -387,18 +387,40 @@ function authorityCase(name: Text, target: Text): Outcome {
     return outcome(Bytes(), Bytes(), report, expected)
 }
 
-function receiptItem(directory: Text, name: Text, raw: Bytes, original: Text, role: Text, format: Text): json.Value {
-    io.writeBytesFile(directory + "/" + name, raw)
-    let digest = ledger.sha(raw)
+function receiptValue(original: Text, name: Text, digest: Text, bytes: Integer, role: Text, format: Text): json.Value {
     let value = data.object(["original", "retained", "sha256", "bytes", "source_before_sha256", "retained_sha256", "source_after_sha256", "pre_link_sha256", "post_link_sha256"],
-        [data.string(original), data.string(name), data.string(digest), data.number(raw.length), data.string(digest), data.string(digest), data.string(digest), data.string(digest), data.string(digest)])
+        [data.string(original), data.string(name), data.string(digest), data.number(bytes), data.string(digest), data.string(digest), data.string(digest), data.string(digest), data.string(digest)])
     if role != "" { value = data.with(value, "role", data.string(role)) }
     if format != "" { value = data.with(value, "format", data.string(format)) }
     return value
 }
+function receiptItem(directory: Text, name: Text, raw: Bytes, original: Text, role: Text, format: Text): json.Value {
+    io.writeBytesFile(directory + "/" + name, raw)
+    return receiptValue(original, name, ledger.sha(raw), raw.length, role, format)
+}
 function receiptFileItem(directory: Text, name: Text, path: Text): json.Value {
     let raw = files.readFile(path)
     return receiptItem(directory, name, raw, ledger.canonicalPath(path), "", "")
+}
+// Every receipt control binds the real Clang (282 MB for an LLVM release build). It is read and hashed once per run
+// into one read-only copy, which each receipt's build directory hard-links (or copies across file systems).
+record Shared { path: Text; original: Text; digest: Text; bytes: Integer }
+function sharedCompiler(store: Text): Shared {
+    let compiler = compilerPath()
+    let raw = files.readFile(compiler)
+    test.check(files.lastError() == 0, "cannot read the selected clang: " + compiler)
+    let copy = store + "/clang.bin"
+    io.writeBytesFile(copy, raw)
+    test.require(test.run(["chmod", "a-w", "--", copy], system.environment(), "", store + "/.freeze", 10), "read-only shared clang")
+    return Shared { path: copy; original: ledger.canonicalPath(compiler); digest: ledger.sha(raw); bytes: raw.length }
+}
+function sharedItem(directory: Text, name: Text, shared: Shared): json.Value {
+    let target = directory + "/" + name
+    if test.run(["ln", "--", shared.path, target], system.environment(), "", directory + "/.link-" + name, 10).status != 0 {
+        test.require(test.run(["cp", "--", shared.path, target], system.environment(), "", directory + "/.copy-" + name, 60), "copy shared " + name)
+    }
+    for log in [directory + "/.link-" + name, directory + "/.copy-" + name] { files.remove(log); files.remove(log + ".err") }
+    return receiptValue(shared.original, name, shared.digest, shared.bytes, "", "")
 }
 function compilerPath(): Text {
     let selected = system.getenv("MINYAR_TEST_CLANG")
@@ -407,7 +429,7 @@ function compilerPath(): Text {
     test.check(resolved != "", "receipt control needs a clang binary on PATH")
     return resolved
 }
-function receiptCase(name: Text, target: Text, driver: Text): Outcome {
+function receiptCase(name: Text, target: Text, driver: Text, shared: Shared): Outcome {
     let buildRoot = target + "/build"
     test.check(files.makeDirectory(buildRoot) == 0, "receipt build directory")
     let raw = receiptItem(buildRoot, "program.raw.ll", Bytes("define i32 @main() { ret i32 0 }\n"), target + "/server.ll", "program", "llvm")
@@ -415,7 +437,7 @@ function receiptCase(name: Text, target: Text, driver: Text): Outcome {
     for index in 0..6 { objects = objects.appended(receiptItem(buildRoot, "native-" + Text(index) + ".o", Bytes("mock-provider-" + Text(index)), target + "/provider-" + Text(index) + ".o", "provider", "native_object")) }
     let compiler = compilerPath()
     let driverItem = receiptFileItem(buildRoot, "clang-driver", driver)
-    let compilerItem = receiptFileItem(buildRoot, "clang.bin", compiler)
+    let compilerItem = sharedItem(buildRoot, "clang.bin", shared)
     let staged = target + "/.minyar-link-control/server"
     let final = data.with(receiptItem(buildRoot, "program", Bytes("mock-linked-output"), target + "/server", "", ""), "path", data.string(target + "/server"))
     let stagedItem = data.with(receiptItem(buildRoot, "program.staged", Bytes("mock-linked-output"), staged, "", ""), "path", data.string(staged))
@@ -552,9 +574,9 @@ function cliCase(name: Text, target: Text, checker: Text): Outcome {
     return result
 }
 
-function runCase(name: Text, target: Text, checker: Text, driver: Text): Outcome {
+function runCase(name: Text, target: Text, checker: Text, driver: Text, shared: Shared): Outcome {
     if quic.starts(name, "cli-") { return cliCase(name, target, checker) }
-    if quic.starts(name, "receipt-") { return receiptCase(name, target, driver) }
+    if quic.starts(name, "receipt-") { return receiptCase(name, target, driver, shared) }
     if quic.starts(name, "frontend-") || quic.starts(name, "endpoint-") { return authorityCase(name, target) }
     if name == "rfc-chacha-vector" {
         let material = quic.fromHex("9ac312a7f877468ebe69422748ad00a15443f18203a07d6060f688f30f21632b")
@@ -603,10 +625,15 @@ let checker = quic.root() + "/build/tooling/tests/quic-ledger-checker"
 let driver = quic.root() + "/build/tooling/tools/clang-driver"
 let rows: List<Text> = []
 let passed = true
+// Hard links need the shared copy on the evidence's own mount: beside the artifact directory, or a second scratch.
+let store = directory + ".link-tools"
+if scratch != "" { store = test.scratch() } else { test.check(files.makeDirectory(store) == 0, "cannot create the shared link tool directory") }
+let shared = Shared { path: ""; original: ""; digest: ""; bytes: 0 }
+for name in cases { if quic.starts(name, "receipt-") && shared.path == "" { shared = sharedCompiler(store) } }
 for name in cases {
     let target = directory + "/" + name
     test.check(files.makeDirectory(target) == 0, "cannot create case directory")
-    let result = runCase(name, target, checker, driver)
+    let result = runCase(name, target, checker, driver, shared)
     if result.checks.length > 0 {
         let keys: List<json.Value> = []
         for position in 0..result.checks.length { keys = keys.appended(data.boolean(result.values[position])) }
@@ -652,5 +679,5 @@ for name in cases {
 io.writeTextFile(directory + "/manifest.json", "{\n  \"schema_version\": 1,\n  \"status\": " + quic.string(status) + ",\n  \"inputs\": " + inputs + ",\n  \"declared_cases\": " + quic.quoted(cases) +
     ",\n  \"files\": {" + quic.joined(entries, ", ") + "},\n  \"file_bytes\": {" + quic.joined(sizes, ", ") + "},\n  \"case_inventory\": [" + quic.joined(inventory, ", ") + "]\n}\n")
 files.writeStandardOutput(report)
-if scratch != "" { test.removeTree(scratch) }
+if scratch != "" { test.removeTree(scratch); test.removeTree(store) }
 if !passed { exit(1) }
