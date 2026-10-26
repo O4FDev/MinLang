@@ -942,3 +942,28 @@ long long minyar_runtime_scopeNameEnd(MinyarText *line, long long start) {
         start++;
     return start;
 }
+
+/* compilerAppendIntegers and compilerFillIntegers in compiler/stages/source.min
+ * append source[start, end), or count copies of value, to target. Both take a
+ * CompilerIntegers record; this field order is their ABI. */
+enum { COMPILER_INTEGERS_TARGET, COMPILER_INTEGERS_SOURCE, COMPILER_INTEGERS_FIELDS };
+
+static MinyarList *compiler_integers(MinyarRecord *lists, int field) {
+    if (lists->length != COMPILER_INTEGERS_FIELDS)
+        minyar_stop("integer tables do not match the compiler runtime.");
+    return (MinyarList *)(uintptr_t)lists->values[field];
+}
+
+void minyar_runtime_compilerAppendIntegers(MinyarRecord *lists, long long start, long long end) {
+    token_append(compiler_integers(lists, COMPILER_INTEGERS_TARGET), compiler_integers(lists, COMPILER_INTEGERS_SOURCE),
+                 start, end);
+}
+
+void minyar_runtime_compilerFillIntegers(MinyarRecord *lists, long long count, long long value) {
+    MinyarList *target = compiler_integers(lists, COMPILER_INTEGERS_TARGET);
+    if (count < 0 || count > LLONG_MAX - target->length)
+        minyar_stop("this List became too large.");
+    list_reserve(target, target->length + count);
+    for (long long index = 0; index < count; index++)
+        target->values[target->length++] = value;
+}
