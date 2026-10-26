@@ -13,6 +13,15 @@ function occurrences(text: Text, needle: Text): Integer {
     return count
 }
 
+function genericCalls(llvm: Text): List<Text> {
+    let calls: List<Text> = []
+    for line in test.lines(llvm) {
+        let at = line.find("call ptr @.minyar.fn.minyar_generic_function_")
+        if at >= 0 { calls.add(line.slice(at + 9, line.find("("))) }
+    }
+    return calls
+}
+
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 let levels = ["-O0", "-O2"]
 let first = "function firstOr<Item>(values: List<Item>, fallback: Item): Item { if values.length == 0 { return fallback }; return values[0] }\n"
@@ -103,6 +112,20 @@ growing.add("print(sum)\n")
 fixtures.executes(frontend, joinText(growing), "32640\n", levels, 0, "", true)
 let grownLLVM = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
 test.check(occurrences(grownLLVM, "define ptr @.minyar.fn.minyar_generic_function_") == 256, "growing type index preserves one function per concrete record")
+
+// Instance names hash the instantiation, not first-use order: live patches bind stored function values by name,
+// so swapping the first uses of two same-ABI instances must not swap their names.
+let stableTypes = "record Apple { seeds: Integer }\nrecord Pear { label: Text }\nfunction tag<Item>(item: Item): Item { return item }\n"
+let appleUse = "let apple = tag(Apple { seeds: 1 })\n"
+let pearUse = "let pear = tag(Pear { label: \"ripe\" })\n"
+let shown = "print(apple.seeds)\nprint(pear.label)\n"
+fixtures.executes(frontend, stableTypes + appleUse + pearUse + shown, "1\nripe\n", levels, 0, "", true)
+let appleFirst = genericCalls(io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll"))
+fixtures.executes(frontend, stableTypes + pearUse + appleUse + shown, "1\nripe\n", levels, 0, "", true)
+let pearFirst = genericCalls(io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll"))
+test.check(appleFirst.length == 2 && pearFirst.length == 2 && appleFirst[0] != appleFirst[1], "two distinct tag instances are called")
+test.check(appleFirst[0] == pearFirst[1] && appleFirst[1] == pearFirst[0], "reordering first uses keeps each instance's name: " + appleFirst[0] + " " + appleFirst[1] + " / " + pearFirst[0] + " " + pearFirst[1])
+test.check(appleFirst[0].endsWith("_tag") && appleFirst[0].length == "minyar_generic_function_".length + 16 + 4 + 12, "instance names are a 16-digit digest plus the readable name: " + appleFirst[0])
 
 test.removeTree(frontend.compiler.directory)
 print("Generics: passed")
