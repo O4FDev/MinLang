@@ -53,6 +53,32 @@ MinyarText *minyar_bytes_text(const MinyarBytes *bytes) {
     return minyar_native_copy_text(bytes->bytes, bytes->byte_length);
 }
 
+/* text.decodeOrStop: Bytes the program built from Text; invalid UTF-8 stops. */
+MinyarText *minyar_runtime_decodeOrStop(const MinyarBytes *bytes) {
+    long long length = bytes->byte_length;
+    int status = utf8_scan(bytes->bytes, length);
+    if (status < 0)
+        minyar_stop("these Bytes are not valid UTF-8 text; use text.decode for bytes from outside the program.");
+    MinyarText *text = new_text_storage(length, status ? length : -1);
+    unsigned char *data = (unsigned char *)text->bytes;
+    if (length) memcpy(data, bytes->bytes, (size_t)length);
+    data[length] = 0;
+    return text;
+}
+
+/* text.decode: one validating pass and one copy. Returns NULL (Maybe None)
+ * when the bytes are not UTF-8. */
+MinyarText *minyar_runtime_utf8Text(const MinyarBytes *bytes) {
+    long long length = bytes->byte_length;
+    int status = utf8_scan(bytes->bytes, length);
+    if (status < 0) return NULL;
+    MinyarText *text = new_text_storage(length, status ? length : -1);
+    unsigned char *data = (unsigned char *)text->bytes;
+    if (length) memcpy(data, bytes->bytes, (size_t)length);
+    data[length] = 0;
+    return text;
+}
+
 /* Bytes(text): the text's UTF-8 encoding. */
 MinyarBytes *minyar_text_bytes(const MinyarText *text) {
     MinyarBytes *bytes = minyar_bytes_new(text->byte_length);

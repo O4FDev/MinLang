@@ -743,14 +743,30 @@ positions and byte values keep the runtime's bounds and range errors. Aliases
 and C-layout views retain their shared storage semantics; a mutating call can
 change the length or storage before the access completes.
 
-`Bytes(text)` is a Text's UTF-8 encoding. `Text(bytes)` validates and copies
-UTF-8 immediately; invalid UTF-8 stops at that conversion. Use
-`text.decode(bytes)` for untrusted input that needs recoverable failure:
+`Bytes(text)` is a Text's UTF-8 encoding. Going back can fail, so it is a
+library call that says so. `text.decode(bytes)` validates and copies in one
+pass and returns `Result<Text, errors.Error>`; invalid UTF-8 is an
+`errors.invalidDataCode()` error the program must handle. Use it for anything
+read from outside the program: files, sockets, processes, people.
+`text.decodeOrStop(bytes)` is the same pass for Bytes the program built from
+Text (a slice at an ASCII boundary, a buffer of encoded pieces); invalid UTF-8
+there is a program error and stops, like a List position outside its length.
+Both cost one validating pass and one copy, the same as the old conversion.
 
 ```minyar
-let wire = Bytes("héllo")   // 6 bytes
-print(Text(wire).length)     // 5
+use "text" as text
+let wire = Bytes("héllo")              // 6 bytes
+match text.decode(wire) {
+    Ok(word) { print(word.length) }    // 5
+    Err(problem) { print("not UTF-8 text") }
+}
+print(text.decodeOrStop(wire.slice(0, 1)))   // h
 ```
+
+`Text(bytes)` does not compile: the error names both calls. Migration from
+earlier versions: replace `Text(bytes)` with `text.decode(bytes)` where the
+bytes come from outside and handle the error, or with
+`text.decodeOrStop(bytes)` where the program built them from Text.
 
 Import `use "random" as random`; `random.bytes(count)` returns Bytes from the platform's cryptographically secure
 generator: `arc4random_buf` on macOS and the BSDs, `getrandom` on Linux,

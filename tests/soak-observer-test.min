@@ -8,6 +8,7 @@ use "system" as system
 use "files" as files
 use "json" as json
 use "net" as net
+use "text" as utf8
 
 record Row { elapsed: Float; timed: Boolean; rss: Float; measured: Boolean }
 record Pending { data: Bytes }
@@ -96,7 +97,7 @@ function readLine(process: soak.Child, buffer: Pending, milliseconds: Integer): 
     while system.monotonicNanoseconds() < deadline {
         for index in 0..buffer.data.length {
             if buffer.data[index] == 10 {
-                let line = Text(buffer.data.slice(0, index))
+                let line = utf8.decodeOrStop(buffer.data.slice(0, index))
                 buffer.data = buffer.data.slice(index + 1, buffer.data.length)
                 return line
             }
@@ -129,7 +130,7 @@ function isolatedChild(work: Text) {
         let elapsed = seconds(started)
         print("{\"signal\": " + Text(value) + ", \"driver_status\": " + Text(status) + ", \"child_exists\": " + Text(soak.exists(target)) +
             ", \"group_exists\": " + Text(soak.groupExists(target)) + ", \"elapsed_seconds\": " + Text(elapsed) + "}")
-        test.check(status == 17, "driver status " + Text(status) + "\n" + Text(files.readFile(errors)))
+        test.check(status == 17, "driver status " + Text(status) + "\n" + utf8.decodeOrStop(files.readFile(errors)))
         let result = json.parse(report)
         test.check(json.string(result, "interruption") == "INTERRUPTED", "driver did not report interruption: " + report)
         test.check(json.member(result, "child_status").kind == json.NUMBER, "driver child was not reaped: " + report)
@@ -260,7 +261,7 @@ function summaryRows() {
     for index in 0..2048 { filler.add(120) }
     for index in 0..count {
         if index % 128 == 0 { peak = max(peak, soak.processSample(own).rssKib) }
-        let line = Text(index) + ":" + Text(filler)
+        let line = Text(index) + ":" + utf8.decodeOrStop(filler)
         let item = Row { elapsed: Float((index * 97) % 10007 + 60); timed: true; rss: Float(1000 + (index * 53) % 997); measured: line.byteLength > 0 }
         if item.measured { soak.include(result, item.elapsed, item.rss) }
     }
@@ -273,9 +274,9 @@ function boundedSummary(work: Text) {
     test.check(process.processId > 0, "launch summary process")
     let status = soak.waitFor(process, 30000)
     if status == soak.PENDING { soak.stop(process) }
-    test.check(status == 0, "summary process status " + Text(status) + "\n" + Text(files.readFile(work + "/summary.err")))
+    test.check(status == 0, "summary process status " + Text(status) + "\n" + utf8.decodeOrStop(files.readFile(work + "/summary.err")))
     test.check(files.readFile(work + "/summary.err").length == 0, "summary process wrote diagnostics")
-    let output = Text(files.readFile(work + "/summary.out"))
+    let output = utf8.decodeOrStop(files.readFile(work + "/summary.out"))
     print(test.replace(output, "\n", ""))
     let result = json.parse(output)
     let summary = json.member(result, "summary")
@@ -318,7 +319,7 @@ function quiet(listener: Integer, status: Integer, burn: Boolean, work: Text, na
             buffer.data.addBytes(data)
         }
     }
-    test.check(Text(buffer.data) == "ready\n", "quiet child " + name + " was not ready")
+    test.check(utf8.decodeOrStop(buffer.data) == "ready\n", "quiet child " + name + " was not ready")
     return Quiet { child: process; connection: connection; output: output; errors: errors }
 }
 function release(item: Quiet) {
@@ -391,7 +392,7 @@ function quicHistory(work: Text, result: Text) {
             proxy.forwarded = state.count * 5
             proxy.dropped = state.count
             proxy.delayed = (state.count + 1) / 2
-            let detail = Text(state.count) + ":" + Text(filler)
+            let detail = Text(state.count) + ":" + utf8.decodeOrStop(filler)
             state.detail = detail.byteLength
         }
         if processId == own {
@@ -434,9 +435,9 @@ function quicLongHistory(work: Text) {
     test.check(process.processId > 0, "launch QUIC history driver")
     let status = soak.waitFor(process, 120000)
     if status == soak.PENDING { soak.stop(process) }
-    test.check(status == 0, "QUIC history driver status " + Text(status) + "\n" + Text(files.readFile(work + "/history-driver.err")))
+    test.check(status == 0, "QUIC history driver status " + Text(status) + "\n" + utf8.decodeOrStop(files.readFile(work + "/history-driver.err")))
     test.check(files.readFile(work + "/history-driver.err").length == 0, "QUIC history driver wrote diagnostics")
-    let text = Text(files.readFile(result))
+    let text = utf8.decodeOrStop(files.readFile(result))
     print(text.trim())
     let value = json.parse(text)
     test.check(json.member(value, "rows").number == 16000.0, "history rows")
@@ -557,7 +558,7 @@ function rolesCase(work: Text, peerExit: Integer, listener: Integer): Text {
     let observed = adapter.observeSamples(quietRole(server), peerRole, proxy, 0.0, 1000.0, 1.0, path, metadata, hooks)
     test.check(observed == "", name + " observation: " + observed)
     let rejected = adapter.finishObservations(quietRole(server), peerRole, proxy, path, metadata, hooks) != ""
-    let report = json.parse(Text(files.readFile(path)))
+    let report = json.parse(utf8.decodeOrStop(files.readFile(path)))
     let rows = json.member(report, "samples").items
     let failures = state.failures
     if rejected != (peerExit == 7) { failures.add("rejection") }
@@ -588,7 +589,7 @@ function rolesCase(work: Text, peerExit: Integer, listener: Integer): Text {
         }
         if json.member(row, "proxy_forwarded").number != Float((index + 1) * 5) || json.member(row, "proxy_dropped").number != Float(index + 1) { failures.add("proxy " + Text(index)) }
     }
-    let raw = Text(files.readFile(directory + "/samples.jsonl")).trim().split("\n")
+    let raw = utf8.decodeOrStop(files.readFile(directory + "/samples.jsonl")).trim().split("\n")
     if raw.length != rows.length { failures.add("raw rows") }
     else { for index in 0..rows.length { if json.pretty(json.parse(raw[index]), "") != json.pretty(rows[index], "") { failures.add("raw row " + Text(index)) } } }
     if json.member(report, "sample_count").number != Float(rows.length) || json.pretty(json.member(report, "last_sample"), "") != json.pretty(rows[rows.length - 1], "") { failures.add("last sample") }
@@ -616,9 +617,9 @@ function quicRoleCases(work: Text) {
     test.check(process.processId > 0, "launch QUIC roles driver")
     let status = soak.waitFor(process, 120000)
     if status == soak.PENDING { soak.stop(process) }
-    test.check(status == 0, "QUIC roles driver status " + Text(status) + "\n" + Text(files.readFile(work + "/roles-driver.err")))
+    test.check(status == 0, "QUIC roles driver status " + Text(status) + "\n" + utf8.decodeOrStop(files.readFile(work + "/roles-driver.err")))
     test.check(files.readFile(work + "/roles-driver.err").length == 0, "QUIC roles driver wrote diagnostics")
-    let text = Text(files.readFile(result)).trim()
+    let text = utf8.decodeOrStop(files.readFile(result)).trim()
     print(text)
     let cases = json.member(json.parse(text), "cases")
     test.check(json.pretty(cases, "") == json.pretty(json.parse("[{\"peer_exit\": 0, \"rejected\": false, \"rows\": 8, \"statuses\": [0, 0]}, {\"peer_exit\": 7, \"rejected\": true, \"rows\": 3, \"statuses\": [0, 7]}, {\"peer_exit\": null, \"rejected\": false, \"rows\": 8, \"statuses\": [0, null]}]"), ""), "QUIC role cases " + text)

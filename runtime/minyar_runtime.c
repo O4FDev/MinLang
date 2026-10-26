@@ -851,12 +851,28 @@ static unsigned int decode_character(const unsigned char *bytes, long long remai
     return 0;
 }
 
-/* Validate at foreign-byte boundaries, skipping ASCII a word at a time. ASCII
- * Text needs no character-offset cache, so callers can record its character
- * length at once; other caches remain lazy. Returns whether every byte was ASCII. */
-static _Bool validate_text_bytes(const unsigned char *bytes, long long length) {
+/* The width of the UTF-8 sequence at bytes, or 0 when it is not a complete,
+ * shortest-form encoding of a scalar value (the same rules as decode_character). */
+static long long utf8_sequence_width(const unsigned char *bytes, long long remaining) {
+    unsigned int first = bytes[0];
+    if (first < 0x80) return 1;
+    if (first >= 0xc2 && first <= 0xdf && remaining >= 2 && (bytes[1] & 0xc0) == 0x80) return 2;
+    if ((first & 0xf0) == 0xe0 && remaining >= 3 && (bytes[1] & 0xc0) == 0x80 &&
+        (bytes[2] & 0xc0) == 0x80 && (first != 0xe0 || bytes[1] >= 0xa0) &&
+        (first != 0xed || bytes[1] < 0xa0))
+        return 3;
+    if (first >= 0xf0 && first <= 0xf4 && remaining >= 4 && (bytes[1] & 0xc0) == 0x80 &&
+        (bytes[2] & 0xc0) == 0x80 && (bytes[3] & 0xc0) == 0x80 &&
+        (first != 0xf0 || bytes[1] >= 0x90) && (first != 0xf4 || bytes[1] < 0x90))
+        return 4;
+    return 0;
+}
+
+/* Scan foreign bytes once, skipping ASCII a word at a time: 1 when every byte
+ * is ASCII, 0 for other valid UTF-8, -1 for invalid UTF-8. */
+static int utf8_scan(const unsigned char *bytes, long long length) {
     long long position = 0;
-    _Bool ascii = 1;
+    int ascii = 1;
     while (position < length) {
         while (length - position >= (long long)sizeof(uint64_t)) {
             uint64_t word;
@@ -868,13 +884,22 @@ static _Bool validate_text_bytes(const unsigned char *bytes, long long length) {
         if (bytes[position] < 0x80) {
             position++;
         } else {
-            long long width;
-            decode_character(bytes + position, length - position, &width);
+            long long width = utf8_sequence_width(bytes + position, length - position);
+            if (!width) return -1;
             position += width;
             ascii = 0;
         }
     }
     return ascii;
+}
+
+/* Validate at foreign-byte boundaries. ASCII Text needs no character-offset
+ * cache, so callers can record its character length at once; other caches
+ * remain lazy. Returns whether every byte was ASCII; invalid UTF-8 stops. */
+static _Bool validate_text_bytes(const unsigned char *bytes, long long length) {
+    int status = utf8_scan(bytes, length);
+    if (status < 0) invalid_utf8();
+    return status == 1;
 }
 
 enum { TEXT_INDEX_STRIDE = 64 };

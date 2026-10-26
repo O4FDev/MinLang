@@ -4,6 +4,7 @@
 use "net" as net
 use "eventloop" as loop
 use "errors" as errors
+use "text" as utf8
 
 public record Limits {
     maxConnections: Integer
@@ -264,7 +265,13 @@ function lowercase(data: Bytes): Text {
         if byte >= 65 && byte <= 90 { lower += 32 }
         result.add(lower)
     }
-    return Text(result)
+    // Callers pass token bytes, which are visible ASCII.
+    return utf8.decodeOrStop(result)
+}
+function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for at in 0..left.length { if left[at] != right[at] { return false } }
+    return true
 }
 function findByte(data: Bytes, byte: Integer, start: Integer, end: Integer): Integer {
     for at in start..end { if data[at] == byte { return at } }
@@ -287,7 +294,11 @@ function validHost(data: Bytes): Boolean {
     let portAt = -1
     if data[0] == 91 {
         let end = findByte(data, 93, 1, data.length)
-        if end < 0 || net.ipVersion(Text(data.slice(1, end))) != 6 { return false }
+        if end < 0 { return false }
+        match utf8.decode(data.slice(1, end)) {
+            Ok(address) { if net.ipVersion(address) != 6 { return false } }
+            Err(error) { return false }
+        }
         if end + 1 < data.length {
             if data[end + 1] != 58 { return false }
             portAt = end + 2
@@ -333,9 +344,10 @@ function parseHead(data: Bytes, start: Integer, end: Integer, limits: Limits): H
     if second <= first + 1 { return badHead(400) }
     for at in start..first { if !tokenByte(data[at]) { return badHead(400) } }
     for at in first + 1..second { if data[at] <= 32 || data[at] >= 127 || data[at] == 35 { return badHead(400) } }
-    if Text(data.slice(second + 1, lineEnd)) != "HTTP/1.1" { return badHead(400) }
-    let method = Text(data.slice(start, first))
-    let target = Text(data.slice(first + 1, second))
+    if !sameBytes(data.slice(second + 1, lineEnd), Bytes("HTTP/1.1")) { return badHead(400) }
+    // The method is token bytes and the target visible ASCII, both checked above.
+    let method = utf8.decodeOrStop(data.slice(start, first))
+    let target = utf8.decodeOrStop(data.slice(first + 1, second))
     if method == "CONNECT" { return badHead(405) }
     if data[first + 1] != 47 && !(target == "*" && method == "OPTIONS") { return badHead(400) }
     let fields: List<Header> = []
@@ -360,7 +372,11 @@ function parseHead(data: Bytes, start: Integer, end: Integer, limits: Limits): H
         while to > from && (data[to - 1] == 32 || data[to - 1] == 9) { to -= 1 }
         let name = lowercase(data.slice(fieldStart, colon))
         let raw = data.slice(from, to)
-        let value = Text(raw)
+        let value = ""
+        match utf8.decode(raw) {
+            Ok(decoded) { value = decoded }
+            Err(error) { return badHead(400) }
+        }
         if fields.length >= limits.maxHeaders { return badHead(431) }
         fields.add(Header { name: name; value: value })
         if name == "host" { hostCount += 1; if !validHost(raw) { return badHead(400) } }

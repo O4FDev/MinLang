@@ -6,6 +6,7 @@ use "system" as system
 use "files" as files
 use "sha256" as sha
 use "json" as json
+use "text" as utf8
 
 public constant ROUNDS = 40
 public constant WARMUPS = 3
@@ -40,7 +41,7 @@ function strip(source: Text): Text {
     let end = raw.length
     while begin < end && space(raw[begin]) { begin += 1 }
     while end > begin && space(raw[end - 1]) { end -= 1 }
-    return Text(raw.slice(begin, end))
+    return utf8.decodeOrStop(raw.slice(begin, end))
 }
 function pythonQuote(text: Text): Text {
     let digits = "0123456789abcdef"
@@ -59,7 +60,7 @@ function pythonQuote(text: Text): Text {
             if code > 65535 { units = [55296 + ((code - 65536) >> 10), 56320 + ((code - 65536) & 1023)] }
             for unit in units {
                 let escape = "\\u"
-                for shift in [12, 8, 4, 0] { let digit = (unit >> shift) & 15; escape += Text(Bytes(digits).slice(digit, digit + 1)) }
+                for shift in [12, 8, 4, 0] { let digit = (unit >> shift) & 15; escape += utf8.decodeOrStop(Bytes(digits).slice(digit, digit + 1)) }
                 parts.add(escape)
             }
         } else { parts.add(Text(c)) }
@@ -207,7 +208,7 @@ function cpuTicks(host: Host): Map<Integer, List<Integer>> {
     host.tickCalls[0] += 1
     let result = Map<Integer, List<Integer>>()
     if host.fake { return result }
-    for line in test.lines(Text(files.readFile("/proc/stat"))) {
+    for line in test.lines(utf8.decodeOrStop(files.readFile("/proc/stat"))) {
         let fields = test.words(line)
         if fields.length == 0 { continue }
         let raw = Bytes(fields[0])
@@ -217,7 +218,7 @@ function cpuTicks(host: Host): Map<Integer, List<Integer>> {
         if !digits { continue }
         let values: List<Integer> = []
         for index in 1..fields.length { if index <= 8 { values.add(Integer(fields[index])) } }
-        result[Integer(Text(raw.slice(3, raw.length)))] = values
+        result[Integer(utf8.decodeOrStop(raw.slice(3, raw.length)))] = values
     }
     return result
 }
@@ -246,10 +247,10 @@ function sleep(host: Host, seconds: Integer) {
 public function affinity(host: Host): List<Integer> {
     if host.fake { return host.affinity.sorted() }
     let result: List<Integer> = []
-    for line in test.lines(Text(files.readFile("/proc/self/status"))) {
+    for line in test.lines(utf8.decodeOrStop(files.readFile("/proc/self/status"))) {
         if !line.startsWith("Cpus_allowed_list:") { continue }
         let raw = Bytes(line)
-        let value = strip(Text(raw.slice(18, raw.length)))
+        let value = strip(utf8.decodeOrStop(raw.slice(18, raw.length)))
         for span in value.split(",") {
             let bounds = span.split("-")
             let low = Integer(bounds[0])
@@ -273,7 +274,7 @@ public function kernel(host: Host): List<Text> {
         let raw = Bytes(value.output)
         let end = raw.length
         if end > 0 && raw[end - 1] == 10 { end -= 1 }
-        result.add(Text(raw.slice(0, end)))
+        result.add(utf8.decodeOrStop(raw.slice(0, end)))
     }
     return result
 }
@@ -283,19 +284,19 @@ function lines(source: Text): List<Text> {
     let start = 0
     for index in 0..raw.length {
         if raw[index] == 10 || raw[index] == 13 {
-            result.add(Text(raw.slice(start, index)))
+            result.add(utf8.decodeOrStop(raw.slice(start, index)))
             if raw[index] == 13 && index + 1 < raw.length && raw[index + 1] == 10 { start = index + 2 } else { start = index + 1 }
         }
     }
-    if start < raw.length { result.add(Text(raw.slice(start, raw.length))) }
+    if start < raw.length { result.add(utf8.decodeOrStop(raw.slice(start, raw.length))) }
     return result
 }
 function splitLimit(source: Text): List<Text> {
     let raw = Bytes(source)
     let result: List<Text> = []
     let start = 0
-    for index in 0..raw.length { if raw[index] == 58 && result.length < 2 { result.add(Text(raw.slice(start, index))); start = index + 1 } }
-    result.add(Text(raw.slice(start, raw.length)))
+    for index in 0..raw.length { if raw[index] == 58 && result.length < 2 { result.add(utf8.decodeOrStop(raw.slice(start, index))); start = index + 1 } }
+    result.add(utf8.decodeOrStop(raw.slice(start, raw.length)))
     return result
 }
 function pathParts(location: Text): List<Text> {
@@ -322,7 +323,7 @@ function readLimit(host: Host, path: Text): json.Value {
     if host.denied != "" && path == host.denied { return object(["availability", "errno"], [string("unreadable"), integer(13)]) }
     let data = files.readFile(path)
     let code = files.lastError()
-    if code == 0 { return object(["availability", "value"], [string("exposed"), string(Text(data))]) }
+    if code == 0 { return object(["availability", "value"], [string("exposed"), string(utf8.decodeOrStop(data))]) }
     if code < 0 { code = -code }
     if code == 2 { return object(["availability"], [string("not exposed in guest")]) }
     return object(["availability", "errno"], [string("unreadable"), integer(code)])
@@ -360,7 +361,7 @@ public function resourceIdentity(host: Host, membership: Text, root: Text): json
 }
 function resourceSnapshot(host: Host): json.Value {
     if host.snapshot.length > 0 { return host.snapshot[0] }
-    let membership = Text(files.readFile("/proc/self/cgroup"))
+    let membership = utf8.decodeOrStop(files.readFile("/proc/self/cgroup"))
     let paths: List<Text> = []
     for line in lines(membership) {
         let fields = splitLimit(line)
@@ -398,7 +399,7 @@ public function register(host: Host, executablePath: Text, protocolPath: Text, l
     let keys = ["frozen_at_unix_ns", "executable", "executable_sha256", "workload_sha256", "lowered_llvm", "lowered_llvm_sha256", "sampler_sha256", "expected_stdout", "source_shas", "build_flags", "memory_profile", "toolchain", "clang_path", "clang_sha256", "kernel", "guest_topology", "affinity", "quota", "resource_identity", "resource_snapshot", "work", "timing", "warmup_order", "paired_order", "estimator", "interval", "quiet", "gates"]
     let items = [integer(system.wallClockMicroseconds() * 1000), string(executable), string(digest(executable)), string(digest(WORKLOAD)), string(lowered), string(digest(lowered)), string(digest(SAMPLER)), string(oracle()),
         object(["candidate", "compiler", "runtime"], [string(candidate), string(compiler), string(runtime)]), string(flags), string(memory), string(checkOutput(host, [clang, "--version"])),
-        string(clangPath), string(digest(clangPath)), texts(kernel(host)), string(checkOutput(host, ["lscpu", "-J"])), integers(cpus), object(quotaNames, quotaValues), resourceIdentity(host, Text(files.readFile("/proc/self/cgroup")), "/sys/fs/cgroup"), resourceSnapshot(host),
+        string(clangPath), string(digest(clangPath)), texts(kernel(host)), string(checkOutput(host, ["lscpu", "-J"])), integers(cpus), object(quotaNames, quotaValues), resourceIdentity(host, utf8.decodeOrStop(files.readFile("/proc/self/cgroup")), "/sys/fs/cgroup"), resourceSnapshot(host),
         object(["blocks", "dependent_steps_per_block", "seed", "input_bytes", "kernel"], [integer(131072), integer(4096), integer(20261012), integer(1048576), string("x = x * 48271 % 2147483647; sum final x per block")]),
         string("whole executable wall time: input creation, publication, launch, work, join, output"), scheduleValue(WARMUPS, ORDER_SEED + 1), scheduleValue(ROUNDS, ORDER_SEED), string("median of 40 within-round T1/Tn ratios"),
         object(["method", "replicates", "seed", "bounds"], [string("paired percentile bootstrap of median ratios"), integer(BOOTSTRAPS), integer(BOOTSTRAP_SEED), string("floor(.025*(B-1)), ceil(.975*(B-1))")]),

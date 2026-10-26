@@ -13,6 +13,7 @@ use "system" as system
 use "files" as files
 use "json" as json
 use "net" as net
+use "text" as utf8
 
 record Resp { kind: Integer; integer: Integer; data: Bytes; items: List<Resp>; error: Text }
 record Client { connection: Integer; buffer: Bytes }
@@ -82,7 +83,7 @@ function readReply(client: Client, depth: Integer): Resp {
     let kind = head.data[0]
     let value = head.data.slice(1, head.data.length)
     if kind == 43 { return Resp { kind: redis.SIMPLE; integer: 0; data: value; items: []; error: "" } }
-    if kind == 45 { return failed("Redis error: " + Text(value)) }
+    if kind == 45 { return failed("Redis error: " + utf8.decodeOrStop(value)) }
     let length = decimal(value)
     if kind == 58 { return Resp { kind: redis.INTEGER; integer: length; data: Bytes(); items: []; error: "" } }
     if kind == 36 {
@@ -120,18 +121,18 @@ function observe(client: Client, records: List<scale.Observed>): Text {
         let reply = command(client, ["SCAN", cursor, "MATCH", "peer:live:*", "COUNT", "1000"])
         if reply.error != "" { return reply.error }
         if reply.kind != ARRAY || reply.items.length != 2 || reply.items[1].kind != ARRAY { return "unexpected SCAN reply" }
-        cursor = Text(reply.items[0].data)
+        cursor = utf8.decodeOrStop(reply.items[0].data)
         let found = reply.items[1].items
         if found.length > 0 {
             let request = ["MGET"]
-            for key in found { request.add(Text(key.data)) }
+            for key in found { request.add(utf8.decodeOrStop(key.data)) }
             let fetched = command(client, request)
             if fetched.error != "" { return fetched.error }
             if fetched.kind != ARRAY || fetched.items.length != found.length { return "MGET did not return one value per key" }
             for index in 0..found.length {
                 if fetched.items[index].kind == redis.NULL { return "live state disappeared during independent observation" }
-                let name = Text(found[index].data)
-                let text = Text(fetched.items[index].data)
+                let name = utf8.decodeOrStop(found[index].data)
+                let text = utf8.decodeOrStop(fetched.items[index].data)
                 let known = -1
                 for at in 0..keys.length { if keys[at] == name { known = at } }
                 if known >= 0 {
@@ -160,7 +161,7 @@ function sampleJson(sample: soak.Sample): Text {
 function udpQueues(port: Integer): Text {
     let rows: List<Text> = []
     for family in ["udp", "udp6"] {
-        let lines = Text(files.readFile("/proc/net/" + family)).split("\n")
+        let lines = utf8.decodeOrStop(files.readFile("/proc/net/" + family)).split("\n")
         for index in 1..lines.length {
             let fields = test.words(lines[index])
             if fields.length > 12 {
@@ -202,14 +203,14 @@ function waitStart(path: Text, deadline: Float): Text {
         if now() >= deadline { return "measurement start was not supplied before setup deadline" }
         soak.nap(200)
     }
-    let start = json.member(json.parse(Text(files.readFile(path))), "utc_start")
+    let start = json.member(json.parse(utf8.decodeOrStop(files.readFile(path))), "utc_start")
     if !scale.integral(start) || Integer(start.number) - wallSeconds() < 0 || Integer(start.number) - wallSeconds() > 30 {
         return "measurement requires one fresh future UTC start within thirty seconds"
     }
     while system.wallClockMicroseconds() < Integer(start.number) * 1000000 { soak.nap(min(100, max(0, (Integer(start.number) * 1000000 - system.wallClockMicroseconds()) / 1000))) }
     return ""
 }
-function edgeLines(options: Options): List<Text> { return Text(files.readFile(options.output + "/edge.stdout")).split("\n") }
+function edgeLines(options: Options): List<Text> { return utf8.decodeOrStop(files.readFile(options.output + "/edge.stdout")).split("\n") }
 
 function serve(options: Options, run: Run): Text {
     let directory = options.output
@@ -280,7 +281,7 @@ function serve(options: Options, run: Run): Text {
     files.writeStandardOutput("ADMITTED " + Text(epochs.length) + "\n")
     let started = waitStart(options.start, deadline)
     if started != "" { return started }
-    let utcStart = Integer(json.member(json.parse(Text(files.readFile(options.start))), "utc_start").number)
+    let utcStart = Integer(json.member(json.parse(utf8.decodeOrStop(files.readFile(options.start))), "utc_start").number)
     let measured = now()
     let lastState = measured
     let points: List<Point> = []

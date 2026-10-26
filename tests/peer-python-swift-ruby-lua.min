@@ -6,8 +6,10 @@ use "files" as files
 use "json" as json
 use "errors" as errors
 use "sha256" as sha256
+use "text" as utf8Text
 
 constant INVALID_UTF8 = "Minyar stopped: Text contained invalid UTF-8.\n"
+constant DECODE_STOP = "Minyar stopped: these Bytes are not valid UTF-8 text; use text.decode for bytes from outside the program.\n"
 constant OOM = "Minyar stopped: the computer ran out of memory.\n"
 
 function isDigit(byte: Integer): Boolean { return byte >= 48 && byte <= 57 }
@@ -103,7 +105,7 @@ function decimalDiagnostic(c: peer.Case, token: Text): Text {
     if token == "-" { return "line 1, column 8: expected an expression, found ')'" }
     let number = numberPrefix(raw)
     if number >= 0 { offset = number }
-    let name = Text(raw.slice(offset, raw.length))
+    let name = utf8Text.decodeOrStop(raw.slice(offset, raw.length))
     peer.expect(c, identifierShape(name), "decimal diagnostic name is not an identifier: " + name)
     return "line 1, column " + Text(7 + offset) + ": I can't find a value named '" + name + "'"
 }
@@ -141,7 +143,7 @@ function decimalCells(c: peer.Case): List<DecimalCell> {
 
 function suffix(optimization: Text): Text {
     let raw = Bytes(optimization)
-    return Text(raw.slice(1, raw.length))
+    return utf8Text.decodeOrStop(raw.slice(1, raw.length))
 }
 function literals(values: List<Text>): List<Text> {
     let result: List<Text> = []
@@ -164,7 +166,7 @@ function lowercase(value: Text): Text {
     for byte in Bytes(value) {
         if byte >= 65 && byte <= 90 { result.add(byte + 32) } else { result.add(byte) }
     }
-    return Text(result)
+    return utf8Text.decodeOrStop(result)
 }
 function sameTexts(left: List<Text>, right: List<Text>): Boolean {
     let first = peer.sortTexts(left)
@@ -465,11 +467,11 @@ function test_zig_and_ruby_malformed_utf8_ingress_vectors(c: peer.Case) {
         paths.add(peer.writeBytes(c, "invalid" + Text(index) + ".txt", raw))
         lengths.add(raw.length)
     }
-    let source = "let raw = io.readBytesFile(processInfo.argument(0))\nprint(raw.length)\nlet text = Text(raw)\nprint(text.length)\n"
-    let base = peer.executesWith(c, source, Text(lengths[0]) + "\n", 1, INVALID_UTF8, [paths[0]])
+    let source = "use \"text\" as utf8\nlet raw = io.readBytesFile(processInfo.argument(0))\nprint(raw.length)\nlet text = utf8.decodeOrStop(raw)\nprint(text.length)\n"
+    let base = peer.executesWith(c, source, Text(lengths[0]) + "\n", 1, DECODE_STOP, [paths[0]])
     for optimization in c.variants {
         for index in 1..rows.length {
-            peer.observe(c, peer.run(c, [peer.executable(base, optimization), paths[index]], "execute-peer-malformed-utf8", c.runTimeout), 1, Text(lengths[index]) + "\n", INVALID_UTF8, hexes[index] + " at " + optimization)
+            peer.observe(c, peer.run(c, [peer.executable(base, optimization), paths[index]], "execute-peer-malformed-utf8", c.runTimeout), 1, Text(lengths[index]) + "\n", DECODE_STOP, hexes[index] + " at " + optimization)
         }
     }
 }
@@ -616,7 +618,7 @@ function test_supplementary_scalar_23456_has_exact_utf8(c: peer.Case) {
 function test_f1_followed_by_ascii_is_invalid_utf8(c: peer.Case) {
     let path = peer.writeBytes(c, "f1-ascii.txt", peer.fromHex("f161626364"))
     for operation in [".length", "[0]", ".slice(0, 1)"] {
-        peer.executesWith(c, "let raw = io.readBytesFile(processInfo.argument(0))\nprint(raw.length)\nlet text = Text(raw)\nprint(text" + operation + ")\n", "5\n", 1, INVALID_UTF8, [path])
+        peer.executesWith(c, "use \"text\" as utf8\nlet raw = io.readBytesFile(processInfo.argument(0))\nprint(raw.length)\nlet text = utf8.decodeOrStop(raw)\nprint(text" + operation + ")\n", "5\n", 1, DECODE_STOP, [path])
     }
 }
 function test_nul_prefix_slices_and_control_fragment_join(c: peer.Case) {
@@ -907,7 +909,7 @@ function test_every_byte_in_identifier_start_and_continuation(c: peer.Case) {
             peer.expect(c, (files.pathSize(llvm) >= 0) == valid, stem + " LLVM presence")
             if valid {
                 peer.equal(c, result.errorOutput, "", stem + " stderr")
-                accepted.add(Text(source) + "print(" + Text(name) + ")\n")
+                accepted.add(utf8Text.decodeOrStop(source) + "print(" + utf8Text.decodeOrStop(name) + ")\n")
             } else {
                 peer.expect(c, peer.validUTF8(Bytes(result.errorOutput)), stem + " diagnostic is not UTF-8")
                 peer.expect(c, peer.validCompilerDiagnostics(result.errorOutput), stem + " diagnostic prefix\n" + result.errorOutput)
@@ -1304,7 +1306,7 @@ function parseReport(c: peer.Case, text: Text, label: Text): Report {
     let events = peer.find(text, ",\"events\":[", 0)
     let peaks = peer.find(text, "],\"peaks\":[", 0)
     peer.expect(c, events > 0 && peaks > events, "invalid allocation report " + label + ": " + text)
-    let scalars = json.parse(Text(raw.slice(0, events)) + "}")
+    let scalars = json.parse(utf8Text.decodeOrStop(raw.slice(0, events)) + "}")
     peer.expect(c, scalars.kind == json.OBJECT, "invalid allocation report " + label + ": " + text)
     let eventValues = reportIntegers(raw, events + 11, peaks)
     let peakValues = reportIntegers(raw, peaks + 11, raw.length)
@@ -1670,7 +1672,7 @@ function test_incompatible_compiler_and_runtime_fail_required_suite(c: peer.Case
     requireSuccess(c, build, "incompatible runtime build")
     let target = "PeerPythonSwiftRubyLua.test_iterative_fibonacci_uses_previous_pair"
     let raw = Bytes(c.suite.source)
-    let program = c.suite.root + "/build/tooling/" + Text(raw.slice(0, raw.length - 4))
+    let program = c.suite.root + "/build/tooling/" + utf8Text.decodeOrStop(raw.slice(0, raw.length - 4))
     let kinds = ["compiler", "runtime"]
     let compilers = [fake, c.compiler.executable]
     let runtimes = [c.compiler.runtime, wrongRuntime]
@@ -2202,7 +2204,7 @@ function test_all_twelve_bad_radix_tokens_reject(c: peer.Case) {
         let expected = "line 1, column 7: an octal Integer literal needs only digits 0 through 7 after 0o"
         if !peer.starts(token, "0o") {
             let raw = Bytes(token)
-            let name = Text(raw.slice(1, raw.length))
+            let name = utf8Text.decodeOrStop(raw.slice(1, raw.length))
             expected = "line 1, column 8: I can't find a value named '" + name + "'"
             if peer.starts(token, "0b") && token.length > 2 { expected = "line 1, column 7: binary Integer literals are not supported; use decimal digits, 0xFF for hexadecimal, or 0o755 for octal" }
             if token == "0x1_" { expected = "line 1, column 7: number separators are not supported; remove '_' from this number" }
@@ -2488,7 +2490,7 @@ function test_utf8_constructor_value_projections_keep_complete_bytes(c: peer.Cas
         let projected = raw
         if counts[index] >= 0 { projected = raw.slice(0, counts[index]) }
         peer.expect(c, peer.validUTF8(projected), "constructor cell " + name + " is not UTF-8")
-        let value = Text(projected)
+        let value = utf8Text.decodeOrStop(projected)
         let selection = "let value = original"
         if counts[index] >= 0 { selection = "let value = original.slice(0, 2)" }
         peer.extend(source, ["function case" + name + "() {", "let original = io.readTextFile(" + peer.literal(path) + ")",

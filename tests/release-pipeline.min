@@ -8,6 +8,7 @@ use "system" as system
 use "files" as files
 use "sha256" as sha256
 use "json" as json
+use "text" as utf8
 
 public record Arguments { native: Text; output: Text; openssl: Text; cc: Text; signtool: Text; ephemeralMacosCi: Boolean; macosCertificate: Text; macosThumbprint: Text; macosKeychain: Text; ownedBoatWindows: Boolean; report: Text; target: Text }
 public record Command { args: List<Text>; timeout: Integer; closedInput: Boolean; environment: List<Text>; check: Boolean }
@@ -66,7 +67,7 @@ function osFailure(code: Integer, path: Text): Outcome {
 
 public function getenv(hooks: Hooks, name: Text): Text {
     for entry in hooks.environment {
-        if support.starts(entry, name + "=") { return Text(Bytes(entry).slice(Bytes(name).length + 1, Bytes(entry).length)) }
+        if support.starts(entry, name + "=") { return utf8.decodeOrStop(Bytes(entry).slice(Bytes(name).length + 1, Bytes(entry).length)) }
     }
     return ""
 }
@@ -82,7 +83,7 @@ function merged(base: List<Text>, extra: List<Text>): List<Text> {
             let raw = Bytes(override)
             let ending = 0
             while ending < raw.length && raw[ending] != 61 { ending += 1 }
-            if support.starts(entry, Text(raw.slice(0, ending + 1))) { keep = false }
+            if support.starts(entry, utf8.decodeOrStop(raw.slice(0, ending + 1))) { keep = false }
         }
         if keep { result.add(entry) }
     }
@@ -123,7 +124,7 @@ function execute(command: Command, environment: List<Text>): support.Execution {
     if state.state == system.SIGNALED { code = -state.signal }
     if state.error != 0 { code = -1 }
     let output = files.readFile(out)
-    let errorOutput = Text(files.readFile(err))
+    let errorOutput = utf8.decodeOrStop(files.readFile(err))
     support.removeTree(capture.path)
     if !timedOut && code == 127 && output.length == 0 && support.find(errorOutput, "not found") >= 0 { return support.Execution { status: code; output: output; errorOutput: errorOutput; timedOut: false; launch: -2 } }
     return support.Execution { status: code; output: output; errorOutput: errorOutput; timedOut: timedOut; launch: 0 }
@@ -148,7 +149,7 @@ function releaseRunner(hooks: Hooks): Callback<List<Text>, release.Completed> {
         let ran = tool(hooks, args)
         let status = ran.result.status
         if ran.result.launch != 0 || ran.result.timedOut { status = 1 }
-        return release.Completed { status: status; output: Text(ran.result.output); errorOutput: ran.result.errorOutput }
+        return release.Completed { status: status; output: utf8.decodeOrStop(ran.result.output); errorOutput: ran.result.errorOutput }
     }
 }
 function signingRunner(hooks: Hooks, environment: List<Text>, state: Signing): Callback<List<Text>, support.Execution> {
@@ -202,11 +203,11 @@ function systemRunner(): Callback<Command, support.Execution> {
 public function defaults(): Hooks {
     let platform = "unknown"
     let kernel = support.execute(["uname", "-s"], 10)
-    let name = support.join(support.split(Text(kernel.output), 10), "")
+    let name = support.join(support.split(utf8.decodeOrStop(kernel.output), 10), "")
     if name == "Darwin" { platform = "darwin" }
     if name == "Linux" { platform = "linux" }
     let machine = support.execute(["uname", "-m"], 10)
-    return Hooks { platform: platform; machine: support.lower(support.join(support.split(Text(machine.output), 10), "")); environment: system.environment();
+    return Hooks { platform: platform; machine: support.lower(support.join(support.split(utf8.decodeOrStop(machine.output), 10), "")); environment: system.environment();
         run: systemRunner(); makeDirectory: directoryMaker(); staging: privateMaker(); unstage: stagingCleaner(); generation: privateMaker();
         writeReport: reportWriter(); publish: publisher(); defaultFixture: true;
         fixture: function(work: Text, cc: Text, native: Text): Fixture { return Fixture { outcome: failure("ValueError", "native fixture override is not configured"); source: ""; entry: ""; resource: "" } };
@@ -252,7 +253,7 @@ public function quote(value: Text): Text {
         index += 1
     }
     out.add(34)
-    return Text(out)
+    return utf8.decodeOrStop(out)
 }
 public function flag(value: Boolean): Text {
     if value { return "true" }
@@ -329,7 +330,7 @@ function randomHex(count: Integer): Text {
 function upper(value: Text): Text {
     let raw = Bytes(value)
     for index in 0..raw.length { if raw[index] >= 97 && raw[index] <= 122 { raw[index] = raw[index] - 32 } }
-    return Text(raw)
+    return utf8.decodeOrStop(raw)
 }
 function hexDigits(value: Text, count: Integer): Boolean {
     let raw = Bytes(value)
@@ -370,7 +371,7 @@ function trustInventory(hooks: Hooks): Ran {
         if !ok(ran.outcome) { return ran }
         let combined = ran.result.output.slice(0, ran.result.output.length)
         combined.addBytes(Bytes(ran.result.errorOutput))
-        if ran.result.status != 0 && support.find(Text(combined), "No Trust Settings") < 0 {
+        if ran.result.status != 0 && support.find(utf8.decodeOrStop(combined), "No Trust Settings") < 0 {
             return Ran { outcome: require(false, "cannot inventory certificate trust"); result: ran.result }
         }
         values.add(Text(ran.result.status) + "\n" + support.hex(ran.result.output) + "\n" + support.hex(Bytes(ran.result.errorOutput)))
@@ -472,7 +473,7 @@ public function provisionedMacosCredentials(hooks: Hooks, certificate: Text, thu
 
 public function decodedPath(data: Bytes): Decoded {
     for byte in data { if byte >= 128 { return Decoded { outcome: failure("UnicodeDecodeError", "'ascii' codec can't decode the bundle path"); entry: "" } } }
-    let value = Text(data)
+    let value = utf8.decodeOrStop(data)
     let length = require(data.length >= 1 && data.length <= 512, "invalid decoded path length")
     if !ok(length) { return Decoded { outcome: length; entry: "" } }
     for part in support.split(value, 47) {
@@ -575,13 +576,13 @@ function splitLines(data: Bytes): List<Text> {
     while index < data.length {
         let byte = data[index]
         if byte == 10 || byte == 13 || byte == 11 || byte == 12 || byte == 28 || byte == 29 || byte == 30 {
-            result.add(Text(data.slice(start, index)))
+            result.add(utf8.decodeOrStop(data.slice(start, index)))
             if byte == 13 && index + 1 < data.length && data[index + 1] == 10 { index += 1 }
             start = index + 1
         }
         index += 1
     }
-    if start < data.length { result.add(Text(data.slice(start, data.length))) }
+    if start < data.length { result.add(utf8.decodeOrStop(data.slice(start, data.length))) }
     return result
 }
 function canonicalNumber(value: Text): Boolean {
@@ -664,7 +665,7 @@ public function nativeFixture(hooks: Hooks, work: Text, cc: Text, native: Text):
     io.writeTextFile(app + "/Contents/Info.plist", fixturePlist())
     let sdk = tool(hooks, ["xcrun", "--show-sdk-path"])
     if !ok(sdk.outcome) { return Fixture { outcome: sdk.outcome; source: ""; entry: ""; resource: "" } }
-    let root = support.join(support.split(Text(sdk.result.output), 10), "")
+    let root = support.join(support.split(utf8.decodeOrStop(sdk.result.output), 10), "")
     let compiled = tool(hooks, [cc, "-isysroot", root, "-Os", source, "-o", app + "/Contents/MacOS/fixture"])
     if !ok(compiled.outcome) { return Fixture { outcome: compiled.outcome; source: ""; entry: ""; resource: "" } }
     return Fixture { outcome: succeeded(); source: app; entry: "TEST-fixture.app/Contents/MacOS/fixture"; resource: "TEST-fixture.app/Contents/Resources/TEST-resource.txt" }
@@ -739,7 +740,7 @@ function sign(flow: Flow, metadata: Bytes, key: Text, passphrase: Text, secret: 
     return result
 }
 function signingFailure(result: manifest.Signature): Outcome {
-    if support.starts(result.error, "TimeoutExpired:") { return failure("TimeoutExpired", Text(Bytes(result.error).slice(15, Bytes(result.error).length))) }
+    if support.starts(result.error, "TimeoutExpired:") { return failure("TimeoutExpired", utf8.decodeOrStop(Bytes(result.error).slice(15, Bytes(result.error).length))) }
     return failure("ValueError", result.error)
 }
 function signedFlow(flow: Flow, identities: Identities): Outcome {
@@ -933,7 +934,7 @@ public function invoke(argv: List<Text>, hooks: Hooks): Exit {
         let hasInline = false
         let raw = Bytes(item)
         if support.starts(item, "--") {
-            for position in 0..raw.length { if !hasInline && raw[position] == 61 { option = Text(raw.slice(0, position)); inline = Text(raw.slice(position + 1, raw.length)); hasInline = true } }
+            for position in 0..raw.length { if !hasInline && raw[position] == 61 { option = utf8.decodeOrStop(raw.slice(0, position)); inline = utf8.decodeOrStop(raw.slice(position + 1, raw.length)); hasInline = true } }
         }
         if item == "-h" || item == "--help" { return Exit { status: 0; output: "usage: release-pipeline.min [-h] --native {macos,windows} --output OUTPUT --openssl OPENSSL --cc CC [--signtool SIGNTOOL] [--ephemeral-macos-ci] [--macos-certificate MACOS_CERTIFICATE] [--macos-thumbprint MACOS_THUMBPRINT] [--macos-keychain MACOS_KEYCHAIN] [--owned-boat-windows] [--report REPORT]\n\nTEST ONLY: real tiny native signing, updater roundtrip, mutations and cleanup.\n"; errorOutput: "" } }
         if option == "--ephemeral-macos-ci" || option == "--owned-boat-windows" {
@@ -1016,7 +1017,7 @@ function perform(arguments: Arguments, hooks: Hooks): Exit {
             setKey(target, "windowsTimestamp", quote("TEST ONLY: omitted; production still requires RFC3161 SHA256 and /tw"))
             let version = tool(hooks, [arguments.openssl, "version"])
             outcome = version.outcome
-            if ok(outcome) { outcome = require(support.starts(Text(version.result.output), "OpenSSL 3."), "OpenSSL 3 required") }
+            if ok(outcome) { outcome = require(support.starts(utf8.decodeOrStop(version.result.output), "OpenSSL 3."), "OpenSSL 3 required") }
         }
     }
     if ok(outcome) {

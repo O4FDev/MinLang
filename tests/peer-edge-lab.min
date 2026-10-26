@@ -8,6 +8,7 @@ use "system" as system
 use "files" as files
 use "json" as json
 use "net" as net
+use "text" as utf8
 
 public record Reader { path: Text; offset: Integer; pending: Bytes }
 public record Device { process: fixtures.Process; fifo: Text; input: Integer; reader: Reader; closed: Boolean; finished: Boolean; events: List<Text> }
@@ -68,7 +69,7 @@ public function poll(item: Reader): Text {
     }
     for index in 0..item.pending.length {
         if item.pending[index] == 10 {
-            let line = Text(item.pending.slice(0, index))
+            let line = utf8.decodeOrStop(item.pending.slice(0, index))
             item.pending = item.pending.slice(index + 1, item.pending.length)
             return fixtures.strip(line) + "\n"
         }
@@ -79,7 +80,7 @@ public function nextLine(item: Reader, milliseconds: Integer): Text {
     let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
     while true {
         let line = poll(item)
-        if line != "" { return Text(Bytes(line).slice(0, line.byteLength - 1)) }
+        if line != "" { return utf8.decodeOrStop(Bytes(line).slice(0, line.byteLength - 1)) }
         if system.monotonicNanoseconds() >= deadline { return TIMEOUT }
         fixtures.pause("0.01")
     }
@@ -148,7 +149,7 @@ function startRedis(lab: Lab) {
         if connection >= 0 {
             let client = redis.Client { connection: connection; buffer: Bytes() }
             let info = redis.command(client, ["INFO", "server"])
-            if test.contains(Text(info.data), "process_id:" + Text(pid(process)) + "\r\n") {
+            if test.contains(utf8.decodeOrStop(info.data), "process_id:" + Text(pid(process)) + "\r\n") {
                 lab.redis = process
                 lab.redisPort = port
                 lab.client = client
@@ -261,7 +262,7 @@ function writeSource(lab: Lab) {
     let hashes: List<Text> = []
     for line in test.lines(listed.output) {
         let parts = fixtures.split(line, 32)
-        hashes.add(json.quote(Text(Bytes(line).slice(66, line.byteLength))) + ": " + json.quote(parts[0]))
+        hashes.add(json.quote(utf8.decodeOrStop(Bytes(line).slice(66, line.byteLength))) + ": " + json.quote(parts[0]))
     }
     let commitValue = "null"
     let originValue = "\"git-free snapshot\""
@@ -273,7 +274,7 @@ function writeSource(lab: Lab) {
         ",\n  \"sources_sha256\": {" + joined(hashes, ", ") + "},\n  \"binary_sha256\": " + json.quote(digest(context, lab.binary)) + ",\n  \"launcher_sha256\": " + json.quote(digest(context, context.root + "/minyar")) +
         ",\n  \"start\": " + Text(Float(system.wallClockMicroseconds()) / 1000000.0) + ",\n  \"pid\": " + Text(pid(lab.edge)) + ",\n  \"asan_options\": " + asanValue + "\n}\n")
 }
-public function diagnostic(lab: Lab): Text { return Text(files.readFile(lab.edge.log + ".err")) }
+public function diagnostic(lab: Lab): Text { return utf8.decodeOrStop(files.readFile(lab.edge.log + ".err")) }
 public function require(lab: Lab, condition: Boolean, message: Text) {
     if condition { return }
     close(lab)
@@ -290,7 +291,7 @@ public function startDevice(lab: Lab, certificate: Text): Device {
     lab.devices.add(item)
     require(lab, input >= 0, "open device input")
     let ready = nextLine(item.reader, 10000)
-    require(lab, ready == "READY", "device was not ready: " + ready + "\n" + Text(files.readFile(process.log + ".err")))
+    require(lab, ready == "READY", "device was not ready: " + ready + "\n" + utf8.decodeOrStop(files.readFile(process.log + ".err")))
     require(lab, waitState(lab, 5000) != "", "device did not reach live state")
     return item
 }
@@ -326,7 +327,7 @@ public function waitState(lab: Lab, milliseconds: Integer): Text {
     let deadline = system.monotonicNanoseconds() + milliseconds * 1000000
     while system.monotonicNanoseconds() < deadline {
         let reply = state(lab)
-        if reply.kind == redis.BULK { return Text(reply.data) }
+        if reply.kind == redis.BULK { return utf8.decodeOrStop(reply.data) }
         fixtures.pause("0.02")
     }
     return ""
@@ -376,7 +377,7 @@ public function describe(values: List<Setting>): Text {
 public function rss(process: fixtures.Process): Integer {
     let status = "/proc/" + Text(pid(process)) + "/status"
     if io.fileExists(status) {
-        for line in test.lines(Text(files.readFile(status))) {
+        for line in test.lines(utf8.decodeOrStop(files.readFile(status))) {
             if fixtures.starts(line, "VmRSS:") { return fixtures.number(test.words(line)[1]) }
         }
     } else {
@@ -418,7 +419,7 @@ public function close(lab: Lab) {
         while true {
             let line = poll(item.reader)
             if line == "" { break }
-            item.events.add(Text(Bytes(line).slice(0, line.byteLength - 1)))
+            item.events.add(utf8.decodeOrStop(Bytes(line).slice(0, line.byteLength - 1)))
         }
         let quoted: List<Text> = []
         for line in item.events { quoted.add(json.quote(line)) }
@@ -436,7 +437,7 @@ public function peerBinary(lab: Lab): Text { return fixtures.valueOr(lab.context
 public function session(lab: Lab, certificate: Text): Session {
     let process = fixtures.launch(lab.context, test.fullAddressSpace([peerBinary(lab), "session", "localhost:" + Text(lab.gatewayPort), fixtures.path(lab.certs, "ca", "pem"), fixtures.path(lab.certs, certificate, "pem"), fixtures.path(lab.certs, certificate, "key")]), 3600)
     let line = fixtures.firstLine(lab.context, process, 15000)
-    require(lab, fixtures.starts(line, "READY "), "independent gRPC session did not start: " + line + "\n" + Text(files.readFile(process.log + ".err")))
+    require(lab, fixtures.starts(line, "READY "), "independent gRPC session did not start: " + line + "\n" + utf8.decodeOrStop(files.readFile(process.log + ".err")))
     let connection = net.connect("127.0.0.1", fixtures.number(fixtures.split(line, 32)[1]))
     require(lab, connection >= 0, "connect to independent gRPC session")
     return Session { process: process; connection: connection; buffer: Bytes() }
@@ -453,7 +454,7 @@ public function ask(lab: Lab, item: Session, request: Text, milliseconds: Intege
     while true {
         for index in 0..item.buffer.length {
             if item.buffer[index] == 10 {
-                let line = Text(item.buffer.slice(0, index))
+                let line = utf8.decodeOrStop(item.buffer.slice(0, index))
                 item.buffer = item.buffer.slice(index + 1, item.buffer.length)
                 return json.parse(line)
             }
@@ -461,7 +462,7 @@ public function ask(lab: Lab, item: Session, request: Text, milliseconds: Intege
         let remaining = (deadline - system.monotonicNanoseconds()) / 1000000
         require(lab, remaining > 0 && net.ready(item.connection, remaining), "independent gRPC session did not answer " + request)
         let part = net.receive(item.connection, 1048576)
-        require(lab, part.length > 0, "independent gRPC session ended\n" + Text(files.readFile(item.process.log + ".err")))
+        require(lab, part.length > 0, "independent gRPC session ended\n" + utf8.decodeOrStop(files.readFile(item.process.log + ".err")))
         item.buffer.addBytes(part)
     }
     return json.parse("{}")
@@ -511,7 +512,7 @@ public function base64(data: Bytes): Text {
         if remaining > 2 { result.add(alphabet[value & 63]) } else { result.add(61) }
         index += 3
     }
-    return Text(result)
+    return utf8.decodeOrStop(result)
 }
 public function recorded(context: fixtures.Context, directory: Text, command: List<Text>, seconds: Integer): Text {
     let result = fixtures.run(context, command, seconds)

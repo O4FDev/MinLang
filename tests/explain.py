@@ -346,7 +346,7 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
          "print expects one Integer, Float, Text, Character, or Boolean value; found List<Integer>",
          (1, 7, 1, 8)),
         ("text-list", "Text([1])\n",
-         "Text expects one Integer, Float, Text, Character, Boolean, or Bytes value; found List<Integer>",
+         "Text expects one Integer, Float, Text, Character, or Boolean value; found List<Integer>",
          (1, 6, 1, 7)),
         ("fail-integer", "fail(42)\n", "fail expects one Text argument; found Integer",
          (1, 6, 1, 8)),
@@ -367,6 +367,15 @@ with tempfile.TemporaryDirectory(prefix="minyar explain · outside project '") a
         diagnostic(path, "E0404" if name == "count-before-type" else "E0401",
                    expected_message=primary, expected_span=span,
                    expected_source_lines=source.splitlines())
+
+    # Text(bytes) is gone: the conversion that can fail returns a Result.
+    text_bytes = root / "builtin-span-text-bytes.min"
+    source = 'let data = Bytes("hi")\nprint(Text(data))\n'
+    text_bytes.write_text(source, encoding="utf-8")
+    diagnostic(text_bytes, "E0401", expected_span=(2, 12, 2, 16), expected_source_lines=source.splitlines(),
+               expected_message="Text expects one Integer, Float, Text, Character, or Boolean value; found Bytes",
+               expected_help="use text.decode(bytes), which returns Result<Text, errors.Error>; for Bytes this "
+                             "program built from Text, text.decodeOrStop(bytes) stops on invalid UTF-8")
 
     for index, literal in enumerate(("0b102", "1__0", "1.5_0", "0xFF_FF"), 1):
         path = root / f"malformed-number-{index}.min"
