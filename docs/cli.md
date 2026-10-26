@@ -336,7 +336,10 @@ dependencies. A successful build replaces the running program. An invalid edit
 prints its diagnostics and keeps the previous program alive. Arguments after
 `--` reach each run unchanged. Interrupting the watcher stops its program and
 descendants. Watching uses filesystem notifications on Linux and macOS; generated
-`target`, `build` and `.git` directories are excluded.
+`target`, `build` and `.git` directories are excluded. After the first build of a
+session, rebuilds skip the toolchain check, and debug rebuilds compile the program
+in partitions cached beside the binary (`target/<profile>/.minyar-link/<name>/`),
+so an edit recompiles only the partitions it changes before linking.
 
 ```sh
 minyar run --watch -- first-argument
