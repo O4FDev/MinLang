@@ -34,6 +34,16 @@ link() {
     "$clang_command" -O0 -Wno-override-module "$1" "$runtime" $math_library -o "$2"
 }
 
+# AddressSanitizer reserves its shadow memory up front, so an instrumented program (MINYAR_TEST_LINK_FLAGS names
+# -fsanitize=address) runs with only its soft address-space limit raised to the hard limit, like test.fullAddressSpace
+# in tools/testing.min; the compiler and every uninstrumented program keep the harness cap.
+run_program() {
+    case " ${MINYAR_TEST_LINK_FLAGS-} " in
+        *-fsanitize=address*) (ulimit -S -v "$(ulimit -H -v)" || exit $?; exec "$@") ;;
+        *) "$@" ;;
+    esac
+}
+
 # 1. The compiler's command line.
 banner=$("$compiler" | sed -n '1p')
 [ "$banner" = "Minyar compiler bootstrap is ready" ] || fail "compiler banner" "got: $banner"
@@ -72,7 +82,7 @@ pass
 # 3. The language smoke program, through the single-module code path.
 "$compiler" "$project_dir/tests/smoke/language.min" "$build_dir/language.ll"
 link "$build_dir/language.ll" "$build_dir/language"
-"$build_dir/language" > "$build_dir/language.out"
+run_program "$build_dir/language" > "$build_dir/language.out"
 if ! cmp -s "$build_dir/language.out" "$project_dir/tests/smoke/expected-language.txt"; then
     diff "$project_dir/tests/smoke/expected-language.txt" "$build_dir/language.out" >&2 || true
     fail "language smoke program output changed"
@@ -84,7 +94,7 @@ pass
 sed 's/^function factorial/public function factorial/' "$project_dir/tests/smoke/language.min" > "$build_dir/language-public.min"
 "$compiler" "$build_dir/language-public.min" "$build_dir/language-public.ll"
 link "$build_dir/language-public.ll" "$build_dir/language-public"
-"$build_dir/language-public" > "$build_dir/language-public.out"
+run_program "$build_dir/language-public" > "$build_dir/language-public.out"
 cmp -s "$build_dir/language-public.out" "$project_dir/tests/smoke/expected-language.txt" || fail "module-aware code path disagrees with single-module path"
 pass
 
@@ -97,7 +107,7 @@ pass
 "$compiler" "$project_dir/tests/runtime/divide-by-zero.min" "$build_dir/divide.ll"
 link "$build_dir/divide.ll" "$build_dir/divide"
 status=0
-"$build_dir/divide" > "$build_dir/divide.out" 2> "$build_dir/divide.err" || status=$?
+run_program "$build_dir/divide" > "$build_dir/divide.out" 2> "$build_dir/divide.err" || status=$?
 [ "$status" -eq 1 ] || fail "runtime stop should exit with status 1" "status: $status"
 grep -q "^Minyar stopped: an Integer cannot be divided by zero" "$build_dir/divide.err" || fail "runtime stop message" "$(cat "$build_dir/divide.err")"
 pass
@@ -106,7 +116,7 @@ pass
 "$compiler" "$project_dir/tests/runtime/top-level-exit.min" "$build_dir/exit.ll"
 link "$build_dir/exit.ll" "$build_dir/exit"
 status=0
-"$build_dir/exit" > "$build_dir/exit.out" || status=$?
+run_program "$build_dir/exit" > "$build_dir/exit.out" || status=$?
 [ "$status" -eq 7 ] || fail "exit(7) should set the process status" "status: $status"
 [ "$(cat "$build_dir/exit.out")" = "before exit" ] || fail "output before exit" "$(cat "$build_dir/exit.out")"
 pass
@@ -114,7 +124,7 @@ pass
 # 8. Command-line arguments reach the program.
 "$compiler" "$project_dir/tests/runtime/text-and-files.min" "$build_dir/arguments.ll" --library "$project_dir/library"
 link "$build_dir/arguments.ll" "$build_dir/arguments"
-output=$("$build_dir/arguments" first "$project_dir/examples/hello.min" "$build_dir/written.txt" | tr '\n' ' ')
+output=$(run_program "$build_dir/arguments" first "$project_dir/examples/hello.min" "$build_dir/written.txt" | tr '\n' ' ')
 [ "$output" = "6 M 42 3 first true " ] || fail "program arguments and file access" "got: $output"
 [ "$(cat "$build_dir/written.txt")" = "Minyar" ] || fail "writeTextFile contents"
 pass
