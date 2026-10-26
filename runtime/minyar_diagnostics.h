@@ -795,3 +795,109 @@ long long minyar_runtime_diagnosticColumns(const MinyarText *text) {
     }
     return columns;
 }
+
+/* compilerCopyTokens and compilerCopyPaths in compiler/stages/source.min copy a
+ * run of unchanged tokens from one token stage to the end of another, the way
+ * copyModuleToken copies one token. Both arguments are TokenTables records that
+ * alias a stage's Lists; this field order is the ABI of both natives. */
+enum {
+    TOKEN_KINDS,
+    TOKEN_TEXTS,
+    TOKEN_COORDINATES,
+    TOKEN_PATHS,
+    TOKEN_DOCUMENTATION,
+    TOKEN_ORIGINS,
+    TOKEN_PATH_MAP,
+    TOKEN_EMPTY,
+    TOKEN_TABLE_FIELDS
+};
+
+static MinyarList *token_table(MinyarRecord *tables, int field) {
+    if (tables->length != TOKEN_TABLE_FIELDS)
+        minyar_stop("token tables do not match the compiler runtime.");
+    return (MinyarList *)(uintptr_t)tables->values[field];
+}
+
+/* Appends source[start, end), which must not be target itself. */
+static void token_append(MinyarList *target, const MinyarList *source, long long start, long long end) {
+    if (start < 0 || end < start || end > source->length || target == source)
+        minyar_stop("token run positions are outside their stage.");
+    long long count = end - start;
+    if (!count)
+        return;
+    if (count > LLONG_MAX - target->length)
+        minyar_stop("this List became too large.");
+    list_reserve(target, target->length + count);
+#ifdef MINYAR_COMPILER_ARENA
+    memcpy(target->values + target->length, source->values + start, (size_t)count * sizeof(*target->values));
+    target->length += count;
+#else
+    for (long long position = start; position < end; position++)
+        minyar_list_add(target, source->values[position]);
+#endif
+}
+
+/* Documentation and origins are sparse: a stage's List ends at its last entry
+ * and pads skipped tokens with empty Text, like setTokenDocumentation. A token
+ * has an origin when its line coordinate is -1; it has documentation when that
+ * Text is not empty. */
+static void token_sparse(MinyarList *target, long long target_start, const MinyarList *source,
+                         long long start, long long end, const MinyarList *coordinates, long long empty) {
+    long long available = end < source->length ? end : source->length;
+    for (long long position = start; position < available; position++) {
+        long long value = source->values[position];
+        if (coordinates ? coordinates->values[position * 2] != -1
+                        : ((const MinyarText *)(uintptr_t)value)->byte_length == 0)
+            continue;
+        long long slot = target_start + position - start;
+        if (slot < target->length)
+            minyar_stop("token run overlaps its stage's sparse entries.");
+        while (target->length < slot)
+            minyar_list_add(target, empty);
+        minyar_list_add(target, value);
+    }
+}
+
+void minyar_runtime_compilerCopyTokens(MinyarRecord *target, MinyarRecord *source, long long start, long long end) {
+    MinyarList *kinds = token_table(target, TOKEN_KINDS);
+    long long target_start = kinds->length;
+    MinyarList *coordinates = token_table(source, TOKEN_COORDINATES);
+    if (start < 0 || end < start || end > LLONG_MAX / 2)
+        minyar_stop("token run positions are outside their stage.");
+    token_append(kinds, token_table(source, TOKEN_KINDS), start, end);
+    token_append(token_table(target, TOKEN_TEXTS), token_table(source, TOKEN_TEXTS), start, end);
+    token_append(token_table(target, TOKEN_COORDINATES), coordinates, start * 2, end * 2);
+    long long empty = target->values[TOKEN_EMPTY];
+    token_sparse(token_table(target, TOKEN_DOCUMENTATION), target_start, token_table(source, TOKEN_DOCUMENTATION),
+                 start, end, NULL, empty);
+    token_sparse(token_table(target, TOKEN_ORIGINS), target_start, token_table(source, TOKEN_ORIGINS), start, end,
+                 coordinates, empty);
+}
+
+/* Path indices are lazily sized too: a missing entry means path 0. Writes
+ * source's pathMap[path] for its tokens from start to end, as tokens from
+ * targetStart on, padding target with path 0. Stops at a path the map does
+ * not translate yet (-1) and returns that position, so the caller enters paths
+ * in the order tokens first use them; otherwise returns end. */
+long long minyar_runtime_compilerCopyPaths(MinyarRecord *target, MinyarRecord *source, long long target_start,
+                                           long long start, long long end) {
+    MinyarList *paths = token_table(target, TOKEN_PATHS), *from = token_table(source, TOKEN_PATHS);
+    MinyarList *map = token_table(source, TOKEN_PATH_MAP);
+    if (start < 0 || end < start || target_start < paths->length || paths == from)
+        minyar_stop("token run positions are outside their stage.");
+    long long available = end < from->length ? end : from->length;
+    if (start >= available)
+        return end;
+    list_reserve(paths, target_start + (available - start));
+    while (paths->length < target_start)
+        paths->values[paths->length++] = 0;
+    for (long long position = start; position < available; position++) {
+        long long path = from->values[position];
+        if (path < 0 || path >= map->length)
+            minyar_stop("token path is outside its stage's path table.");
+        if (map->values[path] < 0)
+            return position;
+        paths->values[paths->length++] = map->values[path];
+    }
+    return end;
+}

@@ -126,17 +126,50 @@ function setTokenOrigin(locations: SourceMap, position: Integer, origin: Text) {
 }
 
 function copyModuleToken(tokenKinds: List<Integer>, tokenTexts: List<Text>, locations: SourceMap, kind: Integer, text: Text, source: SourceMap, position: Integer, origin: Integer) {
-    if locations.inputPath == "" { locations.inputPath = source.inputPath }
+    if locations.inputPath.byteLength == 0 { locations.inputPath = source.inputPath }
     let target = tokenKinds.length
     tokenKinds.add(kind)
     tokenTexts.add(text)
-    if position < source.documentation.length && source.documentation[position] != "" { setTokenDocumentation(locations, target, source.documentation[position]) }
+    let documentation = source.documentation
+    if position < documentation.length && documentation[position].byteLength > 0 { setTokenDocumentation(locations, target, documentation[position]) }
     let from = source.coordinates
     let to = locations.coordinates
-    to.add(from[position * 2])
+    let line = from[position * 2]
+    to.add(line)
     to.add(from[position * 2 + 1])
-    setTokenPath(locations, target, origin)
-    if from[position * 2] == -1 { setTokenOrigin(locations, target, source.origins[position]) }
+    if origin != 0 || target < locations.pathIndices.length { setTokenPath(locations, target, origin) }
+    if line == -1 { setTokenOrigin(locations, target, source.origins[position]) }
+}
+
+// A token stage's Lists, aliased for the runtime's run copy. The field order is
+// the ABI of compilerCopyTokens and compilerCopyPaths (runtime/minyar_diagnostics.h).
+record TokenTables { kinds: List<Integer>; texts: List<Text>; coordinates: List<Integer>; paths: List<Integer>; documentation: List<Text>; origins: List<Text>; pathMap: List<Integer>; empty: Text }
+function compilerCopyTokens(target: TokenTables, source: TokenTables, start: Integer, end: Integer) { native "runtime" }
+function compilerCopyPaths(target: TokenTables, source: TokenTables, targetStart: Integer, start: Integer, end: Integer): Integer { native "runtime" }
+
+// Token passes copy most of their input unchanged. A pass advances over such
+// a run and copies tokens [start, end) here when it reaches a rewrite or the
+// end: the same stage copyModuleToken builds token by token with each token's
+// own path, in a few runtime appends. keepPaths false drops the paths
+// (copyModuleToken with origin 0).
+function copyTokenRun(tokenKinds: List<Integer>, tokenTexts: List<Text>, locations: SourceMap, sourceKinds: List<Integer>, sourceTexts: List<Text>, source: SourceMap, start: Integer, end: Integer, keepPaths: Boolean) {
+    if end <= start { return }
+    if locations.inputPath == "" { locations.inputPath = source.inputPath }
+    let target = tokenKinds.length
+    let unused: List<Integer> = []
+    let map: List<Integer> = []
+    let into = TokenTables { kinds: tokenKinds; texts: tokenTexts; coordinates: locations.coordinates; paths: locations.pathIndices; documentation: locations.documentation; origins: locations.origins; pathMap: unused; empty: "" }
+    let from = TokenTables { kinds: sourceKinds; texts: sourceTexts; coordinates: source.coordinates; paths: source.pathIndices; documentation: source.documentation; origins: source.origins; pathMap: map; empty: "" }
+    compilerCopyTokens(into, from, start, end)
+    if keepPaths && start < source.pathIndices.length {
+        // Paths enter the stage in the order its tokens first use them.
+        while map.length < source.paths.length { map.add(-1) }
+        let next = start
+        while next < end {
+            next = compilerCopyPaths(into, from, target + next - start, next, end)
+            if next < end { map[source.pathIndices[next]] = sourcePath(locations, source.paths[source.pathIndices[next]]) }
+        }
+    }
 }
 
 // Token passes copy the whole stream into a fresh stage and never read the
