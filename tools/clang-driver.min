@@ -599,6 +599,60 @@ function binding(path: Text, retained: Text): Binding {
     if size < 0 { return unbound(original, host.osRepr(size), host.osError(size, target)) }
     return Binding { original: original; retained: host.baseName(target); digest: first; size: size; error: ""; failure: "" }
 }
+function linkFile(source: Text, destination: Text): Integer { native "driverhost" }
+function freezeFile(path: Text): Integer { native "driverhost" }
+function identityOf(info: host.Status): Text { return info.device + " " + info.inode + " " + Text(info.size) + " " + Text(info.modified) + " " + Text(info.changed) }
+// MINYAR_LINK_TOOL_STORE (optional) names one directory per evidence run that links many times. Each tool (this
+// driver, the selected Clang: 282 MB for an LLVM release build) is retained there once, read-only, as <store>/<sha256>
+// and hard-linked into every link's artifact directory, so each manifest still names its own clang.bin. A tool whose
+// identity (device, inode, size, modification and change times) is unchanged since it was stored is not hashed
+// again; a new or changed tool is hashed before, during and after retention exactly as `binding` does. Without the
+// variable, or when a hard link is impossible (another file system), every link copies its tools as before.
+function toolBinding(path: Text, retained: Text): Binding {
+    let store = host.setting("MINYAR_LINK_TOOL_STORE", "")
+    if store == "" { return binding(path, retained) }
+    let original = host.resolveName(path)
+    let before = host.fileStatus(original)
+    if before.kind != "f" || files.makeDirectory(store) != 0 { return binding(path, retained) }
+    let identity = identityOf(before)
+    let record = store + "/" + host.hashBytes(Bytes(original + "\n" + identity)) + ".identity"
+    let digest = ""
+    if host.isFile(record) { digest = utf8.decodeOrStop(host.load(record).data) }
+    let entry = store + "/" + digest
+    let stored = host.fileStatus(entry)
+    if digest == "" || stored.kind != "f" || stored.size != before.size {
+        let staging = makeTemporary(store, ".incoming-")
+        if staging == "" { return binding(path, retained) }
+        registerTemporary(staging)
+        let fresh = binding(original, staging + "/tool")
+        if fresh.error != "" { host.release(staging); return fresh }
+        digest = fresh.digest
+        entry = store + "/" + digest
+        // Content already stored under this digest (another path or an older identity) keeps its one copy.
+        let published = 0
+        let existing = host.fileStatus(entry)
+        if existing.kind != "f" || existing.size != fresh.size {
+            published = files.rename(staging + "/tool", entry)
+            if published == 0 { published = freezeFile(entry) }
+        }
+        if published == 0 { published = host.store(staging + "/identity", Bytes(digest)) }
+        if published == 0 { published = files.rename(staging + "/identity", record) }
+        host.release(staging)
+        if published != 0 { return unbound(original, host.osRepr(published), host.osError(published, entry)) }
+    }
+    let directory = makeTemporary(host.parentPath(retained), ".retain-")
+    if directory == "" { let error = host.lastError(); return unbound(original, host.osRepr(error), host.osError(error, retained)) }
+    registerTemporary(directory)
+    let linked = linkFile(entry, directory + "/tool")
+    if linked == 0 { linked = files.rename(directory + "/tool", retained) }
+    host.release(directory)
+    if linked != 0 { return binding(path, retained) }
+    if identityOf(host.fileStatus(original)) != identity || !host.sameFile(entry, retained) {
+        let message = "link input changed while retaining evidence"
+        return unbound(original, "ValueError(" + host.pythonText(message) + ")", message)
+    }
+    return Binding { original: original; retained: host.baseName(retained); digest: digest; size: before.size; error: ""; failure: "" }
+}
 function bindingFailed(link: Link, value: Binding): Boolean { return failedWith(link, value.failure, value.error) }
 function bindingObject(doc: host.Document, value: Binding): Integer {
     let row = host.jsonObject(doc)
@@ -927,14 +981,14 @@ function linkSteps(link: Link, clang: Text, prefix: List<Text>, linkFlags: List<
         let tools = host.jsonLookup(doc, root, "tools")
         let bindings = host.jsonLookup(doc, root, "tool_bindings")
         let self = host.selfPath()
-        let driver = binding(self, directory + "/clang-driver")
+        let driver = toolBinding(self, directory + "/clang-driver")
         if driver.error != "" { return bindingFailed(link, driver) }
         host.jsonPut(doc, tools, "clang-driver", host.jsonString(doc, driver.digest))
         host.jsonPut(doc, bindings, "clang-driver", bindingObject(doc, driver))
         let selected = host.which(clang)
         if selected == "" { selected = clang }
         let compiler = host.resolveName(selected)
-        let bound = binding(compiler, directory + "/clang.bin")
+        let bound = toolBinding(compiler, directory + "/clang.bin")
         if bound.error != "" { return bindingFailed(link, bound) }
         host.jsonPut(doc, tools, "clang.bin", host.jsonString(doc, bound.digest))
         host.jsonPut(doc, bindings, "clang.bin", bindingObject(doc, bound))

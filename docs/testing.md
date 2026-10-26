@@ -65,7 +65,15 @@ Quinn labs (`go` and `cargo` builds, the Go and Rust peer programs and
 `redis-server`). Checks whose link evidence keeps Clang itself (an LLVM release
 `clang` is 282 MB) raise the file limit to 512 MiB with
 `MINYAR_MAX_FILE_BLOCKS ?= 1048576`; without it the link dies with SIGXFSZ
-(status 153). The labs that run a real Redis (`check-peer-edge*`,
+(status 153). A harness that retains many links sets `MINYAR_LINK_TOOL_STORE`
+to one directory beside its evidence (`<run>.link-tools`: hard links cannot
+cross mount points): `clang-driver` then keeps one read-only copy of each tool
+there, named by its SHA-256, and hard-links it into every link's artifact
+directory, so each manifest still names its own `clang.bin`; where a hard link
+is impossible it copies as before. A tool whose
+device, inode, size and modification/change times are unchanged is not hashed
+again (`check-quic-rfc`, `check-generated-llvm-sanitizer` and the stock CID lab
+use it; the QUIC ledger's receipt controls share one copy the same way). The labs that run a real Redis (`check-peer-edge*`,
 `check-peer-live-redis`) print `SKIP <target>: redis-server is not on PATH` and
 pass on hosts without one; `MINYAR_REQUIRE_LAB_TOOLS=1` makes a missing server a
 failure.

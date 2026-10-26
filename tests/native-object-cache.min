@@ -111,6 +111,19 @@ function build(fixture: Fixture, flags: List<Text>): Text {
     test.check(rows.length == 1, "expected one retained native object, saw " + Text(rows.length))
     return rows[0]
 }
+// One link through MINYAR_LINK_TOOL_STORE; its evidence stays for the caller to compare.
+function storedLink(fixture: Fixture, clang: Text, store: Text): Text {
+    fixture.serial += 1
+    let evidence = fixture.scratch + "/stored-evidence-" + Text(fixture.serial)
+    let environment = support.merge(system.environment(), ["MINYAR_CLANG=" + clang, "MINYAR_NATIVE_FLAGS=-O1", "MINYAR_CLANG_FLAGS=-O1 -Wno-override-module",
+        "MINYAR_LINK_ARTIFACTS=" + evidence, "MINYAR_LINK_TOOL_STORE=" + store])
+    let result = tf.run(fixture.logs, [fixture.driver, "link", fixture.project, fixture.program, fixture.runtime, fixture.project + "/program", "0"], environment, "", 120)
+    test.check(result.status == 0, "stored-tool link failed (" + Text(result.status) + ")\n" + result.errorOutput)
+    let manifest = json.parse(io.readTextFile(evidence + "/manifest.json"))
+    test.check(manifest.kind == json.OBJECT, "link manifest must be a JSON object")
+    fingerprints(fixture, evidence, manifest)
+    return evidence
+}
 function contentObject(name: Text): Boolean {
     let raw = Bytes(name)
     if raw.length != 4 + 64 + 2 || !support.starts(name, "net-") || !support.ends(name, ".o") { return false }
@@ -125,7 +138,8 @@ let scratch = test.scratch()
 let logs = tf.logs(scratch + "/logs")
 let root = test.lines(support.output(["pwd", "-P"], tf.next(logs)))[0]
 let clang = test.setting("MINYAR_CLANG", test.setting("LLVM_CC", "clang"))
-let names = ["test_unchanged_sources_reuse_the_object", "test_header_source_and_flag_changes_compile_a_new_object", "test_changed_link_input_preserves_evidence_and_previous_output"]
+let names = ["test_unchanged_sources_reuse_the_object", "test_header_source_and_flag_changes_compile_a_new_object", "test_changed_link_input_preserves_evidence_and_previous_output",
+    "test_tool_store_keeps_one_read_only_copy_per_tool"]
 for index in 0..processInfo.argumentCount() {
     let valid = processInfo.argument(index) == "NativeObjectCache"
     for name in names { if processInfo.argument(index) == name || processInfo.argument(index) == "NativeObjectCache." + name { valid = true } }
@@ -193,6 +207,42 @@ if chosen("test_changed_link_input_preserves_evidence_and_previous_output") {
         }
     }
     test.check(runtimeRows == 1, "failed link must retain its runtime row")
+    cases += 1
+}
+if chosen("test_tool_store_keeps_one_read_only_copy_per_tool") {
+    let fixture = setUp(root, scratch, "store", clang, logs)
+    let store = scratch + "/tool-store"
+    let first = storedLink(fixture, clang, store)
+    let second = storedLink(fixture, clang, store)
+    let digests: List<Text> = []
+    let records = 0
+    for name in tf.listing(store) {
+        if support.ends(name, ".identity") { records += 1 } else { digests.add(name) }
+    }
+    test.check(digests.length == 2 && records == 2, "one stored copy and one identity per tool, saw " + tf.show(tf.listing(store)))
+    for name in ["clang.bin", "clang-driver"] {
+        let shared = tf.identity(first + "/" + name)
+        test.check(shared != "" && shared == tf.identity(second + "/" + name), name + " must be one hard-linked copy in both links")
+        let stored = false
+        for entry in digests { if tf.identity(store + "/" + entry) == shared { stored = true } }
+        test.check(stored, name + " must be the store's copy")
+        test.check(test.run(["/bin/sh", "-c", "test ! -w \"$1\"", "minyar", first + "/" + name], system.environment(), "", tf.next(logs), 10).status == 0, name + " must be read-only")
+    }
+    // Another tool path is bound afresh; the same tool with a changed modification time is bound again into its one
+    // content copy. A forwarding Clang keeps this cheap; its comment pads it past one 64 KiB retention chunk, which
+    // fingerprints() requires of every retained Clang.
+    let forwarding = fixture.project + "/forwarding-clang"
+    let padding: List<Text> = []
+    for line in 0..1100 { padding.add("# forwarding Clang for the tool store identity control ------------\n") }
+    tf.executable(forwarding, joinText(padding) + "exec '" + clang + "' \"$@\"\n", logs)
+    storedLink(fixture, forwarding, store)
+    tf.setModified(forwarding, tf.mtime(forwarding) + 1000000000)
+    let third = storedLink(fixture, forwarding, store)
+    records = 0
+    let entries = 0
+    for name in tf.listing(store) { if support.ends(name, ".identity") { records += 1 } else { entries += 1 } }
+    test.check(records == 4 && entries == 3, "a new tool and a changed identity must be bound again (one copy per content), saw " + tf.show(tf.listing(store)))
+    test.check(tf.identity(third + "/clang-driver") == tf.identity(first + "/clang-driver"), "an unchanged driver keeps its one copy")
     cases += 1
 }
 test.removeTree(scratch)

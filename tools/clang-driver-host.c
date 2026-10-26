@@ -233,6 +233,28 @@ long long minyar_driverhost_copyExclusive(const MinyarText *source, const Minyar
     return -error;
 }
 
+// A second name for an existing regular file (link(2)); 0 or -errno, e.g. -EXDEV across file systems.
+long long minyar_driverhost_linkFile(const MinyarText *source, const MinyarText *destination) {
+    char *from = host_cstring(source);
+    char *to = host_cstring(destination);
+    int error = !from || !to ? (host_error ? host_error : EINVAL) : 0;
+    if (!error && link(from, to)) error = errno;
+    free(from);
+    free(to);
+    return -error;
+}
+
+// Remove every write permission bit, so no hard link to the file can be rewritten in place; 0 or -errno.
+long long minyar_driverhost_freezeFile(const MinyarText *path) {
+    char *name = host_cstring(path);
+    if (!name) return -(host_error ? host_error : EINVAL);
+    struct stat info;
+    int error = stat(name, &info) ? errno : 0;
+    if (!error && chmod(name, info.st_mode & 07555)) error = errno;
+    free(name);
+    return -error;
+}
+
 static long long host_lock(const MinyarText *path, int operation) {
     char *name = host_cstring(path);
     if (!name) return -(host_error ? host_error : EINVAL);
