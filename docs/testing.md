@@ -145,6 +145,10 @@ process groups. Output readiness and FIFO handshakes establish ordering.
 `make check-live-transform` executes LLVM forwarding at O0/O2 and checks source
 and image ABI guards. `make check-live-hot` checks the same PID and heap roots
 across function updates and rejected edits, and reports edit-to-observation time.
+`make check-live-generic-names` patches a body that swaps the first uses of two
+same-ABI generic instances and requires a closure stored before the patch to keep
+calling its own instance (instance names hash their type arguments, and the image
+signature is order-independent).
 `make check-live-patch-load` updates a serving HTTP process under keep-alive load
 and requires every request to succeed and its request counter to continue.
 `make check-minyar-repl` runs exact O0/O2 transcripts proving persistent mutations,
