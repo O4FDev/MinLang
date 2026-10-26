@@ -117,3 +117,89 @@ function recoveryTextPosition(text: Text, wanted: Text): Integer {
 function recoveryEnabled(state: List<Integer>): Boolean {
     return state[15] / 8 % 2 != 0
 }
+
+// boundary.run(body) and boundary.runWith(item, body): run body (with item); a
+// program error that stops it becomes the library's failure value instead of
+// ending the process (runtime/minyar_boundary.h). The jump target is this
+// function: _setjmp on runtime-owned storage, then the indirect call to body
+// stays visible to the determinism audit. runWith instances are generic, so
+// their result factories are found by name in the boundary module.
+function compileFailureBoundary(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, name: Text, returnType: Integer) {
+    let names = context.functionNames
+    let kinds = context.symbolKinds
+    let returns = context.functionReturnTypes
+    let counts = context.functionParameterCounts
+    let fields = context.functionParameterTypes
+    let lookup = context.tokenLines.symbolLookup
+    let function = findFunction(names, kinds, lookup, name)
+    let first = functionParameterOffset(counts, function)
+    let readable = readableDeclarationName(name)
+    let withItem = readable == "runWith" && counts[function] == 2
+    let callback = first
+    if withItem { callback = first + 1 }
+    if !(withItem || (readable == "run" && counts[function] == 1)) || !isCallbackType(fields[callback], names) {
+        failCompiler("boundary native requires run(() -> Nothing) or runWith(Item, (Item) -> Nothing)")
+    }
+    let signature = callbackSignatureTypes(names[recordTypeIndex(fields[callback])])
+    if !withItem && (signature.length != 1 || signature[0] != 5) { failCompiler("boundary.run requires a () -> Nothing body") }
+    if withItem && (signature.length != 2 || signature[0] != fields[first] || signature[1] != 5) { failCompiler("boundary.runWith requires an (Item) -> Nothing body") }
+    let success = boundaryFactory(context, name, readable, "boundarySuccess", returnType)
+    let failure = boundaryFactory(context, name, readable, "boundaryFailure", returnType)
+    if counts[success] != 0 || counts[failure] != 1 || fields[functionParameterOffset(counts, failure)] != 2 {
+        failCompiler("boundary result factories have incompatible signatures")
+    }
+    let item = ""
+    if withItem { item = ", " + llvmType(fields[first]) + " %argument.0" }
+    let result = llvmType(returnType)
+    boundaryPrototype(context, "declare ptr @minyar_boundary_begin(ptr)")
+    boundaryPrototype(context, "declare void @minyar_boundary_end(ptr)")
+    boundaryPrototype(context, "declare ptr @minyar_boundary_failure(ptr)")
+    boundaryPrototype(context, "declare ptr @minyar_boundary_success(ptr)")
+    boundaryPrototype(context, "declare i32 @_setjmp(ptr) returns_twice")
+    let record = "%argument." + Text(callback - first)
+    output.add("  call void @minyar_callback_check(ptr " + record + ")\n")
+    output.add("  %boundary.code.slot = getelementptr i64, ptr " + record + ", i64 1\n  %boundary.code = load ptr, ptr %boundary.code.slot\n")
+    output.add("  %boundary.env.slot = getelementptr i64, ptr " + record + ", i64 2\n  %boundary.env = load ptr, ptr %boundary.env.slot\n")
+    output.add("  %boundary.storage = alloca [1024 x i8], align 16\n")
+    output.add("  %boundary.jump = call ptr @minyar_boundary_begin(ptr %boundary.storage)\n")
+    output.add("  %boundary.supported = icmp ne ptr %boundary.jump, null\n")
+    output.add("  br i1 %boundary.supported, label %boundary.arm, label %boundary.body\n")
+    output.add("boundary.arm:\n  %boundary.again = call i32 @_setjmp(ptr %boundary.jump)\n")
+    output.add("  %boundary.first = icmp eq i32 %boundary.again, 0\n")
+    output.add("  br i1 %boundary.first, label %boundary.body, label %boundary.failed\n")
+    output.add("boundary.body:\n  call void %boundary.code(ptr %boundary.env" + item + ")\n")
+    output.add("  call void @minyar_boundary_end(ptr %boundary.storage)\n")
+    recoveryNativeCheckpoint(output, textState, state, 5)
+    output.add("  %boundary.success = call ptr @minyar_boundary_success(ptr @.minyar.fn." + names[success] + ")\n")
+    output.add("  ret " + result + " %boundary.success\n")
+    output.add("boundary.failed:\n  %boundary.message = call ptr @minyar_boundary_failure(ptr %boundary.storage)\n")
+    output.add("  %boundary.error = call " + result + " @.minyar.fn." + names[failure] + "(ptr %boundary.message)\n")
+    output.add("  call void @minyar_rc_release(ptr %boundary.message)\n")
+    output.add("  ret " + result + " %boundary.error\n")
+}
+
+function boundaryPrototype(context: CompilerContext, prototype: Text) {
+    context.nativeLibraries.add("runtime")
+    context.nativePrototypes.add(prototype)
+}
+
+// The boundary module's private result factory: beside an ordinary run, or the
+// only one of that name for a generic runWith instance.
+function boundaryFactory(context: CompilerContext, name: Text, readable: Text, factory: Text, returnType: Integer): Integer {
+    let names = context.functionNames
+    let found = -1
+    if !name.startsWith("minyar_generic_function_") {
+        found = findFunction(names, context.symbolKinds, context.tokenLines.symbolLookup, name.slice(0, name.length - readable.length) + factory)
+    } else {
+        let index = 0
+        while index < names.length {
+            if context.symbolKinds[index] == 1 && names[index].endsWith("_" + factory) && readableDeclarationName(names[index]) == factory && context.functionReturnTypes[index] == returnType {
+                if found >= 0 { failCompiler("boundary result factory '" + factory + "' is ambiguous") }
+                found = index
+            }
+            index = index + 1
+        }
+    }
+    if found < 0 || context.functionReturnTypes[found] != returnType { failCompiler("boundary requires its result factories") }
+    return found
+}

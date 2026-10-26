@@ -1,0 +1,90 @@
+// boundary.run turns program errors into values (runtime/minyar_boundary.h).
+use "boundary" as boundary
+use "errors" as errors
+use "text" as utf8
+
+record Counter { hits: Integer; names: List<Text> }
+
+function report(label: Text, result: Result<Nothing, errors.Error>) {
+    match result {
+        Ok() { print(label + ": ok") }
+        Err(problem) {
+            check(problem.code() == errors.stoppedCode(), "contained stops use stoppedCode")
+            print(label + ": " + problem.message())
+        }
+    }
+}
+function check(condition: Boolean, what: Text) {
+    if !condition { fail("boundary test: " + what) }
+}
+function deep(level: Integer, values: List<Integer>): Integer {
+    let local = [level, level + 1]
+    let name = "level " + Text(level)
+    if level == 0 { return values[local[1] + 10] }
+    return deep(level - 1, values) + local[0] + name.length
+}
+function divide(a: Integer, b: Integer): Integer { return a / b }
+
+let counter = Counter { hits: 0; names: [] }
+report("success", boundary.run(function() { counter.hits += 1 }))
+report("fail", boundary.run(function() { fail("the plugin gave up") }))
+report("list", boundary.run(function() { let values = [1]; print(values[5]) }))
+report("unwrap", boundary.run(function() {
+    let missing: Maybe<Integer> = None
+    print(missing.unwrap())
+}))
+report("overflow", boundary.run(function() { let big = 9223372036854775807; print(big + 1) }))
+report("division", boundary.run(function() { print(divide(1, 0)) }))
+report("map", boundary.run(function() { let ages: Map<Text, Integer> = Map(); ages["ada"] = 36; print(ages["bob"]) }))
+report("text", boundary.run(function() { print("abc".slice(2, 9)) }))
+report("integer", boundary.run(function() { print(Integer("12x")) }))
+report("deep", boundary.run(function() { print(deep(40, [1, 2, 3])) }))
+report("utf8", boundary.run(function() { let raw = Bytes("ab"); raw.add(255); print(utf8.decodeOrStop(raw)) }))
+
+// runWith passes one argument: no closure, so a host calls plugin code per item without allocating.
+function plugin(counter: Counter) { counter.hits += 1; if counter.hits > 1000 { fail("plugin limit") } }
+function brokenPlugin(counter: Counter) { let names = counter.names; print(names[7]) }
+report("runWith", boundary.runWith(counter, plugin))
+report("runWith stop", boundary.runWith(counter, brokenPlugin))
+report("runWith integer", boundary.runWith(6, function(n: Integer) { print(n * 7) }))
+counter.hits -= 1
+
+// A deterministic function may contain stops: the audit follows the boundary into its body.
+deterministic function containedTotal(values: List<Integer>, position: Integer): Integer {
+    let total = Counter { hits: 0; names: [] }
+    match boundary.runWith(total, function(counter: Counter) { counter.hits = values[position] }) {
+        Ok() { return total.hits }
+        Err(problem) { return -1 }
+    }
+}
+print("deterministic " + Text(containedTotal([4, 5], 1)) + " " + Text(containedTotal([4, 5], 9)))
+
+// Nothing is rolled back: changes made before the stop stay.
+report("partial", boundary.run(function() {
+    counter.hits += 1
+    counter.names.add("before")
+    fail("after the change")
+}))
+print("hits " + Text(counter.hits) + ", names " + Text(counter.names.length))
+
+// Boundaries nest; the innermost one contains the stop.
+report("outer", boundary.run(function() {
+    report("inner", boundary.run(function() { fail("inner stop") }))
+    counter.hits += 1
+}))
+print("hits " + Text(counter.hits))
+
+// Many contained stops in a row: ownership frames are released each time.
+let failures = 0
+for round in 0..20000 {
+    let names = ["a", "b", Text(round)]
+    match boundary.run(function() { let copy = names.slice(0, 3); copy.add("x"); print(copy[round + 10]) }) {
+        Ok() { }
+        Err(problem) { failures += 1 }
+    }
+}
+print("failures " + Text(failures))
+
+// The program carries on normally afterwards.
+let after = [3, 1, 2].sorted()
+print("after " + Text(after[0]) + Text(after[2]))

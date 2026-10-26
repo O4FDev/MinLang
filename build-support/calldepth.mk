@@ -64,3 +64,16 @@ ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s))
 check check-portable: check-calldepth check-calldepth-launcher check-calldepth-reporting check-calldepth-hooks
 check-sanitize: check-calldepth-sanitize check-calldepth-reporting-sanitize check-calldepth-hooks-sanitize
 endif
+
+# Contained failure boundary (library boundary, runtime/minyar_boundary.h): Linux and macOS.
+.PHONY: check-boundary check-boundary-sanitize
+check-boundary: build/minyarc build/tooling/tests/boundary-test
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/boundary-test
+
+check-boundary-sanitize: build/minyarc build/tooling/tests/boundary-test
+	MINYAR_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/boundary-test --sanitize
+
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+check check-portable: check-boundary
+check-sanitize: check-boundary-sanitize
+endif

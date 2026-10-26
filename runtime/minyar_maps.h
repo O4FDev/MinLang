@@ -56,7 +56,7 @@ static long long map_canonical_key(long long kind, long long key) {
         if ((bits & UINT64_C(0x7fffffffffffffff)) == 0) return 0;
         if ((bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000) &&
             (bits & UINT64_C(0x000fffffffffffff)))
-            minyar_stop("NaN cannot be used as a Map key or Set element.");
+            minyar_stop_program("NaN cannot be used as a Map key or Set element.");
     }
     return key;
 }
@@ -102,7 +102,9 @@ static inline uint64_t map_hash_key(const MinyarRecord *map, long long key) {
     if (minyar_recovery_pending()) return 0;
     if (map->values[MAP_KEY_KIND] < 1000) return minyar_map_hash(map->values[MAP_KEY_KIND], key);
     MinyarRecordHash hash = (MinyarRecordHash)(uintptr_t)map->values[MAP_HASH_CALLBACK];
+    minyar_runtime_callers++; /* stops inside a key callback are never contained */
     uint64_t value = hash((const MinyarRecord *)(uintptr_t)key);
+    minyar_runtime_callers--;
     if (minyar_recovery_pending()) return 0;
     return value ? value : UINT64_C(0x9e3779b97f4a7c15);
 }
@@ -119,7 +121,9 @@ static inline int map_keys_equal(const MinyarRecord *map, long long a, long long
     if (minyar_recovery_pending()) return 0;
     if (map->values[MAP_KEY_KIND] < 1000) return map_key_equal(map->values[MAP_KEY_KIND], a, b);
     MinyarRecordEqual equal = (MinyarRecordEqual)(uintptr_t)map->values[MAP_EQUAL_CALLBACK];
+    minyar_runtime_callers++;
     int result = equal((const MinyarRecord *)(uintptr_t)a, (const MinyarRecord *)(uintptr_t)b);
+    minyar_runtime_callers--;
     return !minyar_recovery_pending() && result;
 }
 /* The last present slot found for a scalar or Text key, per thread, so an
@@ -260,7 +264,7 @@ long long minyar_map_get(const MinyarRecord *map, long long key) {
     }
 done:
     map_read_end(&guard);
-    if (absent) minyar_stop("Map key is absent.");
+    if (absent) minyar_stop_program("Map key is absent.");
     return result;
 }
 static inline void map_store(MinyarList *array, size_t bucket, long long value) {
@@ -307,7 +311,9 @@ void minyar_map_set(MinyarRecord *map, long long key, long long value) {
     }
     if (kind >= 1000) {
         MinyarRecordCopy copy = (MinyarRecordCopy)(uintptr_t)map->values[MAP_COPY_CALLBACK];
+        minyar_runtime_callers++;
         MinyarRecord *snapshot = copy((const MinyarRecord *)(uintptr_t)key);
+        minyar_runtime_callers--;
         map_store(map_array(map, MAP_KEYS), bucket, (long long)(uintptr_t)snapshot);
         minyar_rc_release(snapshot);
     } else map_store(map_array(map, MAP_KEYS), bucket, key);
@@ -376,7 +382,9 @@ MinyarList *minyar_map_keys(const MinyarRecord *map) {
         if (hashes->values[bucket]) {
             if (map->values[MAP_KEY_KIND] >= 1000) {
                 MinyarRecordCopy copy = (MinyarRecordCopy)(uintptr_t)map->values[MAP_COPY_CALLBACK];
+                minyar_runtime_callers++;
                 MinyarRecord *snapshot = copy((const MinyarRecord *)(uintptr_t)keys->values[bucket]);
+                minyar_runtime_callers--;
                 minyar_list_add(result, (long long)(uintptr_t)snapshot);
                 minyar_rc_release(snapshot);
             } else minyar_list_add(result, keys->values[bucket]);

@@ -1560,6 +1560,45 @@ For `Result<Nothing, E>`, `map` and `andThen` take a no-argument success
 callback. Mapping to Nothing calls the callback and returns `Ok()`;
 `unwrapOrElse` takes an `(E) -> Nothing`. Maybe payloads must be values.
 
+### Contained failures
+
+A program error stops the program: `fail(...)`, `unwrap()` of `None` or `Err`,
+a position outside a List, Text or Bytes, an absent Map key, Integer overflow
+or division by zero. A host that runs code it does not control — an extension,
+a plugin, a request handler — can contain those stops with
+`boundary.run(body: () -> Nothing): Result<Nothing, errors.Error>`. A stop
+inside `body` becomes `Err` with `errors.stoppedCode()` and the stop's message,
+and the program carries on:
+
+```minyar
+use "boundary" as boundary
+let values = [1, 2]
+match boundary.run(function() { print(values[5]) }) {
+    Ok() { print("ran") }
+    Err(problem) { print(problem.message()) }   // List position 5 is outside its length of 2.
+}
+```
+
+`boundary.runWith(item, body: (Item) -> Nothing)` does the same with one
+argument passed to `body`, so a host that calls plugin code per item (neo-db calls
+each extension function per row with its `Call`) needs no closure:
+`boundary.runWith(call, extension.body)`.
+
+Nothing is rolled back: whatever `body` changed before it stopped stays
+changed, so give it state you can discard (neo-db gives each extension call its
+own result buffer). Every value the stopped code owned in a function frame is
+released as on a normal return; a value that was only in flight between two
+operations at that moment is never freed early, at worst kept until exit. Only
+program errors whose check runs before anything changes are contained. Running
+out of memory or call depth, runtime invariant failures and native-library stops
+still end the process, and so does a stop inside code that runtime C code
+called: a Map's record key `hash`/`equal`, a sort comparator, a `parallel for`
+body or a thread. Boundaries nest; the innermost contains the stop. A run that does not
+stop returns one shared `Ok()` and allocates nothing; the boundary costs one
+`_setjmp` and a few stores (about 18 retired instructions per run on x86-64, and
+nothing on the code inside). A contained stop costs about 3,700. Linux and macOS. Elsewhere
+`body` runs without a boundary and stops end the program as before.
+
 The standard library offers typed operations alongside deprecated compatibility
 names. An empty success remains a success; failures carry an `errors.Error`.
 

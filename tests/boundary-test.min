@@ -1,0 +1,42 @@
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "system" as system
+
+function setting(environment: List<Text>, name: Text, value: Text): List<Text> {
+    let result: List<Text> = []
+    let prefix = name + "="
+    for entry in environment {
+        if !entry.startsWith(prefix) { result.add(entry) }
+    }
+    result.add(prefix + value)
+    return result
+}
+
+let sanitize = false
+test.check(processInfo.argumentCount() <= 1, "unexpected boundary option")
+if processInfo.argumentCount() == 1 {
+    test.check(processInfo.argument(0) == "--sanitize", "unknown boundary option")
+    sanitize = true
+}
+let environment = system.environment()
+if sanitize {
+    for name in ["MINYAR_CLANG_FLAGS", "MINYAR_NATIVE_FLAGS", "MINYAR_RUNTIME_FLAGS"] {
+        environment = setting(environment, name, "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Wno-override-module")
+    }
+    environment = setting(environment, "ASAN_OPTIONS", "detect_leaks=1")
+    environment = setting(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+}
+let work = test.scratch()
+let expected = test.run(["cat", "tests/boundary.stdout"], environment, "", work + "/expected", 10).output
+for mode in ["--debug", "--release"] {
+    let output = work + "/boundary"
+    test.require(test.run(["./minyar", mode, "tests/boundary.min", "-o", output], environment, "", work + "/build" + mode, 180), "boundary compile")
+    let result = test.run([output], environment, "", work + "/run" + mode, 60)
+    test.check(result.status == 0 && result.output == expected && result.errorOutput == "", "boundary run " + mode + "\n" + result.output + result.errorOutput)
+    let stopped = work + "/uncontained"
+    test.require(test.run(["./minyar", mode, "tests/boundary-uncontained.min", "-o", stopped], environment, "", work + "/build-stopped" + mode, 180), "uncontained compile")
+    let ended = test.run([stopped], environment, "", work + "/run-stopped" + mode, 60)
+    test.check(ended.status == 1 && ended.output == "" && test.contains(ended.errorOutput, "Minyar stopped: comparator stop"), "a stop inside a sort comparator still ends the process\n" + ended.output + ended.errorOutput)
+}
+test.removeTree(work)
+print("Failure boundary: contained program errors, nesting, ownership release and uncontained stops passed")

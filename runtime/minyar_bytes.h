@@ -20,13 +20,13 @@ static MINYAR_COLD MINYAR_NORETURN void bytes_position_stop(long long position, 
         snprintf(message, sizeof(message),
                  "a %lld-byte value at position %lld does not fit in Bytes of length %lld.", size,
                  position, length);
-    minyar_stop(message);
+    minyar_stop_program(message);
 }
 
 static MINYAR_COLD MINYAR_NORETURN void bytes_value_stop(long long value, const char *kind) {
     char message[160];
     snprintf(message, sizeof(message), "%lld does not fit in %s.", value, kind);
-    minyar_stop(message);
+    minyar_stop_program(message);
 }
 
 static unsigned char *bytes_data(const MinyarBytes *bytes) {
@@ -40,7 +40,7 @@ static void bytes_check(const MinyarBytes *bytes, long long position, long long 
 
 MinyarBytes *minyar_bytes_new(long long length) {
     if (length < 0)
-        minyar_stop("Bytes cannot have a negative length.");
+        minyar_stop_program("Bytes cannot have a negative length.");
     if ((unsigned long long)length >= SIZE_MAX / 2)
         minyar_stop("these Bytes are too large.");
     unsigned char *data = new_bytes(length);
@@ -58,7 +58,7 @@ MinyarText *minyar_runtime_decodeOrStop(const MinyarBytes *bytes) {
     long long length = bytes->byte_length;
     int status = utf8_scan(bytes->bytes, length);
     if (status < 0)
-        minyar_stop("these Bytes are not valid UTF-8 text; use text.decode for bytes from outside the program.");
+        minyar_stop_program("these Bytes are not valid UTF-8 text; use text.decode for bytes from outside the program.");
     MinyarText *text = new_text_storage(length, status ? length : -1);
     unsigned char *data = (unsigned char *)text->bytes;
     if (length) memcpy(data, bytes->bytes, (size_t)length);
@@ -124,7 +124,7 @@ static void bytes_reserve(MinyarBytes *bytes, long long extra) {
 
 void minyar_bytes_resize(MinyarBytes *bytes, long long length) {
     if (length < 0)
-        minyar_stop("Bytes cannot have a negative length.");
+        minyar_stop_program("Bytes cannot have a negative length.");
     if (length > bytes->byte_length) {
         bytes_reserve(bytes, length - bytes->byte_length);
         memset(bytes_data(bytes) + bytes->byte_length, 0, (size_t)(length - bytes->byte_length));
@@ -273,7 +273,7 @@ MinyarBytes *minyar_bytes_slice(const MinyarBytes *bytes, long long start, long 
         snprintf(message, sizeof(message),
                  "Bytes range %lld to %lld is outside its length of %lld.", start, end,
                  bytes->byte_length);
-        minyar_stop(message);
+        minyar_stop_program(message);
     }
     MinyarBytes *result = minyar_bytes_new(end - start);
     memcpy(bytes_data(result), bytes->bytes + start, (size_t)(end - start));

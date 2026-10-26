@@ -120,6 +120,12 @@ static void free_windows_arguments(void) {
 }
 #endif
 static MINYAR_COLD MINYAR_NORETURN void minyar_stop(const char *message);
+/* Program errors a failure boundary may contain (minyar_boundary.h). While
+ * runtime C code runs Minyar code it called, minyar_runtime_callers is raised
+ * and stops are not contained. */
+static void minyar_stop_contained(const char *message, size_t length);
+static MINYAR_COLD MINYAR_NORETURN void minyar_stop_program(const char *message);
+static MINYAR_THREAD_LOCAL size_t minyar_runtime_callers;
 
 /*
  * Keep language recursion from reaching the guard page. Generated frame sizes
@@ -557,6 +563,7 @@ void minyar_print_text(const MinyarText *text) {
 }
 
 void minyar_fail(const MinyarText *message) {
+    minyar_stop_contained((const char *)message->bytes, (size_t)message->byte_length);
     fputs("Minyar stopped: ", stderr);
     fwrite(message->bytes, 1, (size_t)message->byte_length, stderr);
     fputc('\n', stderr);
@@ -813,11 +820,11 @@ MinyarText *minyar_join_texts(const MinyarList *parts) {
 }
 
 static MINYAR_COLD MINYAR_NORETURN void invalid_utf8(void) {
-    minyar_stop("Text contained invalid UTF-8.");
+    minyar_stop_program("Text contained invalid UTF-8.");
 }
 
 static MINYAR_COLD MINYAR_NORETURN void position_outside_text(void) {
-    minyar_stop("a Text position was outside the Text.");
+    minyar_stop_program("a Text position was outside the Text.");
 }
 
 static unsigned int decode_character(const unsigned char *bytes, long long remaining,
@@ -1082,7 +1089,7 @@ static MINYAR_COLD int indexed_character_at(MinyarText *text, long long position
 }
 
 static MINYAR_COLD MINYAR_NORETURN void negative_text_position(void) {
-    minyar_stop("a Text position cannot be negative.");
+    minyar_stop_program("a Text position cannot be negative.");
 }
 
 static MINYAR_COLD int character_at_slowly(MinyarText *text, long long position) {
@@ -1111,7 +1118,7 @@ int minyar_text_character_at(MinyarText *text, long long position) {
 }
 
 static MINYAR_COLD MINYAR_NORETURN void slice_outside_text(void) {
-    minyar_stop("a Text slice must stay within the Text and end after it starts.");
+    minyar_stop_program("a Text slice must stay within the Text and end after it starts.");
 }
 
 /* A slice by byte range. `characters` is its scalar count, or -1 if unknown. */
@@ -1274,7 +1281,7 @@ MinyarText *minyar_integer_text(long long integer) {
 static long long encode_character(int character, unsigned char *bytes) {
     long long length;
     if (character < 0 || character > 0x10ffff || (character >= 0xd800 && character <= 0xdfff))
-        minyar_stop("this Character is not valid Unicode.");
+        minyar_stop_program("this Character is not valid Unicode.");
     if (character < 0x80) {
         bytes[0] = (unsigned char)character;
         length = 1;
@@ -1294,7 +1301,7 @@ static long long encode_character(int character, unsigned char *bytes) {
         bytes[3] = 0x80 | (character & 0x3f);
         length = 4;
     } else {
-        minyar_stop("this Character is not valid Unicode.");
+        minyar_stop_program("this Character is not valid Unicode.");
         return 0;
     }
     return length;
@@ -1467,6 +1474,7 @@ MinyarText *minyar_interpolate(long long count, ...) {
 
 #include "minyar_library.h"
 #include "minyar_diagnostics.h"
+#include "minyar_boundary.h"
 /* Callback domain checks are ordinary entry points in every profile. Cycle
  * tracing is selected separately, by the compiler's cycle-runtime marker. */
 #include "minyar_callbacks.h"

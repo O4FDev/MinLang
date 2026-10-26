@@ -129,18 +129,41 @@ _Bool minyar_compiler_try(void (*compile)(void *), void *job) {
     return !rejected;
 }
 
-static MINYAR_NORETURN void minyar_diagnostic_jump(int reason) {
-    MinyarDiagnosticBoundary *boundary = minyar_diagnostic_boundary;
-    if (!boundary) exit(1);
 #ifndef MINYAR_COMPILER_ARENA
-    rc_scope_unwind(boundary->scopes);
+#ifdef MINYAR_BOUNDED_RC
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define MINYAR_ASAN_FAKE_STACK 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) && !defined(MINYAR_ASAN_FAKE_STACK)
+#define MINYAR_ASAN_FAKE_STACK 1
+#endif
+#ifdef MINYAR_ASAN_FAKE_STACK
+#include <sanitizer/asan_interface.h>
+#endif
+/* Stack ownership headers (minyar_stack_frames.h) live in their function's
+ * frame. ASan's use-after-return mode moves such locals to its fake stack. */
+static int rc_frame_on_stack(uintptr_t address) {
+    if (address >= minyar_stack_low && address < minyar_stack_high) return 1;
+#ifdef MINYAR_ASAN_FAKE_STACK
+    void *fake = __asan_get_current_fake_stack();
+    if (fake && __asan_addr_is_in_fake_stack(fake, (void *)address, NULL, NULL)) return 1;
+#endif
+    return 0;
+}
+#endif
+/* Release every scope cell and ownership frame above a boundary, as their
+ * normal exits would, while their stack storage is still live. Callers then
+ * finish with minyar_rc_scope_leave_empty_v1. */
+static void minyar_unwind_ownership(RcFrame *frames, MinyarRcScope *scopes) {
+    rc_scope_unwind(scopes);
 #ifdef MINYAR_BOUNDED_RC
     if (!minyar_stack_bounds_ready) minyar_find_stack_bounds();
 #endif
-    while (rc_frames != boundary->frames) {
+    while (rc_frames != frames) {
 #ifdef MINYAR_BOUNDED_RC
-        uintptr_t address = (uintptr_t)rc_frames;
-        if (address >= minyar_stack_low && address < minyar_stack_high) {
+        if (rc_frame_on_stack((uintptr_t)rc_frames)) {
             /* Match leave_stack_v1 without requiring that optional ABI in
              * an ordinary runtime object. The header cannot enter a queue. */
             RcFrame *frame = rc_frames;
@@ -159,6 +182,14 @@ static MINYAR_NORETURN void minyar_diagnostic_jump(int reason) {
 #endif
             minyar_rc_leave();
     }
+}
+#endif
+
+static MINYAR_NORETURN void minyar_diagnostic_jump(int reason) {
+    MinyarDiagnosticBoundary *boundary = minyar_diagnostic_boundary;
+    if (!boundary) exit(1);
+#ifndef MINYAR_COMPILER_ARENA
+    minyar_unwind_ownership(boundary->frames, boundary->scopes);
 #endif
     minyar_call_depth = boundary->depth;
     minyar_depth_limit = boundary->limit;

@@ -12,6 +12,8 @@ void minyar_callback_check(const void *callback);
 void minyar_rc_retain_traced(void *value);
 void minyar_rc_release(void *value);
 long long minyar_callbackruntime_serviceWait(long long timeout_ms);
+void minyar_runtime_callers_enter(void);
+void minyar_runtime_callers_leave(void);
 
 static inline void minyar_mobile_dispatch(void *session, long long event) {
     void *callback = (void *)(uintptr_t)minyar_record_get(session, 0);
@@ -20,7 +22,10 @@ static inline void minyar_mobile_dispatch(void *session, long long event) {
     typedef void (*Handler)(void *, long long);
     Handler handler = (Handler)(uintptr_t)minyar_record_get(callback, 0);
     void *environment = (void *)(uintptr_t)minyar_record_get(callback, 1);
+    /* A failure boundary must not jump across this native frame. */
+    minyar_runtime_callers_enter();
     handler(environment, event);
+    minyar_runtime_callers_leave();
     minyar_rc_release(callback);
 }
 #endif

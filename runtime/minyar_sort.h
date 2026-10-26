@@ -39,7 +39,9 @@ _Bool minyar_equal_slots(long long kind, long long a, long long b) {
 static int list_sort_compare(const MinyarSortOrder *order, long long a, long long b) {
     if (order->comparator) {
         if (minyar_recovery_pending()) return 0;
+        minyar_runtime_callers++; /* a stop here must not leave a merge half done */
         long long result = order->comparator(order->context, order->snapshot[a], order->snapshot[b]);
+        minyar_runtime_callers--;
         if (minyar_recovery_pending()) return 0;
         return (result > 0) - (result < 0);
     }

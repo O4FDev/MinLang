@@ -188,7 +188,7 @@ void minyar_list_clear(MinyarList *list) {
 
 void minyar_list_truncate(MinyarList *list, long long length) {
     if ((unsigned long long)length > (unsigned long long)list->length)
-        minyar_stop("List truncate length is outside its length.");
+        minyar_stop_program("List truncate length is outside its length.");
 #ifndef MINYAR_COMPILER_ARENA
     if ((((RcObject *)list - 1)->ownership & 7) == RC_REFERENCES) {
         while (list->length > length) {
@@ -206,7 +206,7 @@ static MINYAR_COLD MINYAR_NORETURN void list_position_stop(long long position, l
     char message[128];
     snprintf(message, sizeof(message), "List position %lld is outside its length of %lld.",
              position, length);
-    minyar_stop(message);
+    minyar_stop_program(message);
 }
 
 long long minyar_list_get(const MinyarList *list, long long position) {
@@ -226,7 +226,7 @@ long long minyar_list_pop(MinyarList *list) {
 MinyarList *minyar_list_slice(const MinyarList *list, long long start, long long end,
                               long long references) {
     if (start < 0 || end < start || end > list->length)
-        minyar_stop("List slice positions are outside its length.");
+        minyar_stop_program("List slice positions are outside its length.");
     MinyarList *result = minyar_list_new();
     if (references)
         minyar_list_references(result);

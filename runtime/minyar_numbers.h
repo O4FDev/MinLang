@@ -3,6 +3,8 @@
 /* Unconditional failure ABI lets generated checks expose their success path
  * to LLVM without making assumptions about a conditional C function. */
 MINYAR_COLD MINYAR_NORETURN void minyar_fail_integer_overflow(void) {
+    static const char message[] = "this Integer calculation is outside the supported range.";
+    minyar_stop_contained(message, sizeof(message) - 1);
     fputs("Minyar stopped: this Integer calculation is outside the supported range.\n", stderr);
     minyar_print_stack_trace();
     minyar_failure_exit();
@@ -14,6 +16,7 @@ void minyar_check_integer_overflow(_Bool overflowed) {
 }
 
 static MINYAR_COLD MINYAR_NORETURN void integer_division_stop(const char *message) {
+    minyar_stop_contained(message, strlen(message));
     fputs("Minyar stopped: ", stderr);
     fputs(message, stderr);
     fputc('\n', stderr);
@@ -204,36 +207,36 @@ MinyarText *minyar_float_text(double value) {
 long long minyar_float_integer(double value) {
     /* Both bounds are exact powers of two, so the comparison is exact. */
     if (!(value >= -9223372036854775808.0 && value < 9223372036854775808.0))
-        minyar_stop(isnan(value) ? "NaN cannot be converted to an Integer."
+        minyar_stop_program(isnan(value) ? "NaN cannot be converted to an Integer."
                                  : "this Float is outside the Integer range.");
     return (long long)value;
 }
 
 int minyar_integer_character(long long value) {
     if (value < 0 || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff))
-        minyar_stop("this Integer is not a Unicode scalar value.");
+        minyar_stop_program("this Integer is not a Unicode scalar value.");
     return (int)value;
 }
 
 long long minyar_integer_absolute(long long value) {
     if (value == LLONG_MIN)
-        minyar_stop("the absolute value of this Integer is outside the supported range.");
+        minyar_stop_program("the absolute value of this Integer is outside the supported range.");
     return value < 0 ? -value : value;
 }
 
 void minyar_check_clamp_integer(long long lower, long long upper) {
     if (lower > upper)
-        minyar_stop("clamp needs a lower bound that is not above its upper bound.");
+        minyar_stop_program("clamp needs a lower bound that is not above its upper bound.");
 }
 
 void minyar_check_clamp_float(double lower, double upper) {
     if (!(lower <= upper))
-        minyar_stop("clamp needs a lower bound that is not above its upper bound.");
+        minyar_stop_program("clamp needs a lower bound that is not above its upper bound.");
 }
 
 void minyar_check_shift(long long count) {
     if ((unsigned long long)count > 63)
-        minyar_stop("a shift count must be between 0 and 63.");
+        minyar_stop_program("a shift count must be between 0 and 63.");
 }
 
 #include "minyar_decimal.h"

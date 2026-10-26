@@ -149,13 +149,13 @@ long long minyar_text_integer(MinyarText *text) {
     while (end > start && integer_ascii_space(text->bytes[end - 1])) end--;
     _Bool negative = start < end && text->bytes[start] == '-';
     if (start < end && (text->bytes[start] == '-' || text->bytes[start] == '+')) start++;
-    if (start == end) minyar_stop("Integer(Text) requires a signed decimal ASCII integer.");
+    if (start == end) minyar_stop_program("Integer(Text) requires a signed decimal ASCII integer.");
     unsigned long long value = 0, limit = (unsigned long long)LLONG_MAX + negative;
     for (long long i = start; i < end; i++) {
         unsigned char byte = text->bytes[i];
-        if (byte < '0' || byte > '9') minyar_stop("Integer(Text) requires a signed decimal ASCII integer.");
+        if (byte < '0' || byte > '9') minyar_stop_program("Integer(Text) requires a signed decimal ASCII integer.");
         unsigned digit = byte - '0';
-        if (value > (limit - digit) / 10) minyar_stop("Integer(Text) is outside the signed 64-bit range.");
+        if (value > (limit - digit) / 10) minyar_stop_program("Integer(Text) is outside the signed 64-bit range.");
         value = value * 10 + digit;
     }
     if (negative && value == (unsigned long long)LLONG_MAX + 1) return LLONG_MIN;
