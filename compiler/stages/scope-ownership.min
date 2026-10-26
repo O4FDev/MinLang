@@ -133,12 +133,107 @@ function scopeSSAName(value: Text): Boolean {
     return true
 }
 
-// The position of the next '%' at or after start, or the line length. Scans
-// for name uses read names in place: a split per line would persist in the arena.
-function scopeNextReference(line: Text, start: Integer): Integer {
-    let cursor = start
-    while cursor < line.length && line[cursor] != '%' { cursor = cursor + 1 }
-    return cursor
+// The position of the next '%' at or after start, or the line length, and the
+// end of the name characters (scopeSSACharacter) from start. Scans for name uses
+// read names in place: a split per line would persist in the arena.
+function scopeNextReference(line: Text, start: Integer): Integer { native "runtime" }
+function scopeNameEnd(line: Text, start: Integer): Integer { native "runtime" }
+
+// Borrows one coalescing rule may drop. Each candidate owns width consecutive
+// names: its borrowed value, the raw i64 it came from and, for publication,
+// the packed i64 the publisher stores. uses counts the uses the rule requires.
+record ScopeCandidates { names: List<Text>; kinds: List<Integer>; borrows: List<Integer>; valid: List<Boolean>; uses: List<Integer>; lookup: List<Integer>; width: Integer }
+
+function newScopeCandidates(width: Integer): ScopeCandidates {
+    let names: List<Text> = []
+    let kinds: List<Integer> = []
+    let borrows: List<Integer> = []
+    let valid: List<Boolean> = []
+    let uses: List<Integer> = []
+    let lookup: List<Integer> = []
+    return ScopeCandidates { names: names; kinds: kinds; borrows: borrows; valid: valid; uses: uses; lookup: lookup; width: width }
+}
+
+function scopeAddCandidate(candidates: ScopeCandidates, borrow: Integer, value: Text, raw: Text, packed: Text) {
+    candidates.names.add(value.slice(1, value.length))
+    candidates.names.add(raw.slice(1, raw.length))
+    if candidates.width == 3 { candidates.names.add(packed.slice(1, packed.length)) }
+    let name = 0
+    while name < candidates.width { candidates.kinds.add(1); name = name + 1 }
+    candidates.borrows.add(borrow)
+    candidates.valid.add(true)
+    candidates.uses.add(0)
+}
+
+// A name listed twice cannot be audited by position.
+function scopeIndexCandidates(candidates: ScopeCandidates) {
+    candidates.lookup = buildDeclarationIndex(candidates.names, candidates.kinds)
+    let index = 0
+    while index < candidates.names.length {
+        if findIndexedSymbol(candidates.lookup, candidates.names, candidates.kinds, candidates.names[index], 1) != index { candidates.valid[index / candidates.width] = false }
+        index = index + 1
+    }
+}
+
+// One use of a candidate name on line index. Every name may appear only on
+// the lines around its borrow the rule allows.
+function scopeCandidateUse(candidates: ScopeCandidates, line: Text, start: Integer, end: Integer, index: Integer) {
+    if candidates.names.length == 0 { return }
+    let symbol = findIndexedSymbolRange(candidates.lookup, candidates.names, candidates.kinds, line, start, end, 1)
+    if symbol < 0 { return }
+    let candidate = symbol / candidates.width
+    let borrow = candidates.borrows[candidate]
+    let role = symbol % candidates.width
+    if role == 0 {
+        if index != borrow - 1 && index != borrow && index != borrow + 1 { candidates.valid[candidate] = false }
+        if candidates.width == 2 && index == borrow + 1 { candidates.uses[candidate] = candidates.uses[candidate] + 1 }
+    } else if role == 1 {
+        if index != borrow - 2 && index != borrow - 1 { candidates.valid[candidate] = false }
+    } else {
+        if index != borrow + 1 && index != borrow + 2 { candidates.valid[candidate] = false }
+        if index == borrow + 2 { candidates.uses[candidate] = candidates.uses[candidate] + 1 }
+    }
+}
+
+// Audits every local name use in the body once for both rules. False when a
+// quoted or unsupported local identifier needs a different parser: then both
+// rules conservatively keep every borrow.
+function scopeAuditCandidates(body: ScopeOwnershipBody, published: ScopeCandidates, read: ScopeCandidates): Boolean {
+    let index = 0
+    while index < body.lines.length {
+        let line = body.lines[index]
+        let cursor = scopeNextReference(line, 0)
+        while cursor < line.length {
+            let after = scopeNameEnd(line, cursor + 1)
+            if after == cursor + 1 { return false }
+            scopeCandidateUse(published, line, cursor + 1, after, index)
+            scopeCandidateUse(read, line, cursor + 1, after, index)
+            cursor = scopeNextReference(line, after)
+        }
+        index = index + 1
+    }
+    return true
+}
+
+// Drops the borrows of candidates the audit kept valid with the uses they need.
+// A removed borrow might have been the only release at a return: keep a service
+// point on every exit, including branch and loop exits.
+function scopeDropCandidates(body: ScopeOwnershipBody, candidates: ScopeCandidates, uses: Integer) {
+    let removed = false
+    let index = 0
+    while index < candidates.borrows.length {
+        let borrow = candidates.borrows[index]
+        let enough = candidates.uses[index] == uses || (uses < 0 && candidates.uses[index] > 0)
+        if candidates.valid[index] && enough && body.operations[borrow] == 5 { body.operations[borrow] = 12; removed = true }
+        index = index + 1
+    }
+    if removed {
+        index = 0
+        while index < body.operations.length {
+            if body.operations[index] == 2 { body.operations[index] = 13 }
+            index = index + 1
+        }
+    }
 }
 
 function scopePublisherUsesPacked(line: Text, packed: Text): Boolean {
@@ -196,12 +291,7 @@ function scopePublisherUsesPacked(line: Text, packed: Text): Boolean {
 // while its independent parent owner stays live. Generic List C APIs do not
 // universally retain: this matcher relies on the frontend's checked reference
 // element types and pointer packing, and never removes the publisher's count.
-function scopeCoalescePublishedBorrows(body: ScopeOwnershipBody) {
-    let names: List<Text> = []
-    let kinds: List<Integer> = []
-    let borrows: List<Integer> = []
-    let valid: List<Boolean> = []
-    let uses: List<Integer> = []
+function scopeCollectPublishedBorrows(body: ScopeOwnershipBody, candidates: ScopeCandidates) {
     let index = 2
     while index + 2 < body.lines.length {
         if body.operations[index] == 5 {
@@ -217,61 +307,12 @@ function scopeCoalescePublishedBorrows(body: ScopeOwnershipBody) {
                     let exact = packing == "  " + packed + " = ptrtoint ptr " + value + " to i64"
                     let projected = scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.record.get.checked(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @minyar_record_get(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.list.get.checked(ptr ")
                     if exact && projected && scopeSSAName(raw) && scopeSSAName(packed) && scopePublisherUsesPacked(body.lines[index + 2], packed) {
-                        names.add(value.slice(1, value.length)); names.add(raw.slice(1, raw.length)); names.add(packed.slice(1, packed.length))
-                        kinds.add(1); kinds.add(1); kinds.add(1)
-                        borrows.add(index)
-                        valid.add(true)
-                        uses.add(0)
+                        scopeAddCandidate(candidates, index, value, raw, packed)
                     }
                 }
             }
         }
         index = index + 1
-    }
-    if names.length == 0 { return }
-    let lookup = buildDeclarationIndex(names, kinds)
-    index = 0
-    while index < names.length {
-        if findIndexedSymbol(lookup, names, kinds, names[index], 1) != index { valid[index / 3] = false }
-        index = index + 1
-    }
-    index = 0
-    while index < body.lines.length {
-        let line = body.lines[index]
-        let cursor = scopeNextReference(line, 0)
-        while cursor < line.length {
-            let after = cursor + 1
-            while after < line.length && scopeSSACharacter(line[after]) { after = after + 1 }
-            if after == cursor + 1 { return }
-            let symbol = findIndexedSymbolRange(lookup, names, kinds, line, cursor + 1, after, 1)
-            cursor = scopeNextReference(line, after)
-            if symbol >= 0 {
-                let candidate = symbol / 3
-                let borrow = borrows[candidate]
-                if symbol % 3 == 0 {
-                    if index != borrow - 1 && index != borrow && index != borrow + 1 { valid[candidate] = false }
-                } else if symbol % 3 == 1 {
-                    if index != borrow - 2 && index != borrow - 1 { valid[candidate] = false }
-                } else {
-                    if index != borrow + 1 && index != borrow + 2 { valid[candidate] = false }
-                    if index == borrow + 2 { uses[candidate] = uses[candidate] + 1 }
-                }
-            }
-        }
-        index = index + 1
-    }
-    let removed = false
-    index = 0
-    while index < borrows.length {
-        if valid[index] && uses[index] == 1 { body.operations[borrows[index]] = 12; removed = true }
-        index = index + 1
-    }
-    if removed {
-        index = 0
-        while index < body.operations.length {
-            if body.operations[index] == 2 { body.operations[index] = 13 }
-            index = index + 1
-        }
     }
 }
 
@@ -279,12 +320,7 @@ function scopeCoalescePublishedBorrows(body: ScopeOwnershipBody) {
 // Allocation may service dead work, but cannot consume that live owner. The
 // taking join only qualifies on its borrowed right operand. Audit the raw i64
 // too: another inttoptr could otherwise hide a later use of the same value.
-function scopeCoalesceReadBorrows(body: ScopeOwnershipBody) {
-    let names: List<Text> = []
-    let kinds: List<Integer> = []
-    let borrows: List<Integer> = []
-    let valid: List<Boolean> = []
-    let consumed: List<Boolean> = []
+function scopeCollectReadBorrows(body: ScopeOwnershipBody, candidates: ScopeCandidates) {
     let index = 2
     while index + 1 < body.lines.length {
         if body.operations[index] == 5 {
@@ -333,64 +369,10 @@ function scopeCoalesceReadBorrows(body: ScopeOwnershipBody) {
                     }
                 }
                 let projected = scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.record.get.checked(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @minyar_record_get(ptr ") || scopeStarts(body.lines[index - 2], "  " + raw + " = call i64 @.minyar.list.get.checked(ptr ")
-                if read && scopeSSAName(raw) && projected {
-                    names.add(value.slice(1, value.length)); names.add(raw.slice(1, raw.length))
-                    kinds.add(1); kinds.add(1)
-                    borrows.add(index)
-                    valid.add(true)
-                    consumed.add(false)
-                }
+                if read && scopeSSAName(raw) && projected { scopeAddCandidate(candidates, index, value, raw, "") }
             }
         }
         index = index + 1
-    }
-    if names.length == 0 { return }
-    let lookup = buildDeclarationIndex(names, kinds)
-    index = 0
-    while index < names.length {
-        if findIndexedSymbol(lookup, names, kinds, names[index], 1) != index { valid[index / 2] = false }
-        index = index + 1
-    }
-    index = 0
-    while index < body.lines.length {
-        let line = body.lines[index]
-        let cursor = scopeNextReference(line, 0)
-        while cursor < line.length {
-            let after = cursor + 1
-            while after < line.length && scopeSSACharacter(line[after]) { after = after + 1 }
-            // Quoted or unsupported local identifiers require a different
-            // parser. Conservatively keep every comparison borrow here.
-            if after == cursor + 1 { return }
-            let symbol = findIndexedSymbolRange(lookup, names, kinds, line, cursor + 1, after, 1)
-            cursor = scopeNextReference(line, after)
-            if symbol >= 0 {
-                let candidate = symbol / 2
-                let borrow = borrows[candidate]
-                if symbol % 2 == 0 {
-                    if index != borrow - 1 && index != borrow && index != borrow + 1 { valid[candidate] = false }
-                    if index == borrow + 1 { consumed[candidate] = true }
-                } else if index != borrow - 2 && index != borrow - 1 { valid[candidate] = false }
-            }
-        }
-        index = index + 1
-    }
-    let removed = false
-    index = 0
-    while index < borrows.length {
-        if valid[index] && consumed[index] {
-            body.operations[borrows[index]] = 12
-            removed = true
-        }
-        index = index + 1
-    }
-    if removed {
-        // A removed borrow might have been the only release at a return.
-        // Keep a service point on every exit, including branch/loop exits.
-        index = 0
-        while index < body.operations.length {
-            if body.operations[index] == 2 { body.operations[index] = 13 }
-            index = index + 1
-        }
     }
 }
 
@@ -398,8 +380,20 @@ function scopeCoalesceReadBorrows(body: ScopeOwnershipBody) {
 // temporary count. Keep the local/return retain, including its overflow check.
 // No call or control-flow edge can occur before that retaining consumer.
 function scopeCoalesceBorrows(body: ScopeOwnershipBody) {
-    scopeCoalescePublishedBorrows(body)
-    scopeCoalesceReadBorrows(body)
+    // Published borrows need exactly one publisher use; read borrows need their
+    // consumer. Both rules audit the same name uses, so the body is scanned once.
+    let published = newScopeCandidates(3)
+    let read = newScopeCandidates(2)
+    scopeCollectPublishedBorrows(body, published)
+    scopeCollectReadBorrows(body, read)
+    if published.names.length > 0 || read.names.length > 0 {
+        if published.names.length > 0 { scopeIndexCandidates(published) }
+        if read.names.length > 0 { scopeIndexCandidates(read) }
+        if scopeAuditCandidates(body, published, read) {
+            scopeDropCandidates(body, published, 1)
+            scopeDropCandidates(body, read, -1)
+        }
+    }
     let index = 0
     while index + 3 < body.lines.length {
         if body.operations[index] == 5 {
@@ -604,13 +598,11 @@ function lowerScopeBody(module: Text, source: List<Text>, sourceStarts: List<Int
     return copied
 }
 
-// The result joins to the lowered module. Unchanged text, including every
-// function without scope operations, is emitted as views of the joined module:
-// this pass sees the compiler's whole output in an arena that never frees, so
-// copying each line or body would keep several copies of the module alive.
-function lowerScopeOwnershipParts(pieces: List<Text>): List<Text> {
-    let module = joinText(pieces)
-    let output: List<Text> = []
+// Lowers every scoped function body in text, which holds whole lines. Unchanged
+// text, including every function without scope operations, is emitted as views
+// of text: copying each line or body would keep several copies alive in an
+// arena that never frees.
+function lowerScopeText(module: Text, output: List<Text>) {
     let body: List<Text> = []
     let bodyStarts: List<Integer> = []
     let inFunction = false
@@ -619,17 +611,9 @@ function lowerScopeOwnershipParts(pieces: List<Text>): List<Text> {
     let position = 0
     let copied = 0
     let index = 0
-    let names = ["enter", "leave", "leave_empty", "move", "poll", "release"]
     while index < lines.length {
         let line = lines[index]
-        if scopeStarts(line, "declare ") {
-            let name = 0
-            while name < names.length {
-                let symbol = "minyar_rc_scope_" + names[name] + "_v1"
-                if line.find("@" + symbol + "(") >= 0 { failCompiler("native symbol conflicts with scope ownership: '" + symbol + "'") }
-                name = name + 1
-            }
-        }
+        if scopeStarts(line, "declare ") { scopeCheckDeclaration(line) }
         if scopeStarts(line, "define ") { inFunction = true }
         if inFunction {
             body.add(line)
@@ -656,6 +640,105 @@ function lowerScopeOwnershipParts(pieces: List<Text>): List<Text> {
         index = index + 1
     }
     if copied < module.length { output.add(module.slice(copied, module.length)) }
+}
+
+function scopeCheckDeclaration(line: Text) {
+    let names = ["enter", "leave", "leave_empty", "move", "poll", "release"]
+    let name = 0
+    while name < names.length {
+        let symbol = "minyar_rc_scope_" + names[name] + "_v1"
+        if line.find("@" + symbol + "(") >= 0 { failCompiler("native symbol conflicts with scope ownership: '" + symbol + "'") }
+        name = name + 1
+    }
+}
+
+// The declare lines of text, found without splitting text into lines.
+function scopeCheckDeclarations(text: Text) {
+    if text.find("@minyar_rc_scope_") < 0 { return }
+    let rest = text
+    if scopeStarts(rest, "declare ") {
+        let end = rest.find("\n")
+        if end < 0 { end = rest.length }
+        scopeCheckDeclaration(rest.slice(0, end))
+    }
+    let found = rest.find("\ndeclare ")
+    while found >= 0 {
+        rest = rest.slice(found + 1, rest.length)
+        let end = rest.find("\n")
+        if end < 0 { end = rest.length }
+        scopeCheckDeclaration(rest.slice(0, end))
+        found = rest.find("\ndeclare ")
+    }
+}
+
+// Code between the compiler's functions: runtime declarations, literals,
+// constant initializers, closures, bridges and tables. It is cut where each
+// definition starts; only stretches that call minyar_rc_enter are split into
+// lines and lowered, the rest pass through as views.
+function lowerScopeGap(text: Text, output: List<Text>) {
+    scopeCheckDeclarations(text)
+    let enter = "\n  call void @minyar_rc_enter("
+    if text.find(enter) < 0 {
+        output.add(text)
+        return
+    }
+    let start = 0
+    let rest = text
+    let found = rest.find("\ndefine ")
+    while start < text.length {
+        let end = text.length
+        if found >= 0 { end = start + found + 1 }
+        let stretch = text.slice(start, end)
+        if stretch.find(enter) >= 0 { lowerScopeText(stretch, output) } else { output.add(stretch) }
+        start = end
+        if found >= 0 {
+            rest = text.slice(start, text.length)
+            found = rest.find("\ndefine ")
+        }
+    }
+}
+
+function joinScopePieces(pieces: List<Text>, start: Integer, end: Integer): Text {
+    let part: List<Text> = []
+    let piece = start
+    while piece < end { part.add(pieces[piece]); piece = piece + 1 }
+    return joinText(part)
+}
+
+// The result joins to the lowered module. functionPieces holds, for each
+// function the compiler emitted in order, its first piece, the piece after it
+// and whether its entry calls minyar_rc_enter (see CompilerContext). Only those
+// bodies are split into lines; other functions keep their pieces, and the code
+// between functions goes through lowerScopeGap. Without a table (a module
+// build), the whole module is one such stretch.
+function lowerScopeOwnershipParts(pieces: List<Text>, functionPieces: List<Integer>): List<Text> {
+    let output: List<Text> = []
+    let ranges = functionPieces
+    let none: List<Integer> = []
+    let entry = 0
+    let previous = 0
+    while entry + 2 < ranges.length {
+        if ranges[entry] < previous || ranges[entry + 1] < ranges[entry] || ranges[entry + 1] > pieces.length { ranges = none } else {
+            previous = ranges[entry + 1]
+            entry = entry + 3
+        }
+    }
+    let piece = 0
+    entry = 0
+    while piece < pieces.length {
+        let next = pieces.length
+        if entry < ranges.length { next = ranges[entry] }
+        if next > piece { lowerScopeGap(joinScopePieces(pieces, piece, next), output) }
+        piece = next
+        if entry < ranges.length {
+            let end = ranges[entry + 1]
+            if ranges[entry + 2] != 0 { lowerScopeText(joinScopePieces(pieces, next, end), output) } else {
+                while piece < end { output.add(pieces[piece]); piece = piece + 1 }
+            }
+            piece = end
+            entry = entry + 3
+        }
+    }
     output.add("declare void @minyar_rc_scope_enter_v1(ptr, ptr, i64)\n")
     output.add("declare void @minyar_rc_scope_leave_v1(ptr)\n")
     output.add("declare void @minyar_rc_scope_leave_empty_v1()\n")
@@ -667,5 +750,6 @@ function lowerScopeOwnershipParts(pieces: List<Text>): List<Text> {
 
 function lowerScopeOwnership(llvm: Text): Text {
     let pieces: List<Text> = [llvm]
-    return joinText(lowerScopeOwnershipParts(pieces))
+    let noFunctions: List<Integer> = []
+    return joinText(lowerScopeOwnershipParts(pieces, noFunctions))
 }

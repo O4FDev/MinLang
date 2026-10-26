@@ -901,3 +901,44 @@ long long minyar_runtime_compilerCopyPaths(MinyarRecord *target, MinyarRecord *s
     }
     return end;
 }
+
+/* scopeNextReference and scopeNameEnd in compiler/stages/scope-ownership.min
+ * walk the LLVM local names of one line: the next '%' at or after start (or the
+ * line's length), and where the name characters [A-Za-z0-9_.$-] starting at
+ * start end. Positions are Text characters; ASCII lines use their bytes. */
+static int scope_name_character(int character) {
+    return (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+           (character >= '0' && character <= '9') || character == '_' || character == '.' ||
+           character == '$' || character == '-';
+}
+
+long long minyar_runtime_scopeNextReference(MinyarText *line, long long start) {
+    ensure_text_index(line);
+    long long length = line->character_length;
+    if (start < 0)
+        start = 0;
+    if (start >= length)
+        return length;
+    if (!line->character_offsets) {
+        const unsigned char *found = memchr(line->bytes + start, '%', (size_t)(length - start));
+        return found ? (long long)(found - line->bytes) : length;
+    }
+    while (start < length && minyar_text_character_at(line, start) != '%')
+        start++;
+    return start;
+}
+
+long long minyar_runtime_scopeNameEnd(MinyarText *line, long long start) {
+    ensure_text_index(line);
+    long long length = line->character_length;
+    if (start < 0)
+        start = 0;
+    if (!line->character_offsets) {
+        while (start < length && scope_name_character(line->bytes[start]))
+            start++;
+        return start;
+    }
+    while (start < length && scope_name_character(minyar_text_character_at(line, start)))
+        start++;
+    return start;
+}
