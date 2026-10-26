@@ -1,6 +1,6 @@
 set -eu
 test "$(uname -s)" = Linux
-clang=${MINYAR_TEST_CLANG:-/usr/lib/llvm-23/bin/clang}
+clang=${MINYAR_TEST_REAL_CLANG:-${MINYAR_TEST_CLANG:-/usr/lib/llvm-23/bin/clang}}
 "$clang" --version | head -1 | grep -F '23.1.3'
 work=$PWD/build/erofs-utils-1.8.10
 mkdir -p "$work"
