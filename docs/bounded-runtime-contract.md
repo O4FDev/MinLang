@@ -222,7 +222,9 @@ Batching reduces scheduler overhead under specific conditions:
   frame's written slots plus its retirement, or the statement's temporaries
   plus their chunk retirements, fit within K, they are released at that
   service point without entering the queues, in the order and with the units
-  the scheduler would use. If a release queues an object, the
+  the scheduler would use. A frame that exits with statement temporaries
+  still attached alternates frame and chunk units from the scheduler's
+  current queue turn, as the queues would. If a release queues an object, the
   remaining slots or chunks are queued and the scheduler continues from the
   state it would have reached. `make check-direct-service` compares both
   paths' complete transcripts at K 1, 2, 4, 7, 32 and 1,024, with no

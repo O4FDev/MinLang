@@ -672,6 +672,86 @@ static inline int rc_bounded_direct_allowed(void) {
     return 1;
 }
 
+/* Frame exit that also retires the frame's statement temporaries, with no
+ * other fresh work pending and no backlog batch due. The scheduler would
+ * alternate the frame queue and the chunk queue from its current turn: frame
+ * units visit the written slots in reverse order and then retire the frame;
+ * chunk units release owners newest first, then retire each chunk, oldest
+ * chunk first. Do exactly that here, with the same queue turns. If a release
+ * queues an object, queue what remains and continue in the scheduler. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static int rc_bounded_leave_mixed(RcFrame *frame) {
+    size_t chunks = frame->temporary_count / RC_TEMPORARY_CHUNK_SLOTS
+                  + (frame->temporary_count % RC_TEMPORARY_CHUNK_SLOTS != 0);
+    if (frame->written_count + 1 + frame->temporary_count + chunks > MINYAR_RC_POLL_BUDGET ||
+        !rc_bounded_direct_allowed()) return 0;
+    RcTemporaryChunk *chunk = frame->temporary_head, *tail = frame->temporary_tail;
+    frame->temporary_head = frame->temporary_tail = NULL;
+    frame->temporary_count = 0;
+    frame->local_count = frame->written_count;
+    size_t pending = rc_pending_count;
+    size_t work = 0;
+    unsigned queue = rc_bounded_next_queue;
+    int live = 1;
+    while (live || chunk) {
+        /* rc_bounded_schedule's queue choice when no object is pending. */
+        if (queue == 0) queue = live ? 1 : 2;
+        else if (queue == 1) { if (!live) queue = 2; }
+        else if (!chunk) queue = 1;
+        if (queue == 1) {
+            queue = 2;
+            if (frame->local_count) {
+                size_t index = rc_bounded_local_indices(frame)[--frame->local_count];
+                void *value = rc_bounded_local_value(frame, index);
+                frame->locals[index] = NULL;
+                rc_drop(value);
+            } else {
+                rc_bounded_cache_frame(frame);
+                live = 0;
+            }
+        } else {
+            queue = 0;
+            if (chunk->count) rc_drop(chunk->values[--chunk->count]);
+            else {
+                RcTemporaryChunk *next = chunk->next;
+                rc_bounded_chunk_retire(chunk);
+                chunks--;
+                chunk = next;
+            }
+        }
+        work++;
+        if (rc_pending_count != pending) {
+            if (live) {
+                frame->previous = NULL;
+                rc_bounded_frame_head = rc_bounded_frame_tail = frame;
+                rc_pending_count++;
+                rc_bounded_owner_tasks++;
+            }
+            if (chunk) {
+                rc_bounded_chunk_head = chunk;
+                rc_bounded_chunk_tail = tail;
+                rc_pending_count += chunks;
+                rc_bounded_owner_tasks += chunks;
+            }
+            rc_bounded_next_queue = queue;
+            size_t more = rc_bounded_service(MINYAR_RC_POLL_BUDGET - work, 0);
+#ifdef MINYAR_RC_TESTING
+            rc_bounded_last_work = work + more;
+#endif
+            MINYAR_RC_DIRECT_SERVICE_OBSERVER(work + more);
+            return 1;
+        }
+    }
+    rc_bounded_next_queue = queue;
+#ifdef MINYAR_RC_TESTING
+    rc_bounded_last_work = work;
+#endif
+    MINYAR_RC_DIRECT_SERVICE_OBSERVER(work);
+    return 1;
+}
+
 /* Frame exit with no fresh work pending and no backlog batch due, the
  * commonest service point. The scheduler would give this frame every unit:
  * one per written owner slot, in reverse order, then one to retire it. Do
@@ -681,6 +761,7 @@ static inline int rc_bounded_direct_allowed(void) {
  * Returns 0 when the general path must run. */
 static int rc_bounded_leave_direct(RcFrame *frame) {
     if (!MINYAR_RC_DIRECT_SERVICE) return 0;
+    if (frame->temporary_head) return rc_bounded_leave_mixed(frame);
     if (frame->written_count >= MINYAR_RC_POLL_BUDGET || !rc_bounded_direct_allowed()) return 0;
     size_t pending = rc_pending_count;
     size_t work = 0;
