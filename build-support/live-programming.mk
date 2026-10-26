@@ -10,7 +10,7 @@ comma := ,
 check-minyar-repl: build/tooling/tools/repl-cli build/minyarc
 	python3 tests/repl.py "$(CURDIR)/minyar"
 
-.PHONY: check-live-programming check-live-transform check-live-hot check-live-patch-load
+.PHONY: check-live-programming check-live-transform check-live-hot check-live-patch-load check-incremental-link
 check-live-programming: build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyarc-modules build/minyar-module-build build/minyar-default-runtime.o build/minyar-default-runtime-release.ll
 	python3 tests/live-programming.py "$(CURDIR)/minyar"
 
@@ -24,4 +24,8 @@ check-live-hot: build/tooling/tools/project-cli build/tooling/tools/live-build-c
 check-live-patch-load: build/tooling/tools/project-cli build/tooling/tools/live-build-cli build/tooling/tools/clang-driver build/minyarc-modules build/minyar-module-build build/minyar-default-runtime.o
 	python3 tests/live-patch-load.py "$(CURDIR)/minyar"
 
-check: check-live-programming check-live-transform check-live-hot check-live-patch-load check-minyar-repl
+# Watch rebuilds link cached partitions: same behaviour, one or two objects per edit.
+check-incremental-link: build/tooling/tools/clang-driver build/minyarc-modules build/minyar-module-build build/minyar-default-runtime.o
+	python3 tests/incremental-link.py "$(CURDIR)/minyar"
+
+check: check-live-programming check-live-transform check-live-hot check-live-patch-load check-incremental-link check-minyar-repl

@@ -3,6 +3,7 @@ use "./driver-support.min" as host
 use "./llvm-sanitizer.min" as sanitizer
 use "./llvm-debug.min" as debugInfo
 use "./driver-providers.min" as providers
+use "./link-partitions.min" as partitions
 use "system" as system
 use "files" as files
 
@@ -771,7 +772,7 @@ function publishMessage(link: Link) {
     if link.status != 0 { host.leave(link.status) }
     host.stop(link.message)
 }
-function linkProgram(clang: Text, linkFlags: List<Text>, lto: List<Text>, llvm: Text, runtime: Text, native: List<Text>, libraries: List<Text>, output: Text, source: Text) {
+function linkProgram(clang: Text, linkFlags: List<Text>, lto: List<Text>, llvm: Text, objects: List<Text>, runtime: Text, native: List<Text>, libraries: List<Text>, output: Text, source: Text) {
     let address = sanitizer.addressEnabled(linkFlags)
     let thread = sanitizer.threadEnabled(linkFlags)
     let enabled = address || thread
@@ -779,7 +780,8 @@ function linkProgram(clang: Text, linkFlags: List<Text>, lto: List<Text>, llvm: 
     let command = [clang]
     for group in [linkFlags, lto] { for item in group { command.add(item) } }
     if !enabled && requested == "" {
-        command.add(llvm)
+        if objects.length > 0 { for object in objects { command.add(object) } }
+        else { command.add(llvm) }
         command.add(runtime)
         for group in [native, libraries] { for item in group { command.add(item) } }
         let link = Link { doc: host.newDocument(); root: 0; directory: ""; artifacts: false; rows: []; originals: []; failure: ""; message: ""; status: 0 }
@@ -1168,7 +1170,19 @@ function linkCommand(arguments: List<Text>) {
         }
     }
     let program = llvm
-    if debug && debugInfo.enabled(linkFlags) {
+    // Watch rebuilds (MINYAR_INCREMENTAL_LINK=1) compile the program in cached
+    // partitions beside the output and link objects.
+    let objects: List<Text> = []
+    if host.setting("MINYAR_INCREMENTAL_LINK", "") == "1" && release != "1" && lto.length == 0 && !isWindows &&
+            !sanitizer.addressEnabled(linkFlags) && !sanitizer.threadEnabled(linkFlags) && host.setting("MINYAR_LINK_ARTIFACTS", "") == "" {
+        let annotate = debug && debugInfo.enabled(linkFlags)
+        let compile = [clang]
+        for item in compileFlags(linkFlags) { compile.add(item) }
+        let identity = host.jsonList(compile) + Text(clangIdentity(clang)) + host.hashFile(host.selfPath()) + host.jsonList([source, Text(annotate), Text(debugInfo.full(linkFlags)), Text(opaqueDebugRecords)])
+        let cache = host.parentPath(host.resolveName(output)) + "/.minyar-link/" + host.baseName(output)
+        objects = partitions.objects(host.readText(llvm), cache, identity, compile, annotate, source, debugInfo.full(linkFlags), opaqueDebugRecords)
+    }
+    if objects.length == 0 && debug && debugInfo.enabled(linkFlags) {
         // Add sanitizer attributes before function metadata; the subsequent
         // sanitizer pass recognizes them and leaves the header ordering intact.
         let annotated = sanitizer.program(host.readText(llvm), linkFlags)
@@ -1177,7 +1191,7 @@ function linkCommand(arguments: List<Text>) {
         program = directory + "/program.ll"
         host.writeBytes(program, Bytes(debugInfo.program(annotated.text, source, debugInfo.full(linkFlags), opaqueDebugRecords)))
     }
-    linkProgram(clang, linkFlags, lto, program, runtime, native, math, output, source)
+    linkProgram(clang, linkFlags, lto, program, objects, runtime, native, math, output, source)
 }
 
 function compile(arguments: List<Text>) {

@@ -1,0 +1,257 @@
+// Incremental debug links for watch rebuilds. A program's LLVM is split into a
+// data partition (every global) and PARTITIONS code partitions (functions by
+// name hash). Each partition is compiled to its own object, cached by its text,
+// so a rebuild recompiles only partitions whose functions or data changed and
+// then links objects. Symbols another partition needs become hidden, so the
+// finished program exports nothing it did not export before. LLVM this split
+// does not understand is linked whole instead.
+use "./driver-support.min" as host
+use "./live-transform.min" as llvmText
+use "./llvm-debug.min" as debugInfo
+use "files" as files
+use "system" as system
+
+constant PARTITIONS = 32
+
+public record Split { partitions: List<Text>; error: Text }
+record Chunk { name: Text; text: Text; declaration: Text; partition: Integer }
+
+function failed(message: Text): Split { return Split { partitions: []; error: message } }
+function moveAll(from: List<Text>, to: List<Text>) {
+    for item in from { to.add(item) }
+    while from.length > 0 { from.pop() }
+}
+function nameOf(line: Text): llvmText.Symbol {
+    let at = host.findText(line, "@", 0)
+    if at < 0 { return llvmText.Symbol { token: ""; raw: ""; end: 0; error: "missing symbol" } }
+    return llvmText.symbol(Bytes(line), at + 1)
+}
+// Code partition for a function: stable across builds, so unchanged functions
+// keep their object.
+function partitionOf(name: Text): Integer {
+    let digest = Bytes(host.hashBytes(Bytes(name)))
+    let value = 0
+    for index in 0..6 {
+        let byte = digest[index]
+        let digit = byte - 48
+        if byte >= 97 { digit = byte - 87 }
+        value = value * 16 + digit
+    }
+    return 1 + value % PARTITIONS
+}
+// `define [linkage] ... @name(...)`: private and internal definitions become
+// hidden ones other partitions can reach; anything unusual is refused.
+function visibleDefinition(line: Text): Text {
+    let words = host.words(line)
+    if words.length < 2 { return "" }
+    for word in words {
+        if word == "linkonce" || word == "linkonce_odr" || word == "weak" || word == "weak_odr" || word == "common" || word == "comdat" || word == "available_externally" || word.startsWith("comdat(") || word.startsWith("section") { return "" }
+    }
+    if line.startsWith("define private ") { return "define hidden " + host.textAfter(line, "define private ") }
+    if line.startsWith("define internal ") { return "define hidden " + host.textAfter(line, "define internal ") }
+    return line
+}
+// The declaration other partitions use for a function: its return and
+// parameter types, without names, linkage or attributes after the list.
+function functionDeclaration(line: Text, name: llvmText.Symbol): Text {
+    let data = Bytes(line)
+    let at = host.findText(line, "@", 0)
+    let leading = host.words(host.textSlice(line, 7, at))
+    let kept: List<Text> = []
+    for word in leading {
+        if !host.listed(["private", "internal", "hidden", "dso_local", "default", "protected", "unnamed_addr", "local_unnamed_addr", "external"], word) { kept.add(word) }
+    }
+    let open = name.end
+    while open < data.length && data[open] == 32 { open += 1 }
+    if open >= data.length || data[open] != 40 { return "" }
+    let depth = 0
+    let close = open
+    while close < data.length {
+        if data[close] == 40 || data[close] == 91 || data[close] == 123 || data[close] == 60 { depth += 1 }
+        if data[close] == 41 || data[close] == 93 || data[close] == 125 || data[close] == 62 {
+            depth -= 1
+            if depth == 0 { break }
+        }
+        close += 1
+    }
+    if close >= data.length { return "" }
+    let parameters: List<Text> = []
+    let start = open + 1
+    let position = open + 1
+    depth = 0
+    while position <= close {
+        let byte = data[position]
+        if byte == 40 || byte == 91 || byte == 123 || byte == 60 { depth += 1 }
+        if (byte == 41 || byte == 93 || byte == 125 || byte == 62) && position < close { depth -= 1 }
+        if (byte == 44 && depth == 0) || position == close {
+            let parameter = host.strip(Text(data.slice(start, position)))
+            if parameter != "" {
+                let parts = host.words(parameter)
+                if parts.length > 1 && parts[parts.length - 1].startsWith("%") { parts.pop() }
+                parameters.add(host.joined(parts, " "))
+            }
+            start = position + 1
+        }
+        position += 1
+    }
+    return "declare " + host.joined(kept, " ") + " @" + name.token + "(" + host.joined(parameters, ", ") + ")"
+}
+// `@name = [linkage...] global|constant <type> <initializer>`.
+function globalParts(line: Text, name: llvmText.Symbol): List<Text> {
+    let data = Bytes(line)
+    let index = name.end
+    while index < data.length && (data[index] == 32 || data[index] == 61) { index += 1 }
+    let words: List<Text> = []
+    while index < data.length {
+        let start = index
+        while index < data.length && data[index] != 32 { index += 1 }
+        let word = Text(data.slice(start, index))
+        while index < data.length && data[index] == 32 { index += 1 }
+        if word == "global" || word == "constant" {
+            // The type is the first balanced unit after the keyword.
+            let typeStart = index
+            let depth = 0
+            while index < data.length {
+                let byte = data[index]
+                if byte == 91 || byte == 123 || byte == 60 || byte == 40 { depth += 1 }
+                if byte == 93 || byte == 125 || byte == 62 || byte == 41 { depth -= 1 }
+                index += 1
+                if depth == 0 && (index >= data.length || data[index] == 32 || data[index] == 44) { break }
+            }
+            return [host.joined(words, " "), word, Text(data.slice(typeStart, index)), Text(data.slice(index, data.length))]
+        }
+        words.add(word)
+    }
+    return []
+}
+function globalChunk(text: Text, name: llvmText.Symbol): Chunk {
+    let first = host.lines(text)[0]
+    let parts = globalParts(first, name)
+    let invalid = Chunk { name: ""; text: ""; declaration: ""; partition: 0 }
+    if parts.length != 4 { return invalid }
+    let linkage = host.words(parts[0])
+    let kept: List<Text> = []
+    for word in linkage {
+        if word == "private" || word == "internal" { kept.add("hidden"); continue }
+        if host.listed(["hidden", "dso_local", "unnamed_addr", "local_unnamed_addr", "external", "default"], word) { kept.add(word); continue }
+        return invalid
+    }
+    if parts[3] == "" || host.hasText(parts[3], " section ") || host.hasText(parts[3], " comdat") { return invalid }
+    let definition = "@" + name.token + " = " + host.joined(kept, " ")
+    if kept.length > 0 { definition += " " }
+    definition += parts[1] + " " + parts[2] + parts[3] + host.textAfter(text, first)
+    let declaration = "@" + name.token + " = external hidden " + parts[1] + " " + parts[2]
+    return Chunk { name: name.raw; text: definition; declaration: declaration; partition: 0 }
+}
+
+// One LLVM module per partition: partition 0 holds every global, the others
+// the functions whose names hash to them. Every partition repeats the header,
+// types, attribute groups, metadata and external declarations, and declares
+// the symbols it uses from other partitions.
+public function split(llvm: Text): Split {
+    let lines = host.lines(llvm)
+    let shared: List<Text> = []
+    let declares: List<Text> = []
+    let chunks: List<Chunk> = []
+    let extra: List<Text> = []
+    let pending: List<Text> = []
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        if line == "" { moveAll(pending, extra); index += 1; continue }
+        if line.startsWith(";") { pending.add(line); index += 1; continue }
+        if line.startsWith("define ") {
+            let name = nameOf(line)
+            if name.error != "" { return failed(name.error) }
+            let header = visibleDefinition(line)
+            let declaration = functionDeclaration(line, name)
+            if header == "" || declaration == "" { return failed("unsupported function definition: " + name.raw) }
+            let body: List<Text> = []
+            moveAll(pending, body)
+            body.add(header)
+            index += 1
+            while index < lines.length && lines[index] != "}" { body.add(lines[index]); index += 1 }
+            if index >= lines.length { return failed("unterminated function " + name.raw) }
+            body.add("}")
+            index += 1
+            chunks.add(Chunk { name: name.raw; text: host.joined(body, "\n"); declaration: declaration; partition: partitionOf(name.raw) })
+            continue
+        }
+        moveAll(pending, extra)
+        if line.startsWith("@") {
+            let name = nameOf(line)
+            if name.error != "" { return failed(name.error) }
+            let body: List<Text> = [line]
+            index += 1
+            // Initializers can continue on the following lines (dispatch tables).
+            while index < lines.length && lines[index] != "" && !lines[index].startsWith("@") && !lines[index].startsWith("define ") && !lines[index].startsWith("declare ") &&
+                    !lines[index].startsWith("%") && !lines[index].startsWith(";") && !lines[index].startsWith("!") && !lines[index].startsWith("attributes ") &&
+                    !lines[index].startsWith("source_filename") && !lines[index].startsWith("target ") { body.add(lines[index]); index += 1 }
+            let chunk = globalChunk(host.joined(body, "\n"), name)
+            if chunk.name == "" { return failed("unsupported global " + name.raw) }
+            chunks.add(chunk)
+            continue
+        }
+        if line.startsWith("declare ") { declares.add(line); index += 1; continue }
+        if line.startsWith("%") || line.startsWith("attributes ") || line.startsWith("!") || line.startsWith("source_filename") || line.startsWith("target ") {
+            shared.add(line); index += 1; continue
+        }
+        return failed("unsupported top-level LLVM: " + host.textSlice(line, 0, min(line.byteLength, 40)))
+    }
+    moveAll(pending, extra)
+    let owner = Map<Text, Integer>()
+    for position in 0..chunks.length {
+        if owner.has(chunks[position].name) { return failed("repeated symbol " + chunks[position].name) }
+        owner[chunks[position].name] = position
+    }
+    let result = Split { partitions: []; error: "" }
+    let prefix = host.joined(shared, "\n") + "\n" + host.joined(declares, "\n") + "\n"
+    for partition in 0..(PARTITIONS + 1) {
+        let body: List<Text> = [prefix]
+        if partition == 0 { body.add(host.joined(extra, "\n")); body.add("\n") }
+        let wanted = Map<Text, Boolean>()
+        let needed: List<Text> = []
+        for chunk in chunks {
+            if chunk.partition != partition { continue }
+            body.add(chunk.text); body.add("\n")
+            for name in llvmText.references(chunk.text) {
+                if !wanted.has(name) && owner.has(name) && chunks[owner[name]].partition != partition { wanted[name] = true; needed.add(name) }
+            }
+        }
+        for name in needed { body.add(chunks[owner[name]].declaration); body.add("\n") }
+        result.partitions.add(joinText(body))
+    }
+    return result
+}
+
+// Objects for `program` (LLVM before debug metadata), compiled by `compile`
+// and cached in `cache`; objects the link no longer uses are removed. With
+// `debug`, each partition gets its own debug metadata for `source`. Empty when
+// the program cannot be split; the caller then links it whole.
+public function objects(program: Text, cache: Text, identity: Text, compile: List<Text>, debug: Boolean, source: Text, variables: Boolean, opaqueRecords: Boolean): List<Text> {
+    let parts = split(program)
+    if parts.error != "" { return [] }
+    host.makeDirectories(cache)
+    let used: List<Text> = []
+    for index in 0..parts.partitions.length {
+        let key = host.hashBytes(Bytes(identity + "\n" + parts.partitions[index]))
+        let object = cache + "/" + key + ".o"
+        used.add(key + ".o")
+        if host.isFile(object) { continue }
+        let staging = host.temporaryDirectory(cache, "partition-")
+        let text = parts.partitions[index]
+        if debug { text = debugInfo.program(text, source, variables, opaqueRecords) }
+        host.writeBytes(staging + "/part.ll", Bytes(text))
+        let command = host.copied(compile)
+        for item in ["-c", staging + "/part.ll", "-o", staging + "/part.o"] { command.add(item) }
+        host.runWithTerminalDiagnostics(command)
+        if files.rename(staging + "/part.o", object) != 0 { host.stop(host.osError(files.lastError(), object)) }
+        host.release(staging)
+    }
+    for name in files.list(cache) {
+        if name.endsWith(".o") && !host.listed(used, name) { files.remove(cache + "/" + name) }
+    }
+    let result: List<Text> = []
+    for name in used { result.add(cache + "/" + name) }
+    return result
+}
