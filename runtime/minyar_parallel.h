@@ -267,6 +267,16 @@ void minyar_parallel_run(MinyarParallelEntry entry, long long first,
     parallel_run_grain(entry, first, after, environment, 0);
 }
 
+/* Threads a safe parallel range runs on: MINYAR_PARALLEL_THREADS, else the online processors (at most 64). */
+long long minyar_parallel_workers(void) {
+#if (defined(__APPLE__) || defined(__linux__)) && !defined(MINYAR_FREESTANDING)
+    pthread_once(&parallel_once, parallel_initialize);
+    return (long long)parallel_pool.count;
+#else
+    return 1;
+#endif
+}
+
 typedef long long (*MinyarParallelReduceEntry)(long long, long long, void *);
 typedef struct {
     MinyarParallelReduceEntry entry;

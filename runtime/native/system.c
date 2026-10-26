@@ -74,6 +74,18 @@ long long minyar_system_monotonicNanoseconds(void) {
 
 long long minyar_system_processId(void) { return (long long)getpid(); }
 
+/* Threads safe parallel ranges use (the runtime's pool size). Weak: native fixtures that link this file without
+ * the Minyar runtime never call it, and get one thread if they do. */
+#ifdef _WIN32
+long long minyar_parallel_workers(void);
+long long minyar_system_parallelWorkers(void) { return minyar_parallel_workers(); }
+#else
+__attribute__((weak)) long long minyar_parallel_workers(void);
+long long minyar_system_parallelWorkers(void) {
+    return minyar_parallel_workers ? minyar_parallel_workers() : 1;
+}
+#endif
+
 /* Current resident set size in bytes, or -errno. */
 long long minyar_system_residentBytes(void) {
 #ifdef __APPLE__

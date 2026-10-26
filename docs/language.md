@@ -1897,7 +1897,9 @@ few long iterations still uses every worker. Idle workers steal chunks from
 other workers; the calling thread also works, and returns only after every
 worker has finished. Set
 `MINYAR_PARALLEL_THREADS` to 1–64 to choose the total number of participating
-threads; the default is the online processor count, capped at 64. Freestanding
+threads; the default is the online processor count, capped at 64.
+`system.parallelWorkers()` returns that number, for code that sizes its work
+items to the workers. Freestanding
 OS builds use the processor-entry scheduler after the processors are started.
 Other targets and recoverable execution use the sequential backend. Each loop can
 capture at most 64 values. Scalar captures are snapshots; the caller keeps buffer
