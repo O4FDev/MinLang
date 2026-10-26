@@ -7,10 +7,21 @@ use "system" as system
 use "files" as files
 use "json" as json
 use "text" as utf8
+// LLVM's tools come from MINYAR_LLVM_BIN, else from the real directory of the Clang tools/toolchain.sh pins
+// (/usr/lib/llvm-23/bin for apt.llvm.org's /usr/bin/clang-23, ~/llvm-23.1.3/bin for an unpacked release).
+function llvmBin(context: evidence.Context): Text {
+    let directory = system.getenv("MINYAR_LLVM_BIN")
+    if directory != "" { return directory }
+    let pinned = test.run(["/bin/sh", "tools/toolchain.sh", "toolchain"], system.environment(), "", context.path + "/pinned-clang", 30)
+    evidence.expect(context, pinned.status == 0 && test.lines(pinned.output).length == 1, "tools/toolchain.sh selects no pinned Clang; set MINYAR_LLVM_BIN\n" + pinned.errorOutput)
+    let real = test.resolvePath(test.lines(pinned.output)[0])
+    let raw = Bytes(real)
+    let index = raw.length - 1
+    while index > 0 && raw[index] != 47 { index -= 1 }
+    return utf8.decodeOrStop(raw.slice(0, index))
+}
 function tool(context: evidence.Context, name: Text): Text {
-    let directory = system.getenv("MINYAR_LLVM_BIN"); let candidate = name
-    if directory != "" { candidate = directory + "/" + name }
-    else { candidate = "/usr/lib/llvm-23/bin/" + name }
+    let candidate = llvmBin(context) + "/" + name
     let found = test.run(["/bin/sh", "-c", "command -v \"$1\"", "minyar", candidate], system.environment(), "", context.path + "/tool-" + name, 10)
     evidence.expect(context, found.status == 0 && found.output != "", "Required LLVM tool " + name + " unavailable; set MINYAR_LLVM_BIN")
     return evidence.absolute(context, test.lines(found.output)[0])
@@ -18,7 +29,8 @@ function tool(context: evidence.Context, name: Text): Text {
 let context = evidence.context("codegen", "codegen", "tests/codegen.min")
 context.compiler.flags = []
 let opt = tool(context, "opt"); let check = tool(context, "FileCheck")
-context.compiler.clang = test.setting("MINYAR_TEST_CLANG", "/usr/lib/llvm-23/bin/clang")
+// Its version and digest are evidence: never a fixture compile cache (test.realClang).
+context.compiler.clang = test.realClang(llvmBin(context) + "/clang")
 data.set(context.controls, "opt", data.text(opt)); data.set(context.controls, "FileCheck", data.text(check))
 let names: List<Text> = []
 for name in files.list("tests/codegen") { if data.ends(name, ".min") { names.add(name) } }
