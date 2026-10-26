@@ -217,28 +217,62 @@ function settleValueBorrows(context: CompilerContext, output: List<Text>, state:
     borrows.count = mark
 }
 
-// `let name = root[index]` in a block, where `root` is a local the block never
-// reassigns, can borrow its element: the binding never owns it. A hidden guard
-// local reserved here takes a count only if code in the rest of the block can
-// release the element (settleBindingGuards).
+// `root` followed by one or more `.field`, `[index]` or `[key]` steps, with no
+// method call; index and key expressions are arbitrary.
+function bindingPath(tokenKinds: List<Integer>, tokenTexts: List<Text>, start: Integer, end: Integer): Boolean {
+    if tokenKinds[start] != 1 || end - start < 3 { return false }
+    let position = start + 1
+    while position < end {
+        if tokenKinds[position] == 4 && tokenTexts[position] == "." && position + 1 < end && tokenKinds[position + 1] == 1 && !(position + 2 < end && tokenTexts[position + 2] == "(") {
+            position = position + 2
+        } else if tokenKinds[position] == 4 && tokenTexts[position] == "[" {
+            let depth = 0
+            let closed = false
+            while position < end && !closed {
+                if tokenKinds[position] == 4 && tokenTexts[position] == "[" { depth = depth + 1 }
+                if tokenKinds[position] == 4 && tokenTexts[position] == "]" {
+                    depth = depth - 1
+                    closed = depth == 0
+                }
+                position = position + 1
+            }
+            if !closed { return false }
+        } else {
+            return false
+        }
+    }
+    return true
+}
+
+// `let name = root[index]`, `let name = root.field` or a longer path of fields,
+// List elements and Map values in a block, where `root` is a local the block
+// never reassigns, can borrow its value: the binding never owns it. A hidden
+// guard local reserved here takes a count only if code in the rest of the
+// block can release the value, such as a user call or a store that replaces a
+// field, element or Map value on the path (settleBindingGuards).
+// The initializer's read and the binding ask about the same binding; the
+// answer is kept for its tokens and type, so its block is scanned once.
 function guardableElementBinding(context: CompilerContext, localNames: List<Text>, localLengths: List<Integer>, state: List<Integer>, start: Integer, end: Integer, name: Text, resultType: List<Integer>): Boolean {
+    let borrows = context.valueBorrows
+    if borrows.guardStart == start && borrows.guardEnd == end && borrows.guardType == resultType[0] { return borrows.guardable }
+    let guardable = guardableBinding(context, localNames, localLengths, state, start, end, name, resultType)
+    borrows.guardStart = start
+    borrows.guardEnd = end
+    borrows.guardType = resultType[0]
+    borrows.guardable = guardable
+    return guardable
+}
+
+function guardableBinding(context: CompilerContext, localNames: List<Text>, localLengths: List<Integer>, state: List<Integer>, start: Integer, end: Integer, name: Text, resultType: List<Integer>): Boolean {
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
     let borrows = context.valueBorrows
     if !borrows.enabled || borrows.blocks == 0 || recoveryEnabled(state) || state[15] / 4 % 2 != 0 { return false }
     if !isReferenceType(resultType[0]) || possibleCycleType(resultType[0], context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes) { return false }
-    if tokenKinds[start] != 1 || tokenTexts[start + 1] != "[" || tokenTexts[end - 1] != "]" { return false }
-    let depth = 0
-    let position = start + 1
-    while position < end - 1 {
-        if tokenTexts[position] == "[" { depth = depth + 1 }
-        if tokenTexts[position] == "]" { depth = depth - 1 }
-        if depth == 0 { return false }
-        position = position + 1
-    }
+    if !bindingPath(tokenKinds, tokenTexts, start, end) { return false }
     let root = tokenTexts[start]
     if findLocal(localNames, localLengths, state, root) < 0 { return false }
-    return !blockAssignsName(tokenKinds, tokenTexts, end, root) && !blockAssignsName(tokenKinds, tokenTexts, end, name)
+    return !blockAssignsEither(tokenKinds, tokenTexts, end, root, name)
 }
 
 function reserveBindingGuard(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>, value: Text, type: Integer) {

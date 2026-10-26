@@ -248,6 +248,19 @@ test.check(advanceOwners == 0 && test.contains(advancing, "call i1 @minyar_rc_id
 let swapping = guarded.slice(guarded.find("swap(ptr %argument.0"), guarded.length)
 swapping = swapping.slice(0, swapping.find("\n}\n"))
 test.check(test.contains(swapping, "call void @minyar_rc_local(i64 "), "a binding whose element is replaced must keep a guard count")
+// The same for field paths and Map values: `let x = h.f` borrows unless the
+// rest of its block replaces a field, element or Map value on the path, or
+// makes a user call.
+test.executes(compiler, "record Row { label: Text; tags: Map<Text, Text> }\nrecord Holder { name: Text; rows: List<Row> }\nfunction total(rows: List<Row>): Integer { let sum = 0; for i in 0..rows.length { let label = rows[i].label; let tag = rows[i].tags[\"k\"]; sum += label.length + tag.length }; return sum }\nfunction rename(holder: Holder): Text { let name = holder.name; holder.name = \"z\" + Text(9); return name }\nfunction retag(row: Row): Text { let tag = row.tags[\"k\"]; row.tags[\"k\"] = \"q\" + Text(8); return tag }\nfunction clear(holder: Holder) { holder.rows = [] }\nfunction called(holder: Holder): Text { let label = holder.rows[0].label; clear(holder); return label }\nlet tags: Map<Text, Text> = Map()\ntags[\"k\"] = \"t\" + Text(3)\nlet holder = Holder { name: \"a\" + Text(1); rows: [Row { label: \"b\" + Text(2); tags: tags }] }\nprint(total(holder.rows))\nprint(rename(holder))\nprint(holder.name)\nprint(retag(holder.rows[0]))\nprint(holder.rows[0].tags[\"k\"])\nprint(called(holder))\nprint(holder.rows.length)\n", "4\na1\nz9\nt3\nq8\nb2\n0\n")
+let fieldGuards = generated(compiler)
+for item in [["total", "false"], ["rename", "true"], ["retag", "true"], ["called", "true"]] {
+    let guardedBody = fieldGuards.slice(fieldGuards.find(" @.minyar.fn." + item[0] + "("), fieldGuards.length)
+    guardedBody = guardedBody.slice(0, guardedBody.find("\n}\n"))
+    let owners = 0
+    for line in test.lines(guardedBody) { if test.contains(line, "call void @minyar_rc_local(i64 ") && !test.contains(line, ", ptr null)") { owners += 1 } }
+    if item[1] == "true" { test.check(owners > 0, "a field or Map value binding whose holder can change must keep a guard count: " + item[0]) }
+    else { test.check(owners == 0, "a field or Map value binding whose block cannot release it must borrow: " + item[0]) }
+}
 test.executes(compiler, "function sum(values: List<Integer>): Integer { let total = 0; let index = 0; while index < values.length { total += values[index]; index += 1 }; return total }\nprint(sum([1, 2, 3]))\n", "6\n")
 let path = compiler.directory + "/case" + Text(compiler.serial)
 // Keep this exact-count oracle on one scalar iteration; ordinary O0/O2
