@@ -66,18 +66,47 @@ function takeResult(output: List<Text>, state: List<Integer>, value: Text, resul
     return false
 }
 
-// Direct returns still provide the bounded runtime's cleanup poll. A
-// protecting borrow records that progress point, so leave it in the frame and
-// publish a separate return count.
-function takeReturnedResult(output: List<Text>, state: List<Integer>, value: Text, resultType: List<Integer>): Boolean {
+// In frame lowering, a protecting borrow of the returned value is its count for
+// the caller when nothing ran after the read: `return holder.name` retains once
+// and keeps no temporary. A borrow that later code relied on stays in the
+// frame, and the return publishes a separate count. Scope lowering keeps the
+// borrow, whose scope poll is the return's cleanup progress point.
+function takeReturnedResult(output: List<Text>, state: List<Integer>, value: Text, resultType: List<Integer>, handOff: Boolean): Boolean {
     if isReferenceType(resultType[0]) && resultType.length > 1 {
         let owner = resultType[1]
         if owner >= 0 && owner < output.length {
-            if output[owner] == "  call void @minyar_rc_borrow(ptr " { return false }
             if output[owner] == "  call void @minyar_rc_borrow(ptr " + value + ")\n" { return false }
+            if handOff && output[owner] == "  call void @minyar_rc_borrow(ptr " && !piecesRunCode(output, owner + 3) { return takeResult(output, state, value, resultType) }
+            if output[owner] == "  call void @minyar_rc_borrow(ptr " { return false }
         }
     }
     return takeResult(output, state, value, resultType)
+}
+
+function piecesRunCode(output: List<Text>, start: Integer): Boolean {
+    let piece = start
+    while piece < output.length {
+        if output[piece].find("call ") >= 0 || output[piece].find("invoke ") >= 0 { return true }
+        piece = piece + 1
+    }
+    return false
+}
+
+// Whether the body keeps temporaries or uses local owner slots. A function
+// that only hands counts to its caller or to consumers owns nothing.
+function bodyUsesFrame(output: List<Text>, start: Integer): Boolean {
+    let piece = start
+    while piece < output.length {
+        let text = output[piece]
+        let at = text.find("@minyar_rc_")
+        if at >= 0 {
+            let rest = text.slice(at + 11, text.length)
+            if rest.startsWith("keep") || rest.startsWith("borrow") || rest.startsWith("local") || rest.startsWith("scope") || rest.startsWith("enter_stack") || rest.startsWith("leave_stack") { return true }
+        }
+        if text.find("minyar-owned-local-transfer") >= 0 { return true }
+        piece = piece + 1
+    }
+    return false
 }
 
 // A Result propagation or another expression-level early return can leave

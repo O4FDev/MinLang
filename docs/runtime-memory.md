@@ -509,7 +509,11 @@ immutable value.
 Ownership-using functions place a cleanup service point on every loop backedge,
 so a long scalar phase after releasing a graph cannot starve pending retirement.
 The compiler removes these calls from functions that never acquire managed
-owners. This guarantees progress per completed loop iteration, not a wall-clock
+owners. A count handed to the caller is not an owner: `return holder.name`
+retains the field once for the caller (the read's protecting count becomes that
+count when nothing runs after the read), so such a function needs no frame.
+`--scope-owners` keeps the protecting count; its scope poll is the return's
+cleanup progress point. This guarantees progress per completed loop iteration, not a wall-clock
 deadline for code that reaches no further runtime or loop service point.
 A `for` or `while` loop whose compiled body and bounds (or condition) call only the inline checked
 accessors and arithmetic helpers cannot release, allocate or run user code, so
