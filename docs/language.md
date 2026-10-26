@@ -606,7 +606,7 @@ twice on the stack, once to measure it. There is no parts List and no
 temporary Text per scalar. Text parts are borrowed; one read from a field or
 element is counted only when a later part calls code that could replace it.
 A chain of three or more Text values joined with `+`, such as
-`name + ": " + value`, compiles to the same single call. A chain whose first
+`name + ": " + value`, is also one runtime call with one exactly sized result. A chain whose first
 value is owned, such as a call result or a local at its last use in
 `text = text + a + b`, keeps its joins so that value can grow in place.
 

@@ -673,6 +673,39 @@ MinyarText *minyar_join_text(const MinyarText *left, const MinyarText *right) {
     return join_by_copying(left, right);
 }
 
+/* a + b + c (+ d) on Text, compiled from one chain: one exactly sized result,
+ * each part read once. Parts are borrowed for the call. */
+static MinyarText *join_text_parts(const MinyarText *const *parts, int count) {
+    long long length = 0;
+    _Bool ascii = 1;
+    for (int index = 0; index < count; index++) {
+        if (parts[index]->byte_length > LLONG_MAX - length)
+            join_too_large();
+        length += parts[index]->byte_length;
+        if (parts[index]->character_length != parts[index]->byte_length) ascii = 0;
+    }
+    MinyarText *text = new_text_storage(length, ascii ? length : -1);
+    unsigned char *bytes = (unsigned char *)text->bytes;
+    long long offset = 0;
+    for (int index = 0; index < count; index++) {
+        copy_bytes(bytes + offset, parts[index]->bytes, (size_t)parts[index]->byte_length);
+        offset += parts[index]->byte_length;
+    }
+    bytes[length] = 0;
+    return text;
+}
+
+MinyarText *minyar_join_text3(const MinyarText *first, const MinyarText *second, const MinyarText *third) {
+    const MinyarText *parts[3] = {first, second, third};
+    return join_text_parts(parts, 3);
+}
+
+MinyarText *minyar_join_text4(const MinyarText *first, const MinyarText *second, const MinyarText *third,
+                              const MinyarText *fourth) {
+    const MinyarText *parts[4] = {first, second, third, fourth};
+    return join_text_parts(parts, 4);
+}
+
 #ifndef MINYAR_COMPILER_ARENA
 /* Grow a Text that no one else can observe, doubling its byte capacity. */
 static void append_in_place(MinyarText *left, const MinyarText *right) {

@@ -382,6 +382,7 @@ function parseBinary(context: CompilerContext, localNames: List<Text>, localType
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
     let tokenLines = context.tokenLines
+    let leftStart = state[0]
     let left = parseUnary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
     let level = operatorLevel(tokenKinds, tokenTexts, state)
     while level >= minimumLevel && level > 0 {
@@ -419,7 +420,8 @@ function parseBinary(context: CompilerContext, localNames: List<Text>, localType
         if textPiece >= 0 && leftOwner < 0 && resultType[0] == 2 && tokenKinds[state[0]] == 4 && tokenTexts[state[0]] == "+" {
             endSyntaxNode(context.syntax, syntaxNode, state[0], 2)
             if resultType.length > 1 { keepTransferredOwner(output, resultType[1]) }
-            left = compileTextChain(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, left, textPiece, leftCalls, right, level)
+            let firstStable = chainPartStable(context, localNames, localLengths, state, left, leftStart, operatorLocation, -1)
+            left = compileTextChain(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, left, firstStable, textPiece, leftCalls, right, operatorLocation + 1, level)
         } else {
             left = emitBinary(context, globals, output, textState, state, operator, left, leftType, leftOwner, right, resultType[0], resultType, tokenLines, operatorLocation)
             if leftPiece >= 0 {
@@ -442,15 +444,27 @@ function keepTransferredOwner(output: List<Text>, owner: Integer) {
     }
 }
 
-// `a + b + c` on Text is one interpolation over all its parts: one exactly
-// sized result instead of a joined temporary per `+`. A part is borrowed; it
-// gets a count only if a later part runs user code that could replace its
-// holder. Two parts keep the join, and so does a chain whose first part is
+// A chain part that no later part can release: a literal, a result the
+// statement owns, or a local (a call cannot reassign the caller's locals, and
+// a borrowed binding's guard keeps its value when its block makes a call).
+function chainPartStable(context: CompilerContext, localNames: List<Text>, localLengths: List<Integer>, state: List<Integer>, value: Text, start: Integer, end: Integer, owner: Integer): Boolean {
+    if value.startsWith("getelementptr (i8, ptr @") || owner >= 0 { return true }
+    return end == start + 1 && context.tokenKinds[start] == 1 && findLocal(localNames, localLengths, state, context.tokenTexts[start]) >= 0
+}
+
+// `a + b + c` on Text is one call over all its parts: one exactly sized
+// result instead of a joined temporary per `+`. Three or four parts use the
+// Text-only joins; longer chains use the interpolation call. A part is borrowed; one
+// that a later part could release gets a count if that part runs user code
+// that could replace its holder. Two parts keep the join, and so does a chain whose first part is
 // owned (a result, or a local's last use): its join can grow it in place.
-function compileTextChain(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, first: Text, firstPiece: Integer, firstCalls: Integer, second: Text, level: Integer): Text {
+function compileTextChain(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, first: Text, firstStable: Boolean, firstPiece: Integer, firstCalls: Integer, second: Text, secondStart: Integer, level: Integer): Text {
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
+    let secondOwner = -1
+    if resultType.length > 1 { secondOwner = resultType[1] }
     let parts: List<Text> = [first, second]
+    let stable: List<Boolean> = [firstStable, chainPartStable(context, localNames, localLengths, state, second, secondStart, state[0], secondOwner)]
     let pieces: List<Integer> = [firstPiece, output.length]
     let calls: List<Integer> = [firstCalls, context.callTargets.length]
     output.add("")
@@ -460,10 +474,15 @@ function compileTextChain(context: CompilerContext, localNames: List<Text>, loca
         state[0] = state[0] + 1
         setType(resultType, 0)
         let part = parseBinary(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, level + 1)
-        if resultType.length > 1 { keepTransferredOwner(output, resultType[1]) }
+        let owner = -1
+        if resultType.length > 1 {
+            keepTransferredOwner(output, resultType[1])
+            owner = resultType[1]
+        }
         // Reports the same mismatch as a single `+`.
         if resultType[0] != 2 { let ignored = emitBinary(context, globals, output, textState, state, "+", first, 2, -1, part, resultType[0], resultType, context.tokenLines, location) }
         parts.add(part)
+        stable.add(chainPartStable(context, localNames, localLengths, state, part, location + 1, state[0], owner))
         pieces.add(output.length)
         output.add("")
         calls.add(context.callTargets.length)
@@ -471,17 +490,27 @@ function compileTextChain(context: CompilerContext, localNames: List<Text>, loca
     }
     let index = 0
     while index < parts.length {
-        settleBorrow(context, output, state, pieces[index], parts[index], 2, calls[index])
-        index = index + 1
-    }
-    let slots: List<Text> = []
-    index = 0
-    while index < parts.length {
-        slots.add(", i64 2, i64 " + valueAsListSlot(output, textState, state, parts[index], 2))
+        if !stable[index] { settleBorrow(context, output, state, pieces[index], parts[index], 2, calls[index]) }
         index = index + 1
     }
     let value = valueName(textState, newTemporary(state))
-    output.add("  " + value + " = call ptr (i64, ...) @minyar_interpolate(i64 " + Text(parts.length) + joinText(slots) + ")\n")
+    if parts.length <= 4 {
+        output.add("  " + value + " = call ptr @minyar_join_text" + Text(parts.length) + "(ptr " + parts[0])
+        index = 1
+        while index < parts.length {
+            output.add(", ptr " + parts[index])
+            index = index + 1
+        }
+        output.add(")\n")
+    } else {
+        let slots: List<Text> = []
+        index = 0
+        while index < parts.length {
+            slots.add(", i64 2, i64 " + valueAsListSlot(output, textState, state, parts[index], 2))
+            index = index + 1
+        }
+        output.add("  " + value + " = call ptr (i64, ...) @minyar_interpolate(i64 " + Text(parts.length) + joinText(slots) + ")\n")
+    }
     setType(resultType, 2)
     ownResult(output, state, value, resultType)
     return value
