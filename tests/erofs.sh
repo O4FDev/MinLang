@@ -1,6 +1,6 @@
 set -eu
 test "$(uname -s)" = Linux
-clang=${MINYAR_TEST_CLANG:-clang-23}
+clang=${MINYAR_TEST_REAL_CLANG:-${MINYAR_TEST_CLANG:-clang-23}}
 fsck=${MINYAR_EROF_FSCK:-/usr/bin/fsck.erofs}
 images='plain lz4'
 "$clang" --version | head -1 | grep -F '23.1.3'
@@ -12,7 +12,9 @@ MINYAR_CLANG="$clang" ./minyar tests/erofs.min -o "$work/writer"
 MINYAR_CLANG="$clang" ./minyar tests/erofs-api.min -o "$work/api"
 "$clang" -std=c11 -O2 -Wall -Wextra -Werror -static tests/erofs-tree.c -o "$work/tree"
 "$work/tree" create "$work/source"
-"$work/tree" limits "$work/limits"
+# The limits fixture holds a 1 TiB sparse file (no disk blocks): only this step lifts the soft file-size cap of
+# scripts/with-limits.sh to the inherited hard limit, or ftruncate dies with SIGXFSZ.
+(ulimit -S -f "$(ulimit -H -f)" && exec "$work/tree" limits "$work/limits")
 "$work/api" "$work/source" "$work/api.erofs"
 test ! -e "$work/api.erofs"
 for kind in worker helper legacy legacy-helper; do
