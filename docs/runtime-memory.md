@@ -513,7 +513,11 @@ owners. A count handed to the caller is not an owner: `return holder.name`
 retains the field once for the caller (the read's protecting count becomes that
 count when nothing runs after the read), so such a function needs no frame.
 `--scope-owners` keeps the protecting count; its scope poll is the return's
-cleanup progress point. This guarantees progress per completed loop iteration, not a wall-clock
+cleanup progress point. Likewise, in a loop-free function with no owner slots, a
+temporary of one straight-line statement (a protecting count for an argument, or
+an owned result) becomes a retain and an explicit release where that statement's
+cleanup would retire it, and the function needs no frame. A function with a loop
+keeps its frame, so its back edge stays a cleanup service point. This guarantees progress per completed loop iteration, not a wall-clock
 deadline for code that reaches no further runtime or loop service point.
 A `for` or `while` loop whose compiled body and bounds (or condition) call only the inline checked
 accessors and arithmetic helpers cannot release, allocate or run user code, so

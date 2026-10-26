@@ -29,6 +29,11 @@ function elementOwners(llvm: Text, name: Text): Integer {
     }
     return owners
 }
+// A protecting count is a frame temporary, or, in a function that owns nothing
+// else, a retain released where its statement ends.
+function keepsProtectingCount(body: Text): Boolean {
+    return test.contains(body, "call void @minyar_rc_borrow(") || (test.contains(body, "call void @minyar_rc_retain(") && test.contains(body, "call void @minyar_rc_release("))
+}
 function generated(compiler: test.Compiler): Text {
     return io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
 }
@@ -170,7 +175,7 @@ fill = utf8.decodeOrStop(Bytes(fill).slice(0, fill.find("\n}\n")))
 test.check(!test.contains(fill, "@minyar_rc_borrow(") && !test.contains(fill, "@minyar_rc_keep("), "call-free List appends kept a temporary owner")
 let mixed = after(appended, "define void @.minyar.fn.mixed(")
 mixed = utf8.decodeOrStop(Bytes(mixed).slice(0, mixed.find("\n}\n")))
-test.check(test.contains(mixed, "call void @minyar_rc_borrow("), "a List append whose argument calls a function must keep its receiver owner")
+test.check(keepsProtectingCount(mixed), "a List append whose argument calls a function must keep its receiver owner")
 // Element and field receivers of a nested store need no temporary count when
 // the rest of the statement makes no calls; a call or capability operator that
 // can replace the row keeps it alive until the store completes.
@@ -181,7 +186,7 @@ scale = scale.slice(0, scale.find("\n}\n"))
 test.check(!test.contains(scale, "@minyar_rc_borrow(") && !test.contains(scale, "@minyar_rc_keep("), "call-free nested stores kept a temporary owner")
 let swap = nested.slice(nested.find("swap(ptr %argument.0"), nested.length)
 swap = swap.slice(0, swap.find("\n}\n"))
-test.check(test.contains(swap, "call void @minyar_rc_borrow("), "a nested store whose value calls a function must keep its row owner")
+test.check(keepsProtectingCount(swap), "a nested store whose value calls a function must keep its row owner")
 // An ordered Text comparison keeps its left operand alive through a right
 // operand that replaces its holder, and takes no extra count when it cannot.
 test.executes(compiler, "record Box { label: Text }\nfunction swap(box: Box): Text { box.label = \"zz\" + Text(7); return \"m\" }\nfunction early(box: Box): Boolean { return box.label < swap(box) }\nfunction plain(a: Box, b: Box): Boolean { return a.label < b.label }\nlet box = Box { label: \"a\" + Text(1) }\nprint(early(box))\nprint(box.label)\nprint(plain(Box { label: \"b\" }, Box { label: \"c\" }))\n", "true\nzz7\ntrue\n")
@@ -233,9 +238,13 @@ test.executes(compiler, "record Holder { name: Text; parts: List<Text> }\nfuncti
 let settledLate = generated(compiler)
 let probing = settledLate.slice(settledLate.find("probe(ptr %argument.0"), settledLate.length)
 probing = probing.slice(0, probing.find("\n}\n"))
-test.check(test.contains(probing, "call void @minyar_rc_borrow("), "a field read before a user call that can replace it took no count")
-let afterBorrow = probing.slice(probing.find("call void @minyar_rc_borrow("), probing.length)
-test.check(test.contains(afterBorrow, "call void @minyar_rc_step()"), "a count taken when the statement settled was not released at the end of its statement")
+test.check(keepsProtectingCount(probing), "a field read before a user call that can replace it took no count")
+// In a function that owns nothing else the count is a retain whose release
+// replaces that statement's cleanup.
+let protectingAt = probing.find("call void @minyar_rc_borrow(")
+if protectingAt < 0 { protectingAt = probing.find("call void @minyar_rc_retain(") }
+let afterBorrow = probing.slice(protectingAt, probing.length)
+test.check(test.contains(afterBorrow, "call void @minyar_rc_step()") || test.contains(afterBorrow, "call void @minyar_rc_release("), "a count taken when the statement settled was not released at the end of its statement")
 // `let b = bodies[i]` borrows its element when the rest of its block cannot
 // release it (a parallel function call cannot); a store that replaces the
 // element makes the hidden guard keep it alive.
@@ -271,6 +280,16 @@ for name in ["name", "row"] {
     let returnedBody = returnedReads.slice(returnedReads.find(" @.minyar.fn." + name + "("), returnedReads.length)
     returnedBody = returnedBody.slice(0, returnedBody.find("\n}\n"))
     test.check(test.contains(returnedBody, "call void @minyar_rc_retain(") && !test.contains(returnedBody, "@minyar_rc_borrow(") && !test.contains(returnedBody, "@minyar_rc_enter(") && !test.contains(returnedBody, "@minyar_rc_leave("), "a returned field or element read must hand its count to the caller without a frame: " + name)
+}
+// A field read passed to a call that may replace the field keeps a count until
+// its statement ends. In a function that owns nothing else that count is a
+// retain released where the statement ends, and the function has no frame.
+test.executes(compiler, "record Holder { name: Text }\nfunction swap(holder: Holder, text: Text): Integer { holder.name = \"x\" + Text(1); let padding = Text(123456789) + Text(987654321); return text.length + padding.length * 0 }\nfunction measure(holder: Holder): Integer { return swap(holder, holder.name) }\nfunction show(holder: Holder) { print(swap(holder, holder.name)) }\nlet holder = Holder { name: \"a\" + Text(1) + \"b\" }\nprint(measure(holder))\nshow(holder)\nprint(holder.name)\n", "3\n2\nx1\n")
+let statementTemporaries = generated(compiler)
+for name in ["measure", "show"] {
+    let temporaryBody = statementTemporaries.slice(statementTemporaries.find(" @.minyar.fn." + name + "("), statementTemporaries.length)
+    temporaryBody = temporaryBody.slice(0, temporaryBody.find("\n}\n"))
+    test.check(test.contains(temporaryBody, "call void @minyar_rc_retain(") && test.contains(temporaryBody, "call void @minyar_rc_release(") && !test.contains(temporaryBody, "@minyar_rc_enter(") && !test.contains(temporaryBody, "@minyar_rc_borrow("), "a statement temporary in a function that owns nothing else must be a retain and a release without a frame: " + name)
 }
 test.executes(compiler, "function sum(values: List<Integer>): Integer { let total = 0; let index = 0; while index < values.length { total += values[index]; index += 1 }; return total }\nprint(sum([1, 2, 3]))\n", "6\n")
 let path = compiler.directory + "/case" + Text(compiler.serial)

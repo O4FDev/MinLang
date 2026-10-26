@@ -583,6 +583,116 @@ function blockAssignsEither(tokenKinds: List<Integer>, tokenTexts: List<Text>, s
     return false
 }
 
+// A temporary that one straight-line statement keeps (a protecting borrow of
+// an argument, or an owned result) dies where that statement's cleanup would
+// retire it. In a function with no owner slots, when every temporary is like
+// that, a retain and an explicit release at that point replace the frame: the
+// function needs no frame. A temporary whose call a cycle fixup may still
+// rewrite keeps its frame. Returns false, changing nothing, otherwise.
+function releaseStatementTemporaries(output: List<Text>, start: Integer, fixups: List<Integer>): Boolean {
+    let sites: List<Integer> = []
+    let widths: List<Integer> = []
+    let values: List<Text> = []
+    let borrows: List<Boolean> = []
+    let ends: List<Integer> = []
+    let piece = start
+    while piece < output.length {
+        let text = output[piece]
+        // A loop keeps its frame: its back edge is the cleanup service point
+        // that keeps a long loop from starving pending retirement.
+        if text.find("minyar-owned-local-transfer") >= 0 || text.find("br label %for.condition.") >= 0 || text.find("br label %while.") >= 0 { return false }
+        let at = text.find("@minyar_rc_")
+        if at >= 0 {
+            let rest = text.slice(at + 11, text.length)
+            let keep = rest.startsWith("keep(")
+            let borrow = rest.startsWith("borrow(")
+            if keep || borrow {
+                let fixed = 0
+                while fixed < fixups.length {
+                    if fixups[fixed] == piece { return false }
+                    fixed = fixed + 1
+                }
+                let value = ""
+                let width = 1
+                if text.endsWith("(ptr ") && piece + 2 < output.length && output[piece + 2] == ")\n" {
+                    value = output[piece + 1]
+                    width = 3
+                } else {
+                    let open = rest.find("(ptr ")
+                    if open < 0 || !rest.endsWith(")\n") { return false }
+                    value = rest.slice(open + 5, rest.length - 2)
+                }
+                let end = statementCleanupAfter(output, piece + width)
+                if end < 0 { return false }
+                sites.add(piece)
+                widths.add(width)
+                values.add(value)
+                borrows.add(borrow)
+                ends.add(end)
+                piece = piece + width - 1
+            } else if rest.startsWith("local") || rest.startsWith("scope") || rest.startsWith("enter_stack") || rest.startsWith("leave_stack") || rest.startsWith("keep") || rest.startsWith("borrow") {
+                return false
+            }
+        }
+        piece = piece + 1
+    }
+    let index = 0
+    while index < sites.length {
+        let site = sites[index]
+        let replacement = ""
+        if borrows[index] { replacement = "  call void @minyar_rc_retain(ptr " + values[index] + ")\n" }
+        output[site] = replacement
+        if widths[index] == 3 {
+            output[site + 1] = ""
+            output[site + 2] = ""
+        }
+        // The function will have no frame, so the release replaces the
+        // statement's cleanup call (later releases at the same point join it).
+        let cleanup = output[ends[index]]
+        if cleanup == "  call void @minyar_rc_step()\n" || cleanup == "  call void @minyar_rc_leave()\n" { cleanup = "" }
+        output[ends[index]] = "  call void @minyar_rc_release(ptr " + values[index] + ")\n" + cleanup
+        index = index + 1
+    }
+    return true
+}
+
+// The statement cleanup (`minyar_rc_step` or the frame's leave) that follows
+// without a branch, label or return in between, or -1.
+function statementCleanupAfter(output: List<Text>, start: Integer): Integer {
+    let piece = start
+    while piece < output.length {
+        let text = output[piece]
+        if text == "  call void @minyar_rc_step()\n" || text == "  call void @minyar_rc_leave()\n" { return piece }
+        if text.find("br ") >= 0 || text.find("ret ") >= 0 || text.find("switch ") >= 0 || text.find("invoke ") >= 0 || text.find("unreachable") >= 0 || text.find(":\n") >= 0 { return -1 }
+        // Other temporaries of the same statement may sit in between.
+        let at = text.find("@minyar_rc_")
+        if at >= 0 {
+            let rest = text.slice(at + 11, text.length)
+            if !(rest.startsWith("keep(") || rest.startsWith("borrow(") || rest.startsWith("retain(") || rest.startsWith("release(")) { return -1 }
+        }
+        piece = piece + 1
+    }
+    return -1
+}
+
+// The pieces of this function whose ownership calls a cycle fixup may rewrite:
+// fixup entries recorded since `start` in returnTypes.
+function functionCycleFixups(returnTypes: List<Integer>, start: Integer): List<Integer> {
+    let pieces: List<Integer> = []
+    let position = start
+    while position < returnTypes.length {
+        if returnTypes[position] == -2 && position + 1 < returnTypes.length {
+            pieces.add(-1 - returnTypes[position + 1])
+            position = position + 4
+        } else if (returnTypes[position] == -3 || returnTypes[position] == -5) && position + 1 < returnTypes.length {
+            position = position + 2
+        } else {
+            position = position + 1
+        }
+    }
+    return pieces
+}
+
 // A readonly parameter, a capture, a constant or a never-reassigned record
 // binding keeps its object alive for the whole scope that can name it.
 function stableBorrowRoot(context: CompilerContext, localNames: List<Text>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, name: Text): Boolean {
