@@ -9,6 +9,8 @@ Modes (run from the repository root on Linux with go on PATH):
   watch    no edit: minyar run --watch --release without --hot.
   patch    minyar build --hot --release, run the binary, edit reply() and
            publish it with minyar patch mid-load (no watcher process).
+  soak     like patch, but publishes one edit after another for the whole
+           run (LIVEPATCH_SECONDS), then checks every request and the RSS.
 Prints one JSON summary per run.
 """
 import json
@@ -230,6 +232,61 @@ def run_patch(base):
         server.stop()
 
 
+def resident_kib(pid):
+    for line in Path("/proc/" + str(pid) + "/status").read_text().splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1])
+    return None
+
+
+def run_soak(base):
+    project = project_copy(base)
+    profile = project / "target/release"
+    subprocess.run([str(LAUNCHER), "build", "--hot", "--release", "--manifest-path", str(project)], check=True,
+                   stdout=subprocess.DEVNULL)
+    server = Process([str(profile / "livepatch-server")], {"LIVEPATCH_PORT": "0"}, project)
+    try:
+        port = server.port()
+        output = base / "soak.csv"
+        started = time.monotonic()
+        client = load(port, output)
+        source = (project / "src/main.min").read_text()
+        durations = []
+        version = 1
+        while client.poll() is None:
+            version += 1
+            publish(project / "src/main.min", edited(source, version))
+            begun = time.monotonic()
+            subprocess.run([str(LAUNCHER), "patch", "--release", "--manifest-path", str(project)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if client.poll() is None:
+                durations.append(time.monotonic() - begun)
+            server.pump(0)
+        elapsed = time.monotonic() - started
+        rss = resident_kib(server.process.pid)
+        rows = []
+        for line in Path(output).read_text().splitlines():
+            if line.startswith("#"):
+                continue
+            conn, start, latency, status, seen, served = line.split(",")
+            rows.append((int(conn), int(start), status == "ok", int(seen), int(served)))
+        ok = [row for row in rows if row[2]]
+        monotonic = True
+        for conn in {row[0] for row in ok}:
+            versions = [row[3] for row in sorted(ok, key=lambda row: row[1]) if row[0] == conn]
+            monotonic = monotonic and versions == sorted(versions)
+        served = sorted(row[4] for row in ok)
+        print(json.dumps({"mode": "soak", "connections": CONNECTIONS, "load_seconds": SECONDS,
+                          "elapsed_seconds": round(elapsed, 1), "patches_during_load": len(durations),
+                          "patch_s_min": round(min(durations), 3), "patch_s_max": round(max(durations), 3),
+                          "requests_ok": len(ok), "errors": len(rows) - len(ok), "final_version": version,
+                          "versions_monotonic_per_connection": monotonic,
+                          "every_request_counted_once": served == list(range(1, len(served) + 1)),
+                          "server_rss_kib_end": rss}), flush=True)
+    finally:
+        server.stop()
+
+
 def build(base, version):
     source = base / ("v" + str(version) + ".min")
     source.write_text(edited((HERE / "server/src/main.min").read_text(), version))
@@ -280,6 +337,8 @@ if __name__ == "__main__":
                 run_restart(work, True)
             elif mode == "patch":
                 run_patch(work)
+            elif mode == "soak":
+                run_soak(work)
             elif mode == "watch":
                 run_hot(work, False, hot=False)
             elif mode == "steady":

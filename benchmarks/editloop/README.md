@@ -25,3 +25,15 @@ After hot builds stopped re-running the launcher's toolchain checks per edit
 0.210 s, Rust 0.153 s and 0.159 s, Go 0.200 s and 0.182 s. About 0.12 s of the
 Minyar figure is the watcher's deliberate save debounce; the Rust and Go loops
 here have none.
+
+Plain `--watch`, 2026-10-26 (8-vCPU box, seven edits, two alternating rounds
+per tree): 1.15–1.20 s before → 0.24–0.27 s after, with `minyar --watch --hot`
+at 0.22–0.24 s in the same sessions. Without `MINYAR_CLANG` in the environment
+the plain loop was 0.46–0.49 s before. Three changes: the launcher caches a
+configured runtime instead of compiling it on every build (0.75 s whenever a
+Clang is selected with `MINYAR_CLANG`), a watch session's rebuilds skip the
+launcher's toolchain check after its first build, and watch rebuilds link
+cached partitions (`tools/link-partitions.min`), so an edit recompiles one or
+two partition objects. `timeline.py` shows where one rebuild spends its time.
+On neo-db (41.7 MB of LLVM) a plain debug rebuild after a one-line edit drops
+from 7.8–8.4 s to 2.3–2.8 s with the partitioned link (4-vCPU box).

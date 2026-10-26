@@ -12,6 +12,9 @@ global. `run.py` keeps eight keep-alive clients busy (`load.go`) and changes
 - `steady` / `watch`: no edit; hot mode, the plain release binary and ordinary
   watch mode, for dispatch cost. `LIVEPATCH_PERF=1` adds the server's user-mode
   instructions per request (`perf stat`).
+- `soak`: like `patch`, but publishes one edit after another for the whole run,
+  then checks every request (no error, versions monotonic per connection, each
+  request counted once) and reports the server's resident memory.
 
 ```sh
 python3 benchmarks/livepatch/run.py hot restart steady watch
@@ -47,3 +50,10 @@ Twenty successive `minyar patch --release` runs on the idle server (4-vCPU
 box): with whole-program update images each took 0.66–1.11 s and resident
 memory grew 2,800 → 8,088 KiB (~265 KiB per patch); with images holding only
 changed functions, 0.29–0.37 s and 2,780 → 4,336 KiB (~78 KiB per patch).
+
+Soak, 2026-10-26, 8-vCPU box as above, 45 s of load (two rounds):
+`minyar patch --release` back to back published 148 patches per round
+(0.27–0.41 s each) while the clients completed 6.82M requests with 0 errors,
+monotonic versions on every connection and every request counted once; the
+server ended at 18.5–18.7 MiB resident, since every published image stays
+loaded.
