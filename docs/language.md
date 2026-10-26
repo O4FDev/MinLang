@@ -1793,9 +1793,12 @@ Boolean and Character fields, read its Bytes and scalar List fields by index,
 `.length` or get methods, follow fields of nested records, and pass the record
 or a buffer field whole to a parallel function. Assigning a field, Text and
 other managed fields, and records whose fields lead back to their own type are
-rejected. Buffers reachable through the record are checked before dispatch
-against every output of the same type, as are the Bytes elements of a captured
-`List<Bytes>` against Bytes outputs (one comparison per element).
+rejected. Elements of a captured List of such records are shared the same way:
+`score(queries[index])` or `queries[index].limit`. Buffers reachable through a
+record are checked before dispatch against every output of the same type, as
+are the Bytes elements of a captured `List<Bytes>` against Bytes outputs and
+the buffers of every element of a captured List of records (one comparison per
+element and path).
 
 On macOS and Linux, a persistent thread pool distributes chunks of up to 128
 indices; short ranges use smaller chunks, down to one index, so a loop over a

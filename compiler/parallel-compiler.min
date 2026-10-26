@@ -99,6 +99,17 @@ function checkParallelBody(context: CompilerContext, firstNode: Integer, body: I
                         if problem != "" { parallelRace(context, start, "'" + name + "' is shared read-only; " + problem) }
                     }
                     allowed = true
+                } else if capture >= 0 && parallelRecordList(context, types[capture]) && texts[start - 1] != "." {
+                    // An element of a captured List of records is shared read-only, like a captured record.
+                    if kind == 200 && !(parent >= 0 && nodes[parent].kind == 212 && nodes[parent].end == start + 3 && texts[start + 2] == "length") {
+                        if parent < 0 || nodes[parent].kind != 213 || nodes[parent].start != start {
+                            parallelRace(context, start, "elements of '" + name + "' are shared read-only; read one by index, such as " + name + "[" + index + "]")
+                        }
+                        let chain = parallelFieldChain(context, nodes[parent].end - 1, listElementType(types[capture]))
+                        let problem = parallelRecordUse(context, start, chain[0], chain[1])
+                        if problem != "" { parallelRace(context, start, "'" + name + "' is shared read-only; " + problem) }
+                    }
+                    allowed = true
                 } else if allowed && findText(windows.bases, name) >= 0 && !(parent >= 0 && nodes[parent].kind == 212 && nodes[parent].end == start + 3 && texts[start + 2] == "length") {
                     parallelWindowedRace(context, start, name)
                 } else if allowed && parallelViewList(types[capture]) {
@@ -181,6 +192,28 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
         capture = capture + 1
     }
     parallelRecordGuards(context, captures, types, parallelWrittenBuffers(context, firstNode, body, captures, types, windows), records, guards)
+    // Lists of records: every element's reachable buffers, checked by the runtime before dispatch.
+    capture = 0
+    while capture < captures.length {
+        if parallelRecordList(context, types[capture]) && parallelCaptureUsed(context, body, state[0], captures[capture]) {
+            let outputs = parallelWrittenBuffers(context, firstNode, body, captures, types, windows)
+            let outputIndex = 0
+            while outputIndex < outputs.length {
+                let write = findText(captures, outputs[outputIndex])
+                let path: List<Integer> = []
+                let firstGuard = guards.length
+                parallelRecordPaths(context, listElementType(types[capture]), types[write], capture, write, path, 0, guards)
+                // the same paths, checked per element: kinds 30 (List) and 31 (Bytes)
+                let entry = firstGuard
+                while entry < guards.length {
+                    guards[entry + 2] = guards[entry + 2] + 20
+                    entry = entry + 4 + guards[entry + 3]
+                }
+                outputIndex = outputIndex + 1
+            }
+        }
+        capture = capture + 1
+    }
     // Bounds execute on the owner thread. Only body calls need the effect proof.
     let node = firstNode
     while node < context.syntax.nodes.length {
@@ -337,6 +370,24 @@ function emitParallelAliasGuards(types: List<Integer>, ids: List<Integer>, guard
         let write = guards[pair + 1]
         let kind = guards[pair + 2]
         let input = loadLocal(output, textState, state, ids[read], types[read])
+        if kind >= 30 {
+            // A List of records: the runtime follows the path in every element.
+            let depth = guards[pair + 3]
+            let path = "@.minyar.parallel.path." + Text(newLabel(state))
+            let values = ""
+            let step = 0
+            while step < depth {
+                if step > 0 { values = values + ", " }
+                values = values + "i64 " + Text(guards[pair + 4 + step])
+                step = step + 1
+            }
+            globals.add(path + " = private unnamed_addr constant [" + Text(depth) + " x i64] [" + values + "]\n")
+            let target = loadLocal(output, textState, state, ids[write], types[write])
+            let declaration = "declare void @minyar_parallel_record_list_guard(ptr, ptr, i64, ptr, i64, i64, i64)\n"
+            if findText(globals, declaration) < 0 { globals.add(declaration) }
+            output.add("  call void @minyar_parallel_record_list_guard(ptr " + input + ", ptr " + path + ", i64 " + Text(depth) + ", ptr " + target + ", i64 " + Text(kind - 30) + ", i64 " + first + ", i64 " + after + ")\n")
+            pair = pair + 4 + depth
+        } else {
         if kind >= 10 && kind < 20 {
             // A buffer reached through a captured record's fields.
             let depth = guards[pair + 3]
@@ -360,6 +411,7 @@ function emitParallelAliasGuards(types: List<Integer>, ids: List<Integer>, guard
         if findText(globals, declaration) < 0 { globals.add(declaration) }
         output.add("  call void @" + callee + "(ptr " + input + ", ptr " + target + ", i64 " + first + ", i64 " + after + extra + ")\n")
         pair = pair + 3
+        }
     }
 }
 
@@ -925,4 +977,9 @@ function parallelRecordUse(context: CompilerContext, start: Integer, end: Intege
     }
     if parallelPlainRecord(context, type) { return "this record's fields lead back to its own type, so the buffers it can reach are unbounded" }
     return "only Integer, Float, Boolean, Character, Bytes, scalar List and record fields can be read"
+}
+
+// A List whose elements are records parallel code may read.
+function parallelRecordList(context: CompilerContext, type: Integer): Boolean {
+    return isListType(type) && parallelRecord(context, listElementType(type))
 }

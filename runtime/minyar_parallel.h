@@ -37,6 +37,24 @@ void minyar_parallel_bytes_list_no_overlap(const MinyarList *list, const MinyarT
                                          first, after, 0);
 }
 
+/* Records in a List a loop reads: the buffer at `path` (field positions; record
+ * layout { length, values[] }) in every element must not alias the output. */
+void minyar_parallel_record_list_guard(const MinyarList *list, const long long *path, long long depth,
+                                       const void *output, long long bytes, long long first,
+                                       long long after) {
+    if (first >= after) return;
+    for (long long index = 0; index < list->length; ++index) {
+        const long long *value = (const long long *)(uintptr_t)list->values[index];
+        for (long long step = 0; step < depth; ++step)
+            value = (const long long *)(uintptr_t)value[1 + path[step]];
+        if (bytes)
+            minyar_parallel_bytes_no_overlap((const MinyarText *)value, (const MinyarText *)output,
+                                             first, after, 0);
+        else
+            minyar_parallel_no_alias(value, output, first, after);
+    }
+}
+
 /* A window is iteration index's own `width` slots, starting at index * width. */
 void minyar_parallel_window_stop(long long index, long long width, long long length) {
     char message[200];

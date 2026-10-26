@@ -68,7 +68,11 @@ records whose fields lead back to their own type are rejected, the last because
 the buffers a record can reach must be finite to guard them: before dispatch,
 every Bytes or List field reachable from a captured record is compared with each
 output of its type. The Bytes elements of a captured `List<Bytes>` are compared
-with every Bytes output in the same way, one comparison per element.
+with every Bytes output in the same way, one comparison per element. A captured
+List of records lets one dispatch serve several read-only records (several
+queries, say): its elements follow the record rules, and the runtime follows
+each reachable field path in every element before dispatch
+(`minyar_parallel_record_list_guard`), one comparison per element and path.
 
 The diagnostics, in the order the checks run:
 
