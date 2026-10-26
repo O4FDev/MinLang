@@ -23,7 +23,7 @@ case "$seconds" in ''|*[!0-9]*) echo "MINYAR_AFL_SECONDS must be a positive inte
 [ "$seconds" -gt 0 ] || { echo "MINYAR_AFL_SECONDS must be positive." >&2; exit 2; }
 
 mkdir -p "$target_dir" "$project_dir/build"
-make -s -C "$project_dir" LLVM_CC="${MINYAR_TEST_CLANG:-clang}" build/compiler-stage2.ll build/tooling/tools/sanitize-llvm
+make -s -C "$project_dir" LLVM_CC="${MINYAR_TEST_REAL_CLANG:-${MINYAR_TEST_CLANG:-clang}}" build/compiler-stage2.ll build/tooling/tools/sanitize-llvm
 "$project_dir/build/tooling/tools/sanitize-llvm" \
     "$project_dir/build/compiler-stage2.ll" "$sanitized_ir"
 case "$(uname -s)" in

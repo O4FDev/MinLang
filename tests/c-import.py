@@ -343,7 +343,8 @@ def main():
     parser.add_argument("--compiler", default=os.environ.get("MINYAR_TEST_COMPILER", "./build/minyarc"))
     parser.add_argument("--runtime", default=os.environ.get("MINYAR_TEST_RUNTIME", "./build/minyar-runtime.o"))
     parser.add_argument("--driver", default="./build/tooling/tools/clang-driver")
-    parser.add_argument("--clang", default=os.environ.get("MINYAR_TEST_CLANG", "clang"))
+    # The launcher and link evidence need the real Clang, never a fixture compile cache (tools/testing.min realClang).
+    parser.add_argument("--clang", default=os.environ.get("MINYAR_TEST_REAL_CLANG", os.environ.get("MINYAR_TEST_CLANG", "clang")))
     parser.add_argument("--case", action="append", choices=CASES)
     options = parser.parse_args()
     (ROOT / "build").mkdir(exist_ok=True)

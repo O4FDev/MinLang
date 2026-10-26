@@ -54,7 +54,13 @@ is never part of `build/.toolchain.json`, so the compiler is not rebuilt. Checks
 whose label names a budget, performance, timing or measurement compile uncached.
 A harness that hands a Clang to the launcher or a sub-make, or records its
 identity as evidence, uses `test.realClang` (`fixtures.realClang`), the real
-compiler in `MINYAR_TEST_REAL_CLANG`.
+compiler in `MINYAR_TEST_REAL_CLANG`; check-in-parallel's `toolchain-stamp`
+check fails a run in which any check hands the wrapper to the launcher. The
+cache is off by default because it does not pay today: on an 8-vCPU Boat box a
+second identical `check-portable` run hit at most 5% of about 5,600 cacheable
+compiles (485 s and 3,160 s of check CPU, against 538 s and 3,129 s uncached),
+because harnesses write fixtures into per-run scratch directories whose paths
+reach the compiled inputs (`#line` markers, `source_filename`, debug info).
 `make check-in-parallel-tool` (in `check-portable`) runs the runner on a
 scratch Makefile: an aggregate of passing checks passes, its shared file
 prerequisite is built exactly once, and every check sees `MINYAR_TEST_JOBS=1`
