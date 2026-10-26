@@ -601,10 +601,9 @@ function lowerScopeBody(module: Text, source: List<Text>, sourceStarts: List<Int
 // Lowers every scoped function body in text, which holds whole lines. Unchanged
 // text, including every function without scope operations, is emitted as views
 // of text: copying each line or body would keep several copies alive in an
-// arena that never frees.
-function lowerScopeText(module: Text, output: List<Text>) {
-    let body: List<Text> = []
-    let bodyStarts: List<Integer> = []
+// arena that never frees. For the same reason every call reuses the caller's
+// empty body Lists.
+function lowerScopeText(module: Text, output: List<Text>, body: List<Text>, bodyStarts: List<Integer>) {
     let inFunction = false
     let scoped = false
     let lines = module.split("\n")
@@ -640,6 +639,7 @@ function lowerScopeText(module: Text, output: List<Text>) {
         index = index + 1
     }
     if copied < module.length { output.add(module.slice(copied, module.length)) }
+    lines.clear()
 }
 
 function scopeCheckDeclaration(line: Text) {
@@ -675,7 +675,7 @@ function scopeCheckDeclarations(text: Text) {
 // constant initializers, closures, bridges and tables. It is cut where each
 // definition starts; only stretches that call minyar_rc_enter are split into
 // lines and lowered, the rest pass through as views.
-function lowerScopeGap(text: Text, output: List<Text>) {
+function lowerScopeGap(text: Text, output: List<Text>, body: List<Text>, bodyStarts: List<Integer>) {
     scopeCheckDeclarations(text)
     let enter = "\n  call void @minyar_rc_enter("
     if text.find(enter) < 0 {
@@ -689,7 +689,7 @@ function lowerScopeGap(text: Text, output: List<Text>) {
         let end = text.length
         if found >= 0 { end = start + found + 1 }
         let stretch = text.slice(start, end)
-        if stretch.find(enter) >= 0 { lowerScopeText(stretch, output) } else { output.add(stretch) }
+        if stretch.find(enter) >= 0 { lowerScopeText(stretch, output, body, bodyStarts) } else { output.add(stretch) }
         start = end
         if found >= 0 {
             rest = text.slice(start, text.length)
@@ -698,11 +698,13 @@ function lowerScopeGap(text: Text, output: List<Text>) {
     }
 }
 
-function joinScopePieces(pieces: List<Text>, start: Integer, end: Integer): Text {
-    let part: List<Text> = []
+// Joins pieces [start, end) through the caller's empty List.
+function joinScopePieces(pieces: List<Text>, start: Integer, end: Integer, part: List<Text>): Text {
     let piece = start
     while piece < end { part.add(pieces[piece]); piece = piece + 1 }
-    return joinText(part)
+    let joined = joinText(part)
+    part.clear()
+    return joined
 }
 
 // The result joins to the lowered module. functionPieces holds, for each
@@ -713,6 +715,9 @@ function joinScopePieces(pieces: List<Text>, start: Integer, end: Integer): Text
 // build), the whole module is one such stretch.
 function lowerScopeOwnershipParts(pieces: List<Text>, functionPieces: List<Integer>): List<Text> {
     let output: List<Text> = []
+    let part: List<Text> = []
+    let body: List<Text> = []
+    let bodyStarts: List<Integer> = []
     let ranges = functionPieces
     let none: List<Integer> = []
     let entry = 0
@@ -728,11 +733,11 @@ function lowerScopeOwnershipParts(pieces: List<Text>, functionPieces: List<Integ
     while piece < pieces.length {
         let next = pieces.length
         if entry < ranges.length { next = ranges[entry] }
-        if next > piece { lowerScopeGap(joinScopePieces(pieces, piece, next), output) }
+        if next > piece { lowerScopeGap(joinScopePieces(pieces, piece, next, part), output, body, bodyStarts) }
         piece = next
         if entry < ranges.length {
             let end = ranges[entry + 1]
-            if ranges[entry + 2] != 0 { lowerScopeText(joinScopePieces(pieces, next, end), output) } else {
+            if ranges[entry + 2] != 0 { lowerScopeText(joinScopePieces(pieces, next, end, part), output, body, bodyStarts) } else {
                 while piece < end { output.add(pieces[piece]); piece = piece + 1 }
             }
             piece = end
