@@ -1,4 +1,3 @@
-MINYAR_TOOL_SOURCES = $(wildcard tools/*.min) $(wildcard library/*.min)
 MINYAR_TOOL_NATIVE = runtime/native/system.c runtime/native/files.c tools/testing-host.c
 MINYAR_TOOL_NATIVE_OBJECTS = $(addprefix build/tooling/,$(MINYAR_TOOL_NATIVE:.c=.o))
 TOOL_RUNTIME = build/minyar-runtime.o
@@ -18,9 +17,27 @@ build/tooling/%.o: %.c build/.toolchain.json build-support/test-tooling.mk
 
 -include $(MINYAR_TOOL_NATIVE_OBJECTS:.o=.d)
 
-build/tooling/%.ll: %.min $(MINYAR_TOOL_SOURCES) build/minyarc-modules
-	mkdir -p $(@D)
-	$(LIMITED) ./build/minyarc-modules $< $@ --library library
+# Each harness LLVM file depends on exactly the modules its compilation loads,
+# recorded in build/tooling/<harness>.ll.d by the scanner (like clang -MMD -MP).
+# A new scanner rebuilds every harness, so trees built before it gain a list.
+MINYAR_DEPENDENCY_SCANNER = build-support/minyar-dependencies.awk
+
+build/tooling/%.ll: %.min build/minyarc-modules $(MINYAR_DEPENDENCY_SCANNER)
+	mkdir -p "$(@D)"
+	@echo '$(LIMITED) ./build/minyarc-modules $< $@ --library library'
+	@set -eu; temporary=$$(mktemp "$@.XXXXXXXX"); \
+	dependencies=$$(mktemp "$@.d.XXXXXXXX"); \
+	trap 'rm -f "$$temporary" "$$dependencies"' 0; \
+	trap 'exit 1' HUP INT TERM; \
+	$(LIMITED) ./build/minyarc-modules "$<" "$$temporary" --library library; \
+	LC_ALL=C awk -f "$(MINYAR_DEPENDENCY_SCANNER)" "$@" "$<" library > "$$dependencies"; \
+	touch "$$temporary"; \
+	mv -f "$$dependencies" "$@.d"; \
+	mv -f "$$temporary" "$@"
+
+# Included lists need no remaking; this also keeps them out of the link rule.
+build/tooling/%.ll.d: ;
+-include $(shell find build/tooling -name '*.ll.d' -type f 2>/dev/null)
 
 # Imported test helpers must invalidate LLVM, not only relink an old harness.
 MINYAR_NATIVE_EVIDENCE_SOURCES = tests/native-evidence.min tests/compiler-port-support.min \
@@ -113,3 +130,10 @@ check-in-parallel-tool: build/tooling/tools/check-in-parallel build/tooling/test
 	$(LIMITED) ./build/tooling/tests/check-in-parallel "$(CURDIR)/build/tooling/tools/check-in-parallel"
 
 check check-portable: check-in-parallel-tool
+
+# The harness LLVM rule above lists exactly the modules a compilation loads.
+.PHONY: check-harness-dependencies
+check-harness-dependencies: build/tooling/tests/harness-dependencies build/tooling/tests/harness-dependency-fixture/app/main.ll build/minyarc-modules
+	$(LIMITED) ./build/tooling/tests/harness-dependencies "$(CURDIR)" "$(CURDIR)/build/minyarc-modules"
+
+check check-portable: check-harness-dependencies

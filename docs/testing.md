@@ -1221,6 +1221,29 @@ dependencies and the toolchain stamp invalidating them when inputs change.
 gate, so those controls run once. POSIX process controls use release handshakes
 to keep children alive for pending-state and session checks without fixed sleeps.
 
+A tooling harness's LLVM file (`build/tooling/<path>.ll` from `<path>.min`)
+depends on exactly the modules its compilation loads, so editing one `tools/` or
+`library/` module rebuilds only the harnesses that import it, directly or
+transitively. After each successful compilation,
+`build-support/minyar-dependencies.awk` writes `build/tooling/<path>.ll.d`, as
+`clang -MMD -MP` does for C. It finds imports with the compiler's rules: a
+`use "..." as name` statement at the top level of a module, outside comments
+and Text literals; `./` and `../` paths from the importing file's directory;
+package names in the `--library` directory; one normalized spelling per
+module. The compiler loads nothing else. An import the scanner cannot read
+exactly, such as a module name written with an interpolation, stops the build
+instead of being skipped. Changing the scanner rebuilds every harness.
+`make check-harness-dependencies` (in `check-portable`) builds the fixture in
+`tests/harness-dependency-fixture` with the real rule. The fixture has a
+relative, a parent-directory, a package and a transitive import, and
+import-shaped text in comments and literals. The check reads the dependency
+file and asks `make -q -W FILE` (which touches nothing) what one edit would
+rebuild. Each loaded module must rebuild the fixture. Unimported fixture
+modules, `tools/peer-audit.min`, `tools/testing.min` and an unimported library
+module must not. In a private copy of the fixture it then removes one file at a
+time: the compiler must fail without each listed module and succeed without
+any other file.
+
 ## Per-commit platform gates
 
 `.github/workflows/ci.yml` runs on every push and pull request. Linux runs the

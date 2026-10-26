@@ -1,0 +1,103 @@
+use "io" as io
+use "process" as processInfo
+use "system" as system
+use "files" as files
+use "../tools/testing.min" as test
+
+// `make check-harness-dependencies`: a tooling harness's LLVM file must depend on
+// exactly the modules its compilation loads. The real Make rule builds the fixture
+// first; this asks Make what one edited file would rebuild (`-W`, nothing is
+// touched), then removes each fixture file from a private copy to show that the
+// compiler needs exactly the listed modules.
+test.check(processInfo.argumentCount() == 2, "usage: harness-dependencies ROOT COMPILER")
+let root = processInfo.argument(0)
+let compiler = processInfo.argument(1)
+let fixture = "tests/harness-dependency-fixture"
+let entry = fixture + "/app/main.min"
+let target = "build/tooling/" + fixture + "/app/main.ll"
+let needed = [entry, fixture + "/app/helper.min", fixture + "/shared/common.min", fixture + "/shared/deep.min", "library/math.min"]
+let unrelated = [fixture + "/app/commented.min", fixture + "/app/embedded.min", fixture + "/shared/unrelated.min", "library/random.min"]
+let work = test.scratch()
+
+let environment: List<Text> = []
+for item in system.environment() {
+    if !item.startsWith("MAKEFLAGS=") && !item.startsWith("MFLAGS=") && !item.startsWith("MAKELEVEL=") { environment.add(item) }
+}
+
+function listed(values: List<Text>, wanted: Text): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+
+// The first rule of a dependency file: "TARGET: \" then one prerequisite per line.
+function prerequisites(source: Text, target: Text): List<Text> {
+    let result: List<Text> = []
+    let first = true
+    for line in test.lines(source) {
+        let words = test.words(line)
+        if words.length == 0 { break }
+        for word in words {
+            if first && word == target + ":" { first = false; continue }
+            if word != "\\" { result.add(word) }
+        }
+        test.check(!first, "dependency file must begin with its target:\n" + source)
+        if !line.endsWith("\\") { break }
+    }
+    return result
+}
+
+// Make's question mode: 0 when TARGET is current, 1 when it would be rebuilt.
+// The toolchain stamp is remade on every run, so it is treated as old.
+function question(root: Text, environment: List<Text>, work: Text, target: Text, edited: Text, log: Text): Integer {
+    let command = ["make", "-q", "-o", "build/.toolchain.json"]
+    if edited != "" {
+        command.add("-W")
+        command.add(edited)
+    }
+    command.add(target)
+    let result = test.run(command, environment, root, work + "/" + log, 300)
+    test.check(result.status == 0 || result.status == 1, "make -q failed (" + Text(result.status) + ")\n" + result.output + result.errorOutput)
+    return result.status
+}
+
+let listing = prerequisites(io.readTextFile(root + "/" + target + ".d"), target)
+for path in needed { test.check(listed(listing, path), target + ".d must list " + path + "\n" + io.readTextFile(root + "/" + target + ".d")) }
+test.check(listing.length == needed.length, target + ".d must list only the loaded modules\n" + io.readTextFile(root + "/" + target + ".d"))
+
+test.check(question(root, environment, work, target, "", "current") == 0, target + " must be current after its build")
+let index = 0
+for path in needed {
+    test.check(question(root, environment, work, target, path, "needed-" + Text(index)) == 1, "editing " + path + " must rebuild " + target)
+    index += 1
+}
+// Editing a tools module this program does not import, even the shared testing
+// library, must leave it alone.
+for path in [unrelated[0], unrelated[1], unrelated[2], unrelated[3], "tools/peer-audit.min", "tools/testing.min"] {
+    test.check(question(root, environment, work, target, path, "unrelated-" + Text(index)) == 0, "editing " + path + " must not rebuild " + target)
+    index += 1
+}
+
+// The compiler opens every listed module and nothing else from this tree.
+let tree = work + "/tree"
+for directory in [tree, tree + "/tests", tree + "/" + fixture, tree + "/" + fixture + "/app", tree + "/" + fixture + "/shared", tree + "/library"] {
+    test.check(files.makeDirectory(directory) == 0, "cannot create " + directory)
+}
+let copies: List<Text> = []
+for path in needed { copies.add(path) }
+for path in unrelated { copies.add(path) }
+for path in copies { io.writeTextFile(tree + "/" + path, io.readTextFile(root + "/" + path)) }
+let compile = [compiler, entry, work + "/main.ll", "--library", "library"]
+test.require(test.run(compile, environment, tree, work + "/complete", 120), "compiling the copied fixture")
+for path in copies {
+    test.check(files.rename(tree + "/" + path, tree + "/" + path + ".away") == 0, "cannot move " + path)
+    let result = test.run(compile, environment, tree, work + "/without-" + Text(index), 120)
+    if listed(needed, path) {
+        test.check(result.status != 0 && test.contains(result.errorOutput + result.output, path), "the compiler must need " + path + "\n" + result.output + result.errorOutput)
+    } else {
+        test.require(result, "compiling without " + path)
+    }
+    test.check(files.rename(tree + "/" + path + ".away", tree + "/" + path) == 0, "cannot restore " + path)
+    index += 1
+}
+test.removeTree(work)
+print("harness dependencies: " + Text(needed.length) + " loaded modules listed and required, " + Text(unrelated.length + 2) + " unrelated edits ignored")
