@@ -1,0 +1,154 @@
+// Variant: the same parallel function called from an ordinary for loop (no pool dispatch).
+// Windows exist only inside a parallel for, so each query gets small fresh Lists.
+use "process" as processInfo
+// Search top-k over posting lists: N*1000 documents, 4096 terms with skewed
+// document frequencies, N queries of 2-4 terms (every third one a
+// conjunction). Each query walks its posting lists document-at-a-time, scores
+// matches with an integer BM25-like formula and keeps its 10 best documents
+// (score descending, document ascending) in its own window of the results.
+constant TERMS = 4096
+constant K = 10
+constant MODULUS = 1000000007
+
+parallel function mix(seed: Integer): Integer {
+    let value = seed
+    for round in 0..3 {
+        value = value ^ (value >> 31)
+        value = wrappingMultiply(value, 0x2545F4914F6CDD1D)
+        value = value ^ (value >> 29)
+        value = wrappingAdd(value, round)
+    }
+    return value & 0x7FFFFFFFFFFFFFFF
+}
+
+// The query's k best (doc, score) pairs into docs/scores; returns how many.
+parallel function search(postDocs: List<Integer>, postTfs: List<Integer>, starts: List<Integer>, idf: List<Integer>,
+                         norm: List<Integer>, terms: List<Integer>, q: Integer, conjunctive: Boolean,
+                         cursor: List<Integer>, docs: List<Integer>, scores: List<Integer>): Integer {
+    let n = 0
+    while n < 4 && terms[q * 4 + n] >= 0 {
+        cursor[n] = starts[terms[q * 4 + n]]
+        n += 1
+    }
+    let found = 0
+    let more = true
+    while more {
+        let doc = -1
+        for j in 0..n {
+            let t = terms[q * 4 + j]
+            if cursor[j] < starts[t + 1] {
+                let d = postDocs[cursor[j]]
+                if doc < 0 || d < doc { doc = d }
+            }
+        }
+        if doc < 0 {
+            more = false
+        } else {
+            let score = 0
+            let matched = 0
+            for j in 0..n {
+                let t = terms[q * 4 + j]
+                if cursor[j] < starts[t + 1] && postDocs[cursor[j]] == doc {
+                    let tf = postTfs[cursor[j]]
+                    score += idf[t] * tf * 16 / (tf + norm[doc])
+                    matched += 1
+                    cursor[j] += 1
+                }
+            }
+            if (!conjunctive || matched == n) && (found < K || score > scores[K - 1]) {
+                let at = min(found, K - 1)
+                while at > 0 && scores[at - 1] < score {
+                    scores[at] = scores[at - 1]
+                    docs[at] = docs[at - 1]
+                    at -= 1
+                }
+                scores[at] = score
+                docs[at] = doc
+                if found < K { found += 1 }
+            }
+        }
+    }
+    return found
+}
+
+let n = Integer(processInfo.argument(0))
+let documents = n * 1000
+let queries = n
+let postDocs: List<Integer> = []
+let postTfs: List<Integer> = []
+let starts: List<Integer> = []
+let idf: List<Integer> = []
+for t in 0..TERMS {
+    starts.add(postDocs.length)
+    let target = min(documents / 2, documents * 4 / (t + 8))
+    let step = max(1, 2 * documents / target)
+    let doc = mix(t) % step
+    let k = 0
+    while doc < documents {
+        let r = mix(t * 16777216 + k)
+        postDocs.add(doc)
+        postTfs.add(1 + (r >> 32) % 5)
+        doc += 1 + r % step
+        k += 1
+    }
+    let df = postDocs.length - starts[t]
+    let ratio = documents / max(df, 1)
+    let bits = 0
+    while ratio > 1 {
+        ratio = ratio / 2
+        bits += 1
+    }
+    idf.add(1000 * (bits + 1))
+}
+starts.add(postDocs.length)
+let norm: List<Integer> = []
+for d in 0..documents { norm.add(3 + mix(d + 777) % 200 / 50) }
+
+let terms: List<Integer> = []
+let conjunctive: List<Boolean> = []
+for q in 0..queries {
+    let count = 2 + mix(q * 7) % 3
+    for j in 0..4 {
+        if j < count { terms.add(mix(q * 7 + 1 + j) % (16 << (2 * j))) } else { terms.add(-1) }
+    }
+    conjunctive.add(q % 3 == 0)
+}
+
+let found: List<Integer> = []
+let topDocs: List<Integer> = []
+let topScores: List<Integer> = []
+let cursors: List<Integer> = []
+for q in 0..queries {
+    found.add(0)
+    for slot in 0..K {
+        topDocs.add(0)
+        topScores.add(0)
+    }
+    for slot in 0..4 { cursors.add(0) }
+}
+let width = K
+let terms4 = 4
+for q in 0..queries {
+    let cursor = [0, 0, 0, 0]
+    let docs: List<Integer> = []
+    let scores: List<Integer> = []
+    for slot in 0..K {
+        docs.add(0)
+        scores.add(0)
+    }
+    found[q] = search(postDocs, postTfs, starts, idf, norm, terms, q, conjunctive[q], cursor, docs, scores)
+    for slot in 0..K {
+        topDocs[q * K + slot] = docs[slot]
+        topScores[q * K + slot] = scores[slot]
+    }
+}
+
+let digest = 0
+for q in 0..queries {
+    for r in 0..found[q] {
+        digest = (digest * 31 + (r + 1) * (topDocs[q * K + r] * 1000003 + topScores[q * K + r])) % MODULUS
+    }
+    if q < 4 { print("query \(q) found \(found[q]) best \(topDocs[q * K]) \(topScores[q * K])") }
+}
+print("postings \(postDocs.length)")
+print("digest \(digest)")

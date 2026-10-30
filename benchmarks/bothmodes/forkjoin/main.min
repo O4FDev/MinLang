@@ -1,0 +1,76 @@
+use "process" as processInfo
+// Fork-join over a tree: build a random expression tree of N leaves (nodes in
+// preorder, children and subtree sizes in Lists), then evaluate it eight
+// times with fresh leaf values. Subtrees larger than CUTOFF evaluate their
+// two children with `join`; smaller ones recurse serially.
+constant MODULUS = 2147483647
+constant PASSES = 8
+constant CUTOFF = 4096
+
+parallel function mix(seed: Integer): Integer {
+    let value = seed
+    for round in 0..3 {
+        value = value ^ (value >> 31)
+        value = wrappingMultiply(value, 0x2545F4914F6CDD1D)
+        value = value ^ (value >> 29)
+        value = wrappingAdd(value, round)
+    }
+    return value & 0x7FFFFFFFFFFFFFFF
+}
+
+record Tree { left: List<Integer>; right: List<Integer>; size: List<Integer>; splits: List<Integer> }
+
+// Appends the subtree of `leaves` leaves in preorder and returns its root.
+function build(tree: Tree, leaves: Integer): Integer {
+    let node = tree.left.length
+    tree.left.add(-1)
+    tree.right.add(-1)
+    tree.size.add(1)
+    if leaves == 1 { return node }
+    let split = 1 + mix(tree.splits.length) % (leaves - 1)
+    tree.splits.add(split)
+    let left = build(tree, split)
+    let right = build(tree, leaves - split)
+    tree.left[node] = left
+    tree.right[node] = right
+    tree.size[node] = 1 + tree.size[left] + tree.size[right]
+    return node
+}
+
+parallel function combine(node: Integer, a: Integer, b: Integer): Integer {
+    let op = mix(node) % 4
+    let value = 0
+    if op == 0 { value = (a + b) % MODULUS }
+    else if op == 1 { value = a * b % MODULUS }
+    else if op == 2 { value = (a ^ b) % MODULUS }
+    else { value = max(a, b) }
+    return (value + mix(value + node) % 1024) % MODULUS
+}
+
+parallel function serial(left: List<Integer>, right: List<Integer>, node: Integer, pass: Integer): Integer {
+    if left[node] < 0 { return mix(node + pass * 1000003) % MODULUS }
+    let a = serial(left, right, left[node], pass)
+    let b = serial(left, right, right[node], pass)
+    return combine(node, a, b)
+}
+
+parallel function evaluate(left: List<Integer>, right: List<Integer>, size: List<Integer>, node: Integer, pass: Integer): Integer {
+    if size[node] < CUTOFF { return serial(left, right, node, pass) }
+    let a, b = join(evaluate(left, right, size, left[node], pass), evaluate(left, right, size, right[node], pass))
+    return combine(node, a, b)
+}
+
+let leaves = Integer(processInfo.argument(0))
+let tree = Tree { left: []; right: []; size: []; splits: [] }
+let root = build(tree, leaves)
+print("nodes \(tree.left.length)")
+let left = tree.left
+let right = tree.right
+let size = tree.size
+let digest = 0
+for pass in 0..PASSES {
+    let value = evaluate(left, right, size, root, pass)
+    print("pass \(pass) \(value)")
+    digest = (digest * 31 + value) % MODULUS
+}
+print("digest \(digest)")

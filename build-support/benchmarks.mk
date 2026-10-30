@@ -1,4 +1,4 @@
-.PHONY: check-benchmarks check-benchmarks-cli check-benchmarks-compare
+.PHONY: check-benchmarks check-benchmarks-cli check-benchmarks-compare check-benchmarks-bothmodes
 
 build/tooling/tests/benchmarks build/tooling/tests/benchmarks-cli build/tooling/tools/project-cli: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/benchmarks build/tooling/tests/benchmarks-cli build/tooling/tools/project-cli: build/testing/cycle-runtime.o
@@ -27,3 +27,11 @@ check check-portable: check-benchmarks check-benchmarks-cli
 # peer prints on the small workload. Timing lives in benchmarks/compare/run.py.
 check-benchmarks-compare: build/minyarc build/tooling/tools/clang-driver
 	$(LIMITED) env CC="$(LLVM_CC)" python3 benchmarks/compare/run.py --check
+
+# One source, both modes (benchmarks/bothmodes): correctness only. Each Minyar
+# program is built at O0 and release and run at 1 and 4 threads; every run must
+# print exactly what its serial C peer prints on the small workload. Timing
+# (serial Ir ratio, parallel wall ratio against std-only Rust) lives in
+# benchmarks/bothmodes/run.py.
+check-benchmarks-bothmodes: build/minyarc build/tooling/tools/clang-driver
+	$(LIMITED) env CC="$(LLVM_CC)" python3 benchmarks/bothmodes/run.py --check

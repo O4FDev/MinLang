@@ -162,6 +162,19 @@ the ratio of Minyar to the fastest peer, with `--only`, `--tree`, `--json`,
 `--perf` (wall time, n=3 interleaved) and `--profile` (top functions).
 Reference counts are cached in `build/compare-cache/`.
 
+`benchmarks/bothmodes/` holds programs written once that must be fast both on
+one thread and on many: each `main.min` runs serially at
+`MINYAR_PARALLEL_THREADS=1` and in parallel at higher counts, beside serial C,
+C++ and Rust peers and a parallel std-only Rust peer (`par.rs`, same thread
+variable). `make check-benchmarks-bothmodes` builds each Minyar program at O0
+and release, runs it at 1 and 4 threads and compares every run with its C peer
+on the small workload; it checks correctness only. `python3
+benchmarks/bothmodes/run.py` measures the full workloads on Linux x86-64: the
+serial ratio (Minyar cachegrind instructions at 1 thread over the fewest of C,
+C++ and Rust) and the parallel ratio (Minyar wall time at 4 threads over
+`par.rs` at 4, n=5 interleaved, median and spread), each with a geomean, plus
+both programs' wall time at 1 thread for scaling.
+
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and
 ordinary-build exclusion. Successful fixtures and the living-tests gallery

@@ -1,0 +1,122 @@
+use "io" as io
+use "process" as processInfo
+use "text" as text
+// Inverted index build: every line of the input file is a document of
+// space-separated words. Lines are tokenized in parallel (each line hashes
+// its words into its own window); terms get ids and posting lists (document,
+// term frequency) in document order; then terms are ranked by spelling.
+constant MAXTOK = 16
+constant MODULUS = 1000000007
+record Term { word: Text; id: Integer }
+
+// FNV-1a over each word of corpus[first, after); returns the word count.
+parallel function tokenize(corpus: Bytes, first: Integer, after: Integer, hashes: List<Integer>, starts: List<Integer>,
+                           lengths: List<Integer>): Integer {
+    let count = 0
+    let i = first
+    while i < after {
+        while i < after && corpus[i] == 32 { i += 1 }
+        if i < after {
+            let start = i
+            let hash = -3750763034362895579
+            while i < after && corpus[i] != 32 {
+                hash = wrappingMultiply(hash ^ corpus[i], 1099511628211)
+                i += 1
+            }
+            hashes[count] = hash
+            starts[count] = start
+            lengths[count] = i - start
+            count += 1
+        }
+    }
+    return count
+}
+
+parallel function sameWord(corpus: Bytes, a: Integer, b: Integer, length: Integer): Boolean {
+    for k in 0..length { if corpus[a + k] != corpus[b + k] { return false } }
+    return true
+}
+
+let corpus = io.readBytesFile(processInfo.argument(0))
+let lineStarts: List<Integer> = [0]
+for i in 0..corpus.length { if corpus[i] == 10 { lineStarts.add(i + 1) } }
+let documents = lineStarts.length - 1
+let counts: List<Integer> = []
+let hashes: List<Integer> = []
+let starts: List<Integer> = []
+let lengths: List<Integer> = []
+for d in 0..documents {
+    counts.add(0)
+    for slot in 0..MAXTOK {
+        hashes.add(0)
+        starts.add(0)
+        lengths.add(0)
+    }
+}
+let width = MAXTOK
+parallel for d in 0..documents {
+    counts[d] = tokenize(corpus, lineStarts[d], lineStarts[d + 1] - 1, hashes.window(d, width), starts.window(d, width),
+                         lengths.window(d, width))
+}
+
+let ids: Map<Integer, Integer> = Map()
+let firstStart: List<Integer> = []
+let firstLength: List<Integer> = []
+let postings: List<List<Integer>> = []
+let frequencies: List<List<Integer>> = []
+let tokens = 0
+for d in 0..documents {
+    for k in 0..counts[d] {
+        let slot = d * MAXTOK + k
+        let hash = hashes[slot]
+        let id = -1
+        if ids.has(hash) { id = ids[hash] }
+        if id < 0 {
+            id = firstStart.length
+            ids[hash] = id
+            firstStart.add(starts[slot])
+            firstLength.add(lengths[slot])
+            postings.add([])
+            frequencies.add([])
+        } else if firstLength[id] != lengths[slot] || !sameWord(corpus, firstStart[id], starts[slot], lengths[slot]) {
+            fail("FNV-1a collision between two words")
+        }
+        let list = postings[id]
+        if list.length > 0 && list[list.length - 1] == d {
+            frequencies[id][list.length - 1] += 1
+        } else {
+            list.add(d)
+            frequencies[id].add(1)
+        }
+        tokens += 1
+    }
+}
+
+let terms: List<Term> = []
+let total = 0
+for id in 0..firstStart.length {
+    terms.add(Term { word: text.decodeOrStop(corpus.slice(firstStart[id], firstStart[id] + firstLength[id])); id: id })
+    total += postings[id].length
+}
+terms.sortBy(function(a: Term, b: Term): Integer {
+    if a.word < b.word { return -1 }
+    if a.word > b.word { return 1 }
+    return 0
+})
+let digest = 0
+let best = 0
+for rank in 0..terms.length {
+    let id = terms[rank].id
+    let docSum = 0
+    let tfSum = 0
+    for k in 0..postings[id].length {
+        docSum += postings[id][k]
+        tfSum += frequencies[id][k] * (k % 7 + 1)
+    }
+    digest = (digest * 31 + postings[id].length * 1000003 + docSum % 1000003 + tfSum) % MODULUS
+    if postings[id].length > postings[terms[best].id].length { best = rank }
+}
+print("documents \(documents) tokens \(tokens)")
+print("terms \(terms.length) postings \(total)")
+print("widest \(terms[best].word) \(postings[terms[best].id].length)")
+print("digest \(digest)")

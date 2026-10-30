@@ -1,0 +1,63 @@
+// Variant: one plain serial loop over the records per pass (no chunks, windows or reduce).
+use "process" as processInfo
+// Map-reduce over records: build N sales, then run six passes of three
+// grouped aggregations (revenue by region and month, units by product, a
+// count of large sales). Each chunk of sales fills its own window of bucket
+// counters; the chunks are combined in order afterwards.
+record Sale { customer: Integer; product: Integer; region: Integer; month: Integer; quantity: Integer; price: Integer; discount: Integer }
+
+constant CHUNK = 8192
+constant PASSES = 6
+constant MODULUS = 1000000007
+
+parallel function mix(seed: Integer): Integer {
+    let value = seed
+    for round in 0..3 {
+        value = value ^ (value >> 31)
+        value = wrappingMultiply(value, 0x2545F4914F6CDD1D)
+        value = value ^ (value >> 29)
+        value = wrappingAdd(value, round)
+    }
+    return value & 0x7FFFFFFFFFFFFFFF
+}
+
+function sale(i: Integer): Sale {
+    let a = mix(i * 2)
+    let b = mix(i * 2 + 1)
+    return Sale {
+        customer: a % 100000
+        product: (a >> 20) % 512
+        region: (a >> 32) % 16
+        month: (a >> 40) % 12
+        quantity: 1 + b % 9
+        price: 100 + (b >> 8) % 20000
+        discount: (b >> 30) % 30
+    }
+}
+
+let count = Integer(processInfo.argument(0))
+let sales: List<Sale> = []
+for i in 0..count { sales.add(sale(i)) }
+
+let digest = 0
+for pass in 0..PASSES {
+    let minimum = 1 + pass % 3
+    let skipMonth = pass % 12
+    let threshold = 100000 + pass * 10000
+    let large = 0
+    let revenue: List<Integer> = []
+    for slot in 0..16 * 12 { revenue.add(0) }
+    let units: List<Integer> = []
+    for slot in 0..512 { units.add(0) }
+    for sale in sales {
+        let net = sale.price * sale.quantity * (100 - sale.discount) / 100
+        if sale.quantity >= minimum { revenue[sale.region * 12 + sale.month] += net }
+        if sale.month != skipMonth { units[sale.product] += sale.quantity }
+        if net > threshold { large += 1 }
+    }
+    for slot in 0..16 * 12 { digest = (digest * 31 + revenue[slot]) % MODULUS }
+    for slot in 0..512 { digest = (digest * 31 + units[slot]) % MODULUS }
+    digest = (digest * 31 + large) % MODULUS
+    print("pass \(pass) large \(large)")
+}
+print("digest \(digest)")

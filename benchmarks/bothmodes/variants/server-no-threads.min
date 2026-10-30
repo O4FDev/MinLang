@@ -1,0 +1,130 @@
+// Variant: the same server with no thread function (ordinary, unthreaded runtime), one event loop.
+use "process" as processInfo
+use "net" as net
+use "eventloop" as eventloop
+use "errors" as errors
+use "system" as system
+// An event-loop server and its load generator: 64 loopback connections each
+// send N requests "GET /item/<key>\n" one at a time; the server answers
+// "OK <key> <value>\n" from a table of 65536 values. Connections are split
+// over the parallel workers; every worker owns one event loop, its listener,
+// both ends of its connections and its own copy of the table. Prints the
+// request count and a checksum of every value received.
+constant CONNECTIONS = 64
+constant KEYS = 65536
+constant MODULUS = 1000000007
+
+record Connection { id: Integer; client: Integer; server: Integer; sent: Integer; received: Integer; clientIn: Bytes; serverIn: Bytes }
+
+function mix(seed: Integer): Integer {
+    let value = seed
+    for round in 0..3 {
+        value = value ^ (value >> 31)
+        value = wrappingMultiply(value, 0x2545F4914F6CDD1D)
+        value = value ^ (value >> 29)
+        value = wrappingAdd(value, round)
+    }
+    return value & 0x7FFFFFFFFFFFFFFF
+}
+
+// The decimal number in data starting at `at` (digits only).
+function number(data: Bytes, at: Integer): Integer {
+    let value = 0
+    let i = at
+    while i < data.length && data[i] >= 48 && data[i] <= 57 {
+        value = value * 10 + data[i] - 48
+        i += 1
+    }
+    return value
+}
+
+function sendAll(socket: Integer, data: Bytes) {
+    let offset = 0
+    while offset < data.length {
+        let sent = net.writeRange(socket, data, offset, data.length - offset)
+        if sent == -2 { fail("write failed: " + net.lastError()) }
+        if sent > 0 { offset += sent }
+    }
+}
+
+function request(connection: Connection) {
+    let key = mix(connection.id * 1000003 + connection.sent) % KEYS
+    sendAll(connection.client, Bytes("GET /item/\(key)\n"))
+    connection.sent += 1
+}
+
+// Serves connections shard, shard + shards, ...; returns the checksum of their values.
+function serve(shard: Integer, shards: Integer, perConnection: Integer): Integer {
+    let table: List<Integer> = []
+    for key in 0..KEYS { table.add(mix(key + 99991) % 1000000) }
+    let listener = net.listen("127.0.0.1", 0, 128)
+    let port = net.localPort(listener)
+    let loop = errors.integerValue(eventloop.create())
+    let connections: List<Connection> = []
+    let id = shard
+    while id < CONNECTIONS {
+        let client = net.connect("127.0.0.1", port)
+        if client < 0 { fail("connect failed: " + net.lastError()) }
+        let server = -1
+        while server < 0 { server = net.accept(listener) }
+        net.nonBlocking(client, true)
+        net.nonBlocking(server, true)
+        errors.booleanValue(net.setNoDelay(client, true))
+        errors.booleanValue(net.setNoDelay(server, true))
+        let index = connections.length
+        errors.integerValue(eventloop.watch(loop, client, eventloop.READABLE, index * 2))
+        errors.integerValue(eventloop.watch(loop, server, eventloop.READABLE, index * 2 + 1))
+        connections.add(Connection { id: id; client: client; server: server; sent: 0; received: 0; clientIn: Bytes(); serverIn: Bytes() })
+        id += shards
+    }
+    for connection in connections { request(connection) }
+    let open = connections.length
+    let checksum = 0
+    let events = Bytes()
+    while open > 0 {
+        let count = eventloop.waitInto(loop, -1, 256, events)
+        if count < 0 { fail("loop wait failed") }
+        for e in 0..count {
+            let token = eventloop.eventToken(events, e)
+            let connection = connections[token / 2]
+            if token % 2 == 1 {
+                let got = net.readInto(connection.server, connection.serverIn, 4096)
+                if got == 0 || got == -2 { fail("server read failed") }
+                let data = connection.serverIn
+                if data.length > 0 && data[data.length - 1] == 10 {
+                    let key = number(data, 10)
+                    sendAll(connection.server, Bytes("OK \(key) \(table[key])\n"))
+                    data.clear()
+                }
+            } else {
+                let got = net.readInto(connection.client, connection.clientIn, 4096)
+                if got == 0 || got == -2 { fail("client read failed") }
+                let data = connection.clientIn
+                if data.length > 0 && data[data.length - 1] == 10 {
+                    let key = number(data, 3)
+                    let digits = 3
+                    while data[digits] != 32 { digits += 1 }
+                    let value = number(data, digits + 1)
+                    if key != mix(connection.id * 1000003 + connection.received) % KEYS { fail("answer for the wrong key") }
+                    checksum = (checksum + value * (connection.id + 1)) % MODULUS
+                    connection.received += 1
+                    data.clear()
+                    if connection.sent < perConnection { request(connection) } else { open -= 1 }
+                }
+            }
+        }
+    }
+    for connection in connections {
+        net.close(connection.client)
+        net.close(connection.server)
+    }
+    net.close(listener)
+    errors.booleanValue(eventloop.close(loop))
+    return checksum
+}
+
+
+let perConnection = Integer(processInfo.argument(0))
+let checksum = serve(0, 1, perConnection)
+print("requests \(CONNECTIONS * perConnection)")
+print("checksum \(checksum)")
