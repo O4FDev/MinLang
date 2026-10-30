@@ -63,7 +63,7 @@ for name in ["bytes", "list"] {
     test.check(!test.contains(length, "noalias") && !test.contains(length, "invariant.load"), "mutable headers must keep aliasing and mutation")
     test.check(test.contains(length, "!range !{i64 0, i64 -9223372036854775808}"), "length range must stay nonnegative")
 }
-for name in ["bytes.get.checked", "bytes.set.checked", "list.get.checked", "list.set.scalar.checked", "list.get.known", "list.set.scalar.known", "shift.checked", "character.checked", "float.integer.checked", "integer.absolute.checked", "clamp.integer.checked", "clamp.float.checked"] {
+for name in ["bytes.get.checked", "bytes.set.checked", "list.get.checked", "list.set.scalar.checked", "list.get.known", "list.set.scalar.known", "list.get.known.offset", "list.set.scalar.known.offset", "shift.checked", "character.checked", "float.integer.checked", "integer.absolute.checked", "clamp.integer.checked", "clamp.float.checked"] {
     let helper = body(llvm, ".minyar." + name)
     test.check(test.contains(helper, "label %good, label %bad, !prof !{!\"branch_weights\", !\"expected\", i32 2000, i32 1}"), name + " must mark only the failure successor unlikely")
     // A reporting path may do I/O or terminate. Pure-reader attributes belong
@@ -185,6 +185,56 @@ for optimization in ["-O0", "-O2"] {
     let result = test.run([failingPath + ".exe"], system.environment(), "", failingPath + ".run", compiler.runTimeout)
     test.check(result.status == 1 && result.output == "", "failing parallel index must stop with status 1 at " + optimization)
     test.check(test.contains(result.errorOutput, "List position 5 is outside its length of 3."), "failing parallel index changed its diagnostic at " + optimization + "\n" + result.errorOutput)
+}
+
+// In such a function an index `base + c` or `base - c` (small constant c) used
+// only by one access is summed without an overflow branch: an overflowing sum
+// is outside every List, and the failure path tests the overflow again, so each
+// error is reported as before. A sum used twice keeps its checked addition.
+let offsets = #"""
+parallel function shift(values: List<Integer>, out: List<Integer>, start: Integer) {
+    for k in 0..out.length { out[k + 0] = values[start + k + 1] - values[start + k - 1] }
+}
+parallel function twice(values: List<Integer>, start: Integer): Integer {
+    let total = 0
+    for k in 0..1 { let at = start + 1; total += values[at] + at }
+    return total
+}
+parallel function edge(values: List<Integer>, start: Integer, step: Integer): Integer {
+    let total = 0
+    for k in 0..1 { total += values[start + step] }
+    return total
+}
+let values = [1, 4, 9, 16, 25]
+let out = [0, 0, 0]
+shift(values, out, 1)
+print(out[0]); print(out[1]); print(out[2])
+print(twice(values, 2))
+print(edge(values, 1, 1))
+"""#
+test.executes(compiler, offsets, "8\n12\n16\n19\n9\n")
+let offsetsIr = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+let shifted = body(offsetsIr, ".minyar.fn.shift")
+test.check(test.contains(shifted, "@.minyar.list.get.known.offset(ptr %argument.0, i64 %argument.0.length, ptr %argument.0.values, i64 ") && test.contains(shifted, ", i64 1)") && test.contains(shifted, ", i64 -1)"), "an index plus or minus a constant must fuse into the known-header access")
+test.check(test.contains(shifted, "@.minyar.list.set.scalar.known.offset(ptr %argument.1, i64 %argument.1.length, ptr %argument.1.values, i64 "), "a stored index plus a constant must fuse into the known-header store")
+test.check(!test.contains(body(offsetsIr, ".minyar.fn.twice"), ".known.offset("), "a sum used twice must keep its checked addition")
+test.check(!test.contains(body(offsetsIr, ".minyar.fn.edge"), ".known.offset("), "a sum of two variables must keep its checked addition")
+// The three failures of a fused index, at O0 and O2: past the end, overflow
+// upward, overflow downward.
+for failure in [["print(probe([7, 8, 9], 2, 1))", "List position 3 is outside its length of 3."], ["print(probe([7, 8, 9], 9223372036854775807, 1))", "this Integer calculation is outside the supported range."], ["print(probe([7, 8, 9], -9223372036854775808, -1))", "this Integer calculation is outside the supported range."], ["print(probe([7, 8, 9], 0, -1))", "List position -1 is outside its length of 3."]] {
+    let program = "parallel function probe(values: List<Integer>, start: Integer, sign: Integer): Integer {\n    let total = 0\n    for k in 0..1 { if sign > 0 { total += values[start + 1] } else { total += values[start - 1] } }\n    return total\n}\n" + failure[0] + "\n"
+    test.require(test.compile(compiler, program), "compile fused index failure")
+    let probePath = compiler.directory + "/case" + Text(compiler.serial)
+    test.check(test.contains(io.readTextFile(probePath + ".ll"), ".known.offset("), "the failing index must be fused")
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [probePath + ".ll", compiler.runtime, "-lm", "-o", probePath + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", probePath + ".link", compiler.linkTimeout), "link fused index failure")
+        let result = test.run([probePath + ".exe"], system.environment(), "", probePath + ".run", compiler.runTimeout)
+        test.check(result.status == 1 && result.output == "", "fused index failure must stop with status 1 at " + optimization)
+        test.check(test.contains(result.errorOutput, failure[1]), "fused index failure changed its diagnostic at " + optimization + "\n" + result.errorOutput)
+    }
 }
 
 // Verify the actual emitted module independently of execution and optimization.

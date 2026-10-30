@@ -79,6 +79,7 @@ function hoistParallelListHeaders(output: List<Text>, entrySlot: Integer, bodySl
         index = index + 1
     }
     if lists.length == 0 { return }
+    fuseKnownIndexOffsets(lines)
     output[bodySlot] = joinText(joinLines(lines))
     piece = bodySlot + 1
     while piece < output.length {
@@ -93,6 +94,105 @@ function hoistParallelListHeaders(output: List<Text>, entrySlot: Integer, bodySl
         index = index + 1
     }
     output[entrySlot] = joinText(loads)
+}
+
+// An index `base + c` (or `base - c`) with a small constant c that is used only
+// by one known-header access: compute the sum without an overflow branch and
+// let the access test it. A sum that overflows upward wraps to a negative
+// position, and one that overflows downward to at least 2^63 - 2^31, both at or
+// past any List length (below 2^61), so the bounds test fails exactly when the
+// sum overflows or is outside the List; the failure path then tests the
+// overflow again and reports whichever error the checked code would have.
+function fuseKnownIndexOffsets(lines: List<Text>) {
+    let index = 0
+    while index + 3 < lines.length {
+        let line = lines[index]
+        let operation = ""
+        if line.find(" = call { i64, i1 } @llvm.sadd.with.overflow.i64(i64 ") > 0 { operation = "sadd" }
+        if line.find(" = call { i64, i1 } @llvm.ssub.with.overflow.i64(i64 ") > 0 { operation = "ssub" }
+        if operation != "" && line.startsWith("  %checked.") && line.endsWith(")") {
+            let checked = line.slice(2, line.find(" = "))
+            let operands = line.slice(line.find("(i64 ") + 5, line.length - 1).split(", i64 ")
+            let result = lines[index + 1]
+            let equals = result.find(" = extractvalue { i64, i1 } " + checked + ", 0")
+            let flag = lines[index + 2]
+            let flagEquals = flag.find(" = extractvalue { i64, i1 } " + checked + ", 1")
+            if operands.length == 2 && equals > 2 && result.startsWith("  %") && flagEquals > 2 && flag.startsWith("  %") {
+                let value = result.slice(2, equals)
+                let overflow = flag.slice(2, flagEquals)
+                let base = operands[0]
+                let offset = ""
+                if operation == "sadd" {
+                    if smallIndexOffset(operands[1]) { offset = operands[1] } else if smallIndexOffset(operands[0]) { base = operands[1]; offset = operands[0] }
+                } else if smallIndexOffset(operands[1]) {
+                    offset = "-" + operands[1]
+                    if operands[1].startsWith("-") { offset = operands[1].slice(1, operands[1].length) }
+                }
+                let use = -1
+                if offset != "" && lines[index + 3] == "  call void @.minyar.integer.overflow.checked(i1 " + overflow + ")" { use = singleKnownIndexUse(lines, index, value) }
+                if use >= 0 {
+                    let access = lines[use]
+                    let known = access.find(".known(ptr ")
+                    let tail = ", i64 " + value + ")"
+                    if access.endsWith(tail) {
+                        lines[use] = access.slice(0, known) + ".known.offset(ptr " + access.slice(known + 11, access.length - tail.length) + ", i64 " + base + ", i64 " + offset + ")"
+                    } else {
+                        let middle = ", i64 " + value + ", i64 "
+                        let at = access.find(middle)
+                        lines[use] = access.slice(0, known) + ".known.offset(ptr " + access.slice(known + 11, at) + ", i64 " + base + ", i64 " + offset + ", i64 " + access.slice(at + middle.length, access.length)
+                    }
+                    lines[index] = ""
+                    lines[index + 1] = ""
+                    lines[index + 2] = ""
+                    lines[index + 3] = ""
+                    index = index + 3
+                }
+            }
+        }
+        index = index + 1
+    }
+}
+
+// A literal of one to nine digits, optionally negative: within 2^31.
+function smallIndexOffset(operand: Text): Boolean {
+    let start = 0
+    if operand.startsWith("-") { start = 1 }
+    if operand.length <= start || operand.length - start > 9 { return false }
+    let at = start
+    while at < operand.length {
+        if operand[at] < '0' || operand[at] > '9' { return false }
+        at = at + 1
+    }
+    return true
+}
+
+// The line of the one use of `value`, defined by the four lines at
+// `definition`, if that use is the position of a known-header List access;
+// otherwise -1. Uses are searched everywhere: a phi may precede a definition.
+function singleKnownIndexUse(lines: List<Text>, definition: Integer, value: Text): Integer {
+    let found = -1
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        if index >= definition && index < definition + 4 { line = "" }
+        let at = line.find(value)
+        while at >= 0 {
+            let end = at + value.length
+            if end >= line.length || !loopNameCharacter(line[end]) {
+                if found >= 0 { return -1 }
+                found = index
+            }
+            let rest = line.slice(end, line.length)
+            let next = rest.find(value)
+            if next < 0 { at = -1 } else { at = end + next }
+        }
+        index = index + 1
+    }
+    if found < 0 { return -1 }
+    let line = lines[found]
+    if line.find("@.minyar.list.get.known(") >= 0 && line.endsWith(", i64 " + value + ")") { return found }
+    if line.startsWith("  call void @.minyar.list.set.scalar.known(") && line.find(".values, i64 " + value + ", i64 ") >= 0 && !line.endsWith(", i64 " + value + ")") { return found }
+    return -1
 }
 
 // `%argument.N` and nothing else.
