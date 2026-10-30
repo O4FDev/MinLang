@@ -20,7 +20,16 @@ long long minyar_compare_slots(long long kind, long long a, long long b) {
         if (!a || !b) return (a != 0) - (b != 0);
         const MinyarText *x = (const void *)(uintptr_t)a, *y = (const void *)(uintptr_t)b;
         size_t length = (size_t)(x->byte_length < y->byte_length ? x->byte_length : y->byte_length);
-        int result = length ? memcmp(x->bytes, y->bytes, length) : 0;
+        int result = 0;
+        if (x->bytes == y->bytes) {
+            /* The same Text or slices from one start: only lengths differ. */
+        } else if (length <= 16) {
+            /* Names and keys are short: a byte loop beats a library call. */
+            for (size_t i = 0; i < length; i++)
+                if (x->bytes[i] != y->bytes[i]) return x->bytes[i] < y->bytes[i] ? -1 : 1;
+        } else {
+            result = memcmp(x->bytes, y->bytes, length);
+        }
         return result ? result : (x->byte_length > y->byte_length) - (x->byte_length < y->byte_length);
     }
     return (a > b) - (a < b);
