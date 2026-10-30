@@ -45,3 +45,14 @@ check-parallel-for-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitiz
 
 check check-portable: check-parallel-for
 check-sanitize: check-parallel-for-sanitize
+
+.PHONY: check-parallel-join check-parallel-join-tsan
+check-parallel-join: build/minyarc build/minyar-runtime.o build/tooling/tests/parallel-join
+	MINYAR_PARALLEL_THREADS=4 MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/parallel-join
+	MINYAR_PARALLEL_THREADS=1 MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/parallel-join
+
+check-parallel-join-tsan: build/minyarc build/minyar-runtime.o build/tooling/tests/parallel-join
+	MINYAR_PARALLEL_THREADS=4 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_LINK_FLAGS="-fsanitize=thread -g" TSAN_OPTIONS=halt_on_error=1 $(SANITIZER_LIMITED) ./build/tooling/tests/parallel-join
+
+check check-portable: check-parallel-join
+check-sanitize: check-parallel-join-tsan check-parallel-pool-tsan

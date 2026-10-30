@@ -1,0 +1,228 @@
+// `let left, right = join(f(...), g(...))` runs two parallel function calls as a
+// fork-join on the work-stealing pool. The token stage rewrites it into two
+// ordinary bindings, so every later stage sees one name per `let`:
+//   let left = minyar_join_pair(f(...), g(...))
+//   let right = minyar_join_second()
+function joinBindingAt(kinds: List<Integer>, texts: List<Text>, position: Integer): Boolean {
+    return position + 7 < texts.length && kinds[position] == 1 && texts[position] == "let" && kinds[position + 1] == 1 && texts[position + 2] == "," && kinds[position + 3] == 1 && texts[position + 4] == "=" && kinds[position + 5] == 1 && texts[position + 5] == "join" && texts[position + 6] == "("
+}
+
+function hasJoinBindings(kinds: List<Integer>, texts: List<Text>): Boolean {
+    let position = 0
+    while position < texts.length {
+        if texts[position] == "join" && position >= 5 && joinBindingAt(kinds, texts, position - 5) { return true }
+        position = position + 1
+    }
+    return false
+}
+
+function normalizeJoinBindings(kinds: List<Integer>, texts: List<Text>, lines: SourceMap): ResultTokenSet {
+    let outputKinds: List<Integer> = []
+    let outputTexts: List<Text> = []
+    let outputLines = newSourceMap()
+    outputLines.features = lines.features
+    let run = 0
+    let position = 0
+    while position < kinds.length {
+        if joinBindingAt(kinds, texts, position) {
+            let close = position + 6
+            let depth = 0
+            let scanning = true
+            while scanning && close < kinds.length {
+                let text = texts[close]
+                if kinds[close] == 4 && (text == "(" || text == "[" || text == "{") { depth = depth + 1 }
+                if kinds[close] == 4 && (text == ")" || text == "]" || text == "}") {
+                    depth = depth - 1
+                    if depth == 0 { scanning = false }
+                }
+                if scanning { close = close + 1 }
+            }
+            if close >= kinds.length { failAtToken(lines, position + 5, "join needs a closing ')'") }
+            copyTokenRun(outputKinds, outputTexts, outputLines, kinds, texts, lines, run, position + 2, true)
+            choiceCopy(outputKinds, outputTexts, outputLines, 4, "=", lines, position + 4)
+            choiceCopy(outputKinds, outputTexts, outputLines, 1, "minyar_join_pair", lines, position + 5)
+            copyTokenRun(outputKinds, outputTexts, outputLines, kinds, texts, lines, position + 6, close + 1, true)
+            choiceCopy(outputKinds, outputTexts, outputLines, 6, "end of line", lines, close)
+            choiceCopy(outputKinds, outputTexts, outputLines, 1, "let", lines, position)
+            choiceCopy(outputKinds, outputTexts, outputLines, 1, texts[position + 3], lines, position + 3)
+            choiceCopy(outputKinds, outputTexts, outputLines, 4, "=", lines, position + 4)
+            choiceCopy(outputKinds, outputTexts, outputLines, 1, "minyar_join_second", lines, position + 5)
+            choiceCopy(outputKinds, outputTexts, outputLines, 4, "(", lines, close)
+            choiceCopy(outputKinds, outputTexts, outputLines, 4, ")", lines, close)
+            run = close + 1
+            position = close + 1
+        } else {
+            position = position + 1
+        }
+    }
+    copyTokenRun(outputKinds, outputTexts, outputLines, kinds, texts, lines, run, kinds.length, true)
+    return ResultTokenSet { kinds: outputKinds; texts: outputTexts; lines: outputLines }
+}
+
+function isJoinBuiltin(name: Text): Boolean {
+    return name == "minyar_join_pair" || name == "minyar_join_second"
+}
+
+// One branch: `name(arguments)` naming a pure parallel function with a scalar
+// result. Returns the function index; argument values and types are appended.
+function parseJoinBranch(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, values: List<Text>, types: List<Integer>): Integer {
+    let location = state[0]
+    if context.tokenKinds[location] != 1 || context.tokenTexts[location + 1] != "(" { failAtToken(context.tokenLines, location, "join runs two calls of parallel functions, such as join(left(n - 1), right(n - 2))") }
+    let name = context.tokenTexts[location]
+    let function = findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, name)
+    if function < 0 { failUnknownFunction(context, location, name) }
+    let resolved = context.functionNames[function]
+    if findText(globals, "; minyar-parallel: " + resolved + "\n") < 0 && findText(globals, "; minyar-parallel: " + name + "\n") < 0 {
+        failAtToken(context.tokenLines, location, "join runs parallel functions; '" + readableDeclarationName(resolved) + "' is not a parallel function")
+    }
+    if !parallelScalar(context.functionReturnTypes[function]) { failAtToken(context.tokenLines, location, "join needs '" + readableDeclarationName(resolved) + "' to return Integer, Float, Boolean or Character") }
+    state[0] = location + 2
+    let count = context.functionParameterCounts[function]
+    let first = functionParameterOffset(context.functionParameterCounts, function)
+    let argument = 0
+    while !tokenIs(context.tokenKinds, context.tokenTexts, state, ")") {
+        if argument > 0 { expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ",") }
+        if argument >= count { failAtToken(context.tokenLines, location, "'" + readableDeclarationName(resolved) + "' expects " + Text(count) + " arguments") }
+        let wanted = context.functionParameterTypes[first + argument]
+        let argumentLocation = state[0]
+        let argumentType: List<Integer> = [wanted]
+        let value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType)
+        requireContextType(context, argumentLocation, argumentType[0], wanted, "an argument passed to " + readableDeclarationName(resolved) + " has the wrong type")
+        if parallelBuffer(wanted) {
+            // Both branches may read a buffer at once, so neither may write it.
+            globals.add("; minyar-parallel-readonly: " + resolved + "|" + Text(argument) + "|" + Text(argumentLocation) + "|\n")
+        } else if !parallelScalar(wanted) {
+            failAtToken(context.tokenLines, argumentLocation, "join passes Integer, Float, Boolean, Character and scalar buffer arguments")
+        }
+        values.add(value)
+        types.add(wanted)
+        argument = argument + 1
+    }
+    if argument != count { failAtToken(context.tokenLines, location, "'" + readableDeclarationName(resolved) + "' expects " + Text(count) + " arguments") }
+    state[0] = state[0] + 1
+    globals.add("; minyar-safe-parallel: " + resolved + "\n")
+    globals.add("; minyar-safe-location: " + resolved + "|" + Text(location) + "\n")
+    context.callTargets.add(function)
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "call", resolved, "join") }
+    return function
+}
+
+function joinSlotConversion(value: Text, raw: Text, type: Integer): Text {
+    if type == 4 { return "  " + value + " = trunc i64 " + raw + " to i1\n" }
+    if type == 3 { return "  " + value + " = trunc i64 " + raw + " to i32\n" }
+    if type == 7 { return "  " + value + " = bitcast i64 " + raw + " to double\n" }
+    if isReferenceType(type) { return "  " + value + " = inttoptr i64 " + raw + " to ptr\n" }
+    return "  " + value + " = add i64 " + raw + ", 0\n"
+}
+
+function joinValueSlot(slot: Text, value: Text, type: Integer): Text {
+    if type == 4 || type == 3 { return "  " + slot + " = zext " + llvmType(type) + " " + value + " to i64\n" }
+    if type == 7 { return "  " + slot + " = bitcast double " + value + " to i64\n" }
+    return "  " + slot + " = add i64 " + value + ", 0\n"
+}
+
+// A thunk reads one branch's arguments from its environment, calls the parallel
+// function and stores the result after them.
+function joinThunk(context: CompilerContext, globals: List<Text>, name: Text, function: Integer) {
+    let count = context.functionParameterCounts[function]
+    let first = functionParameterOffset(context.functionParameterCounts, function)
+    let pieces: List<Text> = ["define internal void @" + name + "(ptr %environment) uwtable {\nentry:\n"]
+    let call = ""
+    let k = 0
+    while k < count {
+        let type = context.functionParameterTypes[first + k]
+        let slot = "%argument." + Text(k)
+        pieces.add("  " + slot + ".address = getelementptr inbounds i64, ptr %environment, i64 " + Text(k) + "\n")
+        pieces.add("  " + slot + ".slot = load i64, ptr " + slot + ".address, align 8\n")
+        pieces.add(joinSlotConversion(slot, slot + ".slot", type))
+        if k > 0 { call = call + ", " }
+        call = call + argumentPrefix(type) + slot
+        k = k + 1
+    }
+    let result = context.functionReturnTypes[function]
+    pieces.add("  %result" + callPrefix(result) + context.functionIRNames[function] + "(" + call + ")\n")
+    pieces.add(joinValueSlot("%result.slot", "%result", result))
+    pieces.add("  %result.address = getelementptr inbounds i64, ptr %environment, i64 " + Text(count) + "\n")
+    pieces.add("  store i64 %result.slot, ptr %result.address, align 8\n  ret void\n}\n")
+    globals.add(joinText(pieces))
+}
+
+function joinEnvironment(output: List<Text>, textState: List<Text>, state: List<Integer>, values: List<Text>, types: List<Integer>): Text {
+    let environment = "%join.environment." + Text(newLabel(state))
+    output.add("  " + environment + " = alloca [" + Text(values.length + 1) + " x i64], align 8\n")
+    let k = 0
+    while k < values.length {
+        let slot = valueAsListSlot(output, textState, state, values[k], types[k])
+        let address = valueName(textState, newTemporary(state))
+        output.add("  " + address + " = getelementptr inbounds i64, ptr " + environment + ", i64 " + Text(k) + "\n")
+        output.add("  store i64 " + slot + ", ptr " + address + ", align 8\n")
+        k = k + 1
+    }
+    return environment
+}
+
+function joinResult(output: List<Text>, textState: List<Text>, state: List<Integer>, environment: Text, index: Integer, type: Integer): Text {
+    let address = valueName(textState, newTemporary(state))
+    output.add("  " + address + " = getelementptr inbounds i64, ptr " + environment + ", i64 " + Text(index) + "\n")
+    let raw = valueName(textState, newTemporary(state))
+    output.add("  " + raw + " = load i64, ptr " + address + ", align 8\n")
+    return slotAsValue(output, textState, state, raw, type)
+}
+
+function parseParallelJoin(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, location: Integer): Text {
+    let leftValues: List<Text> = []
+    let leftTypes: List<Integer> = []
+    let left = parseJoinBranch(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, leftValues, leftTypes)
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ",")
+    let rightValues: List<Text> = []
+    let rightTypes: List<Integer> = []
+    let right = parseJoinBranch(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, rightValues, rightTypes)
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+    let leftType = context.functionReturnTypes[left]
+    let rightType = context.functionReturnTypes[right]
+    let first = ""
+    let second = ""
+    if recoveryEnabled(state) {
+        // Recoverable execution keeps one thread, as parallel for does.
+        first = emitCall(output, textState, state, leftType, context.functionIRNames[left], leftValues, leftTypes)
+        second = emitCall(output, textState, state, rightType, context.functionIRNames[right], rightValues, rightTypes)
+    } else {
+        let site = Text(newLabel(state))
+        let owner = textState[1]
+        if owner == "top level" { owner = "top.level" }
+        let leftThunk = derivedSymbol(".minyar.join." + site + ".left.", owner)
+        let rightThunk = derivedSymbol(".minyar.join." + site + ".right.", owner)
+        joinThunk(context, globals, leftThunk, left)
+        joinThunk(context, globals, rightThunk, right)
+        let declarations: List<Text> = ["declare void @minyar_parallel_join(ptr, ptr, ptr, ptr)\n", "declare ptr @llvm.stacksave.p0()\n", "declare void @llvm.stackrestore.p0(ptr)\n"]
+        let declaration = 0
+        while declaration < declarations.length {
+            if findText(globals, declarations[declaration]) < 0 { globals.add(declarations[declaration]) }
+            declaration = declaration + 1
+        }
+        let saved = valueName(textState, newTemporary(state))
+        output.add("  " + saved + " = call ptr @llvm.stacksave.p0()\n")
+        let leftEnvironment = joinEnvironment(output, textState, state, leftValues, leftTypes)
+        let rightEnvironment = joinEnvironment(output, textState, state, rightValues, rightTypes)
+        output.add("  call void @minyar_parallel_join(ptr @" + leftThunk + ", ptr " + leftEnvironment + ", ptr @" + rightThunk + ", ptr " + rightEnvironment + ")\n")
+        first = joinResult(output, textState, state, leftEnvironment, leftValues.length, leftType)
+        second = joinResult(output, textState, state, rightEnvironment, rightValues.length, rightType)
+        output.add("  call void @llvm.stackrestore.p0(ptr " + saved + ")\n")
+    }
+    globals.add("; minyar-join-second: " + second + "|" + Text(rightType) + "\n")
+    setType(resultType, leftType)
+    return first
+}
+
+// The second binding of the `let left, right = join(...)` just compiled.
+function parseJoinSecond(context: CompilerContext, state: List<Integer>, globals: List<Text>, resultType: List<Integer>, location: Integer): Text {
+    expectToken(context.tokenKinds, context.tokenTexts, context.tokenLines, state, ")")
+    let prefix = "; minyar-join-second: "
+    let index = globals.length - 1
+    while index >= 0 && !globals[index].startsWith(prefix) { index = index - 1 }
+    if index < 0 { failAtToken(context.tokenLines, location, "join results are bound by let left, right = join(...)") }
+    let fields = markerValue(globals[index], prefix).split("|")
+    globals[index] = ""
+    setType(resultType, Integer(fields[1]))
+    return fields[0]
+}

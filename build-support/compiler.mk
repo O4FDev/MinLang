@@ -62,6 +62,7 @@ COMPILER_SOURCES = build/choice-builtins.min build/capability-builtins.min \
 	compiler/property-compiler.min \
 	compiler/documentation-compiler.min \
 	compiler/calldepth-compiler.min \
+	compiler/join-compiler.min \
 	compiler/thread-compiler.min \
 	compiler/compiler.min
 

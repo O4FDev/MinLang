@@ -2161,11 +2161,15 @@ are the Bytes elements of a captured `List<Bytes>` against Bytes outputs and
 the buffers of every element of a captured List of records (one comparison per
 element and path).
 
-On macOS and Linux, a persistent thread pool distributes chunks of up to 128
-indices; short ranges use smaller chunks, down to one index, so a loop over a
-few long iterations still uses every worker. Idle workers steal chunks from
-other workers; the calling thread also works, and returns only after every
-worker has finished. Set
+On macOS and Linux, a persistent work-stealing pool runs every loop, reduction
+and `join`. A loop is divided into chunks of up to 128 indices; short ranges use
+smaller chunks, down to one index, so a loop over a few long iterations still
+uses every worker. The chunks are split in halves: the calling thread works on
+one half while an idle worker may steal the other, recursively, from the
+Chase-Lev deque each participant owns. The caller returns only after every
+chunk has finished, and while it waits it runs stolen work. A parallel function
+may itself contain a `parallel for` or a `join`; the inner work joins the same
+pool rather than starting threads. Set
 `MINYAR_PARALLEL_THREADS` to 1–64 to choose the total number of participating
 threads; the default is the online processor count, capped at 64.
 `system.parallelWorkers()` returns that number, for code that sizes its work
@@ -2262,6 +2266,50 @@ parallel function taking two Integers through that address, and
 `machine.atomicAdd` coordinates processors through shared memory. Ordinary
 functions can call parallel functions directly. Minyar OS uses them to spread
 per-pixel work over every processor; see freestanding programs.
+
+### Fork-join
+
+`let left, right = join(f(...), g(...))` runs two calls of parallel functions at
+once and binds both results. The calls' arguments are evaluated first, on the
+calling thread; then one call runs here while the other may be stolen by an idle
+worker. Recursive divide and conquer needs nothing else:
+
+```minyar
+parallel function fibSerial(n: Integer): Integer {
+    if n < 2 { return n }
+    return fibSerial(n - 1) + fibSerial(n - 2)
+}
+
+parallel function fib(n: Integer): Integer {
+    if n < 20 { return fibSerial(n) }
+    let left, right = join(fib(n - 1), fib(n - 2))
+    return left + right
+}
+
+parallel function total(values: List<Integer>, first: Integer, after: Integer): Integer {
+    if after - first <= 4096 {
+        let sum = 0
+        for i in first..after { sum += values[i] }
+        return sum
+    }
+    let middle = first + (after - first) / 2
+    let low, high = join(total(values, first, middle), total(values, middle, after))
+    return low + high
+}
+
+print(fib(30)) // 832040
+let values: List<Integer> = []
+for i in 0..100000 { values.add(i) }
+print(total(values, 0, values.length)) // 4999950000
+```
+
+Both functions must be pure parallel functions returning Integer, Float,
+Boolean or Character. Arguments are those scalars or scalar buffers, which
+both calls may read at once, so neither function may write a buffer it receives
+from a join. `join` works in ordinary functions, in parallel functions and in
+`parallel for` bodies; recoverable execution runs the two calls in order. Use a
+cutoff, as above: each join costs a few atomic operations, so the work below it
+should be at least a few microseconds.
 
 ## Hardware register fields
 

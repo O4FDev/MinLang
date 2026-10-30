@@ -59,6 +59,35 @@ static long long sum_indices(long long first, long long after, void *argument) {
     return sum;
 }
 
+/* Fork-join: recursive joins below a cutoff, and loops nested in loops. */
+typedef struct { long long n, result; } Fib;
+static long long fib_serial(long long n) { return n < 2 ? n : fib_serial(n - 1) + fib_serial(n - 2); }
+static void fib_task(void *argument) {
+    Fib *job = argument;
+    if (job->n < 12) { job->result = fib_serial(job->n); return; }
+    Fib left = { job->n - 1, 0 }, right = { job->n - 2, 0 };
+    minyar_parallel_join(fib_task, &left, fib_task, &right);
+    job->result = left.result + right.result;
+}
+static _Atomic long long nested_cells;
+static _Atomic int nested_foreign;
+static void nested_inner(long long first, long long after, void *argument) {
+    (void)argument;
+    atomic_fetch_add(&nested_cells, after - first);
+    if (!pthread_equal(owner, pthread_self())) atomic_store(&nested_foreign, 1);
+    else if (parallel_pool.count > 1) {
+        /* While the owner is busy here, its forked nested spans must be stolen. */
+        for (int wait = 0; wait < 5000 && !atomic_load(&nested_foreign); ++wait) {
+            struct timespec pause = { 0, 1000000 };
+            nanosleep(&pause, NULL);
+        }
+    }
+}
+static void nested_outer(long long first, long long after, void *argument) {
+    (void)argument;
+    for (long long row = first; row < after; ++row) minyar_parallel_run(nested_inner, 0, 1000 + row, NULL);
+}
+
 int main(void) {
     owner = pthread_self();
     for (int round = 0; round < 100; ++round) {
@@ -86,5 +115,14 @@ int main(void) {
     pthread_t callers[3];
     for (int index = 0; index < 3; ++index) assert(pthread_create(&callers[index], NULL, independent_owner, NULL) == 0);
     for (int index = 0; index < 3; ++index) assert(pthread_join(callers[index], NULL) == 0);
+    for (int round = 0; round < 3; ++round) {
+        Fib job = { 27, 0 };
+        minyar_parallel_join(fib_task, &job, fib_task, &(Fib){ 3, 0 });
+        assert(job.result == 196418);
+    }
+    minyar_parallel_run(nested_outer, 0, 64, NULL);
+    assert(atomic_load(&nested_cells) == 64 * 1000 + 64 * 63 / 2);
+    assert(atomic_load(&nested_foreign) == (requested > 1));
     puts("parallel pool: exact coverage, concurrent callers, joins and signed endpoints passed");
+    puts("parallel pool: recursive joins and nested loops passed");
 }
