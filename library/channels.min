@@ -1,0 +1,95 @@
+// Typed channels between threads. A send copies a sendable value into the
+// channel; a receive rebuilds it in the receiving thread, which then owns it.
+// Sendable values are Integer, Float, Boolean, Character, Text, Bytes, Lists,
+// plain records of those, FrozenBytes and channels (the compiler checks).
+
+/// A queue of `Item` values that any number of threads may send to and
+/// receive from. Pass it to a thread entry or send it on another channel;
+/// every copy refers to the same queue.
+///
+/// ```minyar
+/// let numbers: api.Channel<Integer> = api.bounded(4)
+/// api.send(numbers, 42)
+/// match api.receive(numbers) {
+///     Some(value) { print(value) }
+///     None { print("closed") }
+/// }
+/// ```
+/// ```output
+/// 42
+/// ```
+public record Channel<Item> { private queue: ValueQueue }
+
+/// A selectable view of a channel of any item type, for `select`.
+public record Waitable { private queue: ValueQueue }
+
+/// A channel holding at most `capacity` values; `send` waits for room.
+public function bounded<Item>(capacity: Integer): Channel<Item> {
+    if capacity <= 0 { fail("a bounded channel needs a positive capacity") }
+    return Channel<Item> { queue: valueQueue(capacity) }
+}
+
+/// A channel without a capacity limit; `send` never waits.
+public function unbounded<Item>(): Channel<Item> {
+    return Channel<Item> { queue: valueQueue(0) }
+}
+
+/// Copy `value` into the channel, waiting while it is full. False once the
+/// channel is closed (the value is not sent).
+public function send<Item>(channel: Channel<Item>, value: Item): Boolean {
+    return queueSend(channel.queue, value)
+}
+
+/// Copy `value` into the channel without waiting: 1 sent, 0 full, 2 closed.
+public function trySend<Item>(channel: Channel<Item>, value: Item): Integer {
+    return queueTrySend(channel.queue, value)
+}
+
+/// The next value, waiting for one; None once the channel is closed and empty.
+public function receive<Item>(channel: Channel<Item>): Maybe<Item> {
+    let slot: List<Item> = []
+    if !queueReceive(channel.queue, slot) { return None }
+    return Some(slot[0])
+}
+
+/// The next value if one is waiting now; None when empty or closed.
+public function tryReceive<Item>(channel: Channel<Item>): Maybe<Item> {
+    let slot: List<Item> = []
+    if queueTryReceive(channel.queue, slot) != 1 { return None }
+    return Some(slot[0])
+}
+
+/// The next value, waiting at most `milliseconds`; None on timeout or once the
+/// channel is closed and empty (`isClosed` tells them apart).
+public function receiveFor<Item>(channel: Channel<Item>, milliseconds: Integer): Maybe<Item> {
+    let slot: List<Item> = []
+    if queueReceiveFor(channel.queue, slot, milliseconds) != 1 { return None }
+    return Some(slot[0])
+}
+
+/// Close the channel: senders get false, receivers drain what is left and then None.
+public function close<Item>(channel: Channel<Item>) { queueClose(channel.queue) }
+
+/// True once the channel has been closed (values may still be waiting).
+public function isClosed<Item>(channel: Channel<Item>): Boolean { return queueClosed(channel.queue) }
+
+/// The number of values waiting.
+public function length<Item>(channel: Channel<Item>): Integer { return queueLength(channel.queue) }
+
+/// A socket that is readable while a receive would not wait (a value is
+/// waiting or the channel is closed). Watch it with `eventloop.watch` to wait
+/// for channels, sockets and timers together; -1 where unsupported.
+public function wakeSocket<Item>(channel: Channel<Item>): Integer { return queueWakeSocket(channel.queue) }
+
+/// The channel as a `Waitable`, for `select`.
+public function waitable<Item>(channel: Channel<Item>): Waitable { return Waitable { queue: channel.queue } }
+
+/// Wait until one of the channels has a value or is closed, at most
+/// `milliseconds` (negative waits forever, 0 only checks). Returns its
+/// position, or -1 on timeout. Another receiver may take the value first, so
+/// follow with `tryReceive` and select again when it returns None.
+public function select(channels: List<Waitable>, milliseconds: Integer): Integer {
+    let queues: List<ValueQueue> = []
+    for channel in channels { queues.add(channel.queue) }
+    return queueSelect(queues, milliseconds)
+}

@@ -1482,6 +1482,7 @@ MinyarText *minyar_interpolate(long long count, ...) {
 #if MINYAR_THREADED
 #include "minyar_thread_domain.h"
 #include "minyar_thread_buffers.h"
+#include "minyar_thread_transfer.h"
 #include "minyar_threads.h"
 #include "minyar_native_regions.h"
 #endif

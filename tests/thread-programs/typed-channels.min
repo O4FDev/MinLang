@@ -1,0 +1,116 @@
+// Typed thread entries and channels: records, Lists, Text, Floats and
+// channels themselves cross threads by copy; select, timeouts and an event
+// loop wait on channels.
+use "channels" as channels
+use "eventloop" as eventloop
+use "errors" as errors
+
+record Job { id: Integer; words: List<Text>; weight: Float; reply: channels.Channel<Text> }
+record Shelf { rows: List<List<Integer>>; label: Text; bytes: Bytes }
+
+thread function worker(name: Text, jobs: channels.Channel<Job>, scale: Float, loud: Boolean, tag: Character): Integer {
+    let handled = 0
+    let more = true
+    while more {
+        match channels.receive(jobs) {
+            Some(job) {
+                let line = Text(job.id) + ":" + joinText(job.words) + ":" + Text(job.weight * scale) + Text(tag)
+                if loud { line = line + "!" }
+                channels.send(job.reply, line)
+                handled += 1
+            }
+            None { more = false }
+        }
+    }
+    return handled
+}
+
+thread function echo(input: channels.Channel<Shelf>, output: channels.Channel<Shelf>) {
+    match channels.receive(input) {
+        Some(shelf) {
+            shelf.rows.add([shelf.bytes.length])
+            shelf.label = shelf.label + " back"
+            channels.send(output, shelf)
+        }
+        None {}
+    }
+}
+
+thread function late(delay: channels.Channel<Integer>, wake: channels.Channel<Text>) {
+    match channels.receiveFor(delay, 5000) {
+        Some(value) { channels.send(wake, "woke " + Text(value)) }
+        None { channels.send(wake, "timeout") }
+    }
+}
+
+function main() {
+    // A pool: two workers share one job channel; every job carries its reply channel.
+    let jobs: channels.Channel<Job> = channels.bounded(2)
+    let replies: channels.Channel<Text> = channels.unbounded()
+    let a = startThread(worker, "a", jobs, 2.0, false, 'x')
+    let b = startThread(worker, "b", jobs, 2.0, false, 'x')
+    for i in 0..6 { channels.send(jobs, Job { id: i; words: ["w", Text(i)]; weight: 0.5; reply: replies }) }
+    channels.close(jobs)
+    print(joinThread(a) + joinThread(b))
+    channels.close(replies)
+    let lines: List<Text> = []
+    let more = true
+    while more {
+        match channels.receive(replies) {
+            Some(line) { lines.add(line) }
+            None { more = false }
+        }
+    }
+    lines.sort()
+    for line in lines { print(line) }
+    print(channels.send(jobs, Job { id: 9; words: []; weight: 0.0; reply: replies }))
+
+    // Nested Lists, Bytes and Text round trip through another thread.
+    let there: channels.Channel<Shelf> = channels.bounded(1)
+    let back: channels.Channel<Shelf> = channels.bounded(1)
+    let echoed = startThread(echo, there, back)
+    channels.send(there, Shelf { rows: [[1, 2], [], [3]]; label: "shelf"; bytes: Bytes("four") })
+    match channels.receive(back) {
+        Some(shelf) { print(shelf.label + " " + Text(shelf.rows.length) + " " + Text(shelf.rows[3][0]) + " " + Text(shelf.rows[0][1])) }
+        None { print("lost") }
+    }
+    joinThread(echoed)
+
+    // Non-waiting operations, timeouts and select.
+    let small: channels.Channel<Integer> = channels.bounded(1)
+    print(channels.trySend(small, 1))
+    print(channels.trySend(small, 2))
+    let quiet: channels.Channel<Integer> = channels.unbounded()
+    print(channels.select([channels.waitable(quiet), channels.waitable(small)], 1000))
+    print(channels.select([channels.waitable(quiet)], 20))
+    match channels.receiveFor(quiet, 20) {
+        Some(value) { print(value) }
+        None { print("no value yet") }
+    }
+    channels.close(small)
+    print(channels.trySend(small, 3))
+    print(channels.length(small))
+
+    // A thread wakes on its own deadline or on a value; the event loop watches a channel.
+    let delay: channels.Channel<Integer> = channels.unbounded()
+    let wake: channels.Channel<Text> = channels.unbounded()
+    let sleeper = startThread(late, delay, wake)
+    let loop = errors.value(eventloop.create())
+    let socket = channels.wakeSocket(wake)
+    errors.value(eventloop.watch(loop, socket, eventloop.readableInterest(), 7))
+    errors.value(eventloop.timer(loop, 10, 0, 8))
+    let order: List<Integer> = []
+    while order.length < 2 {
+        for event in eventloop.events(eventloop.wait(loop, 5000, 8)) {
+            order.add(event.token)
+            if event.token == 8 { channels.send(delay, 42) }
+        }
+    }
+    print(Text(order[0]) + " then " + Text(order[1]))
+    match channels.tryReceive(wake) {
+        Some(text) { print(text) }
+        None { print("nothing") }
+    }
+    errors.value(eventloop.close(loop))
+    joinThread(sleeper)
+}

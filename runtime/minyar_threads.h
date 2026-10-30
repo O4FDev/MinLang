@@ -20,12 +20,16 @@ typedef struct RcManagedThread {
     struct RcManagedThread *parent_next;
 } RcManagedThread;
 static MINYAR_THREAD_LOCAL RcManagedThread *rc_thread_children, *rc_thread_current;
+/* A packet entry receives its unpacked arguments as language slots. */
+typedef long long (*RcPacketBridge)(const long long *);
 typedef struct {
     RcManagedThread *thread;
     RcThreadBridge bridge;
     long long seed;
     RcFrozenBytes *frozen;
     RcBytesChannel *channel;
+    RcPacketBridge packet_bridge;
+    RcPacket *packet;
 } RcThreadLaunch;
 static void rc_managed_thread_destroy(void *pointer) {
     RcManagedThread *t = pointer;
@@ -46,17 +50,36 @@ static void *rc_thread_entry(void *pointer) {
     rc_thread_native_free(pointer, sizeof(launch));
     rc_thread_domain_init();
     rc_thread_current = launch.thread;
-    /* The guard frame owns fresh wrappers independently of the entry's
-     * generated borrowing convention. The launch packet owned their shares. */
-    minyar_rc_enter(2);
-    RcThreadLeaf *frozen = rc_thread_wrap(launch.frozen);
-    minyar_rc_local_take(0, frozen);
-    RcThreadLeaf *channel = rc_thread_wrap(launch.channel);
-    minyar_rc_local_take(1, channel);
-    long long result = launch.bridge(launch.seed, frozen, channel);
+    long long result;
+    long long *arguments = NULL;
+    long long argument_count = 0;
+    if (launch.packet) {
+        /* Rebuild every argument in this domain; the guard frame owns them. */
+        const char *field = rc_descriptor_count(launch.packet->descriptor + 1, &argument_count);
+        arguments = rc_thread_native_allocate((size_t)(argument_count ? argument_count : 1) * sizeof(long long));
+        minyar_rc_enter(argument_count);
+        const long long *words = launch.packet->words;
+        for (long long i = 0; i < argument_count; ++i) {
+            int reference = rc_descriptor_reference(field);
+            field = rc_packet_get(&words, field, &arguments[i]);
+            if (reference) minyar_rc_local_take(i, (void *)(uintptr_t)arguments[i]);
+        }
+        rc_packet_free(launch.packet, 1);
+        result = launch.packet_bridge(arguments);
+    } else {
+        /* The guard frame owns fresh wrappers independently of the entry's
+         * generated borrowing convention. The launch packet owned their shares. */
+        minyar_rc_enter(2);
+        RcThreadLeaf *frozen = rc_thread_wrap(launch.frozen);
+        minyar_rc_local_take(0, frozen);
+        RcThreadLeaf *channel = rc_thread_wrap(launch.channel);
+        minyar_rc_local_take(1, channel);
+        result = launch.bridge(launch.seed, frozen, channel);
+    }
     long long status = minyar_recovery_pending() ? 2 : 0;
     minyar_thread_join_children();
     minyar_rc_leave();
+    if (arguments) rc_thread_native_free(arguments, (size_t)(argument_count ? argument_count : 1) * sizeof(long long));
     rc_thread_domain_dispose();
     RC_NATIVE_ACCOUNT(atomic_fetch_add(&rc_thread_domain_exits, 1));
     RcManagedThread *t = launch.thread;
@@ -76,25 +99,39 @@ static void *rc_thread_entry(void *pointer) {
 
 /* Internal status protocol: allocations remain process fatal. Recoverable OS
  * failures preserve caller ownership and output; convenience exports stop. */
+static long long rc_thread_launch_try(RcThreadLaunch prepared, void **output);
 static long long rc_thread_spawn_try(RcThreadBridge bridge, long long seed,
         const RcThreadLeaf *frozen, const RcThreadLeaf *channel, void **output) {
+    return rc_thread_launch_try((RcThreadLaunch){NULL, bridge, seed, frozen->control, channel->control, NULL, NULL}, output);
+}
+/* Takes the packet in every outcome. */
+static long long rc_thread_spawn_packet_try(RcPacketBridge bridge, RcPacket *packet, void **output) {
+    if (packet->cursor) rc_transfer_invalid();
+    return rc_thread_launch_try((RcThreadLaunch){NULL, NULL, 0, NULL, NULL, bridge, packet}, output);
+}
+static long long rc_thread_launch_try(RcThreadLaunch prepared, void **output) {
     RcManagedThread *t = rc_thread_native_allocate(sizeof(*t));
     memset(t, 0, sizeof(*t));
     if (rc_thread_mutex_init(&t->mutex)) {
         rc_thread_native_free(t, sizeof(*t));
+        if (prepared.packet) rc_packet_free(prepared.packet, 0);
         return 2;
     }
     if (rc_thread_condition_init(&t->changed)) {
         rc_thread_mutex_destroy(&t->mutex);
         rc_thread_native_free(t, sizeof(*t));
+        if (prepared.packet) rc_packet_free(prepared.packet, 0);
         return 2;
     }
     /* One share each for returned wrapper, parent registry, running packet. */
     rc_thread_control_init(&t->owner, 3, rc_managed_thread_destroy);
     RcThreadLaunch *launch = rc_thread_native_allocate(sizeof(*launch));
-    *launch = (RcThreadLaunch){t, bridge, seed, frozen->control, channel->control};
-    rc_thread_control_retain(launch->frozen);
-    rc_thread_control_retain(launch->channel);
+    *launch = prepared;
+    launch->thread = t;
+    if (!launch->packet) {
+        rc_thread_control_retain(launch->frozen);
+        rc_thread_control_retain(launch->channel);
+    }
 #ifdef MINYAR_RC_TESTING
     int failed = rc_thread_test_fail_start != 0;
 #else
@@ -109,8 +146,11 @@ static long long rc_thread_spawn_try(RcThreadBridge bridge, long long seed,
 #endif
     }
     if (failed) {
-        rc_thread_control_release(launch->frozen);
-        rc_thread_control_release(launch->channel);
+        if (launch->packet) rc_packet_free(launch->packet, 0);
+        else {
+            rc_thread_control_release(launch->frozen);
+            rc_thread_control_release(launch->channel);
+        }
         rc_thread_native_free(launch, sizeof(*launch));
         rc_thread_control_release(t);
         rc_thread_control_release(t);
@@ -197,6 +237,22 @@ void minyar_thread_join_children(void) {
         rc_thread_children = t->parent_next;
         rc_thread_control_release(t);
     }
+}
+
+void *minyar_thread_spawn_packet(RcPacketBridge bridge, RcPacket *packet) {
+    void *result;
+    if (rc_thread_spawn_packet_try(bridge, packet, &result))
+        minyar_stop("the system could not start this thread.");
+    return result;
+}
+void *minyar_thread_spawn_packet_result(RcPacketBridge bridge, RcPacket *packet) {
+    void *thread = NULL;
+    long long status = rc_thread_spawn_packet_try(bridge, packet, &thread);
+    MinyarRecord *record = minyar_record_new(2);
+    minyar_record_set(record, 0, status);
+    minyar_record_set_reference(record, 1, (long long)(uintptr_t)thread);
+    minyar_rc_release(thread);
+    return record;
 }
 
 long long minyar_thread_try_spawn(RcThreadBridge bridge, long long seed,

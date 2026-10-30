@@ -43,20 +43,32 @@ function before(text: Text, first: Text, second: Text): Boolean {
     test.check(left >= 0 && right >= 0, "missing ordering markers " + first + " / " + second)
     return left < right
 }
-function exactEntrySignature(context: Context) {
-    for signature in ["Text, FrozenBytes, BytesChannel", "Integer, Bytes, BytesChannel", "Integer, FrozenBytes, Integer", "Integer, FrozenBytes", "Integer, FrozenBytes, BytesChannel, Integer"] {
-        let types: List<Text> = []
-        let raw = Bytes(signature)
-        let start = 0
-        for index in 0..(raw.length + 1) {
-            if index == raw.length || raw[index] == 44 {
-                types.add(utf8.decodeOrStop(raw.slice(start, index)))
-                start = index + 2
-            }
+function entryParameters(signature: Text): Text {
+    let types: List<Text> = []
+    let raw = Bytes(signature)
+    let start = 0
+    let depth = 0
+    for index in 0..(raw.length + 1) {
+        if index < raw.length && raw[index] == 60 { depth += 1 }
+        if index < raw.length && raw[index] == 62 { depth -= 1 }
+        if index == raw.length || (raw[index] == 44 && depth == 0) {
+            types.add(utf8.decodeOrStop(raw.slice(start, index)))
+            start = index + 2
         }
-        let params: List<Text> = []
-        for index in 0..types.length { params.add("p" + Text(index) + ": " + types[index]) }
-        reject(context, "thread function unused(" + support.joined(params, ", ") + "): Integer { return 0 }\n" + ENTRY + MAIN, "thread entry")
+    }
+    let params: List<Text> = []
+    for index in 0..types.length { params.add("p" + Text(index) + ": " + types[index]) }
+    return support.joined(params, ", ")
+}
+function exactEntrySignature(context: Context) {
+    // Any other shape of sendable parameters is a packet entry with its own bridge.
+    for signature in ["Text, FrozenBytes, BytesChannel", "Integer, Bytes, BytesChannel", "Integer, FrozenBytes, Integer", "Integer, FrozenBytes", "Integer, FrozenBytes, BytesChannel, Integer"] {
+        let ir = accept(context, "thread function unused(" + entryParameters(signature) + "): Integer { return 0 }\n" + ENTRY + MAIN)
+        test.check(test.contains(ir, "define internal i64 @.minyar.thread.bridge.unused(ptr %arguments)"), "packet bridge is missing for " + signature)
+    }
+    // Parameters that cannot be copied into another thread's heap are rejected.
+    for signature in ["Map<Text, Integer>", "Thread", "Integer, Set<Integer>", "List<Map<Integer, Integer>>"] {
+        reject(context, "thread function unused(" + entryParameters(signature) + "): Integer { return 0 }\n" + ENTRY + MAIN, "cannot cross threads")
     }
     for result in ["Text", "Bytes", "FrozenBytes", "Thread", "Boolean"] {
         reject(context, test.replace(ENTRY, ": Integer {", ": " + result + " {") + MAIN, "thread entry")

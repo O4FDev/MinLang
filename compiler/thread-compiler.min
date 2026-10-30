@@ -1,9 +1,126 @@
 function isThreadType(type: Integer): Boolean {
-    return type >= 9 && type <= 18
+    return type >= 9 && type <= 19
+}
+
+// Intrinsics behind the typed `channels` library: a ValueQueue moves copies of
+// sendable values between threads (minyar_thread_transfer.h).
+function isQueueBuiltin(name: Text): Boolean {
+    if name.length < 9 || (name[0] != 'q' && name[0] != 'v') { return false }
+    return name == "valueQueue" || name == "queueSend" || name == "queueTrySend" || name == "queueReceive" || name == "queueTryReceive" || name == "queueReceiveFor" || name == "queueClose" || name == "queueLength" || name == "queueClosed" || name == "queueSelect" || name == "queueWakeSocket"
+}
+
+// A plain record: not a choice, callback, C layout or library Result.
+function threadPlainRecord(context: CompilerContext, type: Integer): Boolean {
+    if !isRecordType(type) || isScalarChoiceType(type) || isCallbackType(type, context.functionNames) || isCRecord(context, type) { return false }
+    if choiceCases(context, type).length > 0 { return false }
+    return !resultPrefix(context.functionNames[recordTypeIndex(type)], "minyar_result_type_")
+}
+
+// The transfer descriptor of a sendable type (see minyar_thread_transfer.h), or a
+// compile error naming the part that cannot cross threads.
+function threadDescriptor(context: CompilerContext, type: Integer, visiting: List<Integer>, what: Text): Text {
+    if type == 1 || type == 3 || type == 4 || type == 7 || isScalarChoiceType(type) { return "i" }
+    if type == 2 { return "t" }
+    if type == 8 { return "b" }
+    if type == 9 || type == 10 || type == 14 || type == 19 { return "h" }
+    if isListType(type) { return "l" + threadDescriptor(context, listElementType(type), visiting, what) }
+    if threadPlainRecord(context, type) {
+        let name = readableDeclarationName(context.functionNames[recordTypeIndex(type)])
+        let k = 0
+        while k < visiting.length {
+            if visiting[k] == type { failCompiler(what + " cannot cross threads: record '" + name + "' contains itself; send a List of plain records instead") }
+            k = k + 1
+        }
+        let mark = visiting.length
+        visiting.add(type)
+        let record = recordTypeIndex(type)
+        let count = context.functionParameterCounts[record]
+        let first = functionParameterOffset(context.functionParameterCounts, record)
+        let descriptor = "r" + Text(count) + "."
+        let field = 0
+        while field < count {
+            descriptor = descriptor + threadDescriptor(context, context.functionParameterTypes[first + field], visiting, what)
+            field = field + 1
+        }
+        visiting[mark] = 0
+        return descriptor
+    }
+    let shown = describeType(type)
+    if isRecordType(type) { shown = "'" + readableDeclarationName(context.functionNames[recordTypeIndex(type)]) + "'" }
+    failCompiler(what + " cannot cross threads: " + shown + " is not sendable; send Integer, Float, Boolean, Character, Text, Bytes, Lists, plain records of those, FrozenBytes or channels")
+    return ""
+}
+
+// A private constant holding the descriptor; returns its LLVM name.
+function threadDescriptorGlobal(globals: List<Text>, descriptor: Text): Text {
+    let name = "@\".minyar.transfer." + descriptor + "\""
+    let line = name + " = private unnamed_addr constant [" + Text(descriptor.byteLength + 1) + " x i8] c\"" + descriptor + "\\00\"\n"
+    if findText(globals, line) < 0 { globals.add(line) }
+    return name
+}
+
+function threadQueueBuiltin(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, name: Text, values: List<Text>, types: List<Integer>, resultType: List<Integer>): Text {
+    let arity = 1
+    if name == "valueQueue" { arity = 1 }
+    if name == "queueSend" || name == "queueTrySend" || name == "queueReceive" || name == "queueTryReceive" || name == "queueSelect" { arity = 2 }
+    if name == "queueReceiveFor" { arity = 3 }
+    if types.length != arity { failCompiler(name + " expects " + Text(arity) + " arguments") }
+    if name == "valueQueue" {
+        requireType(context.tokenLines, state, types[0], 1, "valueQueue capacity must be Integer")
+        setType(resultType, 19)
+        return emitCall(output, textState, state, 19, "minyar_queue_new", values, types)
+    }
+    if name == "queueSelect" {
+        requireType(context.tokenLines, state, types[0], makeListType(19), "queueSelect needs a List of ValueQueue")
+        requireType(context.tokenLines, state, types[1], 1, "queueSelect timeout must be Integer milliseconds")
+        setType(resultType, 1)
+        return emitCall(output, textState, state, 1, "minyar_queue_select", values, types)
+    }
+    requireType(context.tokenLines, state, types[0], 19, name + " needs a ValueQueue")
+    let queue: List<Text> = [values[0]]
+    let queueTypes: List<Integer> = [19]
+    if name == "queueClose" {
+        setType(resultType, 5)
+        return emitCall(output, textState, state, 5, "minyar_queue_close", queue, queueTypes)
+    }
+    if name == "queueLength" || name == "queueWakeSocket" || name == "queueClosed" {
+        let callee = "minyar_queue_length"
+        let result = 1
+        if name == "queueWakeSocket" { callee = "minyar_queue_wake_socket" }
+        if name == "queueClosed" { callee = "minyar_queue_closed"; result = 4 }
+        setType(resultType, result)
+        return emitCall(output, textState, state, result, callee, queue, queueTypes)
+    }
+    let visiting: List<Integer> = []
+    if name == "queueSend" || name == "queueTrySend" {
+        let descriptor = threadDescriptorGlobal(globals, threadDescriptor(context, types[1], visiting, "a channel value"))
+        let slot = valueAsListSlot(output, textState, state, values[1], types[1])
+        let callValues: List<Text> = [values[0], slot, descriptor]
+        let callTypes: List<Integer> = [19, 1, 2]
+        let result = 1
+        let callee = "minyar_queue_try_send"
+        if name == "queueSend" { result = 4; callee = "minyar_queue_send" }
+        setType(resultType, result)
+        return emitCall(output, textState, state, result, callee, callValues, callTypes)
+    }
+    if !isListType(types[1]) { failCompiler(name + " receives into a List") }
+    let descriptor = threadDescriptorGlobal(globals, threadDescriptor(context, listElementType(types[1]), visiting, "a channel value"))
+    let callValues: List<Text> = [values[0], values[1], descriptor]
+    let callTypes: List<Integer> = [19, types[1], 2]
+    let result = 1
+    let callee = "minyar_queue_try_receive"
+    if name == "queueReceive" { result = 4; callee = "minyar_queue_receive" }
+    if name == "queueReceiveFor" {
+        requireType(context.tokenLines, state, types[2], 1, "queueReceiveFor timeout must be Integer milliseconds")
+        callValues.add(values[2]); callTypes.add(1); callee = "minyar_queue_receive_for"
+    }
+    setType(resultType, result)
+    return emitCall(output, textState, state, result, callee, callValues, callTypes)
 }
 
 function isThreadBuiltin(name: Text): Boolean {
     if name == "nativeThreadSetup" || name == "mapNativeRegion" || name == "tryMapNativeRegion" || name == "shareNativeRegions" || name == "nativeRegionAddress" || name == "threadKernelKick" || name == "threadEventfd" || name == "threadEventfdRead" || name == "threadEventfdNotify" { return true }
+    if isQueueBuiltin(name) { return true }
     return name == "freezeBytes" || name == "freezeBytesTake" || name == "copyFrozenBytes" || name == "bytesChannel" || name == "trySendBytes" || name == "sendBytes" || name == "tryReceiveBytes" || name == "receiveBytes" || name == "closeBytesChannel" || name == "startThread" || name == "joinThread" || name == "startThreadResult" || name == "joinThreadResult" || name == "frozenBytesChannel" || name == "trySendFrozen" || name == "sendFrozen" || name == "tryReceiveFrozen" || name == "receiveFrozen" || name == "closeFrozenChannel" || name == "threadKernelRun"
 }
 
@@ -198,26 +315,80 @@ function threadRegionMethod(context: CompilerContext, localNames: List<Text>, lo
     return emitCall(output, textState, state, result, callee, values, types)
 }
 
-function threadValidateEntries(globals: List<Text>, names: List<Text>, kinds: List<Integer>, results: List<Integer>, counts: List<Integer>, parameters: List<Integer>, lookup: List<Integer>) {
+// The original entry shape: (Integer, FrozenBytes or native region capability,
+// BytesChannel or FrozenBytesChannel). It keeps its direct bridge.
+function threadLegacyEntry(counts: List<Integer>, parameters: List<Integer>, function: Integer): Boolean {
+    if counts[function] != 3 { return false }
+    let first = functionParameterOffset(counts, function)
+    return parameters[first] == 1 && (parameters[first + 1] == 9 || parameters[first + 1] == 16 || parameters[first + 1] == 17) && (parameters[first + 2] == 10 || parameters[first + 2] == 14)
+}
+
+// Every other entry receives its arguments as one packet: the tuple descriptor
+// of its parameters, each of which must be sendable.
+function threadEntryDescriptor(context: CompilerContext, function: Integer): Text {
+    let counts = context.functionParameterCounts
+    let first = functionParameterOffset(counts, function)
+    let descriptor = "r" + Text(counts[function]) + "."
+    let position = 0
+    while position < counts[function] {
+        let visiting: List<Integer> = []
+        let parameter = readableDeclarationName(context.functionParameterNames[first + position])
+        descriptor = descriptor + threadDescriptor(context, context.functionParameterTypes[first + position], visiting, "thread entry '" + readableDeclarationName(context.functionNames[function]) + "' parameter '" + parameter + "'")
+        position = position + 1
+    }
+    return descriptor
+}
+
+function threadValidateEntries(context: CompilerContext, globals: List<Text>) {
+    let names = context.functionNames
+    let results = context.functionReturnTypes
     let prefix = "; minyar-thread-entry: "
     let i = 0
     while i < globals.length {
         let marker = globals[i]
         if marker.length > prefix.length && marker.slice(0, prefix.length) == prefix {
             let name = markerValue(marker, prefix)
-            let function = findFunction(names, kinds, lookup, name)
+            let function = findFunction(names, context.symbolKinds, context.tokenLines.symbolLookup, name)
             let valid = function >= 0 && name != "main" && name[0] != '"'
-            if valid {
-                valid = counts[function] == 3 && (results[function] == 1 || results[function] == 5)
-                if valid {
-                    let first = functionParameterOffset(counts, function)
-                    valid = parameters[first] == 1 && (parameters[first + 1] == 9 || parameters[first + 1] == 16 || parameters[first + 1] == 17) && (parameters[first + 2] == 10 || parameters[first + 2] == 14)
-                }
-            }
-            if !valid { failCompiler("thread entry '" + readableDeclarationName(name) + "' requires (Integer, FrozenBytes or native region capability, BytesChannel or FrozenBytesChannel) and Integer or Nothing result") }
+            if valid { valid = results[function] == 1 || results[function] == 5 }
+            if !valid { failCompiler("thread entry '" + readableDeclarationName(name) + "' must be a named function returning Integer or Nothing") }
+            if !threadLegacyEntry(context.functionParameterCounts, context.functionParameterTypes, function) { threadEntryDescriptor(context, function) }
         }
         i = i + 1
     }
+}
+
+// startThread(entry, arguments...) for a packet entry: copy every argument into
+// one packet, then start the thread on the entry's packet bridge.
+function threadPacketSpawn(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, name: Text, target: Text, values: List<Text>, types: List<Integer>, resultType: List<Integer>): Text {
+    let function = findFunction(context.functionNames, context.symbolKinds, context.tokenLines.symbolLookup, target)
+    let counts = context.functionParameterCounts
+    let first = functionParameterOffset(counts, function)
+    let readable = readableDeclarationName(target)
+    if values.length != counts[function] { failCompiler(name + " for '" + readable + "' expects " + Text(counts[function]) + " arguments after the entry, but received " + Text(values.length)) }
+    let position = 0
+    while position < values.length {
+        requireType(context.tokenLines, state, types[position], context.functionParameterTypes[first + position], "argument " + Text(position + 1) + " of thread entry '" + readable + "'")
+        position = position + 1
+    }
+    let descriptor = threadDescriptorGlobal(globals, threadEntryDescriptor(context, function))
+    let begin: List<Text> = [descriptor]
+    let beginTypes: List<Integer> = [2]
+    let packet = emitCall(output, textState, state, 16, "minyar_transfer_begin", begin, beginTypes)
+    position = 0
+    while position < values.length {
+        let slot = valueAsListSlot(output, textState, state, values[position], types[position])
+        output.add("  call void @minyar_transfer_put(ptr " + packet + ", i64 " + slot + ")\n")
+        position = position + 1
+    }
+    let result = 11
+    let callee = "minyar_thread_spawn_packet"
+    if name == "startThreadResult" { result = 12; callee = "minyar_thread_spawn_packet_result" }
+    if (state[15] / 4 % 2) != 0 { threadNote(output, textState[1], "spawn", target, "1(packet)") }
+    let spawnValues: List<Text> = ["@" + derivedSymbol(".minyar.thread.bridge.", target), packet]
+    let spawnTypes: List<Integer> = [2, 2]
+    setType(resultType, result)
+    return emitCall(output, textState, state, result, callee, spawnValues, spawnTypes)
 }
 
 function runtimeMathAllowed(name: Text): Boolean {
@@ -455,7 +626,11 @@ function threadEffectPath(pending: List<Text>, parents: List<Integer>, index: In
     return path
 }
 
-function threadAppendABI(output: List<Text>, globals: List<Text>, names: List<Text>, kinds: List<Integer>, results: List<Integer>, recoverable: Boolean, lookup: List<Integer>) {
+function threadAppendABI(context: CompilerContext, output: List<Text>, globals: List<Text>, recoverable: Boolean) {
+    let names = context.functionNames
+    let kinds = context.symbolKinds
+    let results = context.functionReturnTypes
+    let lookup = context.tokenLines.symbolLookup
     if !threadMode(globals) { return }
     let declarations: List<Text> = [
         "declare void @minyar_native_thread_setup()",
@@ -522,7 +697,22 @@ function threadAppendABI(output: List<Text>, globals: List<Text>, names: List<Te
         "declare i64 @minyar_thread_process_id()",
         "declare i64 @minyar_thread_sleep_ns(i64)",
         "declare i64 @minyar_thread_fsync(i64)",
-        "declare i64 @minyar_thread_kernel_run(i64)"
+        "declare i64 @minyar_thread_kernel_run(i64)",
+        "declare ptr @minyar_transfer_begin(ptr)",
+        "declare void @minyar_transfer_put(ptr, i64)",
+        "declare ptr @minyar_thread_spawn_packet(ptr, ptr)",
+        "declare ptr @minyar_thread_spawn_packet_result(ptr, ptr)",
+        "declare ptr @minyar_queue_new(i64)",
+        "declare zeroext i1 @minyar_queue_send(ptr, i64, ptr)",
+        "declare i64 @minyar_queue_try_send(ptr, i64, ptr)",
+        "declare zeroext i1 @minyar_queue_receive(ptr, ptr, ptr)",
+        "declare i64 @minyar_queue_try_receive(ptr, ptr, ptr)",
+        "declare i64 @minyar_queue_receive_for(ptr, ptr, ptr, i64)",
+        "declare void @minyar_queue_close(ptr)",
+        "declare i64 @minyar_queue_length(ptr)",
+        "declare zeroext i1 @minyar_queue_closed(ptr)",
+        "declare i64 @minyar_queue_select(ptr, i64)",
+        "declare i64 @minyar_queue_wake_socket(ptr)"
     ]
     let declaration = 0
     while declaration < declarations.length {
@@ -536,7 +726,15 @@ function threadAppendABI(output: List<Text>, globals: List<Text>, names: List<Te
         if marker.length > prefix.length && marker.slice(0, prefix.length) == prefix {
             let name = markerValue(marker, prefix)
             let function = findFunction(names, kinds, lookup, name)
-            threadAppendBridge(output, name, results[function], recoverable)
+            if threadLegacyEntry(context.functionParameterCounts, context.functionParameterTypes, function) {
+                threadAppendBridge(output, name, results[function], recoverable)
+            } else {
+                let parameters: List<Integer> = []
+                let first = functionParameterOffset(context.functionParameterCounts, function)
+                let k = 0
+                while k < context.functionParameterCounts[function] { parameters.add(context.functionParameterTypes[first + k]); k = k + 1 }
+                threadAppendPacketBridge(output, name, results[function], recoverable, parameters)
+            }
         }
         i = i + 1
     }
@@ -556,6 +754,52 @@ function threadAppendBridge(output: List<Text>, name: Text, result: Integer, rec
         output.add("  %result = call i64 @" + languageSymbol(name) + "(i64 %seed, ptr %frozen.local, ptr %channel.local)\n")
     } else {
         output.add("  call void @" + languageSymbol(name) + "(i64 %seed, ptr %frozen.local, ptr %channel.local)\n")
+    }
+    if recovery {
+        output.add("  %thread.pending = call i32 @minyar_recovery_pending()\n")
+        output.add("  %thread.failed = icmp ne i32 %thread.pending, 0\n")
+        output.add("  br i1 %thread.failed, label %thread.unwind, label %thread.success\nthread.success:\n")
+    }
+    output.add("  call void @minyar_stack_leave()\n")
+    if result == 1 { output.add("  ret i64 %result\n") }
+    else { output.add("  ret i64 0\n") }
+    if recovery {
+        output.add("thread.unwind:\n  call void @minyar_stack_leave()\n  ret i64 0\n")
+    }
+    output.add("}\n")
+}
+
+// The packet bridge reads each argument's language slot and calls the entry.
+function threadAppendPacketBridge(output: List<Text>, name: Text, result: Integer, recovery: Boolean, parameters: List<Integer>) {
+    output.add("define internal i64 @" + derivedSymbol(".minyar.thread.bridge.", name) + "(ptr %arguments) uwtable {\nentry:\n")
+    if recovery {
+        output.add("  %thread.accepted = call i32 @minyar_recovery_enter()\n")
+        output.add("  %thread.allowed = icmp ne i32 %thread.accepted, 0\n")
+        output.add("  br i1 %thread.allowed, label %thread.body, label %thread.reject\n")
+        output.add("thread.reject:\n  ret i64 0\nthread.body:\n")
+    } else {
+        output.add("  call void @minyar_stack_enter()\n")
+    }
+    let call = ""
+    let k = 0
+    while k < parameters.length {
+        let type = parameters[k]
+        let slot = "%argument." + Text(k)
+        output.add("  " + slot + ".address = getelementptr inbounds i64, ptr %arguments, i64 " + Text(k) + "\n")
+        output.add("  " + slot + ".slot = load i64, ptr " + slot + ".address, align 8\n")
+        let value = slot + ".slot"
+        if type == 4 { output.add("  " + slot + " = trunc i64 " + slot + ".slot to i1\n"); value = slot }
+        if type == 3 { output.add("  " + slot + " = trunc i64 " + slot + ".slot to i32\n"); value = slot }
+        if type == 7 { output.add("  " + slot + " = bitcast i64 " + slot + ".slot to double\n"); value = slot }
+        if isReferenceType(type) { output.add("  " + slot + " = inttoptr i64 " + slot + ".slot to ptr\n"); value = slot }
+        if k > 0 { call = call + ", " }
+        call = call + argumentPrefix(type) + value
+        k = k + 1
+    }
+    if result == 1 {
+        output.add("  %result = call i64 @" + languageSymbol(name) + "(" + call + ")\n")
+    } else {
+        output.add("  call void @" + languageSymbol(name) + "(" + call + ")\n")
     }
     if recovery {
         output.add("  %thread.pending = call i32 @minyar_recovery_pending()\n")
@@ -606,12 +850,12 @@ function threadFeatureName(name: Text): Boolean {
     if length < 6 || length > 22 { return false }
     let first = name[0]
     if first >= 'A' && first <= 'Z' {
-        return name == "FrozenBytes" || name == "BytesChannel" || name == "Thread" || name == "ThreadStartResult" || name == "ThreadJoinResult" || name == "FrozenBytesChannel" || name == "FrozenBytesResult" || name == "NativeRegion" || name == "NativeRegions" || name == "NativeRegionResult"
+        return name == "ValueQueue" || name == "FrozenBytes" || name == "BytesChannel" || name == "Thread" || name == "ThreadStartResult" || name == "ThreadJoinResult" || name == "FrozenBytesChannel" || name == "FrozenBytesResult" || name == "NativeRegion" || name == "NativeRegions" || name == "NativeRegionResult"
     }
     if length < 9 { return false }
     let second = name[1]
     let plausible = false
-    if first == 'm' || first == 'n' { plausible = true }
+    if first == 'm' || first == 'n' || first == 'q' || first == 'v' { plausible = true }
     if first == 'f' && second == 'r' { plausible = true }
     if first == 'c' && ((second == 'l' && name[2] == 'o') || (second == 'o' && name[2] == 'p')) { plausible = true }
     if first == 'b' && second == 'y' { plausible = true }

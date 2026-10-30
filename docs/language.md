@@ -1943,10 +1943,69 @@ if net.ready(listener, 5000) { net.close(net.accept(listener)) }
 print(joinThread(thread)) // 19
 ```
 
-An entry takes an Integer seed, a `FrozenBytes` (or a `NativeRegion`/`NativeRegions`
-capability) and a `BytesChannel` or `FrozenBytesChannel`, and returns Integer or
-Nothing. `startThread(entry, seed, input, channel)` starts it and
-`joinThread(thread)` waits for its result. `startThreadResult` and
+An entry returns Integer or Nothing and takes any number of sendable
+parameters: Integer, Float, Boolean, Character, enums, Text, Bytes, Lists and
+plain records of those, `FrozenBytes`, and channels. `startThread(entry,
+arguments...)` copies every argument into the new thread's heap, so the
+thread owns what it receives and the caller keeps its own values;
+`joinThread(thread)` waits for its result. Maps, Sets, callbacks, choices with
+payloads, `Thread` values and records that contain themselves cannot be sent:
+
+```text
+error: thread entry 'w' parameter 'm' cannot cross threads: Map<Text, Integer> is not sendable; send Integer, ...
+```
+
+The `channels` module moves values between running threads:
+
+```minyar
+use "channels" as channels
+
+record Job { id: Integer; words: List<Text> }
+
+thread function worker(jobs: channels.Channel<Job>, results: channels.Channel<Text>): Integer {
+    let handled = 0
+    let more = true
+    while more {
+        match channels.receive(jobs) {
+            Some(job) {
+                channels.send(results, Text(job.id) + " " + joinText(job.words))
+                handled += 1
+            }
+            None { more = false }
+        }
+    }
+    return handled
+}
+
+let jobs: channels.Channel<Job> = channels.bounded(16)
+let results: channels.Channel<Text> = channels.unbounded()
+let workers = [startThread(worker, jobs, results), startThread(worker, jobs, results)]
+for id in 0..4 { channels.send(jobs, Job { id: id; words: ["job", Text(id)] }) }
+channels.close(jobs)
+let handled = 0
+for thread in workers { handled += joinThread(thread) }
+print(handled) // 4
+print(channels.length(results)) // 4
+```
+
+A channel has any number of senders and receivers. `bounded(capacity)` makes
+`send` wait for room and `unbounded()` never waits. `send` returns false once
+the channel is closed; `receive` returns `None` once it is closed and empty,
+so `close` ends every receiver's loop after the last value. `trySend` (1 sent,
+0 full, 2 closed), `tryReceive`, `receiveFor(channel, milliseconds)`, `length`
+and `isClosed` never wait or wait boundedly. `select(waitables, milliseconds)`
+waits until one of several channels, of any item types, has a value or is
+closed (`channels.waitable(channel)`), and returns its position or -1 at the
+deadline; another receiver may take the value first, so follow it with
+`tryReceive`. `wakeSocket(channel)` is readable exactly while a receive would
+not wait; watch it with `eventloop.watch` to serve channels, sockets and timers
+from one loop. A channel is itself sendable, so a request can carry its reply
+channel. Each value is checked against the channel's item type when it is
+received.
+
+The original entry shape, `(seed: Integer, input: FrozenBytes, channel:
+BytesChannel)`, also accepts a `NativeRegion`/`NativeRegions` capability or a
+`FrozenBytesChannel` and passes those handles without copying. `startThreadResult` and
 `joinThreadResult` return a Result-like value (`ok`, `code`, then `thread` or
 `value`) instead of stopping when the system cannot start or join a thread.
 `main` and every thread entry join the threads they started, and still running,
