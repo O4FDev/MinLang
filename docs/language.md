@@ -2003,6 +2003,40 @@ from one loop. A channel is itself sendable, so a request can carry its reply
 channel. Each value is checked against the channel's item type when it is
 received.
 
+`atomicInteger(initial)` and `atomicBoolean(initial)` make shared cells of
+type `AtomicInteger` and `AtomicBoolean`. Like channels they are sendable, and
+every copy refers to the same cell:
+
+```minyar
+thread function count(hits: AtomicInteger, times: Integer): Integer {
+    for i in 0..times { hits.fetchAddRelaxed(1) }
+    return times
+}
+
+let hits = atomicInteger(0)
+let threads = [startThread(count, hits, 1000), startThread(count, hits, 1000)]
+for thread in threads { joinThread(thread) }
+print(hits.load()) // 2000
+```
+
+Each method is one atomic operation: `load`, `store`, `swap`, `fetchAdd`,
+`fetchSub`, `fetchAnd`, `fetchOr`, `fetchXor`, `fetchMin` and `fetchMax` (the
+fetch methods return the previous value; Integer arithmetic wraps),
+`compareExchange(expected, desired)`, which returns the previous value and
+stored `desired` when that equals `expected`, and `compareExchangeWeak`, which
+returns whether it stored and may fail spuriously, for retry loops.
+AtomicBoolean has the same methods except the arithmetic ones. A method name
+alone is sequentially consistent; the suffixes `Relaxed`, `Acquire`, `Release`
+and `AcquireRelease` choose a weaker ordering, as in `loadAcquire`,
+`storeRelease` or `compareExchangeWeakAcquire`. A load cannot release and a
+store cannot acquire; a compare-exchange that fails orders like a load.
+`atomicFence()`, `atomicFenceAcquire()`, `atomicFenceRelease()` and
+`atomicFenceAcquireRelease()` are standalone fences. `wait(expected)` blocks
+while the cell holds `expected`, `waitFor(expected, milliseconds)` returns
+whether it changed before the deadline, and `notifyOne`/`notifyAll` wake
+waiters (a futex on Linux, `__ulock` on macOS). All operations compile to
+inline LLVM atomics on the cell except waits and wakes.
+
 The original entry shape, `(seed: Integer, input: FrozenBytes, channel:
 BytesChannel)`, also accepts a `NativeRegion`/`NativeRegions` capability or a
 `FrozenBytesChannel` and passes those handles without copying. `startThreadResult` and
@@ -2143,6 +2177,11 @@ owners alive, and worker code performs no ownership operations.
 Parallel builds currently check the whole module graph,
 including when module caching is requested. The [parallel gallery](../examples/gallery/parallel.min)
 draws a Julia garden into separate slots, with a woven Unicode preview or a PNG.
+
+A body may also call methods on a captured `AtomicInteger` or `AtomicBoolean`,
+such as `hits.fetchAddRelaxed(1)`, to count or flag across iterations; the cell
+itself cannot be reassigned or passed on. Programs with atomic cells use the
+thread runtime.
 
 Add `reduce name` to sum into one mutable Integer or Float binding:
 

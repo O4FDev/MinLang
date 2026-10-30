@@ -1,0 +1,93 @@
+// AtomicInteger and AtomicBoolean shared by threads, channels and a parallel for.
+use "channels" as channels
+
+record Shared { lock: AtomicBoolean; guarded: AtomicInteger; gate: AtomicInteger; arrived: AtomicInteger }
+
+thread function count(counter: AtomicInteger, times: Integer): Integer {
+    for i in 0..times { counter.fetchAddRelaxed(1) }
+    return times
+}
+
+// A spin lock made of compareExchangeWeakAcquire and storeRelease guards a
+// plain load/store increment, which loses updates without it.
+thread function locked(shared: Shared, times: Integer): Integer {
+    shared.gate.wait(0)
+    shared.arrived.fetchAdd(1)
+    for i in 0..times {
+        while !shared.lock.compareExchangeWeakAcquire(false, true) {}
+        shared.guarded.storeRelaxed(shared.guarded.loadRelaxed() + 1)
+        shared.lock.storeRelease(false)
+    }
+    return times
+}
+
+thread function fromChannel(cells: channels.Channel<AtomicInteger>): Integer {
+    let total = 0
+    let more = true
+    while more {
+        match channels.receive(cells) {
+            Some(cell) { total += cell.fetchAdd(10) }
+            None { more = false }
+        }
+    }
+    return total
+}
+
+function main() {
+    let counter = atomicInteger(0)
+    let counters = [startThread(count, counter, 50000), startThread(count, counter, 50000), startThread(count, counter, 50000), startThread(count, counter, 50000)]
+    let started = 0
+    for thread in counters { started += joinThread(thread) }
+    print(Text(counter.load()) + " of " + Text(started))
+
+    let shared = Shared { lock: atomicBoolean(false); guarded: atomicInteger(0); gate: atomicInteger(0); arrived: atomicInteger(0) }
+    let lockers = [startThread(locked, shared, 20000), startThread(locked, shared, 20000), startThread(locked, shared, 20000)]
+    print(shared.gate.waitFor(0, 20))
+    print(shared.arrived.load())
+    shared.gate.store(1)
+    shared.gate.notifyAll()
+    for thread in lockers { joinThread(thread) }
+    print(Text(shared.guarded.load()) + " guarded, " + Text(shared.arrived.load()) + " arrived")
+
+    let cell = atomicInteger(1)
+    let cells: channels.Channel<AtomicInteger> = channels.unbounded()
+    let reader = startThread(fromChannel, cells)
+    channels.send(cells, cell)
+    channels.send(cells, cell)
+    channels.close(cells)
+    print(joinThread(reader))
+    print(cell.load())
+
+    let value = atomicInteger(400)
+    print(value.swap(5))
+    print(value.compareExchange(5, 9))
+    print(value.compareExchangeAcquireRelease(5, 11))
+    print(value.compareExchangeWeakRelease(9, 12) || value.load() == 12)
+    print(value.fetchSubAcquire(2))
+    print(value.fetchMax(100))
+    print(value.fetchMinRelaxed(-3))
+    print(value.fetchAnd(255))
+    print(value.fetchOr(1))
+    print(value.fetchXor(3))
+    print(value.loadAcquire())
+    let flag = atomicBoolean(true)
+    print(flag.fetchXor(true))
+    print(flag.swapAcquireRelease(true))
+    print(flag.fetchAnd(false))
+    print(flag.compareExchange(false, true))
+    print(flag.load())
+    atomicFence()
+    atomicFenceAcquire()
+    atomicFenceRelease()
+    atomicFenceAcquireRelease()
+    print(value.waitFor(value.load() + 1, 5))
+
+    let hits = atomicInteger(0)
+    let squares: List<Integer> = []
+    for i in 0..1000 { squares.add(0) }
+    parallel for i in 0..squares.length {
+        squares[i] = i * i
+        if i % 3 == 0 { hits.fetchAddRelaxed(1) }
+    }
+    print(Text(hits.load()) + " " + Text(squares[999]))
+}
