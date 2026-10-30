@@ -271,8 +271,9 @@ static _Bool text_white_space(unsigned int scalar) {
            scalar == 0x2028 || scalar == 0x2029 || scalar == 0x202f || scalar == 0x205f || scalar == 0x3000;
 }
 /* Scans bytes from both ends: ASCII bytes are tested directly and other
- * scalars are decoded in place, so trimming never builds the offset index. */
-MinyarText *minyar_text_trim(MinyarText *text) {
+ * scalars are decoded in place, so trimming never builds the offset index.
+ * Returns the scalar count of the trimmed range. */
+static long long text_trim_range(MinyarText *text, long long *first_byte, long long *last_byte) {
     ensure_text_index(text);
     const unsigned char *bytes = text->bytes;
     long long first = 0, last = text->byte_length, dropped = 0;
@@ -294,7 +295,39 @@ MinyarText *minyar_text_trim(MinyarText *text) {
         last = start;
         dropped++;
     }
-    return text_slice_bytes(text, first, last, text->character_length - dropped);
+    *first_byte = first;
+    *last_byte = last;
+    return text->character_length - dropped;
+}
+MinyarText *minyar_text_trim(MinyarText *text) {
+    long long first, last;
+    long long characters = text_trim_range(text, &first, &last);
+    return text_slice_bytes(text, first, last, characters);
+}
+/* trim of an owned receiver (a fresh slice, a call result, a local at its
+ * last use) consumes that count. A view nothing else holds is re-pointed at
+ * its trimmed bytes instead of allocating another view, unless that would
+ * make it a small part of a large root, which slices copy. */
+MinyarText *minyar_text_trim_take(MinyarText *text) {
+    long long first, last;
+    long long characters = text_trim_range(text, &first, &last);
+    if (first == 0 && last == text->byte_length) return text;
+#ifndef MINYAR_COMPILER_ARENA
+    MinyarText *root = text->backing;
+    long long length = last - first;
+    if (((RcObject *)text - 1)->ownership == (8 | RC_TEXT) && root &&
+        (root->byte_length <= 4096 || (unsigned long long)length * 8 >= (unsigned long long)root->byte_length)) {
+        rc_free_data(text->character_offsets);
+        text->bytes += first;
+        text->byte_length = length;
+        text->character_length = length == characters ? characters : -1;
+        text->character_offsets = NULL;
+        return text;
+    }
+#endif
+    MinyarText *result = text_slice_bytes(text, first, last, characters);
+    minyar_rc_release(text);
+    return result;
 }
 static _Bool integer_ascii_space(unsigned char byte) {
     return byte == ' ' || (byte >= '\t' && byte <= '\r');

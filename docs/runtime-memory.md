@@ -530,7 +530,10 @@ iteration. The trade-off: a piece kept by an iteration that leaves through
 `break` or `return` stays a view and retains its root until it is released.
 `Integer(text.slice(a, b))`, and `text.slice(a, b) == other` (or `!=`) when
 `other` is a literal or a local, read the range in place and make no slice;
-the bounds check and its stop are those of the slice.
+the bounds check and its stop are those of the slice. `trim()` of an owned
+receiver (a fresh slice, a call result, a local at its last use) consumes it:
+a view nothing else holds is trimmed in place instead of allocating another,
+unless that would leave a small part of a large root, which is copied as above.
 
 Unicode indexes belong to each
 Text header and are built lazily. They store one byte-position breadcrumb per

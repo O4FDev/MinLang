@@ -316,7 +316,9 @@ splits, owned receivers and compaction of kept pieces of a large Text.
 `Integer(text.slice(a, b))` covers Unicode positions, signs and spaces, and
 each slice and parse stop; `text.slice(a, b) == other` covers literals, locals,
 `!=`, Unicode positions and the slice stop, and keeps the slice when `other`
-runs code. Inline length and indexing cover ASCII, Unicode,
+runs code; `trim()` of fresh slices, call results and literals covers Unicode
+spaces, in-place and copied views, and keeps the ordinary trim for a borrowed
+receiver. Inline length and indexing cover ASCII, Unicode,
 not-yet-counted Text, a parser record's scanning loop and both position stops.
 LLVM checks require the in-place split scan, the range parse and compare, the inline
 header reads (with their type tags and runtime slow path), and keep the List
