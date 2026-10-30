@@ -1,0 +1,61 @@
+use "net" as net
+use "files" as files
+use "eventloop" as eventloop
+use "errors" as errors
+use "system" as system
+use "io" as io
+use "text" as text
+
+// Each worker owns its event loop, file and socket.
+thread function worker(seed: Integer, unused: FrozenBytes, done: BytesChannel): Integer {
+    let port = seed / 10
+    let id = seed % 10
+    let loop = errors.value(eventloop.create())
+    errors.value(eventloop.timer(loop, 5, 0, 40 + id))
+    let fired = 0
+    while fired == 0 {
+        for event in eventloop.events(eventloop.wait(loop, 1000, 8)) {
+            if eventloop.isTimer(event) && event.token == 40 + id { fired = 1 }
+        }
+    }
+    errors.value(eventloop.close(loop))
+    let path = "/tmp/minyar-thread-io-" + Text(system.processId()) + "-" + Text(id)
+    let file = files.open(path, files.WRITE + files.CREATE + files.TRUNCATE)
+    let line = Bytes("worker " + Text(id) + " wrote this")
+    if files.write(file, line, 0, line.length) != line.length { fail("short write") }
+    files.close(file)
+    let back = io.readTextFile(path)
+    files.remove(path)
+    let connection = net.connect("127.0.0.1", port)
+    if net.send(connection, Bytes(back)) < 0 { fail("send failed") }
+    net.close(connection)
+    return back.length * fired
+}
+
+function main() {
+    let listener = net.listen("127.0.0.1", 0, 8)
+    let port = net.localPort(listener)
+    let none = freezeBytes(Bytes(0))
+    let channel = bytesChannel(0, 1)
+    let threads = [startThread(worker, port * 10 + 1, none, channel), startThread(worker, port * 10 + 2, none, channel), startThread(worker, port * 10 + 3, none, channel)]
+    let received: List<Text> = []
+    for i in 0..3 {
+        if !net.ready(listener, 10000) { fail("no connection") }
+        let connection = net.accept(listener)
+        if !net.ready(connection, 10000) { fail("no data") }
+        let message = Bytes(0)
+        let more = true
+        while more {
+            let part = net.receive(connection, 256)
+            if part.length == 0 { more = false } else { message.addBytes(part) }
+        }
+        net.close(connection)
+        received.add(text.decodeOrStop(message))
+    }
+    net.close(listener)
+    let total = 0
+    for t in threads { total += joinThread(t) }
+    received.sort()
+    for line in received { print(line) }
+    print(total)
+}

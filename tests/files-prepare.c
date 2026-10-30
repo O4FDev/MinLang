@@ -491,7 +491,7 @@ int main(int argc,char **argv) {
         else abort();
         assert(minyar_files_prepareStart(fd,1)==-error);
         assert(descriptors()==before && !mutex_live && !condition_live);
-        for(int i=0;i<FILES_MAX_PREPARES;i++) assert(!files_prepares[i].used);
+        for(int i=0;i<FILES_MAX_PREPARES;i++) assert(!files_prepares[i]);
         fd_fail=mutex_fail=condition_fail=create_fail=pair_fail=0;
         long long h=minyar_files_prepareStart(fd,1); assert(h>0); assert(!minyar_files_prepareStop(h));
     } else abort();

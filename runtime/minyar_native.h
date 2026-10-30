@@ -14,6 +14,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Module state a thread owns. The launcher compiles a thread program's native
+ * modules with MINYAR_THREADED=1, so each thread has its own event loops, file
+ * syncers, child processes and last-error values; other programs keep plain
+ * statics and pay nothing. */
+#if defined(MINYAR_THREADED) && MINYAR_THREADED
+#define MINYAR_NATIVE_THREAD_LOCAL _Thread_local
+#else
+#define MINYAR_NATIVE_THREAD_LOCAL
+#endif
+
 /* Must match MinyarText in minyar_runtime.c. Bytes share the layout. */
 typedef struct MinyarText {
     const unsigned char *bytes;

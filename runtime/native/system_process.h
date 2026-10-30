@@ -74,9 +74,11 @@ typedef struct SystemProcess {
     pid_t pid;
 #endif
 } SystemProcess;
-static SystemProcess *system_processes;
-static long long system_process_serial;
-static bool system_process_cleanup_installed;
+/* Each thread waits for the children it starts; handles are unique process-wide,
+ * so another thread's handle is never mistaken for one of these children. */
+static MINYAR_NATIVE_THREAD_LOCAL SystemProcess *system_processes;
+static _Atomic long long system_process_serial;
+static _Atomic bool system_process_cleanup_installed;
 static void system_process_cleanup(void) {
     while (system_processes) {
         SystemProcess *next = system_processes->next;
@@ -375,9 +377,8 @@ static long long system_spawn(const MinyarText *path, const MinyarBytes *argumen
     if (!system_vector(arguments, &argv, false) || !system_vector(environment, &envp, true)) goto failed;
     if (system_process_serial == LLONG_MAX) { system_error = EOVERFLOW; goto failed; }
     process = calloc(1, sizeof(*process)); if (!process) { system_error = ENOMEM; goto failed; }
-    if (!system_process_cleanup_installed) {
-        if (atexit(system_process_cleanup)) { system_error = ENOMEM; goto failed; }
-        system_process_cleanup_installed = true;
+    if (!atomic_exchange(&system_process_cleanup_installed, true)) {
+        if (atexit(system_process_cleanup)) { atomic_store(&system_process_cleanup_installed, false); system_error = ENOMEM; goto failed; }
     }
 #ifdef _WIN32
     system_error = credentials || session ? ENOTSUP : system_windows_spawn(process, executable, &argv, &envp, working);
@@ -403,7 +404,7 @@ failed:
     free(groups);
 #endif
     if (system_error) { free(process); return -system_error; }
-    process->handle = ++system_process_serial; process->next = system_processes; system_processes = process;
+    process->handle = atomic_fetch_add(&system_process_serial, 1) + 1; process->next = system_processes; system_processes = process;
     return process->handle;
 }
 

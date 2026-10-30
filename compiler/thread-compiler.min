@@ -251,6 +251,20 @@ function threadNativeAllowed(name: Text, signature: Text): Boolean {
     return false
 }
 
+// Library modules whose C state is per thread (MINYAR_NATIVE_THREAD_LOCAL) or
+// immutable: each thread owns the sockets, files, event loops, syncers and child
+// processes it opens. Handles are Integers; another thread's loop, syncer or child
+// handle is simply not found there.
+function threadNativeModuleAllowed(name: Text, main: Boolean): Boolean {
+    if name.startsWith("minyar_runtime_") { return name != "minyar_runtime_setParallelScheduler" }
+    if name.startsWith("minyar_system_") {
+        // Signal routing and broken-pipe disposition are process-wide: main only.
+        if name == "minyar_system_shutdownSignalSocket" || name == "minyar_system_drainShutdownSignals" || name == "minyar_system_ignoreBrokenPipes" || name == "minyar_system_raiseOpenFileLimit" || name == "minyar_system_setResourceLimit" { return main }
+        return true
+    }
+    return name.startsWith("minyar_net_") || name.startsWith("minyar_files_") || name.startsWith("minyar_unicode_") || name.startsWith("minyar_sha256_") || name.startsWith("minyar_deflate_") || name.startsWith("minyar_aes_") || name.startsWith("minyar_securecrypto_") || name.startsWith("minyar_completionio_") || name.startsWith("minyar_integer_overflow_")
+}
+
 function threadNativeSetupAllowed(name: Text, signature: Text): Boolean {
     if name == "minyar_erofs_directoryStatus" { return signature == "8(2,2,1,1,1)" }
     if name == "minyar_erofs_layersStatus" { return signature == "8(8,2,1,1,1)" }
@@ -367,9 +381,13 @@ function threadCheckGraph(output: List<Text>, globals: List<Text>) {
             i = i + 1
         }
         let seen: List<Text> = []
+        // parents[k] is the pending index that reached pending[k], or -1 for a root.
+        let parents: List<Integer> = []
+        while parents.length < pending.length { parents.add(-1) }
         let cursor = 0
         while cursor < pending.length {
             let caller = pending[cursor]
+            let current = cursor
             cursor = cursor + 1
             if findText(seen, caller) < 0 {
                 seen.add(caller)
@@ -381,14 +399,15 @@ function threadCheckGraph(output: List<Text>, globals: List<Text>) {
                         let allowed = true
                         if kind == "call" || kind == "spawn" {
                             if threadManagedGetter(name, metadata) && pass == 1 { allowed = false }
-                            pending.add(name)
+                            pending.add(name); parents.add(current)
                         } else if kind == "recovery" {
                             allowed = pass == 0
-                        } else if kind == "indirect" && (name == "closure creation" || name == "callback call") {
-                            allowed = pass == 0
-                            pending.add("callback")
+                        } else if kind == "indirect" && (name == "closure creation" || name == "callback call" || name == "function value") {
+                            // Every closure body and function value is checked as "callback",
+                            // under the rules of the pass that reached it.
+                            pending.add("callback"); parents.add(current)
                         } else if kind == "native" {
-                            allowed = threadNativeAllowed(name, signatures[i])
+                            allowed = threadNativeAllowed(name, signatures[i]) || threadNativeModuleAllowed(name, pass == 0)
                             if pass == 0 && nativeSetup { allowed = allowed || threadNativeSetupAllowed(name, signatures[i]) }
                         } else if kind == "builtin" {
                             allowed = threadBuiltinAllowed(name)
@@ -406,7 +425,7 @@ function threadCheckGraph(output: List<Text>, globals: List<Text>) {
                         if !allowed && kind == "native" && name.length > 11 && name.slice(0, 11) == "minyar_dma_" {
                             failCompiler("serialized boot-CPU DMA cannot be reached from thread or parallel execution: '" + readableDeclarationName(caller) + "' uses " + name)
                         }
-                        if !allowed { failCompiler("unsafe thread effect in '" + readableDeclarationName(caller) + "': " + kind + " '" + name + "' " + signatures[i]) }
+                        if !allowed { failCompiler("unsafe thread effect in '" + readableDeclarationName(caller) + "': " + kind + " '" + name + "' " + signatures[i] + threadEffectPath(pending, parents, current)) }
                     }
                     i = i + 1
                 }
@@ -414,6 +433,26 @@ function threadCheckGraph(output: List<Text>, globals: List<Text>) {
         }
         pass = pass + 1
     }
+}
+
+// ", reached from thread 'worker' through 'a', 'b'" for a finding below a root.
+function threadEffectPath(pending: List<Text>, parents: List<Integer>, index: Integer): Text {
+    if parents[index] < 0 { return "" }
+    let chain: List<Text> = []
+    let at = parents[index]
+    while at >= 0 { chain.add(pending[at]); at = parents[at] }
+    let root = readableDeclarationName(chain[chain.length - 1])
+    let path = ", reached from '" + root + "'"
+    if chain.length > 1 {
+        path = path + " through"
+        let k = chain.length - 2
+        while k >= 0 {
+            path = path + " '" + readableDeclarationName(chain[k]) + "'"
+            if k > 0 { path = path + "," }
+            k = k - 1
+        }
+    }
+    return path
 }
 
 function threadAppendABI(output: List<Text>, globals: List<Text>, names: List<Text>, kinds: List<Integer>, results: List<Integer>, recoverable: Boolean, lookup: List<Integer>) {

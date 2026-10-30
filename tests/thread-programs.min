@@ -1,0 +1,44 @@
+// Thread programs whose threads own their sockets, files and event loops (PAR-1).
+// Fixtures run at O0 and O2 on the threaded runtime with exact ownership checks;
+// rejections keep the effect graph honest for unreviewed native code.
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+use "system" as system
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+frontend.runtimeFlags = ["-DMINYAR_THREADED=1", "-DMINYAR_SYSTEM_HEAP=1"]
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", frontend.compiler.directory + "/root", 10).output)[0]
+// Native modules built as the launcher builds them for a thread program.
+let natives: List<Text> = []
+for name in ["net", "files", "system"] {
+    let wrapper = frontend.compiler.directory + "/threaded-" + name + ".c"
+    io.writeTextFile(wrapper, "#define MINYAR_THREADED 1\n#include \"" + root + "/runtime/native/" + name + ".c\"\n")
+    natives.add(wrapper)
+}
+let levels = ["-O0", "-O2"]
+
+frontend.sources = natives
+fixtures.executes(frontend, io.readTextFile("tests/thread-programs/owned-io.min"), "worker 1 wrote this\nworker 2 wrote this\nworker 3 wrote this\n57\n", levels, 0, "", true)
+print("owned-io: passed")
+frontend.sources = []
+fixtures.executes(frontend, io.readTextFile("tests/thread-programs/callbacks.min"), "1505\n1806\n6\n", levels, 0, "", true)
+print("callbacks: passed")
+
+let entry = "thread function worker(seed: Integer, unused: FrozenBytes, done: BytesChannel): Integer {\n    BODY\n}\nlet thread = startThread(worker, 1, freezeBytes(Bytes(0)), bytesChannel(0, 1))\nprint(joinThread(thread))\nMAIN\n"
+function program(entry: Text, body: Text, main: Text): Text { return test.replace(test.replace(entry, "BODY", body), "MAIN", main) }
+
+// Process-wide signal routing stays on main; a thread may not take it over.
+frontend.sources = natives
+fixtures.executes(frontend, "use \"system\" as system\n" + program(entry, "return seed", "print(system.ignoreBrokenPipes() >= 0)"), "1\ntrue\n", levels, 0, "", true)
+frontend.sources = []
+fixtures.rejects(frontend, "use \"system\" as system\n" + program(entry, "return system.shutdownSignalSocket()", ""), "unsafe thread effect in 'shutdownSignalSocket': native 'minyar_system_shutdownSignalSocket' 1(), reached from 'worker'", true)
+// Unreviewed native code is rejected on threads and on main.
+fixtures.rejects(frontend, "function secret(): Integer { native \"test\" }\n" + program(entry, "return secret()", ""), "unsafe thread effect in 'secret': native 'minyar_test_secret' 1(), reached from 'worker'", true)
+fixtures.rejects(frontend, "function secret(): Integer { native \"test\" }\n" + program(entry, "return seed", "print(secret())"), "unsafe thread effect in 'secret': native 'minyar_test_secret' 1(), reached from 'main'", true)
+// Closure bodies anywhere are checked when a thread can call closures.
+fixtures.rejects(frontend, "use \"system\" as system\n" + program(entry, "let f = function(): Integer { return seed }\n    return f()", "let g = function(): Integer { return system.shutdownSignalSocket() }\nprint(g())"), "native 'minyar_system_shutdownSignalSocket' 1(), reached from 'worker' through 'callback'", true)
+fixtures.rejects(frontend, "use \"system\" as system\nfunction signals(): Integer { return system.shutdownSignalSocket() }\nfunction pick(f: () -> Integer): Integer { return f() }\n" + program(entry, "return pick(signals)", ""), "native 'minyar_system_shutdownSignalSocket' 1(), reached from 'worker' through 'callback', 'signals'", true)
+print("rejections: passed")
+test.removeTree(frontend.compiler.directory)
+print("Thread programs: passed")

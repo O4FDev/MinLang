@@ -61,7 +61,7 @@ MinyarBytes *minyar_unicode_unicodeBoundaries(const MinyarText *source) {
 }
 
 #ifdef MINYAR_UNICODE_NORMALIZATION_TESTING
-static unsigned long long unicode_ordering_work;
+static MINYAR_NATIVE_THREAD_LOCAL unsigned long long unicode_ordering_work;
 void minyar_unicode_normalization_reset_work(void) { unicode_ordering_work = 0; }
 unsigned long long minyar_unicode_normalization_ordering_work(void) { return unicode_ordering_work; }
 #define UNICODE_ORDER_WORK(count) (unicode_ordering_work += (unsigned long long)(count))

@@ -79,9 +79,10 @@ typedef struct {
     NetLoop *loop;
     uint32_t generation;
 } NetLoopSlot;
-static NetLoopSlot *net_loop_slots;
-static size_t net_loop_slot_count, net_loop_slot_capacity;
-static uint64_t net_loop_registration_generation;
+/* Each thread owns the event loops it creates (see MINYAR_NATIVE_THREAD_LOCAL). */
+static MINYAR_NATIVE_THREAD_LOCAL NetLoopSlot *net_loop_slots;
+static MINYAR_NATIVE_THREAD_LOCAL size_t net_loop_slot_count, net_loop_slot_capacity;
+static MINYAR_NATIVE_THREAD_LOCAL uint64_t net_loop_registration_generation;
 
 static uint64_t net_loop_now(void) {
 #ifdef _WIN32

@@ -37,7 +37,7 @@
 #include <sys/vfs.h>
 #endif
 
-static int files_last_error; /* negative errno of the last Bytes-returning call, 0 on success */
+static MINYAR_NATIVE_THREAD_LOCAL int files_last_error; /* negative errno of the last Bytes-returning call, 0 on success */
 
 /* fdatasync where it exists; macOS needs F_FULLFSYNC to reach stable storage. */
 static int files_fullsync(int fd);
@@ -629,13 +629,20 @@ typedef struct {
     int notify_read, notify_write;
 } FilesSyncer;
 
-static FilesSyncer *files_syncers[FILES_MAX_SYNCERS];
-static uint64_t files_syncer_generations[FILES_MAX_SYNCERS];
+/* Each thread owns the syncers it starts: its table is allocated on first use and
+ * freed when its last syncer stops. Generations come from one process-wide
+ * counter, so a stale handle never names a later syncer, in any thread. */
+typedef struct {
+    FilesSyncer *slots[FILES_MAX_SYNCERS];
+    int live;
+} FilesSyncerTable;
+static MINYAR_NATIVE_THREAD_LOCAL FilesSyncerTable *files_syncer_table;
+static _Atomic uint64_t files_syncer_serial;
 
 static FilesSyncer *files_syncer(long long handle) {
-    if (handle <= 0 || !(handle & 1)) return NULL;
+    if (handle <= 0 || !(handle & 1) || !files_syncer_table) return NULL;
     uint64_t identity = (uint64_t)handle / 2;
-    FilesSyncer *s = files_syncers[identity % FILES_MAX_SYNCERS];
+    FilesSyncer *s = files_syncer_table->slots[identity % FILES_MAX_SYNCERS];
     return s && s->used && s->generation == identity / FILES_MAX_SYNCERS ? s : NULL;
 }
 
@@ -693,20 +700,25 @@ static void *files_syncer_main(void *arg) {
 
 static long long files_syncer_start(long long fd, bool full) {
     if (!files_valid_fd(fd)) return -EBADF;
+    if (!files_syncer_table) {
+        files_syncer_table = calloc(1, sizeof(*files_syncer_table));
+        if (!files_syncer_table) return -ENOMEM;
+    }
     int slot = -1;
     for (int i = 0; i < FILES_MAX_SYNCERS; i++)
-        if (!files_syncers[i] && files_syncer_generations[i] <
-            ((uint64_t)LLONG_MAX / 2 - FILES_MAX_SYNCERS) / FILES_MAX_SYNCERS) {
+        if (!files_syncer_table->slots[i]) {
             slot = i;
             break;
         }
     if (slot < 0) return -EMFILE;
+    if (atomic_load(&files_syncer_serial) >= ((uint64_t)LLONG_MAX / 2 - FILES_MAX_SYNCERS) / FILES_MAX_SYNCERS - 1)
+        return -EMFILE;
     /* A closed caller fd must not alias a notification socket allocated here. */
     int dupfd = fcntl((int)fd, F_DUPFD_CLOEXEC, 0);
     if (dupfd < 0) return -errno;
     FilesSyncer *s = calloc(1, sizeof(*s));
     if (!s) { close(dupfd); return -ENOMEM; }
-    uint64_t generation = files_syncer_generations[slot];
+    uint64_t generation = atomic_fetch_add(&files_syncer_serial, 1);
     s->generation = generation;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -735,8 +747,8 @@ static long long files_syncer_start(long long fd, bool full) {
     pthread_attr_destroy(&attr);
     if (error) goto fail_done;
     s->generation = generation + 1;
-    files_syncer_generations[slot] = s->generation;
-    files_syncers[slot] = s;
+    files_syncer_table->slots[slot] = s;
+    files_syncer_table->live++;
     s->used = true;
     return ((long long)(s->generation * FILES_MAX_SYNCERS) + slot) * 2 + 1;
 fail_done:
@@ -931,7 +943,11 @@ long long minyar_files_syncerStop(long long handle) {
     pthread_mutex_destroy(&s->mu);
     pthread_cond_destroy(&s->wake);
     pthread_cond_destroy(&s->done);
-    files_syncers[((uint64_t)handle / 2) % FILES_MAX_SYNCERS] = NULL;
+    files_syncer_table->slots[((uint64_t)handle / 2) % FILES_MAX_SYNCERS] = NULL;
+    if (--files_syncer_table->live == 0) {
+        free(files_syncer_table);
+        files_syncer_table = NULL;
+    }
     free(s);
     return err;
 }
@@ -951,13 +967,16 @@ typedef struct {
     long long length;
     _Atomic int complete, error;
 } FilesPrepare;
-static FilesPrepare files_prepares[FILES_MAX_PREPARES];
+/* Per-thread like syncers. Each job is its own allocation, so a running worker's
+ * pointer stays valid until Stop joins it, whatever happens to its owner's table. */
+static MINYAR_NATIVE_THREAD_LOCAL FilesPrepare *files_prepares[FILES_MAX_PREPARES];
+static _Atomic uint64_t files_prepare_serial;
 static FilesPrepare *files_prepare(long long handle) {
     /* Even handles are prepare jobs; odd handles remain syncers. Cross-kind handles are invalid. */
     if (handle <= 0 || (handle & 1)) return NULL;
     uint64_t identity = (uint64_t)handle / 2 - 1;
-    FilesPrepare *p = &files_prepares[identity % FILES_MAX_PREPARES];
-    return p->used && p->generation == identity / FILES_MAX_PREPARES ? p : NULL;
+    FilesPrepare *p = files_prepares[identity % FILES_MAX_PREPARES];
+    return p && p->used && p->generation == identity / FILES_MAX_PREPARES ? p : NULL;
 }
 static void *files_prepare_main(void *argument) {
     FilesPrepare *p = argument;
@@ -999,19 +1018,21 @@ long long minyar_files_prepareStart(long long fd, long long length) {
     if (flags & O_APPEND) return -EINVAL;
     int slot = -1;
     for (int i=0; i<FILES_MAX_PREPARES; i++)
-        if (!files_prepares[i].used && files_prepares[i].generation <
-            ((uint64_t)LLONG_MAX / 2 - FILES_MAX_PREPARES) / FILES_MAX_PREPARES) { slot=i; break; }
+        if (!files_prepares[i]) { slot=i; break; }
     if (slot < 0) return -EMFILE;
+    if (atomic_load(&files_prepare_serial) >= ((uint64_t)LLONG_MAX / 2 - FILES_MAX_PREPARES) / FILES_MAX_PREPARES - 1)
+        return -EMFILE;
     int dupfd = fcntl((int)fd, F_DUPFD_CLOEXEC, 0);
     if (dupfd < 0) return -errno;
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) { int e=errno; close(dupfd); return -e; }
     int error = files_cloexec_nonblock(sv[0], true);
     if (!error) error = files_cloexec_nonblock(sv[1], true);
-    FilesPrepare *p = &files_prepares[slot];
-    uint64_t generation = p->generation;
     if (error) goto fail_descriptors;
-    memset(p, 0, sizeof(*p)); p->generation=generation;
+    FilesPrepare *p = calloc(1, sizeof(*p));
+    if (!p) { error = -ENOMEM; goto fail_descriptors; }
+    uint64_t generation = atomic_fetch_add(&files_prepare_serial, 1);
+    p->generation=generation;
     p->fd=dupfd; p->length=length; p->notify_read=sv[0]; p->notify_write=sv[1];
     atomic_init(&p->complete, 0); atomic_init(&p->error, 0);
     error = -pthread_mutex_init(&p->mu, NULL);
@@ -1020,12 +1041,13 @@ long long minyar_files_prepareStart(long long fd, long long length) {
     if (error) goto fail_mutex;
     error = -pthread_create(&p->thread, NULL, files_prepare_main, p);
     if (error) goto fail_condition;
-    p->generation=generation+1; p->used=true;
+    p->generation=generation+1; p->used=true; files_prepares[slot]=p;
     return ((long long)p->generation * FILES_MAX_PREPARES + slot + 1) * 2;
 fail_condition:
     pthread_cond_destroy(&p->done);
 fail_mutex:
     pthread_mutex_destroy(&p->mu);
+    free(p);
 fail_descriptors:
     close(dupfd); close(sv[0]); close(sv[1]); return error;
 }
@@ -1073,5 +1095,6 @@ long long minyar_files_prepareStop(long long handle) {
     int error=atomic_load(&p->error);
     close(p->fd); close(p->notify_read); close(p->notify_write);
     pthread_cond_destroy(&p->done); pthread_mutex_destroy(&p->mu); p->used=false;
+    files_prepares[((uint64_t)handle / 2 - 1) % FILES_MAX_PREPARES] = NULL; free(p);
     return error;
 }

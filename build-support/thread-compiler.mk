@@ -80,3 +80,13 @@ ifeq ($(shell uname -s),Linux)
 check check-portable: check-thread-native-regions
 check-sanitize: check-thread-native-regions-sanitize check-thread-native-regions-tsan
 endif
+
+.PHONY: check-thread-programs check-thread-programs-tsan
+check-thread-programs: build/minyarc build/tooling/tests/thread-programs
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/thread-programs
+
+check-thread-programs-tsan: build/minyarc build/tooling/tests/thread-programs
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_LINK_FLAGS="-fsanitize=thread -g" TSAN_OPTIONS=halt_on_error=1 $(SANITIZER_LIMITED) ./build/tooling/tests/thread-programs
+
+check check-portable: check-thread-programs
+check-sanitize: check-thread-programs-tsan

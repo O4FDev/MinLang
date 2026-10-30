@@ -1919,6 +1919,76 @@ callbacks. This first slice supports macOS and Linux; task workers cannot create
 descendant task scopes. See [Tasks that come home together](tasks.md) for the
 complete contract, costs and a runnable example.
 
+## Threads
+
+A `thread function` runs on its own operating-system thread with its own
+managed heap. Lists, Maps, Text, records and closures created on a thread
+belong to that thread; reference counting stays local and non-atomic, so no
+managed object is ever shared. Values cross between threads only through the
+thread values below.
+
+```minyar
+use "net" as net
+
+thread function worker(port: Integer, unused: FrozenBytes, done: BytesChannel): Integer {
+    let connection = net.connect("127.0.0.1", port)
+    let sent = net.send(connection, Bytes("hello from a thread"))
+    net.close(connection)
+    return sent
+}
+
+let listener = net.listen("127.0.0.1", 0, 8)
+let thread = startThread(worker, net.localPort(listener), freezeBytes(Bytes(0)), bytesChannel(0, 1))
+if net.ready(listener, 5000) { net.close(net.accept(listener)) }
+print(joinThread(thread)) // 19
+```
+
+An entry takes an Integer seed, a `FrozenBytes` (or a `NativeRegion`/`NativeRegions`
+capability) and a `BytesChannel` or `FrozenBytesChannel`, and returns Integer or
+Nothing. `startThread(entry, seed, input, channel)` starts it and
+`joinThread(thread)` waits for its result. `startThreadResult` and
+`joinThreadResult` return a Result-like value (`ok`, `code`, then `thread` or
+`value`) instead of stopping when the system cannot start or join a thread.
+`main` and every thread entry join the threads they started, and still running,
+before they return.
+
+- `freezeBytes(bytes)` copies Bytes into an immutable `FrozenBytes` that every
+  thread may read (`length`, `getUInt8`, `getInt64`); `freezeBytesTake` moves
+  the buffer instead, leaving the original empty, and `copyFrozenBytes` makes an
+  ordinary Bytes copy.
+- `bytesChannel(maxBytes, maxMessages)` is a bounded queue that any number of
+  threads may send to and receive from. `sendBytes(channel, bytes)` moves the
+  buffer into the queue (the sender's Bytes become empty) and waits for room;
+  `receiveBytes(channel, into)` waits for a message and replaces `into` with it,
+  returning false once the channel is closed and empty. `trySendBytes` and
+  `tryReceiveBytes` never wait (`tryReceiveBytes` returns 1 for a message, 0 when
+  empty and 2 when closed), and `closeBytesChannel` wakes every waiter.
+  `frozenBytesChannel` does the same for FrozenBytes, sharing rather than moving.
+
+A thread owns the handles it opens. Threads may use `net`, `eventloop`, `files`,
+`io`, `process`, `system`, `random`, `text`, `json`, `unicode` and the hashing,
+compression and cryptography modules. Each thread has its own event loops, file
+syncers and preparation jobs, child processes and last-error values: a loop or
+syncer handle from another thread is not found, as if it had been closed.
+Sockets and files are operating-system descriptors, so a program can accept a
+connection on one thread and hand its Integer to another, which then owns it.
+Process-wide settings — `system.shutdownSignalSocket`,
+`system.drainShutdownSignals`, `system.ignoreBrokenPipes` and resource limits —
+stay on `main`. Closures and function values work on every thread; their bodies
+are checked like the code that can call them.
+
+The compiler checks every effect a thread can reach. A thread that could reach a
+module constant holding managed data, native code outside the modules above, a
+raw machine address or `exit` is rejected with the path that reaches it:
+
+```text
+error: unsafe thread effect in 'secret': native 'minyar_test_secret' 1(), reached from 'worker'
+```
+
+Programs that start threads link a thread-aware runtime whose ownership state
+is per thread. Programs without threads keep the ordinary runtime and pay
+nothing.
+
 ## Parallel ranges
 
 `parallel for` gives each iteration its own slot in an existing `Bytes` or a

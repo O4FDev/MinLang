@@ -135,7 +135,7 @@ static void setup(const char *kind, int failure) {
     if (!strcmp(kind, "create")) create_fail = 1;
     assert(minyar_files_syncerStart(fd) == (!strcmp(kind, "fd") ? -EACCES : -EAGAIN));
     assert(descriptors() == before && mutex_live == 0 && condition_live == 0);
-    for (int i = 0; i < FILES_MAX_SYNCERS; i++) assert(!files_syncers[i]);
+    for (int i = 0; i < FILES_MAX_SYNCERS; i++) assert(!files_syncer_table || !files_syncer_table->slots[i]);
     valid_retry(fd); close(fd);
 }
 static void listing(int mode) {

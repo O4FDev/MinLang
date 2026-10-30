@@ -34,8 +34,8 @@ typedef struct {
     struct sockaddr_storage source;
     socklen_t source_length;
 } NetUdpOffload;
-static NetUdpOffload *udp_offload_slots;
-static size_t udp_offload_count, udp_offload_capacity;
+static MINYAR_NATIVE_THREAD_LOCAL NetUdpOffload *udp_offload_slots;
+static MINYAR_NATIVE_THREAD_LOCAL size_t udp_offload_count, udp_offload_capacity;
 static NetUdpOffload *udp_offload_find(long long handle) {
     if (handle >= -1 || handle == LLONG_MIN)
         return NULL;
