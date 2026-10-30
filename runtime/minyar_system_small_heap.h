@@ -156,7 +156,7 @@ static inline void *rc_system_resize(void *pointer, size_t old_bytes, size_t byt
     return resized;
 }
 
-#if MINYAR_THREADED
+#if MINYAR_THREADED && !defined(MINYAR_MAP_CYCLE_RUNTIME)
 /* A detached set of small pages: a join branch stolen by a pool worker
  * allocates on fresh pages and hands them, with the live result, to the
  * joining thread, which adopts them as its own. */
