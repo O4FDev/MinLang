@@ -1692,9 +1692,10 @@ copy or a JSON tree. The compatibility Response keeps its five-field native
 layout, including status zero and error text on failure.
 `fetchTrusting` and `sendTrusting` take the same limit and timeout plus a list of
 DER root certificates that replaces the OS roots (an empty list keeps them).
-`tls.pemCertificates(bundle)` decodes a PEM CA bundle, and
-`http.environmentTrust()` returns the certificates of the file `SSL_CERT_FILE`
-names, or an empty list when it is unset. `tls.clientWithTrust` accepts up to
+`pem.certificates(bundle)` (also `tls.pemCertificates`) decodes a PEM CA
+bundle, and `http.trustBundle(path)` reads one, so
+`http.trustBundle(system.getenv("SSL_CERT_FILE"))` honours `SSL_CERT_FILE`
+(an empty path keeps the OS roots). `tls.clientWithTrust` accepts up to
 4096 anchors (16 MiB), so a whole bundle is one trust store; on macOS a
 trusting request uses its own NSURLSession.
 

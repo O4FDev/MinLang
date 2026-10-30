@@ -1,0 +1,83 @@
+// PEM: the base64 text form of DER certificates, as in CA bundle files (SSL_CERT_FILE).
+use "errors" as errors
+
+/// Decode the DER certificates of a PEM bundle (the `-----BEGIN CERTIFICATE-----` blocks of, for example, the
+/// file SSL_CERT_FILE names), in order, for `tls.clientWithTrust` or `http.fetchTrusting`. Text outside the blocks and
+/// other block types are skipped; a malformed certificate block or a bundle without one is an invalid-data error.
+///
+/// ```minyar
+/// let bundle = Bytes("comment\n-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n")
+/// match api.certificates(bundle) {
+///     Ok(certificates) { print(certificates.length); print(certificates[0].length) }
+///     Err(problem) { print(problem.describe()) }
+/// }
+/// ```
+/// ```output
+/// 1
+/// 5
+/// ```
+public function certificates(bundle: Bytes): Result<List<Bytes>, errors.Error> {
+    let begin = Bytes("-----BEGIN CERTIFICATE-----")
+    let end = Bytes("-----END CERTIFICATE-----")
+    let found: List<Bytes> = []
+    let at = 0
+    while true {
+        let start = pemFind(bundle, begin, at)
+        if start < 0 { break }
+        let stop = pemFind(bundle, end, start + begin.length)
+        if stop < 0 { return Err(errors.make(errors.invalidDataCode(), 0, "unterminated PEM certificate block")) }
+        let der = pemBase64(bundle, start + begin.length, stop)
+        if der.length == 0 { return Err(errors.make(errors.invalidDataCode(), 0, "invalid base64 in PEM certificate " + Text(found.length + 1))) }
+        found.add(der)
+        at = stop + end.length
+    }
+    if found.length == 0 { return Err(errors.make(errors.invalidDataCode(), 0, "no PEM certificate blocks")) }
+    return Ok(found)
+}
+function pemFind(data: Bytes, needle: Bytes, from: Integer): Integer {
+    let at = from
+    while at + needle.length <= data.length {
+        if data[at] == needle[0] {
+            let same = true
+            for index in 1..needle.length { if data[at + index] != needle[index] { same = false; break } }
+            if same { return at }
+        }
+        at += 1
+    }
+    return -1
+}
+function pemSextet(byte: Integer): Integer {
+    if byte >= 65 && byte <= 90 { return byte - 65 }
+    if byte >= 97 && byte <= 122 { return byte - 71 }
+    if byte >= 48 && byte <= 57 { return byte + 4 }
+    if byte == 43 { return 62 }
+    if byte == 47 { return 63 }
+    return -1
+}
+// Standard base64 between two offsets, ignoring whitespace; empty Bytes when malformed.
+function pemBase64(data: Bytes, from: Integer, to: Integer): Bytes {
+    let out = Bytes()
+    let bits = 0
+    let count = 0
+    let padding = 0
+    for index in from..to {
+        let byte = data[index]
+        if byte == 32 || byte == 9 || byte == 10 || byte == 13 { continue }
+        if byte == 61 { padding += 1; continue }
+        let value = pemSextet(byte)
+        if value < 0 || padding > 0 { return Bytes() }
+        bits = (bits << 6) | value
+        count += 1
+        if count == 4 {
+            out.add((bits >> 16) & 255)
+            out.add((bits >> 8) & 255)
+            out.add(bits & 255)
+            bits = 0
+            count = 0
+        }
+    }
+    if count == 1 || padding > 2 || (count > 0 && count + padding != 4) || (count == 0 && padding > 0) { return Bytes() }
+    if count == 2 { out.add((bits >> 4) & 255) }
+    if count == 3 { out.add((bits >> 10) & 255); out.add((bits >> 2) & 255) }
+    return out
+}
