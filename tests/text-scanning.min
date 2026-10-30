@@ -5,8 +5,8 @@ use "io" as io
 // Text scanning without intermediate objects, at O0 and O2 under the exact
 // ownership-debt runtime, with the LLVM shapes that make it so:
 // `for piece in text.split(separator)` scans in place (no List, one reused
-// view while the body keeps nothing), and Text length and indexing read the
-// header inline.
+// view while the body keeps nothing), Integer(text.slice(a, b)) parses the
+// range without a slice, and Text length and indexing read the header inline.
 
 function functionBody(llvm: Text, name: Text): Text {
     let body: List<Text> = []
@@ -219,6 +219,40 @@ test.check(test.contains(indexLLVM, "!\"minyar text header\"") && test.contains(
 test.require(test.run([frontend.compiler.clang, "-O2", "-S", "-emit-llvm", "-Wno-override-module", frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll", "-o", frontend.compiler.directory + "/count.opt.ll"], frontend.environment, "", frontend.compiler.directory + "/count.opt", 60), "optimise the Text scanning loop")
 let optimised = io.readTextFile(frontend.compiler.directory + "/count.opt.ll")
 test.check(!test.contains(optimised, "@.minyar.text.character(") && test.contains(optimised, "call i32 @minyar_text_character_at("), "the inline read keeps the runtime only on its slow path")
+
+// Integer(text.slice(start, end)) parses in place, with the slice's bounds
+// check and Integer's parse errors, at Unicode positions too.
+fixtures.executes(frontend, #"""
+    function field(line: Text, start: Integer, end: Integer): Integer { return Integer(line.slice(start, end)) }
+    let line = "id=  -42 ;ü=+7;big=9223372036854775807"
+    print(field(line, 3, 8))
+    print(Integer(line.slice(12, 14)))
+    print(Integer(line.slice(19, line.length)) - 1)
+    let text = "x123y"
+    let start = 1
+    let total = 0
+    for end in 2..5 { total += Integer(text.slice(start, end)) }
+    print(total)
+    """#, "-42\n7\n9223372036854775806\n136\n", levels, 0, "", true)
+fixtures.executes(frontend, "let t = \"12\"\nprint(Integer(t.slice(1, 3)))\n", "", levels, 1, "Minyar stopped: a Text slice must stay within the Text and end after it starts.\n", false)
+fixtures.executes(frontend, "let t = \"1 2\"\nprint(Integer(t.slice(0, 3)))\n", "", levels, 1, "Minyar stopped: Integer(Text) requires a signed decimal ASCII integer.\n", false)
+fixtures.executes(frontend, "let t = \"a b\"\nprint(Integer(t.slice(1, 2)))\n", "", levels, 1, "Minyar stopped: Integer(Text) requires a signed decimal ASCII integer.\n", false)
+fixtures.executes(frontend, "let t = \"99999999999999999999\"\nprint(Integer(t.slice(0, 20)))\n", "", levels, 1, "Minyar stopped: Integer(Text) is outside the signed 64-bit range.\n", false)
+fixtures.executes(frontend, #"""
+    function direct(text: Text): Integer { return Integer(text.slice(1, 3)) }
+    function kept(text: Text): Integer {
+        let piece = text.slice(1, 3)
+        return Integer(piece) + piece.length
+    }
+    print(direct("a12b"))
+    print(kept("a12b"))
+    """#, "12\n14\n", levels, 0, "", true)
+let slicePath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let sliceLLVM = io.readTextFile(slicePath + ".ll")
+let directSlice = functionBody(sliceLLVM, "direct")
+test.check(test.contains(directSlice, "call i64 @minyar_text_integer_range(") && !test.contains(directSlice, "@minyar_text_slice(") && !test.contains(directSlice, "@minyar_rc_"), "Integer of a slice must parse the range without a slice")
+let keptSlice = functionBody(sliceLLVM, "kept")
+test.check(test.contains(keptSlice, "@minyar_text_slice(") && test.contains(keptSlice, "@minyar_text_integer(") && !test.contains(keptSlice, "@minyar_text_integer_range("), "a stored slice is still a Text")
 
 test.removeTree(frontend.compiler.directory)
 print("Text scanning: passed")

@@ -126,6 +126,26 @@ function typePairOf(type: Integer): List<Integer> {
     return pair
 }
 
+// The first piece of `value = text.slice(start, end)` when that call made the
+// value and its owned result is consumed here: the keep is dropped, and the
+// caller reads the operands at +3, +5 and +7 and clears the nine call pieces.
+// -1 leaves everything in place.
+function textSliceArgument(output: List<Text>, state: List<Integer>, value: Text, owner: Integer): Integer {
+    if owner < 9 || owner + 3 != output.length { return -1 }
+    let start = owner - 9
+    if output[start] != "  " || output[start + 1] != value || output[start + 2] != " = call ptr @minyar_text_slice(ptr " || output[start + 8] != ")\n" { return -1 }
+    if !takeOwner(output, state, value, owner) { return -1 }
+    return start
+}
+
+function clearPieces(output: List<Text>, start: Integer, end: Integer) {
+    let piece = start
+    while piece < end {
+        output[piece] = ""
+        piece = piece + 1
+    }
+}
+
 function emitInstruction(output: List<Text>, textState: List<Text>, state: List<Integer>, instruction: Text): Text {
     let value = valueName(textState, newTemporary(state))
     output.add("  ")
@@ -404,6 +424,7 @@ function parseCall(context: CompilerContext, localNames: List<Text>, localTypes:
     }
     let argumentValues: List<Text> = []
     let argumentTypes: List<Integer> = []
+    let argumentOwners: List<Integer> = []
     let argumentType: List<Integer> = [0]
     let firstArgumentLocation = state[0]
     while !tokenIs(tokenKinds, tokenTexts, state, ")") {
@@ -426,6 +447,7 @@ function parseCall(context: CompilerContext, localNames: List<Text>, localTypes:
         }
         argumentValues.add(parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType))
         argumentTypes.add(argumentType[0])
+        if argumentType.length > 1 { argumentOwners.add(argumentType[1]) } else { argumentOwners.add(-1) }
         if isTestExpectation(name) && isReferenceType(argumentType[0]) {
             borrowReference(output, state, argumentValues[argumentValues.length - 1], argumentType[0], functionParameterCounts, functionParameterTypes, functionReturnTypes)
         }
@@ -562,9 +584,19 @@ function parseCall(context: CompilerContext, localNames: List<Text>, localTypes:
                     setType(resultType, 2)
                 } else {
                 if isNumericBuiltin(name) {
+                    let range = -1
+                    if name == "Integer" && argumentTypes.length == 1 && argumentTypes[0] == 2 { range = textSliceArgument(output, state, argumentValues[0], argumentOwners[0]) }
+                    if range >= 0 {
+                        // Integer(text.slice(start, end)) parses the range in place.
+                        setType(resultType, 1)
+                        appendTextRuntimeDeclaration(globals, "minyar_text_integer_range", 1, [2, 1, 1])
+                        value = emitCall(output, textState, state, 1, "minyar_text_integer_range", [output[range + 3], output[range + 5], output[range + 7]], [2, 1, 1])
+                        clearPieces(output, range, range + 9)
+                    } else {
                     value = emitNumericBuiltin(context, callLocation, output, textState, state, name, argumentValues, argumentTypes, resultType)
                     if name == "Integer" && argumentTypes.length == 1 && argumentTypes[0] == 2 {
                         appendTextRuntimeDeclaration(globals, "minyar_text_integer", 1, [2])
+                    }
                     }
                 } else {
                     let functionIndex = state[5]

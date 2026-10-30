@@ -299,30 +299,45 @@ MinyarText *minyar_text_trim(MinyarText *text) {
 static _Bool integer_ascii_space(unsigned char byte) {
     return byte == ' ' || (byte >= '\t' && byte <= '\r');
 }
-long long minyar_text_integer(MinyarText *text) {
-    ensure_text_index(text);
-    long long start = 0, end = text->byte_length;
-    while (start < end && integer_ascii_space(text->bytes[start])) start++;
-    while (end > start && integer_ascii_space(text->bytes[end - 1])) end--;
-    _Bool negative = start < end && text->bytes[start] == '-';
-    if (start < end && (text->bytes[start] == '-' || text->bytes[start] == '+')) start++;
+/* Integer(Text) over bytes [start, end) of `bytes`. */
+static long long text_integer_bytes(const unsigned char *bytes, long long start, long long end) {
+    while (start < end && integer_ascii_space(bytes[start])) start++;
+    while (end > start && integer_ascii_space(bytes[end - 1])) end--;
+    _Bool negative = start < end && bytes[start] == '-';
+    if (start < end && (bytes[start] == '-' || bytes[start] == '+')) start++;
     if (start == end) minyar_stop_program("Integer(Text) requires a signed decimal ASCII integer.");
     unsigned long long value = 0, limit = (unsigned long long)LLONG_MAX + negative;
     /* Eighteen digits always fit, so only later digits need the range check. */
     long long i = start, unchecked = end - start > 18 ? start + 18 : end;
     for (; i < unchecked; i++) {
-        unsigned digit = (unsigned)text->bytes[i] - '0';
+        unsigned digit = (unsigned)bytes[i] - '0';
         if (digit > 9) minyar_stop_program("Integer(Text) requires a signed decimal ASCII integer.");
         value = value * 10 + digit;
     }
     for (; i < end; i++) {
-        unsigned digit = (unsigned)text->bytes[i] - '0';
+        unsigned digit = (unsigned)bytes[i] - '0';
         if (digit > 9) minyar_stop_program("Integer(Text) requires a signed decimal ASCII integer.");
         if (value > (limit - digit) / 10) minyar_stop_program("Integer(Text) is outside the signed 64-bit range.");
         value = value * 10 + digit;
     }
     if (negative && value == (unsigned long long)LLONG_MAX + 1) return LLONG_MIN;
     return negative ? -(long long)value : (long long)value;
+}
+long long minyar_text_integer(MinyarText *text) {
+    ensure_text_index(text);
+    return text_integer_bytes(text->bytes, 0, text->byte_length);
+}
+/* Integer(text.slice(start, end)) without the slice: the same bounds check
+ * and stop as the slice, then the same parse over its bytes. */
+long long minyar_text_integer_range(MinyarText *text, long long start, long long end) {
+    ensure_text_index(text);
+    if (start < 0 || end < start || end > text->character_length)
+        slice_outside_text();
+    if (text->character_offsets) {
+        long long first = indexed_byte_offset(text, start);
+        return text_integer_bytes(text->bytes, first, indexed_byte_offset(text, end));
+    }
+    return text_integer_bytes(text->bytes, start, end);
 }
 
 /* JSON scanning helpers for library/json.min. Positions are scalar offsets.
