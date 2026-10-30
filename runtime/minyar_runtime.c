@@ -1501,6 +1501,7 @@ MinyarText *minyar_interpolate(long long count, ...) {
 #include "minyar_thread_transfer.h"
 #include "minyar_thread_atomics.h"
 #include "minyar_threads.h"
+#include "minyar_join_tasks.h"
 #include "minyar_native_regions.h"
 #endif
 

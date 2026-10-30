@@ -2303,13 +2303,55 @@ for i in 0..100000 { values.add(i) }
 print(total(values, 0, values.length)) // 4999950000
 ```
 
-Both functions must be pure parallel functions returning Integer, Float,
-Boolean or Character. Arguments are those scalars or scalar buffers, which
-both calls may read at once, so neither function may write a buffer it receives
-from a join. `join` works in ordinary functions, in parallel functions and in
-`parallel for` bodies; recoverable execution runs the two calls in order. Use a
-cutoff, as above: each join costs a few atomic operations, so the work below it
-should be at least a few microseconds.
+When both functions are pure parallel functions returning Integer, Float,
+Boolean or Character, and the arguments are those scalars or scalar buffers,
+both calls may read the buffers at once, so neither function may write a buffer
+it receives from a join. Such a join works in ordinary functions, in parallel
+functions and in `parallel for` bodies; recoverable execution runs the two
+calls in order. Use a cutoff, as above: each join costs a few atomic
+operations, so the work below it should be at least a few microseconds.
+
+Outside parallel functions and `parallel for` bodies, either call may also name
+an ordinary function. Its body may create and read records, Text, Lists and
+Maps and call other ordinary functions; its parameters and result must be
+sendable, as for a thread entry (Integer, Float, Boolean, Character, enums,
+Text, Bytes, Lists and plain records of those, `FrozenBytes`, channels and
+atomic cells):
+
+```minyar
+record Sale { id: Integer; region: Text }
+
+function build(first: Integer, after: Integer): List<Sale> {
+    let sales: List<Sale> = []
+    for id in first..after { sales.add(Sale { id: id; region: "r" + Text(id % 4) }) }
+    return sales
+}
+
+function buildAll(first: Integer, after: Integer): List<Sale> {
+    if after - first <= 1000 { return build(first, after) }
+    let middle = first + (after - first) / 2
+    let left, right = join(buildAll(first, middle), buildAll(middle, after))
+    for sale in right { left.add(sale) }
+    return left
+}
+
+let sales = buildAll(0, 10000)
+print(sales.length)      // 10000
+print(sales[9999].region) // r3
+```
+
+Each call runs with its own managed heap, on whichever thread takes it: the
+joining thread, or a pool worker that stole it. Values it creates belong to
+that heap and reference counting stays non-atomic. Scalar arguments are passed
+as they are. Text, Bytes, List and record arguments are copied into the call
+once when the join starts, so a call owns what it receives and the caller keeps
+its own values, as with `startThread`; pass index ranges or `FrozenBytes` rather
+than large Lists. Results move to the caller: a call that ran on the joining
+thread hands its value over without copying, which is always the case with
+`MINYAR_PARALLEL_THREADS=1`, and a call that ran on another worker is copied
+back once. Each call is checked like a thread entry: it cannot reach module
+globals holding managed values, `exit`, or native code that threads may not
+use. A program with such a join links the thread runtime.
 
 ## Hardware register fields
 

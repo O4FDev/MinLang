@@ -10,15 +10,32 @@ fixtures.executes(frontend, io.readTextFile("tests/parallel-join/fork-join.min")
 print("fork-join: passed")
 
 let pure = "parallel function one(n: Integer): Integer { return n }\n"
-fixtures.rejects(frontend, pure + "function plain(n: Integer): Integer { return n }\nlet a, b = join(one(1), plain(2))\n", "join runs parallel functions; 'plain' is not a parallel function", true)
 fixtures.rejects(frontend, pure + "parallel function many(n: Integer): Integer { return n }\nlet a, b = join(one(1), many(1, 2))\n", "'many' expects 1 arguments", true)
-fixtures.rejects(frontend, pure + "parallel function flag(n: Integer) {}\nlet a, b = join(one(1), flag(2))\n", "join needs 'flag' to return Integer, Float, Boolean or Character", true)
-fixtures.rejects(frontend, pure + "let a, b = join(one(1), 7)\n", "join runs two calls of parallel functions", true)
+fixtures.rejects(frontend, pure + "let a, b = join(one(1), 7)\n", "join runs two function calls", true)
 // Both branches may read a buffer, so a branch that writes it is rejected.
 fixtures.rejects(frontend, pure + "parallel function scribble(data: Bytes): Integer {\n    data[0] = 1\n    return 0\n}\nlet data = Bytes(4)\nlet a, b = join(one(1), scribble(data))\n", "", true)
 // Branches stay pure, as loop bodies do.
 fixtures.rejects(frontend, "use \"machine\" as machine\nparallel function raw(n: Integer): Integer { return machine.load64(n) }\n" + pure + "let a, b = join(one(1), raw(8))\n", "'load64' must be a pure parallel function", true)
 fixtures.rejects(frontend, "let a = minyar_join_second()\n", "join results are bound by let left, right = join(...)", true)
 print("join rejections: passed")
+
+// join over ordinary functions (C1): branches build records, Text, Lists and Maps
+// in the domain of the thread that runs them, on the threaded runtime.
+let threaded = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+threaded.runtimeFlags = ["-DMINYAR_THREADED=1", "-DMINYAR_SYSTEM_HEAP=1"]
+fixtures.executes(threaded, io.readTextFile("tests/parallel-join/managed.min"), "20000 999937 r0 t0\n499950\n3 joinjoin!\n4 3 3\nmoved moved home\n2.5 true\nc true\n9 héllo wörld 🙂\n49 2\n3000 3000\n124716\n", levels, 0, "", true)
+print("managed join: passed")
+let plain = "function plain(n: Integer): Integer { return n }\n"
+fixtures.rejects(threaded, plain + "function flag(n: Integer) {}\nlet a, b = join(plain(1), flag(2))\n", "join needs 'flag' to return a value", true)
+fixtures.rejects(threaded, plain + "function size(m: Map<Text, Integer>): Integer { return m.length }\nlet m: Map<Text, Integer> = Map()\nlet a, b = join(plain(1), size(m))\n", "join branch 'size' parameter 'm' cannot cross threads: Map<Text, Integer> is not sendable", true)
+fixtures.rejects(threaded, plain + "function table(n: Integer): Map<Text, Integer> { return Map() }\nlet a, b = join(plain(1), table(2))\n", "the result of join branch 'table' cannot cross threads: Map<Text, Integer> is not sendable", true)
+fixtures.rejects(threaded, plain + "function call(f: (Integer) -> Integer): Integer { return f(1) }\nlet a, b = join(plain(1), call(plain))\n", "join branch 'call' parameter 'f' cannot cross threads", true)
+// A branch may run on any worker, so its effects are checked like a thread's.
+fixtures.rejects(threaded, plain + "global NAMES: List<Text> = [\"a\"]\nfunction first(n: Integer): Text { return NAMES[n] }\nlet a, b = join(plain(1), first(0))\n", "unsafe thread effect in 'first': constant 'NAMES'", true)
+fixtures.rejects(threaded, "use \"system\" as system\n" + plain + "function signals(n: Integer): Integer { return system.shutdownSignalSocket() + n }\nlet a, b = join(plain(1), signals(2))\n", "unsafe thread effect in 'shutdownSignalSocket': native 'minyar_system_shutdownSignalSocket' 1(), reached from 'signals'", true)
+// Parallel code still joins parallel functions only.
+fixtures.rejects(threaded, plain + pure + "parallel function inside(n: Integer): Integer {\n    let a, b = join(one(n), plain(n))\n    return a + b\n}\nprint(inside(1))\n", "a join in parallel function 'inside' runs parallel functions with scalar results; 'plain' is not one", true)
+print("managed join rejections: passed")
+test.removeTree(threaded.compiler.directory)
 test.removeTree(frontend.compiler.directory)
 print("Parallel join: passed")
