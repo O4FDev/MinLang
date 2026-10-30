@@ -282,6 +282,28 @@ done:
     if (absent) minyar_stop_program("Map key is absent.");
     return result;
 }
+/* map.getOr(key, fallback): one probe; the stored value or the fallback,
+ * borrowed either way like map[key]. */
+long long minyar_map_get_or(const MinyarRecord *map, long long key, long long fallback) {
+    if (minyar_recovery_pending()) return fallback;
+    long long kind = map->values[MAP_KEY_KIND]; key = map_canonical_key(kind, key);
+    size_t recent = map_recent_find(map, kind, key);
+    if (recent != SIZE_MAX) return MAP_VALUE(map_entries(map), recent);
+    MinyarMapReadGuard guard;
+    map_read_begin(&guard, kind >= 1000 ? map : NULL, NULL);
+    long long result = fallback;
+    uint64_t hash = map_hash_key(map, key);
+    if (minyar_recovery_pending()) goto done;
+    size_t bucket = map_find(map, key, hash);
+    if (minyar_recovery_pending()) goto done;
+    if (bucket != SIZE_MAX && MAP_HASH(map_entries(map), bucket)) {
+        result = MAP_VALUE(map_entries(map), bucket);
+        map_remember(map, kind, key, bucket);
+    }
+done:
+    map_read_end(&guard);
+    return result;
+}
 static inline void map_store_reference(MinyarRecord *entries, size_t field, long long value) {
 #ifdef MINYAR_MAP_CYCLE_RUNTIME
     /* Bucket owners are untraced, but their children can be traced. The store

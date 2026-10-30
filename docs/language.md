@@ -626,6 +626,9 @@ enough, or an empty pad, is returned unchanged. `asciiLowercased()` and
 use `unicode.lowercased` and `unicode.uppercased` for full Unicode casing.
 Each call makes at most one exactly sized result; a `replace` without a match
 and a `repeat(1)` return the receiver itself.
+Import `text` for `text.hex(value)`, which spells an Integer in lowercase
+hexadecimal without a prefix (`-ff` for -255); combine it with `padStart` for a
+fixed width.
 
 Text literals can include expressions inside `\(` and `)`:
 
@@ -1289,6 +1292,13 @@ costs time and space proportional to the record fields copied; internal record
 sharing is not preserved. Scalar keys keep their existing storage and are not copied.
 Float keys, including Float fields in record keys, reject NaN and treat signed
 zeros as the same key.
+
+`map[key]` reads a value and stops when the key is absent; `map[key] = value`
+inserts or replaces. `map.has(key)` tests presence, `map.remove(key)` removes a
+key and reports whether it was present, and `map.clear()` empties the Map.
+`map.getOr(key, fallback)` looks the key up once and returns its value, or the
+fallback when it is absent, so `counts[word] = counts.getOr(word, 0) + 1` counts
+without a separate `has`. The fallback is evaluated before the lookup.
 
 `Set<Item>` holds distinct Hashable values:
 
