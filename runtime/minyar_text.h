@@ -100,6 +100,24 @@ _Bool minyar_text_ends_with(MinyarText *text, MinyarText *needle) {
            bytes_are_equal(text->bytes + text->byte_length - needle->byte_length,
                            needle->bytes, (size_t)needle->byte_length);
 }
+/* The first `wanted` byte at or after `start`, or `length`. Split pieces are
+ * usually short: one eight-byte test finds most separators before the call
+ * to memchr. Only the lowest flagged byte is exact, and it is the one used. */
+static inline long long text_byte_find(const unsigned char *bytes, long long start, long long length,
+                                       unsigned char wanted) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if (length - start >= 8) {
+        uint64_t word;
+        memcpy(&word, bytes + start, sizeof(word));
+        word ^= 0x0101010101010101ULL * wanted;
+        uint64_t found = (word - 0x0101010101010101ULL) & ~word & 0x8080808080808080ULL;
+        if (found) return start + (__builtin_ctzll(found) >> 3);
+        start += 8;
+    }
+#endif
+    const unsigned char *hit = memchr(bytes + start, wanted, (size_t)(length - start));
+    return hit ? hit - bytes : length;
+}
 MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
     ensure_text_index(text);
     ensure_text_index(separator);
@@ -113,9 +131,9 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
     /* Pieces are byte ranges between matches. Every piece of ASCII Text is
      * ASCII; other pieces count their scalars once, as their slices record. */
     if (separator->byte_length == 1) {
-        /* Find up to SPLIT_BATCH piece ends with a short inline scan (memchr
-         * for long pieces), reserve them at once, then cut those pieces: one
-         * pass over the bytes, and a line of a few fields grows its List once. */
+        /* Find up to SPLIT_BATCH piece ends, reserve them at once, then cut
+         * those pieces: one pass over the bytes, and a line of a few fields
+         * grows its List once. */
         enum { SPLIT_BATCH = 64 };
         long long ends[SPLIT_BATCH];
         const unsigned char *bytes = text->bytes;
@@ -126,12 +144,7 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
             long long count = 0, scan = start;
             _Bool finished = 0;
             while (count < SPLIT_BATCH) {
-                long long end = scan, limit = length - scan > 16 ? scan + 16 : length;
-                while (end < limit && bytes[end] != wanted) end++;
-                if (end == limit && end < length) {
-                    const unsigned char *found = memchr(bytes + end, wanted, (size_t)(length - end));
-                    end = found ? found - bytes : length;
-                }
+                long long end = text_byte_find(bytes, scan, length, wanted);
                 ends[count++] = end;
                 if (end >= length) { finished = 1; break; }
                 scan = end + 1;
@@ -161,6 +174,97 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
     text_search_free(table, small);
     return parts;
 }
+#ifndef MINYAR_COMPILER_ARENA
+/* A piece kept past its loop iteration that is a small part (under 1/8) of a
+ * large Text (over 4 KiB) gets its own bytes, so keeping a word does not keep
+ * a whole file alive: the rule text_slice_bytes applies when it creates a
+ * slice. Text is immutable, so every owner sees the same contents. */
+static void text_compact_kept_piece(MinyarText *piece) {
+    MinyarText *root = piece->backing;
+    if (!root || root->byte_length <= 4096 ||
+        (unsigned long long)piece->byte_length * 8 >= (unsigned long long)root->byte_length)
+        return;
+    long long length = piece->byte_length;
+    unsigned char *bytes = new_bytes(length);
+    memcpy(bytes, piece->bytes, (size_t)length);
+    bytes[length] = 0;
+    piece->bytes = bytes;
+    piece->backing = NULL;
+    minyar_rc_release(root);
+}
+#endif
+
+/* One step of `for piece in text.split(separator)`, which the compiler lowers
+ * without building the List. *cursor is the byte where the next piece starts
+ * (0 at first) or -1 after the last one. `previous` is the loop's own reference
+ * to the piece it produced last, or NULL. Returns one owned reference to the
+ * next piece, or NULL when none is left; NULL leaves `previous` to the loop.
+ *
+ * Pieces are zero-copy views of the source's owning Text. When the loop holds
+ * the only count of `previous`, nothing can observe that view any more, so it
+ * is re-pointed at the next piece instead of allocating another. A piece the
+ * body kept is left to its owners, compacted as above when the loop moves past
+ * it or finishes. The pieces and their order are exactly those of split. */
+MinyarText *minyar_text_split_next(MinyarText *text, MinyarText *separator, long long *cursor,
+                                   MinyarText *previous) {
+    long long start = *cursor;
+    ensure_text_index(text);
+    ensure_text_index(separator);
+    const unsigned char *bytes = text->bytes;
+    long long length = text->byte_length, end, next;
+    if (start < 0 || (!separator->byte_length && start >= length)) {
+        *cursor = -1;
+#ifndef MINYAR_COMPILER_ARENA
+        if (previous && ((RcObject *)previous - 1)->ownership != (8 | RC_TEXT))
+            text_compact_kept_piece(previous);
+#endif
+        return NULL;
+    }
+    if (!separator->byte_length) {
+        /* One piece per scalar; Text is valid UTF-8, so the lead byte gives its width. */
+        unsigned char lead = bytes[start];
+        end = start + (lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4);
+        next = end;
+    } else if (separator->byte_length == 1) {
+        end = text_byte_find(bytes, start, length, separator->bytes[0]);
+        next = end < length ? end + 1 : -1;
+    } else {
+        long long small[TEXT_SEARCH_SMALL];
+        long long *table = text_search_table(separator, length - start, small);
+        long long match = text_search_next(text, separator, start, table);
+        text_search_free(table, small);
+        end = match >= 0 ? match : length;
+        next = match >= 0 ? match + separator->byte_length : -1;
+    }
+    *cursor = next;
+    long long piece = end - start;
+    long long characters = text->character_offsets ? text_scalar_count(bytes + start, piece) : piece;
+#ifdef MINYAR_COMPILER_ARENA
+    (void)previous;
+    return text_slice_bytes(text, start, end, characters);
+#else
+    MinyarText *root = text->backing ? text->backing : text;
+    long long known = piece == characters ? characters : -1;
+    if (previous) {
+        RcObject *object = (RcObject *)previous - 1;
+        if (object->ownership == (8 | RC_TEXT) && previous->backing == root) {
+            rc_free_data(previous->character_offsets);
+            previous->bytes = bytes + start;
+            previous->byte_length = piece;
+            previous->character_length = known;
+            previous->character_offsets = NULL;
+            object->ownership += 8;
+            return previous;
+        }
+        text_compact_kept_piece(previous);
+    }
+    MinyarText *view = new_text(bytes + start, piece, known);
+    view->backing = root;
+    minyar_rc_retain(root);
+    return view;
+#endif
+}
+
 static _Bool text_white_space(unsigned int scalar) {
     return (scalar >= 0x09 && scalar <= 0x0d) || scalar == 0x20 || scalar == 0x85 ||
            scalar == 0xa0 || scalar == 0x1680 || (scalar >= 0x2000 && scalar <= 0x200a) ||

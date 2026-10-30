@@ -1,0 +1,171 @@
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+use "io" as io
+
+// Text scanning without intermediate objects, at O0 and O2 under the exact
+// ownership-debt runtime, with the LLVM shapes that make it so:
+// `for piece in text.split(separator)` scans in place (no List, one reused
+// view while the body keeps nothing).
+
+function functionBody(llvm: Text, name: Text): Text {
+    let body: List<Text> = []
+    let taking = false
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.moduleFunction(line, name)) { taking = true }
+        if taking {
+            body.add(line + "\n")
+            if line == "}" { return joinText(body) }
+        }
+    }
+    fail("Text scanning LLVM function is missing: " + name)
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let levels = ["-O0", "-O2"]
+
+// Every separator shape, edge pieces, Unicode lengths and indexing.
+fixtures.executes(frontend, #"""
+    function show(text: Text, separator: Text): Text {
+        let pieces: List<Text> = []
+        for piece in text.split(separator) { pieces.add("[" + piece + "]" + Text(piece.length)) }
+        return joinText(pieces, " ")
+    }
+    print(show("a,b,,c", ","))
+    print(show(",lead,trail,", ","))
+    print(show("", ","))
+    print(show("abc", ""))
+    print(show("", ""))
+    print(show("x--y----z", "--"))
+    print(show("aaab", "aab"))
+    print(show("ab", "abc"))
+    print(show("añb,é🙂,ü", ","))
+    print(show("añ🙂b", ""))
+    print(show("1🙂2🙂🙂3", "🙂"))
+    let total = 0
+    for word in "Mïnyar text split".split(" ") { total += word.length; print(word[1]) }
+    print(total)
+    """#, "[a]1 [b]1 []0 [c]1\n[]0 [lead]4 [trail]5 []0\n[]0\n[a]1 [b]1 [c]1\n\n[x]1 [y]1 []0 [z]1\n[a]1 []0\n[ab]2\n[añb]3 [é🙂]2 [ü]1\n[a]1 [ñ]1 [🙂]1 [b]1\n[1]1 [2]1 []0 [3]1\nï\ne\np\n15\n", levels, 0, "", true)
+
+// Kept pieces survive the loop's reuse: some in a List, some as Map keys,
+// some through a record; the loop variable may also be reassigned.
+fixtures.executes(frontend, #"""
+    record Holder { word: Text }
+    function keepEveryOther(text: Text): List<Text> {
+        let kept: List<Text> = []
+        let index = 0
+        for piece in text.split(" ") {
+            if index % 2 == 0 { kept.add(piece) }
+            index += 1
+        }
+        return kept
+    }
+    print(joinText(keepEveryOther("zero one two three four five"), ","))
+    let counts: Map<Text, Integer> = Map()
+    for word in "b a b c a b".split(" ") {
+        if counts.has(word) { counts[word] += 1 } else { counts[word] = 1 }
+    }
+    let names: List<Text> = []
+    for name in counts { names.add(name) }
+    names.sort()
+    for name in names { print(name + "=" + Text(counts[name])) }
+    let holders: List<Holder> = []
+    for word in "red green blue".split(" ") { holders.add(Holder { word: word }) }
+    for holder in holders { print(holder.word) }
+    let changed: List<Text> = []
+    for piece in "p q r".split(" ") {
+        piece = piece + "!"
+        changed.add(piece)
+    }
+    print(joinText(changed, ""))
+    let last = ""
+    for piece in "k1 k2 k3".split(" ") { last = piece }
+    print(last)
+    """#, "zero,two,four\na=2\nb=3\nc=1\nred\ngreen\nblue\np!q!r!\nk3\n", levels, 0, "", true)
+
+// break, continue and return leave the loop owning nothing; nested loops
+// split a piece of the outer one; owned receivers and computed separators.
+fixtures.executes(frontend, #"""
+    function firstLong(text: Text): Text {
+        for word in text.split(" ") { if word.length > 3 { return word } }
+        return "none"
+    }
+    function make(count: Integer): Text {
+        let parts: List<Text> = []
+        for index in 0..count { parts.add("w" + Text(index)) }
+        return joinText(parts, ";")
+    }
+    function joined(separator: Text): Text { return separator + separator }
+    print(firstLong("a bb ccc dddd eeeee"))
+    print(firstLong("a b"))
+    let seen = 0
+    for word in make(10).split(";") {
+        if word == "w2" { continue }
+        if word == "w5" { break }
+        seen += 1
+    }
+    print(seen)
+    let cells = 0
+    let sum = 0
+    for row in "1,2,3\n4,5\n\n6".split("\n") {
+        for cell in row.split(",") {
+            if cell.length > 0 { sum += Integer(cell); cells += 1 }
+        }
+    }
+    print(Text(cells) + " " + Text(sum))
+    let separator = "-"
+    let pieces = 0
+    for piece in "a--b--c".split(joined(separator)) { pieces += piece.length }
+    print(pieces)
+    for repetition in 0..200 {
+        for piece in make(3).split(";") { if piece.length != 2 { fail("lost a piece") } }
+    }
+    print("repeated")
+    """#, "dddd\nnone\n4\n6 21\n3\nrepeated\n", levels, 0, "", true)
+
+// Large sources: kept small pieces are compacted, unkept ones never copy.
+fixtures.executes(frontend, #"""
+    let lines: List<Text> = []
+    for index in 0..3000 { lines.add("line " + Text(index) + ",field,\(index % 7)") }
+    let source = joinText(lines, "\n")
+    let kept: List<Text> = []
+    let total = 0
+    for line in source.split("\n") {
+        let index = 0
+        for field in line.split(",") {
+            if index == 2 { total += Integer(field) }
+            index += 1
+        }
+        if line.endsWith(",6") { kept.add(line) }
+    }
+    print(total)
+    print(kept.length)
+    print(kept[0])
+    print(kept[kept.length - 1])
+    """#, "8994\n428\nline 6,field,6\nline 2995,field,6\n", levels, 0, "", true)
+
+// The lowering applies only to a direct `for` over a split call.
+fixtures.executes(frontend, #"""
+    function direct(text: Text): Integer {
+        let count = 0
+        for piece in text.split(",") { count += piece.length }
+        return count
+    }
+    function stored(text: Text): Integer {
+        let parts = text.split(",")
+        let count = 0
+        for piece in parts { count += piece.length }
+        return count + parts.length
+    }
+    print(direct("ab,c"))
+    print(stored("ab,c"))
+    """#, "3\n5\n", levels, 0, "", true)
+let path = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+let direct = functionBody(llvm, "direct")
+test.check(test.contains(direct, "@minyar_text_split_next("), "a for over a split call must scan in place")
+test.check(!test.contains(direct, "@minyar_text_split(") && !test.contains(direct, "@minyar_list_"), "a for over a split call must not build a List")
+let stored = functionBody(llvm, "stored")
+test.check(test.contains(stored, "@minyar_text_split(") && !test.contains(stored, "@minyar_text_split_next("), "a stored split keeps its List")
+
+test.removeTree(frontend.compiler.directory)
+print("Text scanning: passed")

@@ -516,7 +516,20 @@ Text values are immutable. A full-range slice retains the same Text, and most
 partial slices use a view that retains the source's owning root. Nested slices
 are flattened to that root, keeping destruction depth constant. A slice below
 one eighth of a source larger than 4 KiB is copied instead, preventing a tiny
-token from retaining a large file or argument. Unicode indexes belong to each
+token from retaining a large file or argument.
+
+`for piece in text.split(separator)` builds no List: each step asks the
+runtime for the next piece, a zero-copy view of the root, even when it is tiny.
+While the loop holds the only count of the current piece, the next step
+re-points that same view instead of allocating, so a loop that only reads its
+pieces allocates one view in total. A piece the body kept (stored in a List,
+Map, record or outer variable) stays valid; when the loop moves past it or
+finishes, a kept piece under one eighth of a root over 4 KiB is given its own
+bytes, the copy rule above applied once the piece is known to outlive its
+iteration. The trade-off: a piece kept by an iteration that leaves through
+`break` or `return` stays a view and retains its root until it is released.
+
+Unicode indexes belong to each
 Text header and are built lazily. They store one byte-position breadcrumb per
 64 characters, using 32-bit entries below 4 GiB; an indexed operation decodes
 at most 63 characters from the nearest breadcrumb. Two words at the end of the

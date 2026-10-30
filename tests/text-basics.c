@@ -119,6 +119,73 @@ static void ownership(void) {
     assert(rc_object_count == 0 && rc_bytes == 0);
 #endif
 }
+/* The List-free `for piece in text.split(needle)` step yields exactly split's
+ * pieces. With nothing kept the loop's view is re-pointed in place; kept
+ * pieces stay intact after the loop moves past them. */
+static void check_split_iteration(MinyarText *text, MinyarText *needle, const MinyarList *parts) {
+    for (int keep = 0; keep < 2; keep++) {
+        MinyarList *kept = minyar_list_new();
+        minyar_list_references(kept);
+        MinyarText *previous = NULL, *piece;
+        long long cursor = 0, count = 0;
+        while ((piece = minyar_text_split_next(text, needle, &cursor, previous))) {
+            assert(count < parts->length);
+            const MinyarText *expected = (const MinyarText *)(uintptr_t)parts->values[count];
+            assert(piece->byte_length == expected->byte_length &&
+                   !memcmp(piece->bytes, expected->bytes, (size_t)piece->byte_length));
+            assert(minyar_text_length(piece) == minyar_text_length((MinyarText *)expected));
+#ifndef MINYAR_COMPILER_ARENA
+            assert(keep || !previous || piece == previous);
+#endif
+            if (keep) minyar_list_add(kept, slot(piece));
+            minyar_rc_release(previous);
+            previous = piece;
+            count++;
+        }
+        assert(count == parts->length && cursor == -1);
+        assert(!minyar_text_split_next(text, needle, &cursor, previous));
+        minyar_rc_release(previous);
+        for (long long i = 0; i < kept->length; i++) {
+            const MinyarText *expected = (const MinyarText *)(uintptr_t)parts->values[i];
+            const MinyarText *held = (const MinyarText *)(uintptr_t)kept->values[i];
+            assert(held->byte_length == expected->byte_length &&
+                   !memcmp(held->bytes, expected->bytes, (size_t)held->byte_length));
+        }
+        minyar_rc_release(kept);
+    }
+}
+#ifndef MINYAR_COMPILER_ARENA
+/* Kept tiny pieces of a large Text get their own bytes once the loop moves
+ * past them or finishes, so they do not keep the whole source alive. */
+static void split_iteration_compaction(void) {
+    enum { WORDS = 2000 };
+    unsigned char *bytes = new_bytes(WORDS * 4);
+    for (int i = 0; i < WORDS; i++) memcpy(bytes + i * 4, "abc,", 4);
+    bytes[WORDS * 4] = 0;
+    MinyarText *text = new_text(bytes, WORDS * 4, WORDS * 4), *comma = copy_c_text(",");
+    MinyarList *kept = minyar_list_new();
+    minyar_list_references(kept);
+    MinyarText *previous = NULL, *piece;
+    long long cursor = 0;
+    while ((piece = minyar_text_split_next(text, comma, &cursor, previous))) {
+        if (piece->byte_length) minyar_list_add(kept, slot(piece));
+        minyar_rc_release(previous);
+        previous = piece;
+    }
+    minyar_rc_release(previous);
+    assert(kept->length == WORDS);
+    for (long long i = 0; i < kept->length; i++) {
+        const MinyarText *held = (const MinyarText *)(uintptr_t)kept->values[i];
+        assert(!held->backing && held->byte_length == 3 && !memcmp(held->bytes, "abc", 3));
+    }
+    /* The source dies with its last owner: no kept piece still retains it. */
+    assert(((RcObject *)text - 1)->ownership == (8 | RC_TEXT));
+    minyar_rc_release(text);
+    minyar_rc_release(comma);
+    minyar_rc_release(kept);
+    drain();
+}
+#endif
 int main(int argc, char **argv) {
     if (argc == 4) {
         MinyarText *text = hex_text(argv[2]), *needle = hex_text(argv[3]);
@@ -134,6 +201,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     ownership();
+#ifndef MINYAR_COMPILER_ARENA
+    split_iteration_compaction();
+    assert(rc_object_count == 0 && rc_bytes == 0);
+#endif
     /* Streaming model protocol avoids process startup for each random case. */
     char line[8192], left[4096], right[4096];
     while (fgets(line, sizeof(line), stdin)) {
@@ -145,6 +216,7 @@ int main(int argc, char **argv) {
         MinyarText *trimmed = minyar_text_trim(text);
         print_hex(trimmed); printf("|");
         MinyarList *parts = minyar_text_split(text, needle);
+        check_split_iteration(text, needle, parts);
         /* Keep pieces alive after releasing their receiver and separator. */
         minyar_rc_release(text); minyar_rc_release(needle);
         printf("%lld", parts->length);

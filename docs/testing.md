@@ -308,6 +308,16 @@ the iteration gallery run at O0/O2 with ownership assertions. LLVM checks retain
 the direct method calls and ordinary loop branches. `check-iteration-sanitize`
 adds compiler and generated-program ASan/UBSan instrumentation.
 
+`make check-text-scanning` checks Text scanning without intermediate objects
+at O0/O2 with ownership assertions. `for piece in text.split(separator)` covers
+every separator shape (one byte, several bytes, empty, Unicode), kept pieces in
+Lists, Maps and records, a reassigned loop variable, early exits, nested
+splits, owned receivers and compaction of kept pieces of a large Text.
+LLVM checks require the in-place split scan and keep the List for a stored
+split. `check-text-basics-models` also streams every model case through the
+runtime split step, kept and unkept. `check-text-scanning-sanitize` adds
+ASan/UBSan.
+
 `make check-iteration-capabilities` checks structural `Iterable` and `Iterator`
 bounds on generic functions over collections, recipes and user cursors. It
 includes constraints on otherwise unused type arguments, so scalar types and

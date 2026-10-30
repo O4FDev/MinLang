@@ -437,7 +437,9 @@ for word in ["Min", "yar"] {
 }
 ```
 
-A range's bounds and a loop's collection are evaluated once. The loop variable
+A loop directly over `text.split(separator)` visits the same pieces without
+building their List (see [runtime memory](runtime-memory.md)). A range's bounds
+and a loop's collection are evaluated once. The loop variable
 is a fresh binding for each iteration, so assigning to it does not change which
 value comes next. A List loop rereads the List's length on every iteration.
 `break` leaves the innermost loop and `continue` starts its next iteration.

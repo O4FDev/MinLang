@@ -36,3 +36,15 @@ build/tooling/tests/text-basics-benchmark: tests/text-basics-benchmark-runtime.c
 benchmark-text-basics: build/minyarc build/minyar-runtime.o build/minyarc-baseline build/tooling/tests/text-basics-benchmark
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/text-basics-benchmark --baseline-compiler build/minyarc-baseline --output build/text-basics-benchmark.json
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/text-basics-benchmark --fixture text-find-prefixes --output build/text-find-prefixes-benchmark.json
+
+.PHONY: check-text-scanning check-text-scanning-sanitize
+build/tooling/tests/text-scanning.ll: tests/frontend-fixtures.min
+
+check-text-scanning: build/minyarc build/minyar-runtime.o build/tooling/tests/text-scanning
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/text-scanning
+
+check-text-scanning-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/text-scanning
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/text-scanning
+
+check check-portable: check-text-scanning
+check-sanitize: check-text-scanning-sanitize

@@ -85,6 +85,102 @@ function compileIterationFor(context: CompilerContext, localNames: List<Text>, l
     state[3] = firstLoopLocal
 }
 
+// The keep of `for piece in text.split(separator)`'s source when it is exactly
+// that call's owned List and nothing was emitted after it, or -1.
+function splitIterationOwner(output: List<Text>, source: Text, sourceType: List<Integer>): Integer {
+    if sourceType.length < 2 || sourceType[0] != makeListType(2) { return -1 }
+    let owner = sourceType[1]
+    if owner < 11 || owner + 3 != output.length { return -1 }
+    if output[owner] != "  call void @minyar_rc_keep(ptr " || output[owner + 1] != source { return -1 }
+    if output[owner - 8] != "minyar_text_split" || output[owner - 9] != " = call ptr @" || output[owner - 10] != source || output[owner - 11] != "  " { return -1 }
+    return owner
+}
+
+// `for piece in text.split(separator)` scans the Text in place: no List is
+// built, and each step asks the runtime for the next piece, a zero-copy view.
+// A hidden local owns the current piece; when the body kept no other count,
+// the runtime re-points that view at the next piece instead of allocating.
+// The loop variable borrows the hidden local's piece unless the body assigns
+// it. Returns false, leaving the call in place, when its keep cannot move.
+function compileSplitFor(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer, name: Text, nameLocation: Integer, forLocation: Integer, source: Text, sourceType: List<Integer>, owner: Integer, firstLoopLocal: Integer): Boolean {
+    let receiver = output[owner - 5]
+    let separator = output[owner - 2]
+    if !takeOwner(output, state, source, owner) { return false }
+    let piece = owner - 11
+    while piece < owner {
+        output[piece] = ""
+        piece = piece + 1
+    }
+    let textType: List<Integer> = [2]
+    let text = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " for text", 2, text)
+    assignReference(output, state, text, receiver, textType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+    storeLocal(output, text, 2, receiver)
+    let separatorType: List<Integer> = [2]
+    let separatorLocal = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " for separator", 2, separatorLocal)
+    assignReference(output, state, separatorLocal, separator, separatorType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+    storeLocal(output, separatorLocal, 2, separator)
+    let cursor = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " for cursor", 1, cursor)
+    storeLocal(output, cursor, 1, "0")
+    let current = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " for piece", 2, current)
+    storeLocal(output, current, 2, "null")
+    let loopLabel = newLabel(state)
+    let bodyLabel = newLabel(state)
+    let stepLabel = newLabel(state)
+    let endLabel = newLabel(state)
+    output.add("  ; minyar-iteration: Text split without a List\n")
+    output.add("  br label %for.condition." + Text(loopLabel) + "\n\nfor.condition." + Text(loopLabel) + ":\n")
+    textState[0] = "for.condition." + Text(loopLabel)
+    let arguments: List<Text> = []
+    arguments.add(loadLocal(output, textState, state, text, 2))
+    arguments.add(loadLocal(output, textState, state, separatorLocal, 2))
+    arguments.add("%local." + Text(cursor))
+    arguments.add(loadLocal(output, textState, state, current, 2))
+    let argumentTypes: List<Integer> = [2, 2, 2, 2]
+    appendTextRuntimeDeclaration(globals, "minyar_text_split_next", 2, argumentTypes)
+    let element = emitCall(output, textState, state, 2, "minyar_text_split_next", arguments, argumentTypes)
+    let continuing = emitInstruction(output, textState, state, "icmp ne ptr " + element + ", null")
+    output.add("  br i1 " + continuing + ", label %for.body." + Text(bodyLabel) + ", label %for.end." + Text(endLabel) + "\n\nfor.body." + Text(bodyLabel) + ":\n")
+    textState[0] = "for.body." + Text(bodyLabel)
+    let elementResult: List<Integer> = [2]
+    ownResult(output, state, element, elementResult)
+    assignReference(output, state, current, element, elementResult, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+    storeLocal(output, current, 2, element)
+    emitDebugOrigin(output, context.tokenLines, forLocation, "line")
+    output.add("; minyar-debug-scope: begin\n")
+    let variable = nextLocal(state)
+    addLocal(localNames, localTypes, localIds, localLengths, state, name, 2, variable)
+    let borrowed = loopBodyKeepsElements(context.tokenKinds, context.tokenTexts, state[0], "", name)
+    if !borrowed {
+        let variableType: List<Integer> = [2]
+        assignReference(output, state, variable, element, variableType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+    }
+    storeLocal(output, variable, 2, element)
+    emitDebugBinding(context, output, nameLocation, name, 2, "ptr %local." + Text(variable), 0, true)
+    addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -2, loopLabel)
+    let bodyReturns = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+    output.add("; minyar-debug-scope: end\n")
+    if !bodyReturns { output.add("  br label %for.step." + Text(stepLabel) + "\n") }
+    output.add("\nfor.step." + Text(stepLabel) + ":\n")
+    textState[0] = "for.step." + Text(stepLabel)
+    // An assigned loop variable owns a count; drop it so that an unkept piece
+    // is unique again when the runtime looks at it.
+    if !borrowed { rootLocal(output, state, variable, "null", 2) }
+    output.add("  call void @minyar_rc_step()\n")
+    output.add("  br label %for.condition." + Text(loopLabel) + "\n\nfor.end." + Text(endLabel) + ":\n")
+    textState[0] = "for.end." + Text(endLabel)
+    let scoped = firstLoopLocal
+    while scoped < state[3] {
+        if hasOwnershipSlot(state, localIds[scoped]) { rootLocal(output, state, localIds[scoped], "null", localTypes[scoped]) }
+        scoped = scoped + 1
+    }
+    state[3] = firstLoopLocal
+    return true
+}
+
 function genericIterationElement(program: GenericProgram, source: Integer): Integer {
     let iterator = genericMemberType(program, source, "iterator", true)
     if iterator == 0 || program.types[iterator].name != "Callback" { return 0 }

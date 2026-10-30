@@ -1182,7 +1182,7 @@ static MinyarText *text_slice_bytes(MinyarText *text, long long first_byte, long
             (unsigned long long)length * 8 < (unsigned long long)root->byte_length) {
             MinyarText *copy = new_text_storage(length, length == characters ? characters : -1);
             unsigned char *bytes = (unsigned char *)copy->bytes;
-            memcpy(bytes, text->bytes + first_byte, (size_t)length);
+            copy_bytes(bytes, text->bytes + first_byte, (size_t)length);
             bytes[length] = 0;
             return copy;
         }
