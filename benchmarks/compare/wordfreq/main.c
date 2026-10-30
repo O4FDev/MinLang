@@ -1,4 +1,4 @@
-// C reference for wordfreq.min: same output.
+// C peer for main.min: word frequencies over a text file, top 10 words.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,6 +40,7 @@ static int compare(const void *x, const void *y) {
     return a->length - b->length;
 }
 int main(int argc, char **argv) {
+    if (argc < 2) return 2;
     FILE *f = fopen(argv[1], "rb"); fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
     char *text = malloc(size + 1); fread(text, 1, size, f); fclose(f);
     table = calloc(capacity, sizeof(Entry));

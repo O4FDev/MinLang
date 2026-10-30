@@ -1,0 +1,121 @@
+use "io" as io
+use "process" as processInfo
+use "text" as text
+// Text processing over application log lines: split fields, search messages,
+// mask addresses, replace words, format output lines and summarise per service.
+
+choice Level {
+    Debug
+    Info
+    Warn
+    Error
+}
+
+function parseLevel(name: Text): Level {
+    return match name {
+        "ERROR" { Error }
+        "WARN" { Warn }
+        "INFO" { Info }
+        _ { Debug }
+    }
+}
+
+function Level.tag(): Text {
+    return match self {
+        Error { "[E]" }
+        Warn { "[W]" }
+        Info { "[I]" }
+        Debug { "[D]" }
+    }
+}
+
+record Summary { lines: Integer; totalMs: Integer; timeouts: Integer; words: Integer; longestWord: Text }
+
+record Replaced { value: Text; count: Integer }
+
+function replaceAll(source: Text, target: Text, replacement: Text): Replaced {
+    let pieces = source.split(target)
+    if pieces.length == 1 { return Replaced { value: source; count: 0 } }
+    let parts: List<Text> = []
+    for i in 0..pieces.length {
+        if i > 0 { parts.add(replacement) }
+        parts.add(pieces[i])
+    }
+    return Replaced { value: joinText(parts); count: pieces.length - 1 }
+}
+
+function maskAddress(address: Text): Text {
+    let at = address.find("@")
+    if at <= 0 { return "***" }
+    return address.slice(0, 1) + "***" + address.slice(at, address.length)
+}
+
+let source = io.readTextFile(processInfo.argument(0))
+let summaries: Map<Text, Summary> = Map()
+let lines = 0
+let malformed = 0
+let internal = 0
+let alerts = 0
+let timeouts = 0
+let replaced = 0
+let formattedBytes = 0
+let samples: List<Text> = []
+for line in source.split("\n") {
+    if line.length == 0 { continue }
+    lines += 1
+    let fields = line.split(" | ")
+    let level = parseLevel(fields[0])
+    let service = fields[1]
+    let address = fields[2]
+    let message = fields[3]
+    let duration = 0
+    match text.integer(fields[4]) {
+        Ok(value) { duration = value }
+        Err(problem) {
+            malformed += 1
+            continue
+        }
+    }
+    match level {
+        Error { alerts += 1 }
+        Warn { alerts += 1 }
+        else { }
+    }
+    if address.endsWith("@example.com") { internal += 1 }
+    let timedOut = message.find("timeout") >= 0
+    if timedOut { timeouts += 1 }
+    if !summaries.has(service) {
+        summaries[service] = Summary { lines: 0; totalMs: 0; timeouts: 0; words: 0; longestWord: "" }
+    }
+    let summary = summaries[service]
+    summary.lines += 1
+    summary.totalMs += duration
+    if timedOut { summary.timeouts += 1 }
+    for word in message.split(" ") {
+        if word.length == 0 { continue }
+        summary.words += 1
+        if word.length > summary.longestWord.length { summary.longestWord = word }
+    }
+    let rewritten = replaceAll(message, "order", "ORDER")
+    replaced += rewritten.count
+    let prefix = "app"
+    if service.startsWith("auth") { prefix = "security" }
+    let formatted = "\(level.tag()) \(prefix)/\(service) \(maskAddress(address)) \(duration)ms: \(rewritten.value)"
+    formattedBytes += formatted.byteLength
+    if samples.length < 3 { samples.add(formatted) }
+}
+print("lines \(lines)")
+print("malformed \(malformed)")
+print("alerts \(alerts)")
+print("internal \(internal)")
+print("timeouts \(timeouts)")
+print("replaced \(replaced)")
+print("formatted bytes \(formattedBytes)")
+for sample in samples { print(sample) }
+let names: List<Text> = []
+for name in summaries { names.add(name) }
+names.sort()
+for name in names {
+    let summary = summaries[name]
+    print("\(name): \(summary.lines) lines, avg \(summary.totalMs / summary.lines) ms, \(summary.timeouts) timeouts, \(summary.words) words, longest \(summary.longestWord)")
+}

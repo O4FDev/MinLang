@@ -1,10 +1,11 @@
-// C reference for service.min: same output.
+// C peer for main.min: parse request lines, look up users, format JSON responses.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 typedef struct { long long id; char name[24]; char email[40]; long long age, score; int present; } User;
-int main(void) {
+int main(int argc, char **argv) {
+    long long requests = argc > 1 ? atoll(argv[1]) : 0;
     enum { SLOTS = 1 << 15 };
     static User users[SLOTS];
     for (long long id = 0; id < 10000; id++) {
@@ -14,7 +15,7 @@ int main(void) {
         snprintf(u->name, sizeof u->name, "user%lld", id); snprintf(u->email, sizeof u->email, "user%lld@example.com", id);
     }
     long long bytes = 0, found = 0, seed = 42; char line[64], response[256];
-    for (long long request = 0; request < 1000000; request++) {
+    for (long long request = 0; request < requests; request++) {
         seed = (seed * 1103515245 + 12345) % 2147483648LL;
         snprintf(line, sizeof line, "GET /users/%lld HTTP/1.1", seed % 80000);
         char *path = strchr(line, ' ') + 1; char *end = strchr(path, ' '); *end = 0;
