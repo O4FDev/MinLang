@@ -519,24 +519,43 @@ MinyarBytes *minyar_net_loopWatch(long long handle, long long connection, long l
     return net_loop_result(0,
                            (long long)net_loop_registration_handle(index, entry->generation));
 }
-MinyarBytes *minyar_net_loopUpdate(long long handle, long long registration, long long interest,
-                                   long long token) {
+static int net_loop_update(long long handle, long long registration, long long interest,
+                           long long token) {
     NetLoop *loop = net_loop_find(handle);
     uint32_t index;
     NetLoopEntry *entry = loop ? net_loop_entry(loop, registration, &index) : NULL;
     if (!entry)
-        return net_loop_result(net_loop_bad_handle(), 0);
+        return net_loop_bad_handle();
     if (entry->timer || interest < 0 || interest > 3)
-        return net_loop_result(BAD_ARGUMENT, 0);
+        return BAD_ARGUMENT;
+#ifndef _WIN32
+    /* Tokens live in the entry, not the kernel registration: an unchanged
+     * interest needs no selector call (readiness stays level-triggered). */
+    if (entry->interest == (unsigned)interest) {
+        entry->token = token;
+        NET_APP_CHANGED(handle);
+        return 0;
+    }
+#endif
     int code = net_loop_selector_update(loop, index, (unsigned)interest, false);
     if (code) {
         (void)net_loop_selector_update(loop, index, entry->interest, false);
-        return net_loop_result(code, 0);
+        return code;
     }
     entry->interest = (unsigned)interest;
     entry->token = token;
     NET_APP_CHANGED(handle);
-    return net_loop_result(0, 1);
+    return 0;
+}
+MinyarBytes *minyar_net_loopUpdate(long long handle, long long registration, long long interest,
+                                   long long token) {
+    int code = net_loop_update(handle, registration, interest, token);
+    return net_loop_result(code, code ? 0 : 1);
+}
+/* Allocation-free form: zero, or the native error code negated. */
+long long minyar_net_updateInterest(long long handle, long long registration, long long interest,
+                                    long long token) {
+    return -(long long)net_loop_update(handle, registration, interest, token);
 }
 MinyarBytes *minyar_net_loopRemove(long long handle, long long registration) {
     NetLoop *loop = net_loop_find(handle);
@@ -754,13 +773,16 @@ static int net_loop_poll(NetLoop *loop, MinyarBytes *result, size_t limit, int t
 #endif
     return 0;
 }
-MinyarBytes *minyar_net_loopWait(long long handle, long long milliseconds, long long maximum) {
-    MinyarBytes *result = minyar_bytes_new(8);
+/* Fill `result`, whose first 8 bytes are the status header, with one batch.
+ * Returns the number of events, or the native error code negated. */
+static long long net_loop_wait_fill(long long handle, long long milliseconds, long long maximum,
+                                    MinyarBytes *result) {
     NetLoop *loop = net_loop_find(handle);
     if (!loop || milliseconds < -1 || milliseconds > INT_MAX || maximum <= 0 ||
         maximum > NET_LOOP_MAX_BATCH) {
-        result_status(result, NET_FAILURE, !loop ? net_loop_bad_handle() : BAD_ARGUMENT);
-        return result;
+        int code = !loop ? net_loop_bad_handle() : BAD_ARGUMENT;
+        result_status(result, NET_FAILURE, code);
+        return -(long long)code;
     }
     result_status(result, NET_OK, 0);
 #if defined(_WIN32) && defined(MINYAR_APP_EVENT_LOOP)
@@ -791,7 +813,7 @@ MinyarBytes *minyar_net_loopWait(long long handle, long long milliseconds, long 
             result->byte_length = 8;
             result_status(result, NET_FAILURE, code);
             NET_APP_POLLED(handle, result);
-            return result;
+            return -(long long)code;
         }
         size_t emitted = (size_t)(result->byte_length - 8) / 32;
         if (emitted < limit)
@@ -799,15 +821,30 @@ MinyarBytes *minyar_net_loopWait(long long handle, long long milliseconds, long 
         if (emitted) {
             loop->timer_turn ^= 1;
             NET_APP_POLLED(handle, result);
-            return result;
+            return (long long)emitted;
         }
         if (net_loop_now() >= deadline) {
             NET_APP_POLLED(handle, result);
-            return result;
+            return 0;
         }
         /* Interrupted waits retain the absolute deadline. Readiness containing
          * only stale registrations also cannot extend the caller's timeout. */
     }
+}
+MinyarBytes *minyar_net_loopWait(long long handle, long long milliseconds, long long maximum) {
+    MinyarBytes *result = minyar_bytes_new(8);
+    (void)net_loop_wait_fill(handle, milliseconds, maximum, result);
+    return result;
+}
+/* Allocation-free form: refill a caller-owned buffer, keeping its capacity.
+ * The layout is the owned envelope above (8-byte header, 32-byte events). */
+long long minyar_net_waitInto(long long handle, long long milliseconds, long long maximum,
+                              MinyarBytes *buffer) {
+    if (!buffer)
+        return -(long long)BAD_ARGUMENT;
+    buffer->byte_length = 0;
+    (void)minyar_native_bytes_append(buffer, 8);
+    return net_loop_wait_fill(handle, milliseconds, maximum, buffer);
 }
 MinyarBytes *minyar_net_loopClose(long long handle) {
     NetLoop *loop = net_loop_find(handle);

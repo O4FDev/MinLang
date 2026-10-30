@@ -1638,6 +1638,19 @@ calls; caching individual generic module bodies remains future work.
 handle lifetime, completion-socket borrowing and durability contracts stay
 the same. A preparation still in progress is `Ok(false)`.
 
+`eventloop` is a single-owner readiness loop (epoll, kqueue, WSAPoll) whose
+`wait` returns a `Batch` of `Event` records. Hot loops use the allocation-free
+forms: `waitInto(loop, timeoutMs, maxEvents, events)` refills a Bytes the
+caller keeps (its capacity is reused, so a steady loop allocates nothing) and
+returns the event count, zero on a timeout, or a negative native error code.
+`eventToken(events, i)`, `eventFlags`, `eventRegistration`, `eventKind` and
+`eventNativeCode` read record `i`; flags test against `READABLE`, `WRITABLE`,
+`CLOSED` and `FAILED`, and timers have kind `TIMER_KIND`. Record `i` starts at
+byte `8 + 32 * i` (registration Int64, token Int64, flags, native code and kind
+UInt32). `updateInterest(loop, registration, interest, token)` returns zero or
+a negative code without a result envelope; changing only the token makes no
+system call on Linux and macOS.
+
 JSON getters never coerce types. `findMember` returns `Result<Maybe<Value>,
 errors.Error>`: a non-object is an error, an absent member is `Ok(None)`, and
 an explicit JSON null is `Ok(Some(value))` with `value.kind == json.NULL`.

@@ -216,6 +216,50 @@ static void socket_interest_and_ownership(void) {
     minyar_net_close(socket);
 }
 
+/* waitInto/updateInterest: the envelope layout in a reused caller buffer,
+ * counts and negated codes as results, and no reallocation once warm. */
+static void allocation_free_wait_and_update(void) {
+    MinyarText host = loop_literal("127.0.0.1");
+    long long socket = minyar_net_udp(&host, 0), sender = minyar_net_udp(&host, 0);
+    assert(socket >= 0 && sender >= 0);
+    assert(minyar_net_udpConnect(sender, &host, minyar_net_localPort(socket)));
+    long long loop = result_handle(minyar_net_loopCreate());
+    long long watch = result_handle(minyar_net_loopWatch(loop, socket, 2, 7));
+    MinyarBytes *events = minyar_bytes_new(0);
+    assert(minyar_net_waitInto(loop, 500, 4, events) == 1 && event_count(events) == 1);
+    assert(loop_wide(events, 8) == (uint64_t)watch && loop_wide(events, 16) == 7);
+    assert(loop_word(events, 24) & 2);
+    const unsigned char *storage = events->bytes;
+    long long capacity = events->character_length;
+    /* Same interest: token only, no selector call. Then a real change. */
+    assert(minyar_net_updateInterest(loop, watch, 2, 8) == 0);
+    assert(minyar_net_waitInto(loop, 500, 4, events) == 1 && loop_wide(events, 16) == 8);
+    assert(minyar_net_updateInterest(loop, watch, 1, 9) == 0);
+    assert(minyar_net_waitInto(loop, 0, 4, events) == 0 && events->byte_length == 8);
+    assert(events->bytes == storage && events->character_length == capacity);
+    MinyarBytes payload = loop_literal("y");
+    MinyarBytes *sent = minyar_net_writeResult(sender, &payload);
+    assert(loop_word(sent, 0) == NET_OK);
+    minyar_rc_release(sent);
+    assert(minyar_net_waitInto(loop, 500, 4, events) == 1 && loop_wide(events, 16) == 9);
+    assert((loop_word(events, 24) & 1) && events->bytes == storage);
+    long long timer = result_handle(minyar_net_loopTimer(loop, 0, 0, -3));
+    assert(minyar_net_updateInterest(loop, timer, 1, 0) == -(long long)BAD_ARGUMENT);
+    assert(minyar_net_waitInto(loop, 500, 1, events) == 1 && event_count(events) == 1);
+    assert(minyar_net_updateInterest(loop, watch, 4, 0) == -(long long)BAD_ARGUMENT);
+    assert(minyar_net_waitInto(loop, -2, 4, events) == -(long long)BAD_ARGUMENT);
+    assert(events->byte_length == 8 && loop_word(events, 0) == NET_FAILURE);
+    assert(minyar_net_waitInto(loop, 0, 0, events) == -(long long)BAD_ARGUMENT);
+    operation_ok(minyar_net_loopRemove(loop, watch));
+    assert(minyar_net_updateInterest(loop, watch, 1, 0) == -(long long)net_loop_bad_handle());
+    operation_ok(minyar_net_loopClose(loop));
+    assert(minyar_net_waitInto(loop, 0, 4, events) == -(long long)net_loop_bad_handle());
+    assert(minyar_net_updateInterest(loop, watch, 1, 0) == -(long long)net_loop_bad_handle());
+    minyar_rc_release(events);
+    minyar_net_close(sender);
+    minyar_net_close(socket);
+}
+
 static void thousands_of_sockets_and_timer_fairness(void) {
     enum { N = 2048, BATCH = 31 };
 #ifndef _WIN32
@@ -375,6 +419,7 @@ int main(void) {
     timers_and_stale_handles();
     failed_poll_preserves_due_timers();
     socket_interest_and_ownership();
+    allocation_free_wait_and_update();
     thousands_of_sockets_and_timer_fairness();
     idle_blocking_and_interrupted_deadline();
     registration_generation_boundaries();

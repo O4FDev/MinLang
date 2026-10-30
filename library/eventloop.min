@@ -88,6 +88,50 @@ public function wait(loop: Integer, timeoutMs: Integer, maxEvents: Integer): Bat
     return Batch { events: events; error: errors.none() }
 }
 
+// ---- allocation-free calls ----
+// waitInto is wait without an Event record per event, a List, a Batch or an error value: it refills `events`,
+// a Bytes the caller keeps and reuses (its capacity is kept, so a steady loop allocates nothing), and returns the
+// number of events, zero on a timeout, or a negative native error code (for example -9 EBADF, -22 EINVAL).
+// The buffer holds an 8-byte header and then one 32-byte record per event; record i starts at byte 8 + 32 * i:
+// registration Int64 at +0, token Int64 at +8, flags UInt32 at +16, native code UInt32 at +20, kind UInt32 at +24.
+// eventToken, eventFlags and the other accessors read them; flags test against READABLE, WRITABLE, CLOSED and
+// FAILED. Timer events have kind TIMER_KIND.
+public constant READABLE = 1
+public constant WRITABLE = 2
+public constant CLOSED = 4
+public constant FAILED = 8
+public constant TIMER_KIND = 1
+/// Wait into a caller-owned buffer and return the event count, or a negative native error code.
+///
+/// ```minyar
+/// use "errors" as errors
+/// let reactor = errors.integerValue(api.create())
+/// let timer = errors.integerValue(api.timer(reactor, 0, 0, 7))
+/// let events = Bytes()
+/// let count = api.waitInto(reactor, 1000, 64, events)
+/// for i in 0..count {
+///     print(api.eventToken(events, i))
+///     print(api.eventKind(events, i) == api.TIMER_KIND)
+///     print(api.eventRegistration(events, i) == timer)
+/// }
+/// print(errors.booleanValue(api.close(reactor)))
+/// ```
+/// ```output
+/// 7
+/// true
+/// true
+/// true
+/// ```
+public function waitInto(loop: Integer, timeoutMs: Integer, maxEvents: Integer, events: Bytes): Integer { native "net" }
+public function eventRegistration(events: Bytes, index: Integer): Integer { return events.getInt64(8 + index * 32) }
+public function eventToken(events: Bytes, index: Integer): Integer { return events.getInt64(16 + index * 32) }
+public function eventFlags(events: Bytes, index: Integer): Integer { return events.getUInt32(24 + index * 32) }
+public function eventNativeCode(events: Bytes, index: Integer): Integer { return events.getUInt32(28 + index * 32) }
+public function eventKind(events: Bytes, index: Integer): Integer { return events.getUInt32(32 + index * 32) }
+// update without the result envelope: zero, or a negative native error code. Changing only the token of a
+// registration (the same interest) makes no system call on Linux and macOS.
+public function updateInterest(loop: Integer, registration: Integer, interest: Integer, token: Integer): Integer { native "net" }
+
 function loopCreate(): Bytes { native "net" }
 function loopWatch(loop: Integer, socket: Integer, interest: Integer, token: Integer): Bytes { native "net" }
 function loopUpdate(loop: Integer, registration: Integer, interest: Integer, token: Integer): Bytes { native "net" }
