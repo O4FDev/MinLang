@@ -130,6 +130,22 @@ Optional packages have additional prerequisites: `graphics` uses GLFW,
 while the native Swift/GTK backends use separate compiler/SDK installations.
 The basic hello project does not require those optional backends.
 
+## Target CPU for release programs on x86-64
+
+On an x86-64 build machine, `--release` programs are compiled for `x86-64-v3`
+(AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE, POPCNT) when that machine supports it,
+and for the baseline x86-64 level otherwise. The driver asks the selected Clang
+which features `-march=native` enables; AVX-512 (`x86-64-v4`) is never chosen
+by default. A program built this way may not start on an older processor.
+
+To choose the level, pass `--target-cpu LEVEL` to `minyar`, set
+`MINYAR_TARGET_CPU`, or set `cpu` under `[package]` in `Minyar.toml`. `LEVEL` is
+`x86-64`, `x86-64-v2`, `x86-64-v3`, `x86-64-v4`, `native` (every feature of the
+build machine) or `baseline` (the architecture's default, for binaries that
+must run anywhere). An explicit level also applies to debug builds. A
+`--target`, `-march` or `-mcpu` in `MINYAR_CLANG_FLAGS` (a cross build) keeps
+that choice. Other architectures ignore the setting.
+
 ## Compiler ThinLTO cache on Linux
 
 Source builds and first-use bootstrap cache compiler ThinLTO backend objects

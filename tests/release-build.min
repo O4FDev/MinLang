@@ -62,8 +62,19 @@ if chosen("test_release_and_custom_flags") {
     let cache = "if [ -d \"$1/build/thinlto-cache\" ]; then cp -Rp \"$1/build/thinlto-cache\" \"$2/build/\"; fi"
     test.require(test.run(["/bin/sh", "-c", cache, "minyar", root, launcherRoot], system.environment(), "", work + "/launcher-cache", 120), "copy release launcher LTO cache")
     let base = ["LIMITED=", "SANITIZER_LIMITED=", "MINYAR_CLANG=" + shim, "MINYAR_RELEASE_ARGUMENT_LOG=" + log]
-    let expectations = ["-O2", "-O2", "-O1"]
-    for index in 0..3 {
+    let expectations = ["-O2", "-O2", "-O1", "-O2"]
+    // Release links for an x86-64 build machine with AVX2/BMI2/FMA default to
+    // x86-64-v3 (as the driver decides from `clang -march=native`); debug
+    // links and `--target-cpu baseline` add no -march.
+    let v3 = false
+    if test.lines(support.output(["uname", "-m"], work + "/machine"))[0] == "x86_64" {
+        let features = support.output([clang, "-march=native", "-dM", "-E", "-x", "c", "/dev/null"], work + "/native-features")
+        v3 = true
+        for feature in ["__AVX2__", "__BMI__", "__BMI2__", "__F16C__", "__FMA__", "__LZCNT__", "__MOVBE__", "__POPCNT__", "__SSE4_2__", "__XSAVE__"] {
+            if !test.contains(features, "#define " + feature + " ") { v3 = false }
+        }
+    }
+    for index in 0..4 {
         let flags: List<Text> = []
         let overrides = support.copy(base)
         let capturedRuntime = work + "/runtime-capture-" + Text(index) + ".ll"
@@ -71,6 +82,7 @@ if chosen("test_release_and_custom_flags") {
         let lto = index > 0
         if lto { flags.add("--release") }
         if index == 2 { overrides.add("MINYAR_CLANG_FLAGS=-O1 -Wno-override-module") }
+        if index == 3 { flags.add("--target-cpu"); flags.add("baseline") }
         let environment = release(overrides)
         let command = [launcherRoot + "/minyar"]
         for flag in flags { command.add(flag) }
@@ -85,6 +97,11 @@ if chosen("test_release_and_custom_flags") {
         let sawLto = false
         for argument in arguments { if support.starts(argument, "-flto") { sawLto = true } }
         test.check(sawLto == lto, "release build LTO selection " + Text(index))
+        let marches: List<Text> = []
+        for argument in arguments { if support.starts(argument, "-march=") { marches.add(argument) } }
+        let march = ""
+        if lto && index != 3 && v3 { march = "-march=x86-64-v3" }
+        test.check((march == "" && marches.length == 0) || (marches.length == 1 && marches[0] == march), "release build target CPU " + Text(index) + ": expected '" + march + "', got " + Text(marches.length) + " -march flags")
         let runtimeName = "runtime.o"
         if lto { runtimeName = "runtime.ll" }
         let runtimePath = ""

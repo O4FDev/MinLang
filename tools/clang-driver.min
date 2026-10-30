@@ -1012,6 +1012,34 @@ function compileFlags(linkFlags: List<Text>): List<Text> {
     }
     return result
 }
+// x86-64 code generation level. MINYAR_TARGET_CPU (from --target-cpu or
+// package.cpu) names a level such as x86-64-v2, `native`, or `baseline` for
+// the architecture's default. Without one, a release build for the build host
+// uses x86-64-v3 when that host has it (AVX2, BMI1/2, FMA, F16C, LZCNT, MOVBE),
+// so the program runs on the machine that built it; AVX-512 is never chosen.
+// Flags that pick another target or CPU (cross builds) keep their own choice.
+// Other architectures keep their defaults.
+function targetCpuFlag(clang: Text, requested: Text, release: Boolean, linkFlags: List<Text>): Text {
+    if host.hostMachine() != "x86_64" { return "" }
+    if requested == "baseline" { return "" }
+    if requested != "" { return "-march=" + requested }
+    if !release { return "" }
+    for item in linkFlags {
+        if item == "-target" || item == "--target" || item == "-arch" || item.startsWith("--target=") || item.startsWith("-march=") || item.startsWith("-mcpu=") { return "" }
+    }
+    if hostHasX86Level3(clang) { return "-march=x86-64-v3" }
+    return ""
+}
+function hostHasX86Level3(clang: Text): Boolean {
+    let empty = "/dev/null"
+    if host.windows() { empty = "NUL" }
+    let probe = host.capture([clang, "-march=native", "-dM", "-E", "-x", "c", empty], 60)
+    if probe.status != 0 { return false }
+    for feature in ["__AVX2__", "__BMI__", "__BMI2__", "__F16C__", "__FMA__", "__LZCNT__", "__MOVBE__", "__POPCNT__", "__SSE4_2__", "__XSAVE__"] {
+        if !host.hasText(probe.output, "#define " + feature + " ") { return false }
+    }
+    return true
+}
 function linkCommand(arguments: List<Text>) {
     let clang = host.pinnedLlvm(host.selectedClang())
     let project = arguments[0]
@@ -1034,10 +1062,8 @@ function linkCommand(arguments: List<Text>) {
     let fallback = DEFAULT_FLAGS
     if release != "1" && debug { fallback = "-O0 -g -Wno-override-module" }
     let linkFlags = host.flags("MINYAR_CLANG_FLAGS", fallback)
-    // package.cpu (x86-64 levels): code generation for that level, e.g. POPCNT and AVX2 at x86-64-v3. Other
-    // architectures keep their defaults.
-    let targetCpu = system.getenv("MINYAR_TARGET_CPU")
-    if targetCpu != "" && host.hostMachine() == "x86_64" { linkFlags.add("-march=" + targetCpu) }
+    let march = targetCpuFlag(clang, system.getenv("MINYAR_TARGET_CPU"), release == "1", linkFlags)
+    if march != "" { linkFlags.add(march) }
     let native: List<Text> = []
     let libraries: List<Text> = []
     let cycles = false
