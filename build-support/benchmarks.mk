@@ -1,4 +1,4 @@
-.PHONY: check-benchmarks check-benchmarks-cli
+.PHONY: check-benchmarks check-benchmarks-cli check-benchmarks-compare
 
 build/tooling/tests/benchmarks build/tooling/tests/benchmarks-cli build/tooling/tools/project-cli: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/benchmarks build/tooling/tests/benchmarks-cli build/tooling/tools/project-cli: build/testing/cycle-runtime.o
@@ -21,3 +21,9 @@ check-benchmarks-cli: build/tooling/tests/benchmarks-cli build/tooling/tools/pro
 	+MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/benchmarks-cli
 
 check check-portable: check-benchmarks check-benchmarks-cli
+
+# Four-language comparison suite (benchmarks/compare): correctness only. Each
+# Minyar program is built at O0 and release and must print exactly what its C
+# peer prints on the small workload. Timing lives in benchmarks/compare/run.py.
+check-benchmarks-compare: build/minyarc build/tooling/tools/clang-driver
+	$(LIMITED) env CC="$(LLVM_CC)" python3 benchmarks/compare/run.py --check
