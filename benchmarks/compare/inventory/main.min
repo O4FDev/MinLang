@@ -1,0 +1,113 @@
+use "process" as processInfo
+// Records holding Lists: warehouses own Lists of items, and each item keeps a
+// List of recent stock changes. Items are adjusted, moved between warehouses,
+// restocked, sold and pruned; then totals per category and a ranked item list.
+record Item { sku: Integer; category: Integer; quantity: Integer; price: Integer; history: List<Integer> }
+record Warehouse { name: Text; items: List<Item>; moves: List<Integer> }
+record Ranked { sku: Integer; value: Integer }
+record Random { state: Integer }
+
+constant CATEGORIES = 12
+
+function Random.next(): Integer {
+    self.state = (self.state * 1103515245 + 12345) % 2147483648
+    return self.state / 16
+}
+
+record Catalog { random: Random; nextSku: Integer }
+
+function Catalog.newItem(): Item {
+    let sku = self.nextSku
+    self.nextSku += 1
+    let category = self.random.next() % CATEGORIES
+    let quantity = self.random.next() % 50
+    let price = 100 + self.random.next() % 9900
+    return Item { sku: sku; category: category; quantity: quantity; price: price; history: [] }
+}
+
+function Item.adjust(delta: Integer) {
+    self.quantity = max(0, self.quantity + delta)
+    self.history.add(delta)
+    if self.history.length > 16 {
+        let recent: List<Integer> = []
+        for k in (self.history.length - 8)..self.history.length { recent.add(self.history[k]) }
+        self.history = recent
+    }
+}
+
+function Warehouse.take(position: Integer): Item {
+    let item = self.items[position]
+    self.items[position] = self.items[self.items.length - 1]
+    self.items.pop()
+    return item
+}
+
+function Warehouse.prune(): Integer {
+    let kept: List<Item> = []
+    for item in self.items {
+        if item.quantity > 0 { kept.add(item) }
+    }
+    let pruned = self.items.length - kept.length
+    self.items = kept
+    return pruned
+}
+
+let operations = Integer(processInfo.argument(0))
+let random = Random { state: 4242 }
+let catalog = Catalog { random: random; nextSku: 0 }
+let warehouses: List<Warehouse> = []
+for w in 0..16 { warehouses.add(Warehouse { name: "wh-\(w)"; items: []; moves: [] }) }
+for i in 0..(operations / 10) { warehouses[i % 16].items.add(catalog.newItem()) }
+
+let pruned = 0
+let sold = 0
+for i in 0..operations {
+    let warehouse = warehouses[random.next() % 16]
+    let kind = random.next() % 10
+    if kind < 6 {
+        if warehouse.items.length > 0 {
+            let item = warehouse.items[random.next() % warehouse.items.length]
+            item.adjust(random.next() % 21 - 10)
+        }
+    } else if kind < 8 {
+        if warehouse.items.length > 0 {
+            let destination = warehouses[random.next() % 16]
+            let item = warehouse.take(random.next() % warehouse.items.length)
+            destination.items.add(item)
+            warehouse.moves.add(item.sku)
+        }
+    } else if kind == 8 {
+        warehouse.items.add(catalog.newItem())
+    } else if warehouse.items.length > 0 {
+        sold += warehouse.take(random.next() % warehouse.items.length).quantity
+    }
+    if i % 1024 == 1023 { pruned += warehouse.prune() }
+}
+
+let units: List<Integer> = []
+let values: List<Integer> = []
+for c in 0..CATEGORIES { units.add(0); values.add(0) }
+let historySum = 0
+let moveSum = 0
+let ranked: List<Ranked> = []
+for warehouse in warehouses {
+    for sku in warehouse.moves { moveSum = (moveSum * 31 + sku) % 1000000007 }
+    for item in warehouse.items {
+        units[item.category] += item.quantity
+        values[item.category] += item.quantity * item.price
+        let changes = item.history.length
+        for delta in item.history { changes += delta }
+        historySum = (historySum * 31 + changes + 1000) % 1000000007
+        ranked.add(Ranked { sku: item.sku; value: item.quantity * item.price })
+    }
+    print("\(warehouse.name) \(warehouse.items.length) \(warehouse.moves.length)")
+}
+for c in 0..CATEGORIES { print("category \(c) \(units[c]) \(values[c])") }
+ranked.sortBy(function(a: Ranked, b: Ranked): Integer {
+    if a.value != b.value { return b.value - a.value }
+    return a.sku - b.sku
+})
+let top = 0
+for i in 0..min(100, ranked.length) { top = (top * 31 + ranked[i].sku) % 1000000007 }
+print("\(ranked.length) \(catalog.nextSku) \(pruned) \(sold)")
+print("\(historySum) \(moveSum) \(top)")

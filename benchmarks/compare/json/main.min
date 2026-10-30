@@ -1,0 +1,133 @@
+use "errors" as errors
+use "io" as io
+use "json" as json
+use "process" as processInfo
+// JSON parse, query and serialise: decode an array of user objects, aggregate
+// spending per city and tag use, and write a derived JSON report.
+record User {
+    id: Integer
+    name: Text
+    active: Boolean
+    age: Integer
+    score: Integer
+    city: Text
+    zip: Integer
+    latitude: Integer
+    longitude: Integer
+    tags: List<Text>
+    spent: Integer
+}
+record CityStats { users: Integer; active: Integer; spent: Integer; oldest: Integer; top: Text; topSpent: Integer }
+
+function integerMember(value: json.Value, name: Text): Result<Integer, errors.Error> {
+    return (try value.get(name)).asInteger()
+}
+
+function textMember(value: json.Value, name: Text): Result<Text, errors.Error> {
+    return (try value.get(name)).asText()
+}
+
+function readUser(value: json.Value): Result<User, errors.Error> {
+    let address = try value.get("address")
+    let geo = try (try address.get("geo")).asArray()
+    let tags: List<Text> = []
+    for tag in try (try value.get("tags")).asArray() { tags.add(try tag.asText()) }
+    let spent = 0
+    for order in try (try value.get("orders")).asArray() {
+        spent += (try integerMember(order, "qty")) * (try integerMember(order, "price"))
+    }
+    return Ok(User {
+        id: try integerMember(value, "id")
+        name: try textMember(value, "name")
+        active: try (try value.get("active")).asBoolean()
+        age: try integerMember(value, "age")
+        score: try integerMember(value, "score")
+        city: try textMember(address, "city")
+        zip: Integer(try textMember(address, "zip"))
+        latitude: try geo[0].asInteger()
+        longitude: try geo[1].asInteger()
+        tags: tags
+        spent: spent
+    })
+}
+
+function readUsers(source: Text): Result<List<User>, errors.Error> {
+    let users: List<User> = []
+    for item in try (try json.decode(source)).asArray() { users.add(try readUser(item)) }
+    return Ok(users)
+}
+
+function sortedKeys<Value>(map: Map<Text, Value>): List<Text> {
+    let keys: List<Text> = []
+    for key in map { keys.add(key) }
+    keys.sort()
+    return keys
+}
+
+function joinWith(parts: List<Text>, separator: Text): Text {
+    let pieces: List<Text> = []
+    for index in 0..parts.length {
+        if index > 0 { pieces.add(separator) }
+        pieces.add(parts[index])
+    }
+    return joinText(pieces)
+}
+
+function fnv(text: Text): Integer {
+    let hash = -3750763034362895579
+    for byte in Bytes(text) { hash = wrappingMultiply(hash ^ byte, 1099511628211) }
+    return hash
+}
+
+function report(users: List<User>) {
+    let cities: Map<Text, CityStats> = Map()
+    let tagCounts: Map<Text, Integer> = Map()
+    let active = 0
+    let checksum = 0
+    let geoSum = 0
+    let spenders: List<Text> = []
+    for user in users {
+        if !cities.has(user.city) {
+            cities[user.city] = CityStats { users: 0; active: 0; spent: 0; oldest: 0; top: ""; topSpent: -1 }
+        }
+        let stats = cities[user.city]
+        stats.users += 1
+        stats.spent += user.spent
+        if user.age > stats.oldest { stats.oldest = user.age }
+        if user.spent > stats.topSpent {
+            stats.topSpent = user.spent
+            stats.top = user.name
+        }
+        checksum = (checksum * 31 + user.name.byteLength + user.age + user.score + 5000 + user.zip) % 1000000007
+        geoSum += user.latitude + user.longitude
+        if !user.active { continue }
+        active += 1
+        stats.active += 1
+        for tag in user.tags {
+            if tagCounts.has(tag) { tagCounts[tag] += 1 } else { tagCounts[tag] = 1 }
+        }
+        if user.spent > 600000 {
+            let quotedTags: List<Text> = []
+            for tag in user.tags { quotedTags.add(json.quote(tag)) }
+            spenders.add("{\"id\":\(user.id),\"name\":\(json.quote(user.name)),\"city\":\(json.quote(user.city)),\"spent\":\(user.spent),\"tags\":[\(joinWith(quotedTags, ","))]}")
+        }
+    }
+    let cityLines: List<Text> = []
+    for city in sortedKeys(cities) {
+        let stats = cities[city]
+        cityLines.add("{\"city\":\(json.quote(city)),\"users\":\(stats.users),\"active\":\(stats.active),\"spent\":\(stats.spent),\"oldest\":\(stats.oldest),\"top\":\(json.quote(stats.top)),\"topSpent\":\(stats.topSpent)}")
+    }
+    let tagMembers: List<Text> = []
+    for tag in sortedKeys(tagCounts) { tagMembers.add("\(json.quote(tag)):\(tagCounts[tag])") }
+    let output = "{\"cities\":[\(joinWith(cityLines, ","))],\"tags\":{\(joinWith(tagMembers, ","))},\"spenders\":[\(joinWith(spenders, ","))]}"
+    print("\(users.length) \(active)")
+    print("\(checksum) \(geoSum)")
+    print(spenders.length)
+    print("\(output.byteLength) \(fnv(output))")
+    for line in cityLines { print(line) }
+}
+
+match readUsers(io.readTextFile(processInfo.argument(0))) {
+    Ok(users) { report(users) }
+    Err(problem) { print("invalid input: \(problem.message())") }
+}
