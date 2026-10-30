@@ -1,0 +1,45 @@
+use "machine" as machine
+
+thread function worker(seed: Integer, input: NativeRegions, channel: BytesChannel): Integer {
+    let data = input.get(1)
+    for index in 0..seed { data.atomicAddInt64(16, 1) }
+    return data.getUInt16(1)
+}
+
+function main() {
+    nativeThreadSetup()
+    let local = Bytes(8)
+    local.setInt64(0, 42)
+    if machine.load64(machine.address(local)) != 42 { fail("main-local address") }
+    let invalid = tryMapNativeRegion(0, 3, 34, -1, 0)
+    if invalid.ok || invalid.code != -22 { fail("mapping Result") }
+    let slot = mapNativeRegion(64, 3, 34, -1, 0)
+    let mapped = tryMapNativeRegion(4096, 3, 34, -1, 0)
+    if !mapped.ok { fail("mapping failed") }
+    let data = mapped.region
+    data.setUInt8(0, 123)
+    data.setUInt16(1, 65535)
+    data.setUInt32(3, 4294967295)
+    data.setInt64(7, -9223372036854775807 - 1)
+    if data.getUInt8(0) != 123 || data.getUInt32(3) != 4294967295 || data.getInt64(7) != -9223372036854775807 - 1 { fail("unaligned fields") }
+    data.storeReleaseInt64(16, 0)
+    slot.storeReleaseUInt32(0, 3)
+    if slot.compareExchangeUInt32(0, 0, 1) != 3 || slot.loadAcquireUInt32(0) != 3 { fail("stop overwritten") }
+    data.copyFromBytes(32, local)
+    let copied = data.copyToBytes(32, 8)
+    if copied.getInt64(0) != 42 { fail("local copy") }
+    let regions: List<NativeRegion> = [slot, data]
+    let shared = shareNativeRegions(regions)
+    regions.truncate(0)
+    if shared.length != 2 || data.length != 4096 { fail("shared regions") }
+    let channel = bytesChannel(0, 1)
+    let first = startThread(worker, 10000, shared, channel)
+    let second = startThread(worker, 10000, shared, channel)
+    if joinThread(first) != 65535 || joinThread(second) != 65535 { fail("worker result") }
+    if data.loadAcquireInt64(16) != 20000 { fail("atomic count") }
+    let event = threadEventfd(524288)
+    if event < 0 || threadEventfdNotify(event, 2) != 0 || threadEventfdRead(event) != 2 { fail("eventfd") }
+    if machine.syscall(3, event, 0, 0, 0, 0, 0) != 0 { fail("eventfd close") }
+    closeBytesChannel(channel)
+    print("native-regions passed")
+}
