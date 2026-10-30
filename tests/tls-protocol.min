@@ -128,6 +128,72 @@ function scenario(mode: Integer, root: Bytes, leaf: Bytes, key: Bytes, other: By
            crypto.hex(session.serverApplication) == crypto.hex(application)
 }
 
+function base64(data: Bytes): Text {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    let out = ""
+    let index = 0
+    while index < data.length {
+        let a = data[index]
+        let b = 0
+        let c = 0
+        if index + 1 < data.length { b = data[index + 1] }
+        if index + 2 < data.length { c = data[index + 2] }
+        let bits = (a << 16) | (b << 8) | c
+        out += alphabet.slice(bits >> 18, (bits >> 18) + 1) + alphabet.slice((bits >> 12) & 63, ((bits >> 12) & 63) + 1)
+        if index + 1 < data.length { out += alphabet.slice((bits >> 6) & 63, ((bits >> 6) & 63) + 1) } else { out += "=" }
+        if index + 2 < data.length { out += alphabet.slice(bits & 63, (bits & 63) + 1) } else { out += "=" }
+        if (index / 3 + 1) % 16 == 0 { out += "\n" }
+        index += 3
+    }
+    return out
+}
+function sameBytes(a: Bytes, b: Bytes): Boolean {
+    if a.length != b.length { return false }
+    for index in 0..a.length { if a[index] != b[index] { return false } }
+    return true
+}
+
+// A CA bundle is one trust store: 40 anchors (the root last), PEM decoding, a full in-memory handshake, the
+// anchor cap, and a store without the issuing root.
+function largeTrustStores(root: Bytes, leaf: Bytes, key: Bytes, other: Bytes): Boolean {
+    let pem = "# bundle\n"
+    for index in 0..39 { pem += "-----BEGIN CERTIFICATE-----\n" + base64(other) + "\n-----END CERTIFICATE-----\n" }
+    pem += "-----BEGIN TRUSTED CERTIFICATE-----\nAAAA\n-----END TRUSTED CERTIFICATE-----\n"
+    pem += "-----BEGIN CERTIFICATE-----\r\n" + base64(root) + "\r\n-----END CERTIFICATE-----\r\n"
+    let roots: List<Bytes> = []
+    match tls.pemCertificates(Bytes(pem)) {
+        Ok(decoded) { roots = decoded }
+        Err(problem) { print("TLS PEM bundle rejected: " + problem.describe()); return false }
+    }
+    if roots.length != 40 || !sameBytes(roots[39], root) || !sameBytes(roots[0], other) { print("TLS PEM bundle decoded wrongly"); return false }
+    for bad in ["", "-----BEGIN CERTIFICATE-----\nMAMC", "-----BEGIN CERTIFICATE-----\nMA*CAQA=\n-----END CERTIFICATE-----", "-----BEGIN CERTIFICATE-----\nMAMCAQ\n-----END CERTIFICATE-----"] {
+        match tls.pemCertificates(Bytes(bad)) {
+            Ok(decoded) { print("TLS accepted a malformed PEM bundle: " + bad); return false }
+            Err(problem) {}
+        }
+    }
+    let client = tls.clientWithTrust("localhost", Bytes(64), roots)
+    let peer = server.server(Bytes(64), "http/1.1", [leaf], key, [], false)
+    for round in 0..6 {
+        server.receive(peer, tls.takeOutgoing(client))
+        tls.receive(client, server.takeOutgoing(peer))
+    }
+    if !tls.established(client) || !client.authenticated { print("TLS rejected a server whose root is the 40th anchor: " + client.error); return false }
+    let strangers: List<Bytes> = []
+    for index in 0..39 { strangers.add(roots[index]) }
+    let without = tls.clientWithTrust("localhost", Bytes(64), strangers)
+    let stranger = server.server(Bytes(64), "http/1.1", [leaf], key, [], false)
+    for round in 0..6 {
+        server.receive(stranger, tls.takeOutgoing(without))
+        tls.receive(without, server.takeOutgoing(stranger))
+    }
+    if tls.established(without) { print("TLS trusted a server outside a 39-anchor store"); return false }
+    let tooMany: List<Bytes> = []
+    for index in 0..4097 { tooMany.add(root) }
+    if tls.clientWithTrust("localhost", Bytes(64), tooMany).state != tls.FAILED { print("TLS accepted 4097 anchors"); return false }
+    return true
+}
+
 function main(): Integer {
     let root = io.readBytesFile(processInfo.argument(0))
     let leaf = io.readBytesFile(processInfo.argument(1))
@@ -320,6 +386,7 @@ function main(): Integer {
     }
     let shortEntropy = tls.client("localhost", Bytes(63))
     if shortEntropy.state != tls.FAILED { print("TLS accepted insufficient entropy"); return 1 }
-    print("TLS raw handshake: 20 state/signature/fragmentation cases, key-change record boundaries, all DER truncations, 3584 parser fuzz cases, record and ticket coalescing, early application rejection, and AEAD record limits passed")
+    if !largeTrustStores(root, leaf, key, other) { return 1 }
+    print("TLS raw handshake: 20 state/signature/fragmentation cases, key-change record boundaries, all DER truncations, 3584 parser fuzz cases, record and ticket coalescing, early application rejection, AEAD record limits, CA-bundle trust stores and PEM bundles passed")
     return 0
 }

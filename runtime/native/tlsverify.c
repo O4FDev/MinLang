@@ -19,6 +19,9 @@
 
 #define MAX_CHAIN 16
 #define MAX_CERT_BYTES (1024 * 1024)
+/* Trust anchors: a whole CA bundle (SSL_CERT_FILE holds ~150 roots) is one isolated trust store. */
+#define MAX_ANCHORS 4096
+#define MAX_ANCHOR_BYTES (16 * 1024 * 1024)
 typedef struct {
     const unsigned char *data;
     size_t length;
@@ -74,20 +77,23 @@ static bool exact_der(const unsigned char *p, size_t n) {
     return length == n - header;
 }
 
-static int unpack_chain(const MinyarBytes *bytes, CertBytes out[MAX_CHAIN]) {
-    if (bytes->byte_length < 0 || bytes->byte_length > MAX_CERT_BYTES)
+/* Count (out == NULL) or unpack at most `limit` CertificateEntry records. */
+static int unpack_entries(const MinyarBytes *bytes, CertBytes *out, int limit, long long max_bytes) {
+    if (bytes->byte_length < 0 || bytes->byte_length > max_bytes)
         return -1;
     size_t n = (size_t)bytes->byte_length, at = 0;
     int count = 0;
     while (at < n) {
-        if (count == MAX_CHAIN || n - at < 3)
+        if (count == limit || n - at < 3)
             return -1;
         size_t length = ((size_t)bytes->bytes[at] << 16) | ((size_t)bytes->bytes[at + 1] << 8) |
                         bytes->bytes[at + 2];
         at += 3;
         if (!length || length > n - at || !exact_der(bytes->bytes + at, length))
             return -1;
-        out[count++] = (CertBytes){bytes->bytes + at, length};
+        if (out)
+            out[count] = (CertBytes){bytes->bytes + at, length};
+        count++;
         at += length;
         if (n - at < 2)
             return -1;
@@ -98,6 +104,22 @@ static int unpack_chain(const MinyarBytes *bytes, CertBytes out[MAX_CHAIN]) {
         at += extensions;
     }
     return count;
+}
+
+static int unpack_chain(const MinyarBytes *bytes, CertBytes out[MAX_CHAIN]) {
+    return unpack_entries(bytes, out, MAX_CHAIN, MAX_CERT_BYTES);
+}
+
+/* Anchors live on the heap: up to MAX_ANCHORS. Free *out after use; -1 rejects the set. */
+static int unpack_anchors(const MinyarBytes *bytes, CertBytes **out) {
+    *out = NULL;
+    int count = unpack_entries(bytes, NULL, MAX_ANCHORS, MAX_ANCHOR_BYTES);
+    if (count <= 0)
+        return count;
+    *out = malloc((size_t)count * sizeof(**out));
+    if (!*out)
+        return -1;
+    return unpack_entries(bytes, *out, count, MAX_ANCHOR_BYTES);
 }
 
 static bool hostname(const MinyarText *host, char out[254]) {
@@ -261,10 +283,8 @@ static SecCertificateRef apple_certificate(CertBytes bytes) {
     return certificate;
 }
 
-static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
-                                const MinyarBytes *anchors, bool server_peer) {
-    CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
-    int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
+static MinyarText *verify_unpacked(const MinyarText *host, const CertBytes *peers, int peer_count,
+                                   const CertBytes *roots, int root_count, bool server_peer) {
     char name[254] = {0};
     if (peer_count <= 0 || root_count < 0 || !certificate_signing_usage(peers[0]) ||
         (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
@@ -498,10 +518,8 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
 
 #elif defined(_WIN32)
 
-static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
-                                const MinyarBytes *anchors, bool server_peer) {
-    CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
-    int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
+static MinyarText *verify_unpacked(const MinyarText *host, const CertBytes *peers, int peer_count,
+                                   const CertBytes *roots, int root_count, bool server_peer) {
     char name[254] = {0};
     if (peer_count <= 0 || root_count < 0 || !certificate_signing_usage(peers[0]) ||
         (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
@@ -832,10 +850,8 @@ static X509 *unix_certificate(CertBytes bytes) {
     return certificate;
 }
 
-static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
-                                const MinyarBytes *anchors, bool server_peer) {
-    CertBytes peers[MAX_CHAIN], roots[MAX_CHAIN];
-    int peer_count = unpack_chain(chain, peers), root_count = unpack_chain(anchors, roots);
+static MinyarText *verify_unpacked(const MinyarText *host, const CertBytes *peers, int peer_count,
+                                   const CertBytes *roots, int root_count, bool server_peer) {
     char name[254] = {0};
     if (peer_count <= 0 || root_count < 0 || !certificate_signing_usage(peers[0]) ||
         (server_peer && (!hostname(host, name) || !certificate_hostname(peers[0], name))))
@@ -975,6 +991,15 @@ MinyarBytes *minyar_tlsverify_sign(const MinyarBytes *private_key, long long sch
     return result;
 }
 #endif
+
+static MinyarText *verify_chain(const MinyarText *host, const MinyarBytes *chain,
+                                const MinyarBytes *anchors, bool server_peer) {
+    CertBytes peers[MAX_CHAIN], *roots;
+    int peer_count = unpack_chain(chain, peers), root_count = unpack_anchors(anchors, &roots);
+    MinyarText *result = verify_unpacked(host, peers, peer_count, roots, root_count, server_peer);
+    free(roots);
+    return result;
+}
 
 MinyarText *minyar_tlsverify_chain(const MinyarText *host, const MinyarBytes *chain,
                                    const MinyarBytes *anchors) {

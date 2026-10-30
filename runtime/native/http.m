@@ -26,6 +26,7 @@ enum { MHWakeSubtype = 0x4D59 };
 @property(nonatomic, strong) NSURL *credentialOrigin;
 @property(nonatomic, strong) NSURLSession *identitySession;
 @property(nonatomic, copy) NSArray<NSString *> *callerHeaderNames;
+@property(nonatomic, copy) NSArray *anchors; /* SecCertificateRef roots replacing the OS roots, or nil */
 @end
 @implementation MHRequest
 @end
@@ -122,9 +123,38 @@ static NSURLCredential *http_identity_credential(const MinyarBytes *reference, c
         certificates:certificates.count?certificates:nil persistence:NSURLCredentialPersistenceForSession]:nil;
     CFRelease(identity); return credential;
 }
+/* Decode count + (length, DER) roots, as beginTrusting encodes them. nil when invalid. */
+static NSArray *http_anchor_certificates(const MinyarBytes *roots) {
+    if (roots->byte_length < 4 || roots->byte_length > 16777216) return nil;
+    uint32_t count=identity_word(roots->bytes);
+    if (!count || count>4096) return nil;
+    NSMutableArray *certificates=[NSMutableArray new];
+    size_t offset=4;
+    for (uint32_t i=0;i<count;i++) {
+        if ((uint64_t)roots->byte_length-offset<4) return nil;
+        uint32_t size=identity_word(roots->bytes+offset); offset+=4;
+        if (!size || size>(uint64_t)roots->byte_length-offset) return nil;
+        CFDataRef data=CFDataCreate(NULL,roots->bytes+offset,size);
+        SecCertificateRef cert=data?SecCertificateCreateWithData(NULL,data):NULL;
+        if (data) CFRelease(data);
+        if (!cert) return nil;
+        [certificates addObject:CFBridgingRelease(cert)]; offset+=size;
+    }
+    return offset==(uint64_t)roots->byte_length?certificates:nil;
+}
 static void http_authenticate(MHRequest *r, NSURLAuthenticationChallenge *challenge,
                               void (^handler)(NSURLSessionAuthChallengeDisposition,NSURLCredential *)) {
     NSURLProtectionSpace *space=challenge.protectionSpace;
+    if (r.anchors && [space.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+        /* Evaluate the server chain against the caller's roots only (the policy still checks the host). */
+        SecTrustRef trust=space.serverTrust;
+        BOOL trusted=trust && SecTrustSetAnchorCertificates(trust,(__bridge CFArrayRef)r.anchors)==errSecSuccess &&
+            SecTrustSetAnchorCertificatesOnly(trust,true)==errSecSuccess && SecTrustEvaluateWithError(trust,NULL);
+        if (!trusted) finish(r,@"the server certificate did not verify against the trust roots");
+        handler(trusted?NSURLSessionAuthChallengeUseCredential:NSURLSessionAuthChallengeCancelAuthenticationChallenge,
+                trusted?[NSURLCredential credentialForTrust:trust]:nil);
+        return;
+    }
     if (![space.authenticationMethod isEqualToString:NSURLAuthenticationMethodClientCertificate] || !r.clientCredential) {
         handler(NSURLSessionAuthChallengePerformDefaultHandling,nil); return;
     }
@@ -281,7 +311,8 @@ static BOOL http_reserved_header(NSString *name) {
 }
 
 static long long http_begin(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body,
-                            NSURLCredential *credential, BOOL requiresIdentity, long long maximum, long long timeoutMs) { @autoreleasepool {
+                            NSURLCredential *credential, BOOL requiresIdentity, long long maximum, long long timeoutMs,
+                            NSArray *anchors) { @autoreleasepool {
     http_owner();
     if (!session) {
         NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.defaultSessionConfiguration;
@@ -301,6 +332,7 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
     r.maximumBytes = (NSUInteger)maximum;
     long long handle = nextRequest++;
     requests[@(handle)] = r;
+    if (anchors && !anchors.count) { finish(r, @"invalid trust root certificates"); return handle; }
     NSString *verb = method ? string(method) : @"GET";
     if (!http_token(verb)) { finish(r, @"invalid HTTP request method"); return handle; }
     NSString *urlText = string(url);
@@ -334,7 +366,8 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
         finish(r,@"an HTTPS request requires an accessible Keychain identity and valid intermediate certificates"); return handle;
     }
     r.clientCredential=credential; r.credentialOrigin=credential?address:nil;
-    if (credential) {
+    r.anchors=anchors;
+    if (credential || anchors) {
         /* Client certificate credentials and authenticated pooled connections
          * must never be reused by an unrelated request or device identity. */
         NSURLSessionConfiguration *configuration=NSURLSessionConfiguration.ephemeralSessionConfiguration;
@@ -365,18 +398,27 @@ static long long http_begin(const MinyarText *method, const MinyarText *url, con
     return handle;
 } }
 long long minyar_http_begin(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body) {
-    return http_begin(method,url,headers,body,nil,NO,0,0);
+    return http_begin(method,url,headers,body,nil,NO,0,0,nil);
 }
 long long minyar_http_beginBounded(const MinyarText *method, const MinyarText *url, const MinyarText *headers, const MinyarText *body,
                                   long long maximum, long long timeoutMs) {
     if (maximum < 1 || maximum > 134217728 || timeoutMs < 1 || timeoutMs > 300000)
         minyar_native_stop("invalid bounded HTTP request limits.");
-    return http_begin(method,url,headers,body,nil,NO,maximum,timeoutMs);
+    return http_begin(method,url,headers,body,nil,NO,maximum,timeoutMs,nil);
 }
+long long minyar_http_beginTrusting(const MinyarText *method, const MinyarText *url, const MinyarText *headers,
+                                   const MinyarText *body, long long maximum, long long timeoutMs,
+                                   const MinyarBytes *roots) { @autoreleasepool {
+    http_owner();
+    if (maximum < 1 || maximum > 134217728 || timeoutMs < 1 || timeoutMs > 300000)
+        minyar_native_stop("invalid bounded HTTP request limits.");
+    /* An empty array marks invalid roots: http_begin finishes the request with an error before any I/O. */
+    return http_begin(method,url,headers,body,nil,NO,maximum,timeoutMs,http_anchor_certificates(roots)?:@[]);
+} }
 long long minyar_http_beginWithIdentity(const MinyarText *method, const MinyarText *url, const MinyarText *headers,
                                       const MinyarText *body, const MinyarBytes *reference, const MinyarBytes *chain) { @autoreleasepool {
     http_owner();
-    return http_begin(method,url,headers,body,http_identity_credential(reference,chain),YES,0,0);
+    return http_begin(method,url,headers,body,http_identity_credential(reference,chain),YES,0,0,nil);
 } }
 bool minyar_http_wait(long long handle, double seconds) { @autoreleasepool {
     MHRequest *r = entry(handle);

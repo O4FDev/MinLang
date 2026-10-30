@@ -1,6 +1,9 @@
 use "errors" as errors
 use "text" as textTools
 use "json" as json
+use "system" as system
+use "io" as io
+use "tls" as tls
 
 // HTTP and HTTPS requests on macOS. Import it with `use "http" as http`.
 //
@@ -60,6 +63,20 @@ public function fetchBounded(url: Text, headers: List<Text>, limit: Integer): Re
 public function fetchWithin(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer): Result<Reply, errors.Error> { return typedResponse(getBoundedWithin(url, headers, limit, timeoutMs)) }
 public function sendBounded(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer): Result<Reply, errors.Error> { return typedResponse(requestBounded(method, url, headers, body, limit)) }
 public function sendWithin(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Result<Reply, errors.Error> { return typedResponse(requestBoundedWithin(method, url, headers, body, limit, timeoutMs)) }
+// The same requests trusting only the given DER root certificates instead of the OS roots (an empty list uses
+// the OS roots). Each trusting request has its own NSURLSession, so no pooled connection that was trusted
+// another way is reused for it.
+public function fetchTrusting(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer, roots: List<Bytes>): Result<Reply, errors.Error> { return typedResponse(requestTrusting("GET", url, headers, "", limit, timeoutMs, roots)) }
+public function sendTrusting(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer, roots: List<Bytes>): Result<Reply, errors.Error> { return typedResponse(requestTrusting(method, url, headers, body, limit, timeoutMs, roots)) }
+/// The trust roots the environment names: the certificates of the PEM file in SSL_CERT_FILE, or an empty list
+/// (OS roots) when it is unset or empty. Pass the result to fetchTrusting or sendTrusting.
+public function environmentTrust(): Result<List<Bytes>, errors.Error> {
+    let path = system.getenv("SSL_CERT_FILE")
+    if path == "" { return Ok([]) }
+    let bundle = try io.readBytes(path) else ("reading SSL_CERT_FILE " + path)
+    let roots = try tls.pemCertificates(bundle) else ("reading SSL_CERT_FILE " + path)
+    return Ok(roots)
+}
 public function Reply.text(): Result<Text, errors.Error> { return textTools.decode(self.body) }
 public function Reply.json(): Result<json.Value, errors.Error> { return json.decodeBytes(self.body, 134217728) }
 
@@ -112,6 +129,28 @@ public function requestBoundedWithin(method: Text, url: Text, headers: List<Text
     for header in headers { lines.add(header); lines.add("\n") }
     let handle = beginBounded(method, url, joinText(lines), body, limit, timeoutMs)
     let response = collect(handle)
+    if response.error != "" { return failed(response.error) }
+    return response
+}
+
+function requestTrusting(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer, roots: List<Bytes>): Response {
+    if roots.length == 0 { return requestBoundedWithin(method, url, headers, body, limit, timeoutMs) }
+    if limit < 1 || limit > 134217728 { return failed("invalid download size limit") }
+    if timeoutMs < 1 || timeoutMs > 300000 { return failed("invalid download timeout") }
+    if !supported(url) { return failed("only http:// and https:// URLs are supported: " + url) }
+    let framingError = requestFramingError(method, headers)
+    if framingError != "" { return failed(framingError) }
+    if roots.length > 4096 { return failed("too many trust roots") }
+    let encoded = Bytes()
+    encoded.addUInt32(roots.length)
+    for root in roots {
+        if root.length == 0 || encoded.length + root.length + 4 > 16777216 { return failed("invalid or oversized trust roots") }
+        encoded.addUInt32(root.length)
+        encoded.addBytes(root)
+    }
+    let lines: List<Text> = []
+    for header in headers { lines.add(header); lines.add("\n") }
+    let response = collect(beginTrusting(method, url, joinText(lines), body, limit, timeoutMs, encoded))
     if response.error != "" { return failed(response.error) }
     return response
 }
@@ -222,6 +261,9 @@ function beginBounded(method: Text, url: Text, headers: Text, body: Text, limit:
     native "http"
 }
 function beginWithIdentity(method: Text, url: Text, headers: Text, body: Text, signer: Bytes, intermediates: Bytes): Integer {
+    native "http"
+}
+function beginTrusting(method: Text, url: Text, headers: Text, body: Text, limit: Integer, timeoutMs: Integer, roots: Bytes): Integer {
     native "http"
 }
 

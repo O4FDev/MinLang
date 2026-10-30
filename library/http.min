@@ -22,6 +22,8 @@ use "tls" as tls
 use "text" as text
 use "errors" as errors
 use "json" as json
+use "system" as system
+use "io" as io
 
 public record Response {
     status: Integer
@@ -49,6 +51,19 @@ public function fetchBounded(url: Text, headers: List<Text>, limit: Integer): Re
 public function fetchWithin(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer): Result<Reply, errors.Error> { return typedResponse(getBoundedWithin(url, headers, limit, timeoutMs)) }
 public function sendBounded(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer): Result<Reply, errors.Error> { return typedResponse(requestBounded(method, url, headers, body, limit)) }
 public function sendWithin(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Result<Reply, errors.Error> { return typedResponse(requestBoundedWithin(method, url, headers, body, limit, timeoutMs)) }
+// The same requests trusting only the given DER root certificates (for example tls.pemCertificates of a CA
+// bundle) instead of the OS roots; an empty list uses the OS roots. limit and timeoutMs are as in fetchWithin.
+public function fetchTrusting(url: Text, headers: List<Text>, limit: Integer, timeoutMs: Integer, roots: List<Bytes>): Result<Reply, errors.Error> { return typedResponse(requestTrusting("GET", url, headers, "", limit, timeoutMs, roots)) }
+public function sendTrusting(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer, roots: List<Bytes>): Result<Reply, errors.Error> { return typedResponse(requestTrusting(method, url, headers, body, limit, timeoutMs, roots)) }
+/// The trust roots the environment names: the certificates of the PEM file in SSL_CERT_FILE, or an empty list
+/// (OS roots) when it is unset or empty. Pass the result to fetchTrusting or sendTrusting.
+public function environmentTrust(): Result<List<Bytes>, errors.Error> {
+    let path = system.getenv("SSL_CERT_FILE")
+    if path == "" { return Ok([]) }
+    let bundle = try io.readBytes(path) else ("reading SSL_CERT_FILE " + path)
+    let roots = try tls.pemCertificates(bundle) else ("reading SSL_CERT_FILE " + path)
+    return Ok(roots)
+}
 public function Reply.text(): Result<Text, errors.Error> { return text.decode(self.body) }
 public function Reply.json(): Result<json.Value, errors.Error> { return json.decodeBytes(self.body, 134217728) }
 
@@ -193,7 +208,13 @@ public function postBoundedWithin(url: Text, headers: List<Text>, body: Text, li
 public function requestBoundedWithin(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Response {
     if limit < 1 || limit > 134217728 { return failed("invalid download size limit") }
     if timeoutMs < 1 || timeoutMs > 300000 { return failed("invalid download timeout") }
-    return exchange(method, url, headers, body, limit, timeoutMs)
+    return exchange(method, url, headers, body, limit, timeoutMs, [])
+}
+
+function requestTrusting(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer, roots: List<Bytes>): Response {
+    if limit < 1 || limit > 134217728 { return failed("invalid download size limit") }
+    if timeoutMs < 1 || timeoutMs > 300000 { return failed("invalid download timeout") }
+    return exchange(method, url, headers, body, limit, timeoutMs, roots)
 }
 
 function ready(connection: Integer, deadline: Integer): Boolean {
@@ -273,7 +294,7 @@ function requestFramingError(method: Text, headers: List<Text>): Text {
     return ""
 }
 
-function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer): Response {
+function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limit: Integer, timeoutMs: Integer, roots: List<Bytes>): Response {
     let framingError = requestFramingError(method, headers)
     if framingError != "" { return failed(framingError) }
     let address = parse(url)
@@ -298,7 +319,7 @@ function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limi
     let message = Bytes(joinText(lines))
     message.addBytes(content)
     if address.secure {
-        return secureExchange(connection, address.host, method, message, limit, deadline)
+        return secureExchange(connection, address.host, method, message, limit, deadline, roots)
     }
     let sendError = writeWithin(connection, message, deadline, "HTTP upload")
     if sendError != "" {
@@ -326,8 +347,8 @@ function exchange(method: Text, url: Text, headers: List<Text>, body: Text, limi
     }
 }
 
-function secureExchange(connection: Integer, host: Text, method: Text, message: Bytes, limit: Integer, deadline: Integer): Response {
-    let session = tls.client(host, secureRandom.bytes(64))
+function secureExchange(connection: Integer, host: Text, method: Text, message: Bytes, limit: Integer, deadline: Integer, roots: List<Bytes>): Response {
+    let session = tls.clientWithTrust(host, secureRandom.bytes(64), roots)
     let hello = tls.takeOutgoing(session)
     let helloError = writeWithin(connection, hello, deadline, "TLS handshake send")
     if helloError != "" { net.close(connection); return failed(helloError) }
