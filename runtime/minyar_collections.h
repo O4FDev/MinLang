@@ -451,6 +451,11 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
     long long value = record->values[field];
 #ifndef MINYAR_COMPILER_ARENA
     RcObject *object = (RcObject *)record - 1;
+    /* A scalar record owns no slot: releasing it frees a unique one now. */
+    if ((object->ownership & 7) == RC_SCALAR_RECORD) {
+        minyar_rc_release(record);
+        return value;
+    }
     unsigned char *references = (unsigned char *)(record->values + record->length);
     if (object->ownership == (8 | RC_RECORD)) {
         references[field] = 0;

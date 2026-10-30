@@ -50,6 +50,11 @@ let source = #"""
         Branch(kids: List<Tree>)
     }
     record Holder { name: Text }
+    choice Reading {
+        Missing
+        Value(amount: Integer)
+        Pair(low: Integer, high: Float)
+    }
     choice Shape {
         Dot(size: Integer)
         Group(items: List<Shape>, label: Text)
@@ -147,6 +152,18 @@ let source = #"""
             else { return 0 }
         }
     }
+    function reading(index: Integer): Reading {
+        if index == 0 { return Reading.Missing }
+        if index == 1 { return Reading.Value(7) }
+        return Reading.Pair(2, 3.5)
+    }
+    function describe(index: Integer): Integer {
+        return match reading(index) {
+            Missing { 0 }
+            Value(amount) { amount }
+            Pair(low, _) { low + 1 }
+        }
+    }
     function rename(holder: Holder) { holder.name = "renamed" + "!" }
     function product(holder: Holder): Text {
         match holder {
@@ -174,11 +191,12 @@ let source = #"""
     let shape = Shape.Group([Shape.Dot(2), Shape.Group([Shape.Dot(3)], "a" + "b")], "x" + "yz")
     print(area(shape))
     print(regroup(shape))
+    print(describe(0) + describe(1) + describe(2))
     let holder = Holder { name: "holder" + "!" }
     print(product(holder))
     print(holder.name)
     """#
-let expected = "10\n10\n1\n2\n9\n13\n3\nn0!\n3\n10\n5\nholder!\nrenamed!\n"
+let expected = "10\n10\n1\n2\n9\n13\n3\nn0!\n3\n10\n5\n10\nholder!\nrenamed!\n"
 
 test.require(fixtures.compile(frontend, source), "compile match payload borrow IR")
 let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
@@ -204,6 +222,10 @@ test.check(owners(ir, "product") > 0, "product: a record pattern binding keeps i
 // borrow provisionally, and at module end the unused owners, clears and frame go.
 test.check(owners(ir, "area") == 0 && !test.contains(body(ir, "area"), "@minyar_rc_enter(") && !test.contains(body(ir, "area"), "@minyar_rc_leave("), "area: provisional payload borrows of an inactive cycle leave no owner or frame")
 test.check(owners(ir, "regroup") > 0 && test.contains(body(ir, "regroup"), "@minyar_rc_enter("), "regroup: a reassigned provisional binding keeps its slot and frame")
+// A choice whose payloads are all scalars owns no slot, so it is a scalar
+// record; one with a reference payload keeps the reference map.
+test.check(count(body(ir, "reading"), "@minyar_record_new_scalar(") == 3 && count(body(ir, "reading"), "@minyar_record_new(") == 0, "reading: an all-scalar choice allocates scalar records")
+test.check(count(body(ir, "build"), "@minyar_record_new(") > 0, "build: a choice with reference payloads keeps its reference map")
 // Tree's List<Tree> is mutated, so its provisional owners are filled and traced.
 test.check(count(body(ir, "kids"), "@minyar_rc_local_traced(") > 0, "kids: an activated cycle fills its provisional owners as traced")
 fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)

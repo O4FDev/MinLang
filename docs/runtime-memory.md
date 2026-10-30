@@ -478,7 +478,9 @@ an empty List can still have a null values buffer. It adds no pointer-argument
 alias promise or allocation-success guarantee.
 
 Records with reference fields have a byte per field identifying owned references.
-Scalar-only records omit that map. Cleanup releases only initialized reference
+Scalar-only records omit that map, as do tagged choices whose cases carry only
+scalar payloads (such as `Maybe<Integer>`), so their last release frees them
+at once instead of queueing them for field visits. Cleanup releases only initialized reference
 fields, so integer bits are never mistaken for pointers. Container insertion
 retains a borrowed reference or takes an owned one. Replacement either retains
 the borrowed new element or consumes a compiler-proven owned result, then
