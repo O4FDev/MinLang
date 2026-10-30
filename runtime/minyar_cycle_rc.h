@@ -160,13 +160,16 @@ static void *rc_allocate_traced(size_t size, unsigned record) {
     return object + 1;
 }
 
-static void *rc_allocate_data(size_t size) {
+/* Movable data (Bytes storage) may be detached and freed by another thread;
+ * in a thread program it bypasses this thread's small pages. */
+static void *rc_allocate_data_in(size_t size, int movable) {
+    (void)movable;
 #ifdef MINYAR_BOUNDED_RC
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
 #endif
     if (size > SIZE_MAX - sizeof(RcData)) out_of_memory();
 #ifdef MINYAR_BOUNDED_RC
-    RcData *data = rc_heap_allocate_data(sizeof(*data) + size);
+    RcData *data = movable ? rc_heap_allocate_data(sizeof(*data) + size) : rc_heap_allocate(sizeof(*data) + size);
 #else
     RcData *data = RC_ALLOCATE(sizeof(*data) + size);
 #endif
@@ -175,6 +178,9 @@ static void *rc_allocate_data(size_t size) {
     RC_ACCOUNT(rc_bytes += sizeof(*data) + size);
     return data + 1;
 }
+
+static void *rc_allocate_data(size_t size) { return rc_allocate_data_in(size, 0); }
+static void *rc_allocate_movable_data(size_t size) { return rc_allocate_data_in(size, 1); }
 
 static void rc_free_data(void *pointer) {
     if (!pointer) return;
@@ -203,8 +209,9 @@ static inline void rc_free_text_bytes(const MinyarText *text) {
     rc_free_data((void *)text->bytes);
 }
 
-static void *rc_reallocate_data(void *pointer, size_t size) {
-    if (!pointer) return rc_allocate_data(size);
+static void *rc_reallocate_data_in(void *pointer, size_t size, int movable) {
+    (void)movable;
+    if (!pointer) return rc_allocate_data_in(size, movable);
 #ifdef MINYAR_BOUNDED_RC
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
 #endif
@@ -212,7 +219,8 @@ static void *rc_reallocate_data(void *pointer, size_t size) {
     RcData *data = (RcData *)pointer - 1;
     RC_ACCOUNT(rc_bytes -= data->size);
 #ifdef MINYAR_BOUNDED_RC
-    data = rc_heap_resize_data(data, sizeof(*data) + data->size, sizeof(*data) + size);
+    data = movable ? rc_heap_resize_data(data, sizeof(*data) + data->size, sizeof(*data) + size)
+                   : rc_heap_resize(data, sizeof(*data) + data->size, sizeof(*data) + size);
 #else
     data = realloc(data, sizeof(*data) + size);
 #endif
@@ -221,6 +229,8 @@ static void *rc_reallocate_data(void *pointer, size_t size) {
     RC_ACCOUNT(rc_bytes += size);
     return data + 1;
 }
+static void *rc_reallocate_data(void *pointer, size_t size) { return rc_reallocate_data_in(pointer, size, 0); }
+static void *rc_reallocate_movable_data(void *pointer, size_t size) { return rc_reallocate_data_in(pointer, size, 1); }
 
 void minyar_rc_retain(void *value) {
     if (!value) return;

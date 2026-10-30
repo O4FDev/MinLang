@@ -112,7 +112,7 @@ static void bytes_reserve(MinyarBytes *bytes, long long extra) {
     unsigned char *data = data_allocate((size_t)grown + 1, 1);
     memcpy(data, bytes->bytes, (size_t)bytes->byte_length);
 #else
-    unsigned char *data = rc_reallocate_data(bytes_data(bytes), (size_t)grown + 1);
+    unsigned char *data = rc_reallocate_movable_data(bytes_data(bytes), (size_t)grown + 1);
 #endif
     /* Spare capacity is private. Writers initialize their own appended range;
      * eagerly clearing it duplicates work and makes refill-heavy code scan the

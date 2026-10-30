@@ -207,7 +207,7 @@ void *minyar_frozen_bytes_copy(const MinyarBytes *bytes) {
 }
 void *minyar_frozen_bytes_take(MinyarBytes *bytes) {
     rc_thread_validate_bytes(bytes);
-    unsigned char *replacement = rc_allocate_data(1);
+    unsigned char *replacement = rc_allocate_movable_data(1);
     replacement[0] = 0;
     RcThreadBuffer packet = rc_thread_detach(bytes, replacement);
     RC_NATIVE_ACCOUNT(atomic_fetch_add(&rc_thread_native_bytes, rc_thread_buffer_charge(packet)));
@@ -307,7 +307,7 @@ static _Bool rc_channel_send(const RcThreadLeaf *channel, MinyarBytes *bytes, un
     rc_thread_domain_drain(); /* Never run a collector under the channel lock. */
     size_t capacity = (size_t)bytes->character_length;
     if (capacity > c->max_bytes) { rc_thread_control_release(c); return 0; }
-    unsigned char *replacement = rc_allocate_data(1);
+    unsigned char *replacement = rc_allocate_movable_data(1);
     replacement[0] = 0;
     rc_thread_mutex_lock(&c->mutex);
     while (!c->closed && (c->count == c->max_messages || capacity > c->max_bytes - c->retained_bytes)) {

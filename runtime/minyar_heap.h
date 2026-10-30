@@ -70,7 +70,13 @@ static inline void *rc_heap_allocate_data(size_t bytes) {
 static inline void *rc_heap_resize_data(void *pointer, size_t old_bytes, size_t bytes) {
     if (!pointer) return rc_heap_allocate_data(bytes);
     RcSystemSlot *slot = (RcSystemSlot *)pointer - 1;
-    if (slot->page) return rc_heap_resize(pointer, old_bytes, bytes);
+    if (slot->page) {
+        /* Storage that began as a small slot becomes movable as it grows. */
+        void *moved = rc_heap_allocate_data(bytes);
+        memcpy(moved, pointer, old_bytes < bytes ? old_bytes : bytes);
+        rc_heap_deallocate(pointer);
+        return moved;
+    }
     if (bytes > SIZE_MAX - sizeof(*slot)) out_of_memory();
     slot = realloc(slot, sizeof(*slot) + bytes);
     if (!slot) out_of_memory();

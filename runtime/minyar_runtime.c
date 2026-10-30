@@ -499,7 +499,12 @@ MINYAR_HOT void copy_bytes(unsigned char *target, const unsigned char *source, s
 
 MINYAR_HOT unsigned char *new_bytes(long long length) {
     if ((unsigned long long)length >= SIZE_MAX) out_of_memory();
+#ifdef MINYAR_COMPILER_ARENA
     return data_allocate((size_t)length + 1, 1);
+#else
+    /* Bytes storage can be moved to another thread (sendBytes, freezeBytesTake). */
+    return rc_allocate_movable_data((size_t)length + 1);
+#endif
 }
 
 #ifndef MINYAR_COMPILER_ARENA
