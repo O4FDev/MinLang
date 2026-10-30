@@ -223,6 +223,35 @@ long long minyar_list_pop(MinyarList *list) {
     return value;
 }
 
+/* list.removeAt(position): like pop, the removed slot's owner passes to the
+ * caller; later slots move down one place without count changes. */
+long long minyar_list_remove_at(MinyarList *list, long long position) {
+    if ((unsigned long long)position >= (unsigned long long)list->length)
+        list_position_stop(position, list->length);
+    long long value = list->values[position];
+    memmove(list->values + position, list->values + position + 1,
+            (size_t)(list->length - position - 1) * sizeof(*list->values));
+    list->values[--list->length] = 0;
+    return value;
+}
+
+/* list.insert(position, value) checks the position (0 to length), then adds
+ * the value as list.add does and moves that last slot to `position`. Moving
+ * slots within one List changes no counts and no traced edges. */
+void minyar_list_insert_check(const MinyarList *list, long long position) {
+    if (position < 0 || position > list->length)
+        list_position_stop(position, list->length);
+}
+void minyar_list_insert_last(MinyarList *list, long long position) {
+    long long last = list->length - 1;
+    if (position < 0 || position > last)
+        list_position_stop(position, last);
+    long long value = list->values[last];
+    memmove(list->values + position + 1, list->values + position,
+            (size_t)(last - position) * sizeof(*list->values));
+    list->values[position] = value;
+}
+
 MinyarList *minyar_list_slice(const MinyarList *list, long long start, long long end,
                               long long references) {
     if (start < 0 || end < start || end > list->length)

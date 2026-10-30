@@ -287,6 +287,23 @@ void minyar_bytes_append(MinyarBytes *bytes, const MinyarBytes *other) {
     bytes->byte_length += length;
 }
 
+/* bytes.addRange(other, start, end): append other[start..<end] without an
+ * intermediate slice. `other` may be `bytes` itself. */
+void minyar_bytes_append_range(MinyarBytes *bytes, const MinyarBytes *other, long long start,
+                               long long end) {
+    if (start < 0 || end < start || end > other->byte_length) {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "Bytes range %lld to %lld is outside its length of %lld.", start, end,
+                 other->byte_length);
+        minyar_stop_program(message);
+    }
+    long long length = end - start;
+    bytes_reserve(bytes, length);
+    memmove(bytes_data(bytes) + bytes->byte_length, other->bytes + start, (size_t)length);
+    bytes->byte_length += length;
+}
+
 /* Grow Bytes by `count` zeroed bytes and return where they start, for native
  * library code that writes packed data directly. */
 unsigned char *minyar_bytes_extend(MinyarBytes *bytes, long long count) {

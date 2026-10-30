@@ -222,3 +222,186 @@ long long minyar_runtime_jsonSpaceEnd(MinyarText *text, long long position) {
     return position + (i - start);
 }
 
+/* Everyday Text operations. Positions and lengths count Unicode scalars; all
+ * searching and copying works on bytes. A result whose scalar count equals its
+ * byte count is recorded as ASCII, as every other Text constructor does. */
+static long long text_byte_of(MinyarText *text, long long position) {
+    return text->character_offsets ? indexed_byte_offset(text, position) : position;
+}
+static MinyarText *text_build(long long length, _Bool ascii, unsigned char **bytes) {
+    MinyarText *text = new_text_storage(length, ascii ? length : -1);
+    *bytes = (unsigned char *)text->bytes;
+    (*bytes)[length] = 0;
+    return text;
+}
+static MinyarText *text_same(MinyarText *text) {
+    minyar_rc_retain(text);
+    return text;
+}
+static long long text_checked_product(long long left, long long right) {
+    if (left && right > LLONG_MAX / left) join_too_large();
+    return left * right;
+}
+static long long text_checked_sum(long long left, long long right) {
+    if (right > LLONG_MAX - left) join_too_large();
+    return left + right;
+}
+
+_Bool minyar_text_contains(MinyarText *text, MinyarText *needle) {
+    ensure_text_index(text);
+    ensure_text_index(needle);
+    if (!needle->byte_length) return 1;
+    long long small[TEXT_SEARCH_SMALL];
+    long long *table = text_search_table(needle, text->byte_length, small);
+    long long byte = text_search_next(text, needle, 0, table);
+    text_search_free(table, small);
+    return byte >= 0;
+}
+
+/* The first match starting at or after scalar position `start`, or -1. */
+long long minyar_text_find_from(MinyarText *text, MinyarText *needle, long long start) {
+    ensure_text_index(text);
+    ensure_text_index(needle);
+    if (start < 0) negative_text_position();
+    if (start > text->character_length) position_outside_text();
+    if (!needle->byte_length) return start;
+    long long first = text_byte_of(text, start);
+    long long small[TEXT_SEARCH_SMALL];
+    long long *table = text_search_table(needle, text->byte_length - first, small);
+    long long byte = text_search_next(text, needle, first, table);
+    text_search_free(table, small);
+    if (byte < 0) return -1;
+    return text->character_offsets ? start + text_scalar_count(text->bytes + first, byte - first) : byte;
+}
+
+/* Every non-overlapping occurrence, left to right. An empty pattern matches
+ * before every scalar and at the end, so "ab" becomes "-a-b-". */
+MinyarText *minyar_text_replace(MinyarText *text, MinyarText *pattern, MinyarText *replacement) {
+    ensure_text_index(text);
+    ensure_text_index(pattern);
+    ensure_text_index(replacement);
+    _Bool ascii = !text->character_offsets && !replacement->character_offsets;
+    unsigned char *out;
+    if (!pattern->byte_length) {
+        long long slots = text->character_length + 1;
+        long long length = text_checked_sum(text->byte_length, text_checked_product(slots, replacement->byte_length));
+        MinyarText *result = text_build(length, ascii, &out);
+        long long offset = 0;
+        for (long long i = 0; i <= text->byte_length; i++) {
+            if (i == text->byte_length || (text->bytes[i] & 0xc0) != 0x80) {
+                copy_bytes(out + offset, replacement->bytes, (size_t)replacement->byte_length);
+                offset += replacement->byte_length;
+            }
+            if (i < text->byte_length) out[offset++] = text->bytes[i];
+        }
+        return result;
+    }
+    long long small[TEXT_SEARCH_SMALL];
+    long long *table = text_search_table(pattern, text->byte_length, small);
+    long long count = 0;
+    for (long long at = text_search_next(text, pattern, 0, table); at >= 0;
+         at = text_search_next(text, pattern, at + pattern->byte_length, table))
+        count++;
+    if (!count) {
+        text_search_free(table, small);
+        return text_same(text);
+    }
+    long long removed = text_checked_product(count, pattern->byte_length);
+    long long length = text_checked_sum(text->byte_length - removed, text_checked_product(count, replacement->byte_length));
+    MinyarText *result = text_build(length, ascii, &out);
+    long long offset = 0, from = 0;
+    for (long long at = text_search_next(text, pattern, 0, table); at >= 0;
+         at = text_search_next(text, pattern, from, table)) {
+        copy_bytes(out + offset, text->bytes + from, (size_t)(at - from));
+        offset += at - from;
+        copy_bytes(out + offset, replacement->bytes, (size_t)replacement->byte_length);
+        offset += replacement->byte_length;
+        from = at + pattern->byte_length;
+    }
+    copy_bytes(out + offset, text->bytes + from, (size_t)(text->byte_length - from));
+    text_search_free(table, small);
+    return result;
+}
+
+MinyarText *minyar_text_repeat(MinyarText *text, long long count) {
+    ensure_text_index(text);
+    if (count < 0) minyar_stop_program("Text.repeat needs a count of zero or more.");
+    if (count == 1) return text_same(text);
+    long long length = text_checked_product(text->byte_length, count);
+    unsigned char *out;
+    MinyarText *result = text_build(length, !text->character_offsets, &out);
+    if (!length) return result;
+    copy_bytes(out, text->bytes, (size_t)text->byte_length);
+    for (long long filled = text->byte_length; filled < length;) {
+        long long piece = filled < length - filled ? filled : length - filled;
+        copy_bytes(out + filled, out, (size_t)piece);
+        filled += piece;
+    }
+    return result;
+}
+
+/* Pad to `length` scalars with copies of `pad`, the last one cut short at a
+ * scalar boundary. Text already that long, or an empty pad, is unchanged. */
+static MinyarText *text_pad(MinyarText *text, long long length, MinyarText *pad, _Bool at_start) {
+    ensure_text_index(text);
+    ensure_text_index(pad);
+    if (length <= text->character_length || !pad->byte_length) return text_same(text);
+    long long missing = length - text->character_length;
+    long long copies = missing / pad->character_length, rest = missing % pad->character_length;
+    long long rest_bytes = text_byte_of(pad, rest);
+    long long fill = text_checked_sum(text_checked_product(copies, pad->byte_length), rest_bytes);
+    long long total = text_checked_sum(fill, text->byte_length);
+    unsigned char *out;
+    MinyarText *result = text_build(total, !text->character_offsets && !pad->character_offsets, &out);
+    unsigned char *filler = at_start ? out : out + text->byte_length;
+    copy_bytes(at_start ? out + fill : out, text->bytes, (size_t)text->byte_length);
+    for (long long i = 0; i < copies; i++)
+        copy_bytes(filler + i * pad->byte_length, pad->bytes, (size_t)pad->byte_length);
+    copy_bytes(filler + copies * pad->byte_length, pad->bytes, (size_t)rest_bytes);
+    return result;
+}
+MinyarText *minyar_text_pad_start(MinyarText *text, long long length, MinyarText *pad) {
+    return text_pad(text, length, pad, 1);
+}
+MinyarText *minyar_text_pad_end(MinyarText *text, long long length, MinyarText *pad) {
+    return text_pad(text, length, pad, 0);
+}
+
+/* Map only A-Z or a-z; every other byte, including all non-ASCII, is kept. */
+static MinyarText *text_ascii_case(MinyarText *text, _Bool upper) {
+    ensure_text_index(text);
+    unsigned char *out;
+    MinyarText *result = text_build(text->byte_length, !text->character_offsets, &out);
+    unsigned char first = upper ? 'a' : 'A';
+    for (long long i = 0; i < text->byte_length; i++) {
+        unsigned char byte = text->bytes[i];
+        out[i] = (unsigned char)(byte - first) < 26 ? byte ^ 0x20 : byte;
+    }
+    return result;
+}
+MinyarText *minyar_text_ascii_lowercased(MinyarText *text) { return text_ascii_case(text, 0); }
+MinyarText *minyar_text_ascii_uppercased(MinyarText *text) { return text_ascii_case(text, 1); }
+
+/* joinText(parts, separator): one exactly sized copy. */
+MinyarText *minyar_join_texts_with(const MinyarList *parts, MinyarText *separator) {
+    long long length = 0, offset = 0;
+    _Bool ascii = separator->character_length == separator->byte_length;
+    for (long long index = 0; index < parts->length; index++) {
+        const MinyarText *part = (const MinyarText *)(intptr_t)parts->values[index];
+        length = text_checked_sum(length, part->byte_length);
+        if (index) length = text_checked_sum(length, separator->byte_length);
+        if (part->character_length != part->byte_length) ascii = 0;
+    }
+    unsigned char *out;
+    MinyarText *text = text_build(length, ascii, &out);
+    for (long long index = 0; index < parts->length; index++) {
+        const MinyarText *part = (const MinyarText *)(intptr_t)parts->values[index];
+        if (index) {
+            copy_bytes(out + offset, separator->bytes, (size_t)separator->byte_length);
+            offset += separator->byte_length;
+        }
+        copy_bytes(out + offset, part->bytes, (size_t)part->byte_length);
+        offset += part->byte_length;
+    }
+    return text;
+}

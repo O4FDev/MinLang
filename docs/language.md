@@ -230,7 +230,14 @@ or outside the Integer range. `Integer(character)` gives a code point and
 Import `use "math" as math` for Float mathematics: `math.sqrt`, `math.sin`,
 `math.cos`, `math.tan`, `math.asin`, `math.acos`, `math.atan`, `math.atan2(y, x)`,
 `math.exp`, `math.log`, `math.pow(base, exponent)`, `math.floor`, `math.ceil`
-and `math.round` (halves round away from zero). Core `abs`, `min`, `max` and
+and `math.round` (halves round away from zero). The hyperbolic functions
+`math.sinh`, `math.cosh`, `math.tanh`, `math.asinh`, `math.acosh` and
+`math.atanh`, the error functions `math.erf` and `math.erfc`, `math.expm1`
+(`e^x - 1`) and `math.log1p` (`log(1 + x)`), which stay accurate near zero, and
+the real cube root `math.cbrt` call the C library, so results match C bit for
+bit on the same platform. `math.toFloat32(x)` rounds to the nearest 32-bit
+Float, the value `Bytes.addFloat32` stores, and widens it back. All of these can
+be called from parallel functions. Core `abs`, `min`, `max` and
 `clamp(value, low, high)` accept Integers or Floats of one type.
 
 Integers also support bitwise `&`, `|`, `^`, `~` and the shifts `<<` and `>>`
@@ -519,6 +526,12 @@ Import `use "process" as process` for `process.argumentCount()` and
 `io.writeTextParts(path, pieces)` streams a `List<Text>` without allocating its
 concatenation. A program that produces large output in small pieces, such as
 the compiler, avoids holding the whole file twice.
+Import `use "files" as files` for durable descriptor-level I/O.
+`files.status(path)` reads a path's kind (`files.KIND_FILE`,
+`files.KIND_DIRECTORY` or `files.KIND_OTHER`) and size with one `stat`,
+following symbolic links, and `files.hardLink(existing, created)` gives a file a
+second name on the same file system. Both return a `Result` whose error carries
+the system's errno.
 
 Every Text contains valid UTF-8, including values returned by files and native
 libraries. Invalid input is rejected at the conversion boundary.
@@ -583,7 +596,36 @@ ordered input need no sorting buffer. Recursive decomposition uses four bytes
 per resulting scalar before in-place UTF-8 encoding and an optional buffer
 shrink. Normalize complete keys after concatenating their parts.
 
-`joinText(parts)` joins a `List<Text>` into one Text value.
+`joinText(parts)` joins a `List<Text>` into one Text value, and
+`joinText(parts, separator)` places the separator between neighbouring parts.
+
+Text also has these methods. Positions and lengths count Unicode scalar
+values, and every search compares exact UTF-8 bytes:
+
+```minyar
+print("a.b.c".contains("."))          // true
+print("a,b,,c".find(",", 2))         // 3: the first match at or after 2
+print("a.b.c".replace(".", "::"))     // a::b::c
+print("ab".repeat(3))                 // ababab
+print("7".padStart(3, "0"))           // 007
+print("id".padEnd(5, "."))            // id...
+print("Content-Type".asciiLowercased()) // content-type
+print(joinText(["a", "b"], ", "))     // a, b
+```
+
+`find(needle)` returns the first position of `needle` or -1; `find(needle,
+start)` starts searching at `start`, which may be the Text's length and stops
+with a bounds error outside 0 to the length. An empty needle is found at the
+start. `replace(pattern, replacement)` replaces every non-overlapping match
+from left to right; an empty pattern matches before every scalar and at the
+end. `repeat(count)` stops for a negative count. `padStart(length, pad)` and
+`padEnd(length, pad)` add copies of `pad`, the last one cut short at a scalar
+boundary, until the Text has `length` scalars; Text that is already long
+enough, or an empty pad, is returned unchanged. `asciiLowercased()` and
+`asciiUppercased()` change only `A`-`Z` and `a`-`z` and keep every other byte;
+use `unicode.lowercased` and `unicode.uppercased` for full Unicode casing.
+Each call makes at most one exactly sized result; a `replace` without a match
+and a `repeat(1)` return the receiver itself.
 
 Text literals can include expressions inside `\(` and `)`:
 
@@ -672,6 +714,13 @@ In a Result-returning function, a temporary owner protects a List's partially
 built contents when `try` returns an error. Successful construction adds one
 retain/release pair.
 
+`list.insert(position, value)` places a value before the element at
+`position`, which may be the List's length to append; `list.removeAt(position)`
+removes and returns the element there. Later elements move by one place, so
+both take time proportional to the elements after `position`, and positions
+outside the List stop with its bounds error. `list.pop()` removes the last
+element and `list.truncate(length)` drops elements after `length`.
+
 A List is a reference value: aliases observe the same additions and indexed
 replacements, including those performed by functions. Mutations that could
 create a record/List ownership cycle activate traced allocation, as described
@@ -729,7 +778,9 @@ Multi-byte values use little-endian order at any byte offset. For each of
 an `addKind(value)` that appends, a `getKind(offset)` and a
 `setKind(offset, value)`. Integer values outside the kind's range stop the
 program; `Float32` rounds to the nearest 32-bit Float. `addBytes(other)`
-appends other Bytes, `slice(start, end)` copies a range, `resize(length)`
+appends other Bytes, `addRange(other, start, end)` appends the range `start`
+up to `end` of other Bytes (which may be the receiver) without a temporary
+slice, `slice(start, end)` copies a range, `resize(length)`
 truncates or zero-extends, and `clear()` empties the Bytes while keeping its
 storage. Clearing and shrinking take constant time; growing initializes only the
 newly exposed range, plus any allocation/copy needed for capacity growth.

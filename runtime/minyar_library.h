@@ -484,6 +484,22 @@ double minyar_runtime_ceil(double value) { return ceil(value); }
 double minyar_runtime_round(double value) { return round(value); }
 double minyar_runtime_atan2(double first, double second) { return atan2(first, second); }
 double minyar_runtime_pow(double first, double second) { return pow(first, second); }
+/* Bound to the host C library; freestanding images provide only the functions above. */
+#if defined(__STDC_HOSTED__) && __STDC_HOSTED__
+double minyar_runtime_sinh(double value) { return sinh(value); }
+double minyar_runtime_cosh(double value) { return cosh(value); }
+double minyar_runtime_tanh(double value) { return tanh(value); }
+double minyar_runtime_asinh(double value) { return asinh(value); }
+double minyar_runtime_acosh(double value) { return acosh(value); }
+double minyar_runtime_atanh(double value) { return atanh(value); }
+double minyar_runtime_erf(double value) { return erf(value); }
+double minyar_runtime_erfc(double value) { return erfc(value); }
+double minyar_runtime_expm1(double value) { return expm1(value); }
+double minyar_runtime_log1p(double value) { return log1p(value); }
+double minyar_runtime_cbrt(double value) { return cbrt(value); }
+#endif
+/* Round to the nearest 32-bit Float and widen again (fptrunc then fpext). */
+double minyar_runtime_toFloat32(double value) { return (double)(float)value; }
 
 #if defined(__STDC_HOSTED__) && __STDC_HOSTED__
 #include <errno.h>

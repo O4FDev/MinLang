@@ -40,11 +40,16 @@ function sortComparatorThunk(names: List<Text>, type: Integer, element: Integer,
     return closureSortComparatorThunk(names, type, element, globals)
 }
 
-function appendTextRuntimeDeclaration(globals: List<Text>, name: Text, returnType: Integer, count: Integer) {
+function appendTextRuntimeDeclaration(globals: List<Text>, name: Text, returnType: Integer, types: List<Integer>) {
     let declaration = "declare "
     if returnType == 4 { declaration = declaration + "zeroext " }
-    declaration = declaration + llvmType(returnType) + " @" + name + "(ptr"
-    if count == 2 { declaration = declaration + ", ptr" }
+    declaration = declaration + llvmType(returnType) + " @" + name + "("
+    let index = 0
+    while index < types.length {
+        if index > 0 { declaration = declaration + ", " }
+        declaration = declaration + llvmType(types[index])
+        index = index + 1
+    }
     declaration = declaration + ")\n"
     let position = 0
     while position < globals.length {
@@ -55,7 +60,24 @@ function appendTextRuntimeDeclaration(globals: List<Text>, name: Text, returnTyp
 }
 
 function isTextBasicMethod(member: Text): Boolean {
-    return member == "find" || member == "split" || member == "startsWith" || member == "endsWith" || member == "trim"
+    return member == "find" || member == "split" || member == "startsWith" || member == "endsWith" || member == "trim" || member == "contains" || member == "replace" || member == "repeat" || member == "padStart" || member == "padEnd" || member == "asciiLowercased" || member == "asciiUppercased"
+}
+
+// Argument types of a built-in Text method, after the receiver. `find` also
+// accepts an optional Integer start position, handled by its caller.
+function textMethodParameters(member: Text): List<Integer> {
+    if member == "trim" || member == "asciiLowercased" || member == "asciiUppercased" { return [] }
+    if member == "replace" { return [2, 2] }
+    if member == "repeat" { return [1] }
+    if member == "padStart" || member == "padEnd" { return [1, 2] }
+    return [2]
+}
+
+function textMethodSignature(member: Text): Text {
+    if member == "replace" { return "two Text arguments" }
+    if member == "repeat" { return "one Integer count" }
+    if member == "padStart" || member == "padEnd" { return "an Integer length and a Text pad" }
+    return "one Text argument"
 }
 
 function parseTextBasicMethod(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, receiverType: Integer, member: Text, resultType: List<Integer>): Text {
@@ -69,33 +91,61 @@ function parseTextBasicMethod(context: CompilerContext, localNames: List<Text>, 
     let runtimeName = "minyar_list_clear"
     let returnType = 5
     if receiverType == 2 {
+        let parameters = textMethodParameters(member)
+        let index = 0
+        while index < parameters.length {
+            if index > 0 { expectToken(tokenKinds, tokenTexts, tokenLines, state, ",") }
+            let argumentType: List<Integer> = [0]
+            if parameters[index] == 1 { argumentType[0] = 1 }
+            let argumentLocation = state[0]
+            let argument = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType)
+            requireContextType(context, argumentLocation, argumentType[0], parameters[index], "Text." + member + " expects " + textMethodSignature(member))
+            values.add(argument)
+            types.add(parameters[index])
+            index = index + 1
+        }
         runtimeName = "minyar_text_trim"
         returnType = 2
-        if member != "trim" {
-            let argumentType: List<Integer> = [0]
-            let argument = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, argumentType)
-            if argumentType[0] != 2 { failCompiler("Text." + member + " expects one Text argument") }
-            values.add(argument)
-            types.add(2)
+        if member == "find" {
             runtimeName = "minyar_text_find"
             returnType = 1
-            if member == "split" {
-                runtimeName = "minyar_text_split"
-                returnType = 100002
-            }
-            if member == "startsWith" {
-                runtimeName = "minyar_text_starts_with"
-                returnType = 4
-            }
-            if member == "endsWith" {
-                runtimeName = "minyar_text_ends_with"
-                returnType = 4
+            if tokenIs(tokenKinds, tokenTexts, state, ",") {
+                expectToken(tokenKinds, tokenTexts, tokenLines, state, ",")
+                let startType: List<Integer> = [1]
+                let startLocation = state[0]
+                let start = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, startType)
+                if startType[0] != 1 { requireContextType(context, startLocation, startType[0], 1, "Text.find start positions must be Integers") }
+                values.add(start)
+                types.add(1)
+                runtimeName = "minyar_text_find_from"
             }
         }
+        if member == "split" {
+            runtimeName = "minyar_text_split"
+            returnType = 100002
+        }
+        if member == "startsWith" {
+            runtimeName = "minyar_text_starts_with"
+            returnType = 4
+        }
+        if member == "endsWith" {
+            runtimeName = "minyar_text_ends_with"
+            returnType = 4
+        }
+        if member == "contains" {
+            runtimeName = "minyar_text_contains"
+            returnType = 4
+        }
+        if member == "replace" { runtimeName = "minyar_text_replace" }
+        if member == "repeat" { runtimeName = "minyar_text_repeat" }
+        if member == "padStart" { runtimeName = "minyar_text_pad_start" }
+        if member == "padEnd" { runtimeName = "minyar_text_pad_end" }
+        if member == "asciiLowercased" { runtimeName = "minyar_text_ascii_lowercased" }
+        if member == "asciiUppercased" { runtimeName = "minyar_text_ascii_uppercased" }
     }
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
     setType(resultType, returnType)
-    appendTextRuntimeDeclaration(globals, runtimeName, returnType, values.length)
+    appendTextRuntimeDeclaration(globals, runtimeName, returnType, types)
     return emitCall(output, textState, state, returnType, runtimeName, values, types)
 }
 
@@ -122,6 +172,14 @@ function parseListBasicMethod(context: CompilerContext, localNames: List<Text>, 
         output.add("  call void @minyar_list_truncate(ptr " + receiver + ", i64 " + start + ")\n")
         setType(resultType, 5)
         return ""
+    }
+    if member == "removeAt" {
+        expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+        appendTextRuntimeDeclaration(globals, "minyar_list_remove_at", 1, [receiverType, 1])
+        let removed = valueName(textState, newTemporary(state))
+        output.add("  " + removed + " = call i64 @minyar_list_remove_at(ptr " + receiver + ", i64 " + start + ")\n")
+        setType(resultType, listElementType(receiverType))
+        return slotAsValue(output, textState, state, removed, resultType[0])
     }
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ",")
     let endType: List<Integer> = [0]
@@ -401,7 +459,7 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                     }
                     ownsResult = isReferenceType(resultType[0])
                 } else {
-                if isListType(receiverType) && (member == "slice" || member == "truncate" || member == "pop") {
+                if isListType(receiverType) && (member == "slice" || member == "truncate" || member == "pop" || member == "removeAt") {
                     value = parseListBasicMethod(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, receiver, receiverType, member, resultType)
                     ownsResult = isReferenceType(resultType[0])
                 } else {
@@ -410,7 +468,17 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                     ownsResult = isReferenceType(resultType[0])
                 } else {
                 let argumentType: List<Integer> = [0]
-                if (member == "add" || member == "appended") && isListType(receiverType) {
+                // list.insert(position, value) is list.add(value) after a
+                // position check, followed by moving that slot to `position`.
+                let insertPosition = ""
+                if member == "insert" && isListType(receiverType) {
+                    let positionType: List<Integer> = [1]
+                    let positionLocation = state[0]
+                    insertPosition = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
+                    requireContextType(context, positionLocation, positionType[0], 1, "List.insert positions must be Integers")
+                    expectToken(tokenKinds, tokenTexts, tokenLines, state, ",")
+                }
+                if (member == "add" || member == "appended" || member == "insert") && isListType(receiverType) {
                     argumentType[0] = listElementType(receiverType)
                 }
                 let argumentLocation = state[0]
@@ -482,7 +550,7 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                         ownsResult = true
                         setType(resultType, receiverType)
                     } else {
-                    if member != "add" || !isListType(resultType[0]) {
+                    if (member != "add" && member != "insert") || !isListType(resultType[0]) {
                         failAtToken(tokenLines, memberLocation, "this value has no method named '" + member + "'")
                     }
                     if argumentType[0] != listElementType(resultType[0]) {
@@ -495,6 +563,11 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                     let slot = valueAsListSlot(output, textState, state, argument, argumentType[0])
                     let transfers = takeResult(output, state, argument, argumentType)
                     if !transfers { reserveLocalTake(context, state, output, argument, argumentNode) }
+                    if member == "insert" {
+                        appendTextRuntimeDeclaration(globals, "minyar_list_insert_check", 5, [receiverType, 1])
+                        appendTextRuntimeDeclaration(globals, "minyar_list_insert_last", 5, [receiverType, 1])
+                        output.add("  call void @minyar_list_insert_check(ptr " + value + ", i64 " + insertPosition + ")\n")
+                    }
                     noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, receiverType, argumentType[0])
                     if transfers {
                         output.add("  call void @minyar_list_add_take(ptr ")
@@ -505,6 +578,7 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
                     output.add(", i64 ")
                     output.add(slot)
                     output.add(")\n")
+                    if member == "insert" { output.add("  call void @minyar_list_insert_last(ptr " + value + ", i64 " + insertPosition + ")\n") }
                     value = ""
                     setType(resultType, 5)
                     }

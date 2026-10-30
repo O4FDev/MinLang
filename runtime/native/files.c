@@ -479,6 +479,34 @@ long long minyar_files_remove(const MinyarText *path) {
     return unlink(p) == 0 ? 0 : -errno;
 }
 
+/* Another name for an existing file on the same file system (link(2)). */
+long long minyar_files_link(const MinyarText *existing, const MinyarText *created) {
+    char a[PATH_MAX], b[PATH_MAX];
+    int rc = files_path(existing, a);
+    if (rc) return rc;
+    rc = files_path(created, b);
+    if (rc) return rc;
+    return link(a, b) == 0 ? 0 : -errno;
+}
+
+/* One stat(2), following symbolic links: 16 bytes holding the kind (1 regular
+ * file, 2 directory, 3 anything else) and the size, both little-endian Int64.
+ * Failure returns empty Bytes and sets lastError(). */
+MinyarBytes *minyar_files_pathStatus(const MinyarText *path) {
+    char p[PATH_MAX];
+    int rc = files_path(path, p);
+    if (rc) return files_empty(rc);
+    struct stat st;
+    if (stat(p, &st) != 0) return files_empty(-errno);
+    uint64_t fields[2] = {S_ISREG(st.st_mode) ? 1u : S_ISDIR(st.st_mode) ? 2u : 3u, (uint64_t)st.st_size};
+    MinyarBytes *status = minyar_bytes_new(16);
+    unsigned char *bytes = (unsigned char *)status->bytes;
+    for (int field = 0; field < 2; field++)
+        for (int i = 0; i < 8; i++) bytes[field * 8 + i] = (unsigned char)(fields[field] >> (8 * i));
+    files_last_error = 0;
+    return status;
+}
+
 long long minyar_files_removeDirectory(const MinyarText *path) {
     char p[PATH_MAX];
     int rc = files_path(path, p);

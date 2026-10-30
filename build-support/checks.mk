@@ -647,6 +647,18 @@ check-runtime-numeric-sanitize: build/minyarc build/tooling/tests/runtime-numeri
 	$(SANITIZER_LIMITED) ./build/tooling/tests/runtime-numeric --mode sanitize
 
 check-portable: check-runtime-numeric
+
+.PHONY: check-math-library
+check-math-library: build/minyarc build/minyar-runtime.o build/tooling/tests/math-library
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/math-library
+
+check-portable: check-math-library
+
+.PHONY: check-stdlib-everyday
+check-stdlib-everyday: build/minyarc build/minyar-runtime.o build/tooling/tests/stdlib-everyday
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/stdlib-everyday
+
+check-portable: check-stdlib-everyday
 check: check-runtime-numeric
 check-sanitize: check-runtime-numeric-sanitize
 
