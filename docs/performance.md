@@ -433,13 +433,14 @@ while retaining checked accumulation. The suites also exercise errors, shared
 mutation and ownership at O0/O2. Their `-sanitize` counterparts instrument the
 compiler and generated memory accesses.
 
-Record field reads and scalar field writes use the same pattern. Every runtime
-profile, including the compiler's arena, stores a record as its field count
-followed by its fields, so the helper loads the count, checks the constant
-field index against it and reads or writes the slot directly. A failed check
-calls the runtime's diagnostic. Reference fields keep their ownership-aware
-runtime setters. `make check-record-access` checks the helper IR, its inlining at
-O2 and the arena layout.
+Record field reads and scalar field writes are inline slot accesses. Every
+runtime profile, including the compiler's arena, stores a record as its field
+count followed by its fields. The type checker resolves each field to a constant
+position below that count and records never resize, so the helpers
+(`.minyar.record.get`, `.minyar.record.set.scalar`) read or write the slot with
+no length test. Reference fields keep their ownership-aware runtime setters.
+`make check-record-access` checks the helper IR, its inlining at O2, the absence
+of a failure path and the arena layout.
 
 On the frozen safelibs fixtures (Linux x86_64, LLVM 23.1.2, separate O2 codec
 and runtime objects, median of three pinned samples), inline record access

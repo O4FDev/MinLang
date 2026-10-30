@@ -57,7 +57,7 @@ which costs `count * size` slots but keeps results independent of scheduling.
 
 Records reach parallel code read-only, as loop captures or parallel function
 parameters. A field read is a plain load of the record's slot
-(`.minyar.record.get.checked`), without a retain, in every ownership mode
+(`.minyar.record.get`), without a retain, in every ownership mode
 (legacy frames, `--bounded-owners`, `--scope-owners`, release): the owner thread
 is blocked in the dispatch until every worker joins, so no field can be
 reassigned and no value released while a worker holds it, and workers cannot
