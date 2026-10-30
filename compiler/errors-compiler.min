@@ -281,10 +281,17 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
         if expected == found { distinction = " (these are different types)" }
         failAtToken(tokenLines, location, "try error type must match the enclosing Result error type; expected " + expected + ", found " + found + distinction)
     }
+    // A fresh, untraced Result is consumed here instead of being kept as a
+    // statement temporary: success moves its payload's count out and disposes
+    // of the record at once, and failure releases it after building the error.
+    let payloadType = functionParameterTypes[first + 1]
+    let consumed = !recoveryEnabled(state) && inputType.length > 1 && inputType[1] >= 0 && untracedValueType(context, inputType[0]) && (!isReferenceType(payloadType) || untracedValueType(context, payloadType)) && takeResult(output, state, input, inputType)
     if inputType.length == 1 || inputType[1] == -1 {
-        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, inputType[0], 0)
-        output.add("  call void @minyar_rc_retain(ptr " + input + ")\n")
-        ownResult(output, state, input, inputType)
+        if !consumed {
+            noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, inputType[0], 0)
+            output.add("  call void @minyar_rc_retain(ptr " + input + ")\n")
+            ownResult(output, state, input, inputType)
+        }
     }
     let tag = readRecordField(output, textState, state, input, 0, 4)
     let okLabel = "result.try.ok." + Text(newLabel(state))
@@ -336,12 +343,24 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
         ownResult(output, state, error, errorPayload)
     }
     let returned = emitResultValue(output, textState, state, error, errorPayload, false, returnType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+    if consumed { output.add("  call void @minyar_rc_release(ptr " + input + ")\n") }
     output.add("  call void @minyar_rc_leave()\n")
     output.add("  call void @minyar_stack_leave()\n")
     output.add("  ret ptr " + returned + "\n")
     output.add("\n" + okLabel + ":\n")
     textState[0] = okLabel
-    setType(resultType, functionParameterTypes[first + 1])
+    setType(resultType, payloadType)
+    if consumed {
+        // Taking the tag disposes of a payload-free success.
+        let field = 1
+        if payloadType == 5 { field = 0 }
+        let raw = valueName(textState, newTemporary(state))
+        output.add("  " + raw + " = call i64 @minyar_record_take_field(ptr " + input + ", i64 " + Text(field) + ")\n")
+        if payloadType == 5 { return "" }
+        let payload = slotAsValue(output, textState, state, raw, payloadType)
+        ownResult(output, state, payload, resultType)
+        return payload
+    }
     if resultType[0] == 5 { return "" }
     return readRecordField(output, textState, state, input, 1, resultType[0])
 }

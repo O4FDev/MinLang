@@ -1,0 +1,129 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.moduleFunction(line, name)) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing try consumption function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let found = 0
+    let rest = source
+    let position = rest.find(needle)
+    while position >= 0 {
+        found += 1
+        rest = rest.slice(position + needle.length, rest.length)
+        position = rest.find(needle)
+    }
+    return found
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+// Node's cycle runs through List<Node>, which grow mutates, so Node is traced
+// and a Result carrying it keeps the ordinary temporary.
+let source = #"""
+    record Node { name: Text; children: List<Node> }
+
+    function word(index: Integer): Result<Text, Text> {
+        if index < 0 { return Err("negative " + Text(index)) }
+        return Ok("w" + Text(index))
+    }
+    function number(index: Integer): Result<Integer, Text> {
+        if index > 5 { return Err("large " + Text(index)) }
+        return Ok(index * 10)
+    }
+    function check(index: Integer): Result<Nothing, Text> {
+        if index == 3 { return Err("three") }
+        return Ok()
+    }
+    function joined(first: Integer, second: Integer): Result<Text, Text> {
+        let left = try word(first)
+        let right = try word(second)
+        return Ok(left + "+" + right)
+    }
+    function total(first: Integer, second: Integer): Result<Integer, Text> {
+        try check(first)
+        return Ok((try number(first)) + (try number(second)))
+    }
+    function cached(store: List<Result<Text, Text>>, index: Integer): Result<Text, Text> {
+        return store[index]
+    }
+    function shared(store: List<Result<Text, Text>>, index: Integer): Result<Integer, Text> {
+        let text = try cached(store, index)
+        return Ok(text.length)
+    }
+    function borrowed(index: Integer): Result<Text, Text> {
+        let result = word(index)
+        let text = try result
+        return Ok(text + "!")
+    }
+    function grow(node: Node): Result<Node, Text> {
+        node.children.add(Node { name: node.name + "'"; children: [] })
+        return Ok(node)
+    }
+    function traced(node: Node): Result<Integer, Text> {
+        let grown = try grow(node)
+        return Ok(grown.children.length)
+    }
+    function show(result: Result<Text, Text>) {
+        match result {
+            Ok(value) { print("ok " + value) }
+            Err(message) { print("err " + message) }
+        }
+    }
+    function showNumber(result: Result<Integer, Text>) {
+        match result {
+            Ok(value) { print("ok " + Text(value)) }
+            Err(message) { print("err " + message) }
+        }
+    }
+
+    show(joined(1, 2))
+    show(joined(1, -2))
+    show(joined(-1, 2))
+    showNumber(total(1, 2))
+    showNumber(total(3, 2))
+    showNumber(total(1, 7))
+    let store: List<Result<Text, Text>> = [word(4), word(-4)]
+    showNumber(shared(store, 0))
+    showNumber(shared(store, 1))
+    show(store[0])
+    show(store[1])
+    show(borrowed(5))
+    show(borrowed(-5))
+    let node = Node { name: "root" + "!"; children: [] }
+    showNumber(traced(node))
+    showNumber(traced(node))
+    """#
+let expected = "ok w1+w2\nerr negative -2\nerr negative -1\nok 30\nerr three\nerr large 7\nok 2\nerr negative -4\nok w4\nerr negative -4\nok w5!\nerr negative -5\nok 1\nok 2\n"
+
+test.require(fixtures.compile(frontend, source), "compile try consumption IR")
+let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+// A fresh untraced Result is consumed by try: no temporary owner, one take per
+// try, and one release on each failing return.
+let joinedBody = body(ir, "joined")
+test.check(count(joinedBody, "call i64 @minyar_record_take_field(") == 2 && count(joinedBody, "call void @minyar_rc_release(") == 2, "joined: each try takes its payload and releases a failing Result")
+test.check(count(joinedBody, "@minyar_rc_keep(ptr %value.0)") == 0, "joined: a consumed Result is not a statement temporary")
+let totalBody = body(ir, "total")
+test.check(count(totalBody, "call i64 @minyar_record_take_field(") == 3, "total: scalar and payload-free successes are taken")
+test.check(count(totalBody, "@minyar_rc_keep(") == 0, "total: scalar and payload-free tries keep no temporaries")
+// The shared case is decided at run time; the call site is the same.
+test.check(count(body(ir, "shared"), "call i64 @minyar_record_take_field(") == 1, "shared: a returned Result is taken; the runtime keeps a shared one intact")
+// A borrowed Result and a traced payload keep the ordinary temporary.
+test.check(count(body(ir, "borrowed"), "call i64 @minyar_record_take_field(") == 0 && count(body(ir, "borrowed"), "@minyar_rc_keep(") > 0, "borrowed: try on a local keeps its protecting count")
+test.check(count(body(ir, "traced"), "call i64 @minyar_record_take_field(") == 0 && count(body(ir, "traced"), "@minyar_rc_keep(") > 0, "traced: a Result carrying a traced payload keeps its temporary")
+fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+test.removeTree(compiler.directory)
+print("Result try consumption: passed")

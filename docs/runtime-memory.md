@@ -215,6 +215,14 @@ both endpoints of traced ownership operations use the physical payload type.
   the owner slots it actually writes, so slots reserved for bindings that
   ended up borrowing, or for guards settled away, need no frame
   (`make check-match-payload-borrows`).
+- `try` consumes a fresh Result produced by a call when the Result and its
+  payload type are untraced, instead of keeping it as a statement temporary.
+  Success calls `minyar_record_take_field`: a unique Result gives its payload's
+  count to the expression, and with no other owning slot left the
+  incremental profiles free it at once, like a leaf, rather than queueing it
+  for field visits; a shared Result keeps its value and gives the expression a
+  new count. Failure releases the Result after building the propagated error.
+  Recoverable functions keep the temporary (`make check-result-try-consumption`).
 - `minyar_rc_borrow` retains a borrowed field/element as an expression owner
   when its lifetime may extend across a later call or mutation.
 - A chain of field reads borrows intermediate receivers without count changes.

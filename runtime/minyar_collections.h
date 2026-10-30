@@ -438,6 +438,38 @@ void minyar_record_set_reference(MinyarRecord *record, long long field, long lon
     minyar_record_set_take(record, field, value);
 }
 
+/* `try` on a fresh, untraced Result: move one slot's value out of the record
+ * and dispose of the record. A unique record gives its slot's count to the
+ * caller; when no other slot owns a value it has nothing left to visit, so the
+ * incremental profiles free it now, like a leaf, rather than queueing it for
+ * field visits. A shared record keeps its value for its other owners: the
+ * caller receives a new count and this owner is released. Never polls on the
+ * unique path. */
+long long minyar_record_take_field(MinyarRecord *record, long long field) {
+    if ((unsigned long long)field >= (unsigned long long)record->length)
+        list_position_stop(field, record->length);
+    long long value = record->values[field];
+#ifndef MINYAR_COMPILER_ARENA
+    RcObject *object = (RcObject *)record - 1;
+    unsigned char *references = (unsigned char *)(record->values + record->length);
+    if (object->ownership == (8 | RC_RECORD)) {
+        references[field] = 0;
+#ifdef MINYAR_BOUNDED_RC
+        long long owning = 0;
+        for (long long index = 0; index < record->length && !owning; index++) owning = references[index];
+        if (!owning) {
+            rc_bounded_finish_object(object, RC_RECORD);
+            return value;
+        }
+#endif
+    } else if (references[field]) {
+        minyar_rc_retain((void *)(uintptr_t)value);
+    }
+    minyar_rc_release(record);
+#endif
+    return value;
+}
+
 /* Replace a reference field of a live record. The compiler has proved that
  * the new edge cannot close an ownership cycle. */
 void minyar_record_replace(MinyarRecord *record, long long field, long long value,

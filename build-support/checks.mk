@@ -32,6 +32,12 @@ check-match-payload-borrows: build/minyarc build/minyarc-sanitize build/tooling/
 	$(LIMITED) ./build/tooling/tests/match-payload-borrows
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/match-payload-borrows
 
+.PHONY: check-result-try-consumption
+check check-portable: check-result-try-consumption
+check-result-try-consumption: build/minyarc build/minyarc-sanitize build/tooling/tests/result-try-consumption
+	$(LIMITED) ./build/tooling/tests/result-try-consumption
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/result-try-consumption
+
 .PHONY: check-stable-field-borrows
 check check-portable: check-stable-field-borrows
 check-stable-field-borrows: build/minyarc build/minyarc-sanitize build/tooling/tests/stable-field-borrows
