@@ -169,12 +169,12 @@ check-coverage: check-coverage-harness check-coverage-inlining build/minyarc bui
 	./build/tooling/scripts/coverage
 
 check-stack-overflow: build/minyarc build/minyar-runtime.o build/tooling/tests/stack-overflow
-	$(LIMITED) ./build/tooling/tests/stack-overflow
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/stack-overflow
 
 .PHONY: check-stack-overflow-sanitize
 check-stack-overflow-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o runtime/minyar_runtime.c $(RUNTIME_HEADERS) build/tooling/tests/stack-guard-sanitizer build/tooling/tests/stack-overflow
 	$(SANITIZER_LIMITED) ./build/tooling/tests/stack-guard-sanitizer --clang "$(LLVM_CC)"
-	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/stack-overflow
+	ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/stack-overflow
 
 # Cross-platform per-commit gate. Heavier memory-profile and performance
 # matrices remain in the Linux evidence runner and the full `make check` gate.
