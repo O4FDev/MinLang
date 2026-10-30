@@ -535,6 +535,14 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
     long long value = record->values[field];
 #ifndef MINYAR_COMPILER_ARENA
     RcObject *object = (RcObject *)record - 1;
+#ifdef MINYAR_BOUNDED_RC
+    /* A unique scalar record (a success or failure with a scalar payload)
+     * has nothing to visit either. */
+    if (object->ownership == (8 | RC_SCALAR_RECORD)) {
+        rc_bounded_finish_object(object, RC_SCALAR_RECORD);
+        return value;
+    }
+#endif
     if (object->ownership == (8 | RC_RECORD)) {
         unsigned char *references = (unsigned char *)(record->values + record->length);
         references[field] = 0;
