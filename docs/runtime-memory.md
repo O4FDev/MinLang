@@ -208,13 +208,20 @@ both endpoints of traced ownership operations use the physical payload type.
   input owner. Choice and Result payloads are never reassigned, so while the
   input stays alive (by that root or by the match's own owner) a binding
   reached only through choice cases borrows its payload like a parameter;
-  record patterns read assignable fields and keep their counts. Traced types
-  keep their counts: a choice or Result counts as untraced when every type on
+  record patterns read assignable fields and keep their counts. Traced payload
+  types keep their counts: a choice or Result counts as untraced when every type on
   a cycle through it is itself a choice or Result, since activation needs a
   List or field mutation inside that cycle. A function's frame is decided by
   the owner slots it actually writes, so slots reserved for bindings that
   ended up borrowing, or for guards settled away, need no frame
   (`make check-match-payload-borrows`).
+- A `for` loop over a List held by a stable root takes no collection owner,
+  even when its body runs user code: the root keeps that List alive for the
+  whole loop. Its elements keep their per-iteration owners, since user code can
+  still replace them. A module `global` is initialized once and never
+  reassigned, and its module root lives until the entry returns, so reading
+  one borrows its value like a constant root; traced globals keep the
+  protecting count.
 - `try` consumes a fresh Result produced by a call when the Result and its
   payload type are untraced, instead of keeping it as a statement temporary.
   Success calls `minyar_record_take_field`: a unique Result gives its payload's

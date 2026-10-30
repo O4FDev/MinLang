@@ -132,6 +132,29 @@ let source = #"""
         let children = node.children
         return children.length
     }
+    global SHELF: Shelf = makeShelf(7)
+    global ROOT: Node = Node { tag: "root" + "!"; children: [] }
+    function globalRead(): Integer {
+        return SHELF.items.length + SHELF.title.length
+    }
+    function globalReturn(): Text {
+        return SHELF.title
+    }
+    function tracedGlobal(): Integer {
+        return ROOT.children.length
+    }
+    function measure(text: Text): Integer { return text.length }
+    function walkParameter(items: List<Text>): Integer {
+        let total = 0
+        for item in items { total += measure(item) }
+        return total
+    }
+    function walkReassigned(items: List<Text>, other: List<Text>): Integer {
+        let total = 0
+        items = other
+        for item in items { total += measure(item) }
+        return total
+    }
 
     let shelf = makeShelf(1)
     print(stableLocal(shelf))
@@ -159,8 +182,14 @@ let source = #"""
     let node = Node { tag: "node" + "!"; children: [] }
     node.children.add(node)
     print(tracedField(node))
+    print(globalRead())
+    print(globalReturn())
+    ROOT.children.add(ROOT)
+    print(tracedGlobal())
+    print(walkParameter(["ab" + "c", "d"]))
+    print(walkReassigned(["x"], ["ab" + "cd"]))
     """#
-let expected = "10\n2\ntitle1\ntitle1!\ntitle1\ntitle1 more\ntitle1\nlabel1\n9\n1\ntitle5\nlabel6\n2\nholder!\nrenamed!\nnative old!\nnative new!\n1\n1\n1\n"
+let expected = "10\n2\ntitle1\ntitle1!\ntitle1\ntitle1 more\ntitle1\nlabel1\n9\n1\ntitle5\nlabel6\n2\nholder!\nrenamed!\nnative old!\nnative new!\n1\n1\n1\n7\ntitle7\n1\n4\n4\n"
 
 test.require(fixtures.compile(frontend, source), "compile stable field borrow IR")
 let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
@@ -192,6 +221,15 @@ let mutableLocal = count(mutableRoot, "call void @minyar_rc_local(")
 let mutableRetain = count(mutableRoot, "call void @minyar_rc_retain(")
 let mutableTake = count(mutableRoot, "call void @minyar_rc_local_take(")
 test.check(mutableLocal == 0 && mutableRetain == 1 && mutableTake == 3, "mutableLocalRoot: transfer the protecting field count directly into its local (local=" + Text(mutableLocal) + ", retain=" + Text(mutableRetain) + ", take=" + Text(mutableTake) + ")")
+// A global is never reassigned and its module root lives until the entry
+// returns, so reading it takes no count; a traced global keeps its borrow.
+test.check(owners(ir, "globalRead") == 0 && count(body(ir, "globalRead"), "call void @minyar_rc_retain(") == 0, "globalRead: a global read borrows its value")
+test.check(owners(ir, "globalReturn") == 0 && count(body(ir, "globalReturn"), "call void @minyar_rc_retain(") == 1, "globalReturn: returning a global's field gives the caller one count")
+test.check(count(body(ir, "tracedGlobal"), "@minyar_rc_borrow") > 0, "tracedGlobal: a traced global read keeps its protecting count")
+// A loop over a readonly List parameter needs no collection owner even when its
+// body runs user code; its elements keep their per-iteration owners.
+test.check(count(body(ir, "walkParameter"), ", ptr %argument.0)\n") == 0 && count(body(ir, "walkParameter"), "call void @minyar_rc_local(") > 0, "walkParameter: a stable List source is not re-owned by its loop")
+test.check(count(body(ir, "walkReassigned"), "call void @minyar_rc_local(") + count(body(ir, "walkReassigned"), "call void @minyar_rc_local_take(") >= 2, "walkReassigned: a reassigned source keeps its loop owner")
 let traced = body(ir, "tracedField")
 let tracedLocal = count(traced, "call void @minyar_rc_local_traced(")
 let tracedRetain = count(traced, "call void @minyar_rc_retain_traced(")
