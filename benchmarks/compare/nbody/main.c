@@ -1,6 +1,8 @@
-// C reference for nbody.min: same output.
+// C peer for main.min: the classic five-body simulation over a struct array.
+#pragma STDC FP_CONTRACT OFF
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 typedef struct { double x, y, z, vx, vy, vz, mass; } Body;
 #define PI 3.141592653589793
 #define SOLAR_MASS (4 * PI * PI)
@@ -37,12 +39,13 @@ static void advance(double dt) {
     }
     for (int i = 0; i < 5; i++) { Body *b = &bodies[i]; b->x = b->x + dt * b->vx; b->y = b->y + dt * b->vy; b->z = b->z + dt * b->vz; }
 }
-int main(void) {
+int main(int argc, char **argv) {
+    long steps = argc > 1 ? atol(argv[1]) : 0;
     double px = 0, py = 0, pz = 0;
     for (int i = 0; i < 5; i++) { px = px + bodies[i].vx * bodies[i].mass; py = py + bodies[i].vy * bodies[i].mass; pz = pz + bodies[i].vz * bodies[i].mass; }
     bodies[0].vx = 0.0 - px / SOLAR_MASS; bodies[0].vy = 0.0 - py / SOLAR_MASS; bodies[0].vz = 0.0 - pz / SOLAR_MASS;
     printf("%lld\n", (long long)(energy() * 1000000000.0));
-    for (int s = 0; s < 5000000; s++) advance(0.01);
+    for (long s = 0; s < steps; s++) advance(0.01);
     printf("%lld\n", (long long)(energy() * 1000000000.0));
     return 0;
 }

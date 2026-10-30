@@ -1,17 +1,25 @@
-// C reference for matrix.min: same output.
+// C peer for main.min: dense matrix multiply over contiguous row-major storage.
+#pragma STDC FP_CONTRACT OFF
 #include <stdio.h>
 #include <stdlib.h>
-int main(void) {
-    int n = 300;
-    double **a = malloc(n * sizeof *a), **b = malloc(n * sizeof *b), **c = malloc(n * sizeof *c);
-    for (int i = 0; i < n; i++) {
-        a[i] = malloc(n * sizeof(double)); b[i] = malloc(n * sizeof(double)); c[i] = calloc(n, sizeof(double));
-        for (int j = 0; j < n; j++) { a[i][j] = (i * j) % 7 + 1; b[i][j] = (i + j) % 5 + 1; }
-    }
+
+int main(int argc, char **argv) {
+    long n = argc > 1 ? atol(argv[1]) : 0;
+    double *a = malloc((size_t)(n * n) * sizeof(double)), *b = malloc((size_t)(n * n) * sizeof(double));
+    double *c = calloc((size_t)(n * n), sizeof(double));
+    for (long i = 0; i < n; i++)
+        for (long j = 0; j < n; j++) { a[i * n + j] = (double)((i * j) % 7 + 1); b[i * n + j] = (double)((i + j) % 5 + 1); }
     for (int round = 0; round < 4; round++)
-        for (int i = 0; i < n; i++)
-            for (int k = 0; k < n; k++) { double aik = a[i][k]; for (int j = 0; j < n; j++) c[i][j] = c[i][j] + aik * b[k][j]; }
-    double sum = 0; for (int i = 0; i < n; i++) for (int j = 0; j < n; j++) sum += c[i][j];
+        for (long i = 0; i < n; i++) {
+            double *restrict ci = c + i * n;
+            for (long k = 0; k < n; k++) {
+                double aik = a[i * n + k];
+                const double *restrict bk = b + k * n;
+                for (long j = 0; j < n; j++) ci[j] = ci[j] + aik * bk[j];
+            }
+        }
+    double sum = 0.0;
+    for (long i = 0; i < n * n; i++) sum = sum + c[i];
     printf("%lld\n", (long long)sum);
     return 0;
 }
