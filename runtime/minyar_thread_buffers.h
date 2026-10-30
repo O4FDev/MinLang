@@ -236,6 +236,29 @@ long long minyar_frozen_bytes_get_int64(const RcThreadLeaf *frozen, long long po
     rc_frozen_check(b, position, 8);
     return (long long)bytes_load((const unsigned char *)(b.data + 1) + position, 8);
 }
+/* Out-of-line readers: generated code reads inline and calls these only to
+ * report a position outside the storage. */
+static uint64_t rc_frozen_word(const RcThreadLeaf *frozen, long long position, long long size) {
+    RcThreadBuffer b = rc_frozen(frozen)->buffer;
+    rc_frozen_check(b, position, size);
+    return bytes_load((const unsigned char *)(b.data + 1) + position, (int)size);
+}
+long long minyar_frozen_bytes_get_int16(const RcThreadLeaf *frozen, long long position) { return (int16_t)rc_frozen_word(frozen, position, 2); }
+long long minyar_frozen_bytes_get_uint16(const RcThreadLeaf *frozen, long long position) { return (uint16_t)rc_frozen_word(frozen, position, 2); }
+long long minyar_frozen_bytes_get_int32(const RcThreadLeaf *frozen, long long position) { return (int32_t)rc_frozen_word(frozen, position, 4); }
+long long minyar_frozen_bytes_get_uint32(const RcThreadLeaf *frozen, long long position) { return (uint32_t)rc_frozen_word(frozen, position, 4); }
+double minyar_frozen_bytes_get_float32(const RcThreadLeaf *frozen, long long position) {
+    uint32_t word = (uint32_t)rc_frozen_word(frozen, position, 4);
+    float value;
+    memcpy(&value, &word, sizeof(value));
+    return value;
+}
+double minyar_frozen_bytes_get_float64(const RcThreadLeaf *frozen, long long position) {
+    uint64_t word = rc_frozen_word(frozen, position, 8);
+    double value;
+    memcpy(&value, &word, sizeof(value));
+    return value;
+}
 
 typedef union { RcThreadBuffer bytes; RcFrozenBytes *frozen; } RcChannelMessage;
 enum { RC_CHANNEL_BYTES = 1, RC_CHANNEL_FROZEN = 2 };

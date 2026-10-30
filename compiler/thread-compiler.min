@@ -371,20 +371,104 @@ function threadBuiltin(output: List<Text>, textState: List<Text>, state: List<In
     return emitCall(output, textState, state, result, callee, values, types)
 }
 
+// The typed reader behind a FrozenBytes getter: uint8, int16, uint16, int32,
+// uint32, int64, float32 or float64; "" when `member` is not one.
+function frozenReaderKind(member: Text): Text {
+    if member == "getUInt8" { return "uint8" }
+    if member == "getInt16" { return "int16" }
+    if member == "getUInt16" { return "uint16" }
+    if member == "getInt32" { return "int32" }
+    if member == "getUInt32" { return "uint32" }
+    if member == "getInt64" { return "int64" }
+    if member == "getFloat32" { return "float32" }
+    if member == "getFloat64" { return "float64" }
+    return ""
+}
+
+// An inline little-endian read of shared frozen storage. The leaf's control
+// and the buffer it names never change while the leaf lives, so the loads of
+// both are invariant and leave loops; a failed bounds check calls the runtime
+// reader, which reports it and stops.
+function frozenReaderHelper(globals: List<Text>, kind: Text): Text {
+    let name = "@.minyar.frozen.get." + kind
+    let marker = "; minyar-frozen-reader: " + kind + "\n"
+    if findText(globals, marker) >= 0 { return name }
+    globals.add(marker)
+    let width = 1
+    if kind != "uint8" { width = typedByteWidth(kind) }
+    let word = "i" + Text(width * 8)
+    let result = "i64"
+    if kind == "float32" || kind == "float64" { result = "double" }
+    let pieces: List<Text> = ["define internal " + result + " " + name + "(ptr %leaf, i64 %position) alwaysinline {
+entry:
+  %control = load ptr, ptr %leaf, align 8, !invariant.load !{}
+  %data.field = getelementptr inbounds i8, ptr %control, i64 16
+  %data = load ptr, ptr %data.field, align 8, !invariant.load !{}
+  %length.field = getelementptr inbounds i8, ptr %control, i64 24
+  %length = load i64, ptr %length.field, align 8, !invariant.load !{}
+  %last.start = sub i64 %length, " + Text(width) + "
+  %nonnegative = icmp sge i64 %position, 0
+  %fits = icmp sle i64 %position, %last.start
+  %position.valid = and i1 %nonnegative, %fits
+  br i1 %position.valid, label %good, label %bad, !prof !{!\"branch_weights\", !\"expected\", i32 2000, i32 1}
+good:
+  %bytes = getelementptr inbounds i8, ptr %data, i64 8
+  %slot.0 = getelementptr inbounds i8, ptr %bytes, i64 %position
+"]
+    let byte = 0
+    while byte < width {
+        let number = Text(byte)
+        if byte > 0 { pieces.add("  %slot." + number + " = getelementptr inbounds i8, ptr %slot.0, i64 " + number + "\n") }
+        pieces.add("  %byte." + number + " = load i8, ptr %slot." + number + ", align 1\n")
+        if width > 1 { pieces.add("  %part." + number + " = zext i8 %byte." + number + " to " + word + "\n") }
+        if byte > 0 {
+            pieces.add("  %shift." + number + " = shl " + word + " %part." + number + ", " + Text(byte * 8) + "\n")
+            let previous = "%part.0"
+            if byte > 1 { previous = "%word." + Text(byte - 1) }
+            pieces.add("  %word." + number + " = or " + word + " " + previous + ", %shift." + number + "\n")
+        }
+        byte = byte + 1
+    }
+    let assembled = "%word." + Text(width - 1)
+    if kind == "int16" || kind == "int32" {
+        pieces.add("  %result = sext " + word + " " + assembled + " to i64\n  ret i64 %result\n")
+    } else if kind == "uint8" {
+        pieces.add("  %result = zext i8 %byte.0 to i64\n  ret i64 %result\n")
+    } else if kind == "uint16" || kind == "uint32" {
+        pieces.add("  %result = zext " + word + " " + assembled + " to i64\n  ret i64 %result\n")
+    } else if kind == "float32" {
+        pieces.add("  %single = bitcast i32 " + assembled + " to float\n  %result = fpext float %single to double\n  ret double %result\n")
+    } else if kind == "float64" {
+        pieces.add("  %result = bitcast i64 " + assembled + " to double\n  ret double %result\n")
+    } else {
+        pieces.add("  ret i64 " + assembled + "\n")
+    }
+    pieces.add("bad:\n  call " + result + " @minyar_frozen_bytes_get_" + kind + "(ptr %leaf, i64 %position)\n  unreachable\n}\n")
+    globals.add(joinText(pieces))
+    return name
+}
+
+function frozenRead(output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, receiver: Text, position: Text, kind: Text): Text {
+    let helper = frozenReaderHelper(globals, kind)
+    let value = valueName(textState, newTemporary(state))
+    let result = "i64"
+    if kind == "float32" || kind == "float64" { result = "double" }
+    output.add("  " + value + " = call " + result + " " + helper + "(ptr " + receiver + ", i64 " + position + ")\n")
+    return value
+}
+
 function threadFrozenMethod(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, receiver: Text, member: Text, resultType: List<Integer>): Text {
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
     let tokenLines = context.tokenLines
-    if member != "getUInt8" && member != "getInt64" { failCompiler("FrozenBytes exposes only immutable readers") }
+    let kind = frozenReaderKind(member)
+    if kind == "" { failCompiler("FrozenBytes exposes only immutable readers: getUInt8, getInt16, getUInt16, getInt32, getUInt32, getInt64, getFloat32 and getFloat64") }
     let positionType: List<Integer> = [0]
     let position = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
     requireType(tokenLines, state, positionType[0], 1, "FrozenBytes position must be Integer")
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
-    let callee = "minyar_frozen_bytes_get_uint8"
-    if member == "getInt64" { callee = "minyar_frozen_bytes_get_int64" }
-    let types: List<Integer> = [9, 1]
-    setType(resultType, 1)
-    return emitCall(output, textState, state, 1, callee, pairOf(receiver, position), types)
+    if kind == "float32" || kind == "float64" { setType(resultType, 7) } else { setType(resultType, 1) }
+    return frozenRead(output, textState, state, globals, receiver, position, kind)
 }
 
 function threadRegionMember(output: List<Text>, textState: List<Text>, state: List<Integer>, receiver: Text, type: Integer, member: Text, resultType: List<Integer>): Text {
@@ -804,6 +888,12 @@ function threadAppendABI(context: CompilerContext, output: List<Text>, globals: 
         "declare i64 @minyar_frozen_bytes_length(ptr)",
         "declare i64 @minyar_frozen_bytes_get_uint8(ptr, i64)",
         "declare i64 @minyar_frozen_bytes_get_int64(ptr, i64)",
+        "declare i64 @minyar_frozen_bytes_get_int16(ptr, i64)",
+        "declare i64 @minyar_frozen_bytes_get_uint16(ptr, i64)",
+        "declare i64 @minyar_frozen_bytes_get_int32(ptr, i64)",
+        "declare i64 @minyar_frozen_bytes_get_uint32(ptr, i64)",
+        "declare double @minyar_frozen_bytes_get_float32(ptr, i64)",
+        "declare double @minyar_frozen_bytes_get_float64(ptr, i64)",
         "declare ptr @minyar_bytes_channel_new(i64, i64)",
         "declare zeroext i1 @minyar_bytes_channel_try_send(ptr, ptr)",
         "declare zeroext i1 @minyar_bytes_channel_send(ptr, ptr)",

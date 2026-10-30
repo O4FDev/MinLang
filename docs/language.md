@@ -2052,7 +2052,10 @@ BytesChannel)`, also accepts a `NativeRegion`/`NativeRegions` capability or a
 before they return.
 
 - `freezeBytes(bytes)` copies Bytes into an immutable `FrozenBytes` that every
-  thread may read (`length`, `getUInt8`, `getInt64`); `freezeBytesTake` moves
+  thread and every call of a join may read without copying or counting
+  (`length`, indexing, `getUInt8`, `getInt16`, `getUInt16`, `getInt32`,
+  `getUInt32`, `getInt64`, `getFloat32`, `getFloat64`; reads are inline and
+  checked, like Bytes reads); `freezeBytesTake` moves
   the buffer instead, leaving the original empty, and `copyFrozenBytes` makes an
   ordinary Bytes copy.
 - `bytesChannel(maxBytes, maxMessages)` is a bounded queue that any number of
