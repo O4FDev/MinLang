@@ -562,6 +562,23 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
     return value;
 }
 
+/* `try` on a fresh Result whose type this runtime traces: the payload gets its
+ * own count (a traced retain shades it for the collector) and the Result goes
+ * through the ordinary traced release, as it did as a statement temporary. */
+long long minyar_record_take_field_traced(MinyarRecord *record, long long field) {
+    if ((unsigned long long)field >= (unsigned long long)record->length)
+        list_position_stop(field, record->length);
+    long long value = record->values[field];
+#ifndef MINYAR_COMPILER_ARENA
+    if ((((RcObject *)record - 1)->ownership & 7) != RC_SCALAR_RECORD) {
+        unsigned char *references = (unsigned char *)(record->values + record->length);
+        if (references[field]) minyar_rc_retain_traced((void *)(uintptr_t)value);
+    }
+    minyar_rc_release(record);
+#endif
+    return value;
+}
+
 /* Replace a reference field of a live record. The compiler has proved that
  * the new edge cannot close an ownership cycle. */
 void minyar_record_replace(MinyarRecord *record, long long field, long long value,

@@ -32,7 +32,7 @@ function count(source: Text, needle: Text): Integer {
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 let compiler = frontend.compiler
 // Node's cycle runs through List<Node>, which grow mutates, so Node is traced
-// and a Result carrying it keeps the ordinary temporary.
+// and a Result carrying it is taken through the traced form.
 let source = #"""
     record Node { name: Text; children: List<Node> }
 
@@ -121,9 +121,54 @@ test.check(count(totalBody, "call i64 @minyar_record_take_field(") == 3, "total:
 test.check(count(totalBody, "@minyar_rc_keep(") == 0, "total: scalar and payload-free tries keep no temporaries")
 // The shared case is decided at run time; the call site is the same.
 test.check(count(body(ir, "shared"), "call i64 @minyar_record_take_field(") == 1, "shared: a returned Result is taken; the runtime keeps a shared one intact")
-// A borrowed Result and a traced payload keep the ordinary temporary.
+// A borrowed Result keeps the ordinary temporary.
 test.check(count(body(ir, "borrowed"), "call i64 @minyar_record_take_field(") == 0 && count(body(ir, "borrowed"), "@minyar_rc_keep(") > 0, "borrowed: try on a local keeps its protecting count")
-test.check(count(body(ir, "traced"), "call i64 @minyar_record_take_field(") == 0 && count(body(ir, "traced"), "@minyar_rc_keep(") > 0, "traced: a Result carrying a traced payload keeps its temporary")
+// A traced payload is taken through the collector-aware form: the payload is
+// retained with a traced retain and the Result released, not freed in place.
+let tracedBody = body(ir, "traced")
+test.check(test.contains(ir, "; minyar-cycle-runtime: 1\n"), "traced: Node activates the cycle runtime")
+test.check(count(tracedBody, "call i64 @minyar_record_take_field_traced(") == 1 && count(tracedBody, "call i64 @minyar_record_take_field(") == 0, "traced: a Result carrying a traced payload is taken through the traced form")
+test.check(count(tracedBody, "@minyar_rc_keep(ptr %value.0)") == 0, "traced: the consumed Result is not a statement temporary")
+test.check(count(joinedBody, "_traced(") == 0, "joined: untraced takes stay plain in a cycle program")
 fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+
+// Tree could lie on a cycle through List<Tree>, but no code mutates such a
+// List, so the cycle runtime never traces it: its Results are taken plainly.
+let quiet = #"""
+    record Tree { name: Text; kids: List<Tree> }
+
+    function make(depth: Integer): Result<Tree, Text> {
+        if depth < 0 { return Err("negative " + Text(depth)) }
+        if depth == 0 { return Ok(Tree { name: "leaf" + "!"; kids: [] }) }
+        let child = try make(depth - 1)
+        let other = try make(depth - 1)
+        return Ok(Tree { name: "node" + Text(depth); kids: [child, other] })
+    }
+    function size(tree: Tree): Integer {
+        let total = tree.name.length
+        for kid in tree.kids { total += size(kid) }
+        return total
+    }
+    function measure(depth: Integer): Result<Integer, Text> {
+        let tree = try make(depth)
+        return Ok(size(tree))
+    }
+    function show(result: Result<Integer, Text>) {
+        match result {
+            Ok(value) { print("ok " + Text(value)) }
+            Err(message) { print("err " + message) }
+        }
+    }
+
+    show(measure(3))
+    show(measure(-1))
+    show(measure(0))
+    """#
+test.require(fixtures.compile(frontend, quiet), "compile untraced cycle-capable try IR")
+let quietIR = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+test.check(!test.contains(quietIR, "; minyar-cycle-runtime: 1\n") && !test.contains(quietIR, "_traced("), "quiet: an unmutated cycle-capable type stays untraced")
+test.check(count(body(quietIR, "make"), "call i64 @minyar_record_take_field(") == 2, "quiet: both tries take their payloads")
+test.check(count(body(quietIR, "measure"), "call i64 @minyar_record_take_field(") == 1, "quiet: measure takes its tree")
+fixtures.executes(frontend, quiet, "ok 75\nerr negative -1\nok 5\n", ["-O0", "-O2"], 0, "", true)
 test.removeTree(compiler.directory)
 print("Result try consumption: passed")
