@@ -831,7 +831,10 @@ exactly-once scheduling, concurrent callers, joins and signed range endpoints;
 `check-parallel-pool-tsan` runs that oracle under ThreadSanitizer.
 `check-parallel-backend` runs the freestanding dispatcher through four real
 processor-entry threads, including reductions; `check-parallel-backend-tsan`
-checks that boundary under ThreadSanitizer. The ARM64 boot fixture and QEMU
+checks that boundary under ThreadSanitizer. `check-crc32c` compares the
+`checksum.crc32c` hardware path (when the processor has one), its slicing-by-8
+tables and a bitwise oracle; `check-parallel-for` calls it from parallel
+functions at O0/O2. The ARM64 boot fixture and QEMU
 configuration are described in [Safe data parallelism](parallel.md).
 The scaling
 workload is `benchmarks/parallel.min`; run its optimized executable through

@@ -1974,7 +1974,9 @@ buffer field of a record, is rejected there because other iterations may be
 reading it. Ordinary single-threaded code may pass any buffer. Resizing,
 keeping a buffer or record in a local, assigning record fields and returning a
 buffer are rejected, and so are buffer and record parameters of native parallel
-functions. A function with buffer or record parameters cannot be started
+functions, except the runtime's read-only `checksum.crc32c(crc, data, offset,
+length)`, which parallel code may call (CRC-32C on SSE4.2 or ARMv8 CRC
+instructions when present, tables otherwise). A function with buffer or record parameters cannot be started
 through `parallelEntry`, whose callers pass raw Integers. The compiler checks
 this and compiles the function with no call-depth or ownership frame.
 

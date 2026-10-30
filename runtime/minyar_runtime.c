@@ -1461,6 +1461,7 @@ MinyarText *minyar_interpolate(long long count, ...) {
 }
 
 #include "minyar_bytes.h"
+#include "minyar_crc32c.h"
 #include "minyar_dma.h"
 #include "minyar_parallel.h"
 #include "minyar_c_layout.h"
