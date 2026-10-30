@@ -128,7 +128,7 @@ const wasmFrontend = await engine.check(source);
 const work = await mkdtemp(join(tmpdir(), 'minyar-wasm-parity-'));
 try {
   await writeFile(join(work, 'input.min'), source);
-  const native = spawnSync(join(root, 'build/minyarc'), ['input.min', 'output.ll', '--library', join(root, 'library'), '--error-format', 'json'], { cwd: work, encoding: 'utf8', timeout: 120000 });
+  const native = spawnSync(join(root, 'build/minyarc'), ['input.min', 'output.ll', '--library', join(root, 'library'), '--error-format', 'json', '--call-depth-counter'], { cwd: work, encoding: 'utf8', timeout: 120000 });
   assert.equal(native.status, 0, native.stderr);
   assert.equal(normalizeLLVM(wasmFrontend.llvm), normalizeLLVM(await readFile(join(work, 'output.ll'), 'utf8')), 'wasm/native frontend LLVM parity');
 } finally { await rm(work, { recursive: true, force: true }); }

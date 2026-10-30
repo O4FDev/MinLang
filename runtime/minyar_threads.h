@@ -46,6 +46,7 @@ static unsigned __stdcall rc_thread_entry(void *pointer) {
 #else
 static void *rc_thread_entry(void *pointer) {
 #endif
+    minyar_stack_guard_attach_thread();
     RcThreadLaunch launch = *(RcThreadLaunch *)pointer;
     rc_thread_native_free(pointer, sizeof(launch));
     rc_thread_domain_init();
@@ -90,6 +91,7 @@ static void *rc_thread_entry(void *pointer) {
     rc_thread_mutex_unlock(&t->mutex);
     rc_thread_current = NULL;
     rc_thread_control_release(t); /* Running share survives all local teardown. */
+    minyar_stack_guard_detach();
 #ifdef _WIN32
     return 0;
 #else
@@ -142,7 +144,10 @@ static long long rc_thread_launch_try(RcThreadLaunch prepared, void **output) {
         t->thread = (HANDLE)_beginthreadex(NULL, 0, rc_thread_entry, launch, 0, NULL);
         failed = !t->thread;
 #else
-        failed = pthread_create(&t->thread, NULL, rc_thread_entry, launch) != 0;
+        pthread_attr_t storage;
+        pthread_attr_t *attributes = minyar_guarded_thread_attributes(&storage);
+        failed = pthread_create(&t->thread, attributes, rc_thread_entry, launch) != 0;
+        if (attributes) pthread_attr_destroy(attributes);
 #endif
     }
     if (failed) {

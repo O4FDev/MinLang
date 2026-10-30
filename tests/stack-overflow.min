@@ -23,7 +23,10 @@ function prepare(llvm: Text, flags: List<Text>) {
     if test.addressEnabled(flags) { io.writeTextFile(llvm, test.instrument(io.readTextFile(llvm))) }
 }
 function link(clang: Text, flags: List<Text>, llvm: Text, runtime: Text, executable: Text, seconds: Integer) {
-    let command = [clang, "-O0"]
+    linkAt(clang, "-O0", flags, llvm, runtime, executable, seconds)
+}
+function linkAt(clang: Text, optimization: Text, flags: List<Text>, llvm: Text, runtime: Text, executable: Text, seconds: Integer) {
+    let command = [clang, optimization]
     for flag in flags { command.add(flag) }
     for item in ["-Wno-override-module", llvm, runtime, "-o", executable, "-lm"] { command.add(item) }
     let linked = run(command, executable + ".link", seconds)
@@ -104,15 +107,41 @@ if unary.status == 1 {
 }
 
 let safe = 5000
-io.writeTextFile(work + "/recursive.min", test.sourceModules("function descend(depth: Integer): Integer {\n    if depth == 0 { return 0 }\n    return 1 + descend(depth - 1)\n}\nprint(descend(" + Text(safe) + "))\nprint(descend(100000000))\n"))
-let compiled = run([compiler, work + "/recursive.min", work + "/recursive.ll", "--library", "library"], work + "/recursive", 20)
-test.check(compiled.status == 0, compiled.errorOutput)
-prepare(work + "/recursive.ll", flags)
-link(clang, flags, work + "/recursive.ll", runtime, work + "/recursive", 20)
-let program = run([work + "/recursive"], work + "/recursive-run", 20)
-test.check(program.status == 1, "deep program returned " + Text(program.status) + ": " + program.errorOutput)
-test.check(program.output == Text(safe) + "\n", program.output)
-test.check(test.sameDiagnostic(program.errorOutput, message), program.errorOutput)
+// The second call keeps the first out of tail position, so O2 cannot turn the
+// recursion into a loop. Guard pages stop it at O0 and O2; a counted build
+// (targets without guard pages) stops it with the same message.
+io.writeTextFile(work + "/recursive.min", test.sourceModules("function descend(depth: Integer): Integer {\n    if depth == 0 { return 0 }\n    return descend(depth - 1) + 1 + descend(0)\n}\nprint(descend(" + Text(safe) + "))\nprint(descend(100000000))\n"))
+for counted in [false, true] {
+    let compile = [compiler, work + "/recursive.min", work + "/recursive.ll", "--library", "library"]
+    if counted { compile.add("--call-depth-counter") }
+    let compiled = run(compile, work + "/recursive", 20)
+    test.check(compiled.status == 0, compiled.errorOutput)
+    let ir = io.readTextFile(work + "/recursive.ll")
+    test.check(test.contains(body(ir, "descend"), "@minyar_stack_enter(") == counted, "call-depth counter in descend: " + Text(counted))
+    prepare(work + "/recursive.ll", flags)
+    for optimization in ["-O0", "-O2"] {
+        linkAt(clang, optimization, flags, work + "/recursive.ll", runtime, work + "/recursive", 60)
+        let program = run([work + "/recursive"], work + "/recursive-run", 20)
+        let label = "deep program " + optimization + " counted " + Text(counted)
+        test.check(program.status == 1, label + " returned " + Text(program.status) + ": " + program.errorOutput)
+        test.check(program.output == Text(safe) + "\n", label + "\n" + program.output)
+        test.check(test.sameDiagnostic(program.errorOutput, message), label + "\n" + program.errorOutput)
+    }
+}
+
+// Worker threads stop the same way: each parallel worker has its own guard.
+io.writeTextFile(work + "/workers.min", test.sourceModules("parallel function descend(depth: Integer): Integer {\n    if depth == 0 { return 0 }\n    return descend(depth - 1) + 1 + descend(0)\n}\nlet results = [0, 0, 0, 0, 0, 0, 0, 0]\nparallel for index in 0..results.length {\n    results[index] = descend(100000000 + index)\n}\nprint(results[0])\n"))
+let workers = run([compiler, work + "/workers.min", work + "/workers.ll", "--library", "library"], work + "/workers", 20)
+test.check(workers.status == 0, workers.errorOutput)
+prepare(work + "/workers.ll", flags)
+for optimization in ["-O0", "-O2"] {
+    linkAt(clang, optimization, flags, work + "/workers.ll", runtime, work + "/workers", 60)
+    let environment = system.environment()
+    environment.add("MINYAR_PARALLEL_THREADS=4")
+    let program = test.run([work + "/workers"], environment, "", work + "/workers-run", 20)
+    test.check(program.status == 1 && program.output == "", "parallel overflow " + optimization + " returned " + Text(program.status) + "\n" + program.output + program.errorOutput)
+    test.check(test.sameDiagnostic(program.errorOutput, message), "parallel overflow " + optimization + "\n" + program.errorOutput)
+}
 
 io.writeTextFile(work + "/helpers.min", test.sourceModules("public function twice(value: Integer): Integer { return value * 2 }\n"))
 let terms: List<Text> = []
@@ -121,8 +150,22 @@ for index in 0..600 {
     terms.add("value * 3")
 }
 io.writeTextFile(work + "/leaves.min", test.sourceModules("use \"./helpers.min\" as helpers\nfunction leaf(value: Integer): Integer {\n    let text = \"value \" + Text(value) + \" \" + Text(value * 3)\n    return text.length\n}\nfunction caller(value: Integer): Integer { return helpers.twice(value) }\nfunction middle(value: Integer): Integer { return caller(value) + leaf(value) }\nfunction top(value: Integer): Integer { return middle(value) + 1 }\nfunction ping(value: Integer): Integer {\n    if value == 0 { return 0 }\n    return pong(value - 1)\n}\nfunction pong(value: Integer): Integer { return ping(value) }\nfunction callsLarge(value: Integer): Integer { return large(value) + 1 }\nfunction large(value: Integer): Integer { return " + joinText(terms) + " }\nfunction descend(depth: Integer): Integer {\n    if depth == 0 { return leaf(7) }\n    return leaf(depth) - leaf(depth) + descend(depth - 1)\n}\nprint(descend(" + Text(safe) + ") + caller(1) + large(0) + top(0) * 0 + ping(3) + callsLarge(0) - 1)\nprint(descend(100000000))\n"))
+let functions = ["leaf", "caller", "middle", "descend", "top", "ping", "pong", "callsLarge", "large"]
+// Guard pages: no function counts its calls.
 let leaves = run([compiler, work + "/leaves.min", work + "/leaves.ll", "--library", "library"], work + "/leaves", 20)
 test.check(leaves.status == 0, leaves.errorOutput)
+let guarded = io.readTextFile(work + "/leaves.ll")
+for name in functions {
+    let found = body(guarded, name)
+    test.check(!test.contains(found, "@minyar_stack_enter") && !test.contains(found, "@minyar_stack_leave"), found)
+}
+prepare(work + "/leaves.ll", flags)
+link(clang, flags, work + "/leaves.ll", runtime, work + "/leaves", 20)
+let result = run([work + "/leaves"], work + "/leaves-run", 20)
+test.check(result.status == 1 && result.output == "12\n" && test.sameDiagnostic(result.errorOutput, message), "leaf program result\n" + Text(result.status) + "\n" + result.output + result.errorOutput)
+// A counted build checks every function that can deepen recursion.
+let counted = run([compiler, work + "/leaves.min", work + "/leaves.ll", "--library", "library", "--call-depth-counter"], work + "/leaves", 20)
+test.check(counted.status == 0, counted.errorOutput)
 let ir = io.readTextFile(work + "/leaves.ll")
 for name in ["leaf", "caller", "middle"] {
     let found = body(ir, name)
@@ -135,7 +178,7 @@ for name in ["top", "ping", "pong", "callsLarge"] {
 test.check(calls(body(ir, "large"), "call void @minyar_stack_enter()") == 1, "a large leaf keeps its check")
 prepare(work + "/leaves.ll", flags)
 link(clang, flags, work + "/leaves.ll", runtime, work + "/leaves", 20)
-let result = run([work + "/leaves"], work + "/leaves-run", 20)
-test.check(result.status == 1 && result.output == "12\n" && test.sameDiagnostic(result.errorOutput, message), "leaf program result\n" + Text(result.status) + "\n" + result.output + result.errorOutput)
+let countedResult = run([work + "/leaves"], work + "/leaves-run", 20)
+test.check(countedResult.status == 1 && countedResult.output == "12\n" && test.sameDiagnostic(countedResult.errorOutput, message), "counted leaf program result\n" + Text(countedResult.status) + "\n" + countedResult.output + countedResult.errorOutput)
 test.removeTree(work)
-print("compiler and generated-program stack overflows stop cleanly")
+print("compiler, generated-program and worker stack overflows stop cleanly with guard pages and counters")

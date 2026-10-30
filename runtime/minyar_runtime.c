@@ -150,32 +150,31 @@ static MINYAR_THREAD_LOCAL int minyar_stack_bounds_ready;
 /* The depth at which minyar_stack_enter takes its exact path. */
 static MINYAR_THREAD_LOCAL size_t minyar_depth_limit;
 
-/* Keep first-use platform queries out of the frequent guard. This also lets
- * LTO inline the check without importing pthread setup into every caller. */
-static MINYAR_COLD void minyar_find_stack_bounds(void) {
-    minyar_stack_bounds_ready = 1;
+/* The calling thread's stack bounds, or zeros where the platform has none. */
+static MINYAR_COLD void minyar_query_stack_bounds(uintptr_t *low_out, uintptr_t *high_out) {
+    uintptr_t stack_low = 0, stack_high = 0;
 #ifdef _WIN32
     {
         ULONG_PTR low = 0, high = 0;
         GetCurrentThreadStackLimits(&low, &high);
-        minyar_stack_low = (uintptr_t)low;
-        minyar_stack_high = (uintptr_t)high;
+        stack_low = (uintptr_t)low;
+        stack_high = (uintptr_t)high;
     }
 #elif defined(__wasm__)
     {
         /* wasm-ld supplies the linear-memory stack bounds. The language call
          * limit separately protects the engine's own execution stack. */
         extern unsigned char __stack_low, __stack_high;
-        minyar_stack_low = (uintptr_t)&__stack_low;
-        minyar_stack_high = (uintptr_t)&__stack_high;
+        stack_low = (uintptr_t)&__stack_low;
+        stack_high = (uintptr_t)&__stack_high;
     }
 #elif defined(__APPLE__)
     {
         void *high = pthread_get_stackaddr_np(pthread_self());
         size_t size = pthread_get_stacksize_np(pthread_self());
-        minyar_stack_high = (uintptr_t)high;
-        if (size <= minyar_stack_high)
-            minyar_stack_low = minyar_stack_high - size;
+        stack_high = (uintptr_t)high;
+        if (size <= stack_high)
+            stack_low = stack_high - size;
     }
 #elif defined(__linux__)
     {
@@ -189,28 +188,37 @@ static MINYAR_COLD void minyar_find_stack_bounds(void) {
         long process = (long)getpid();
         int main_thread = (long)syscall(SYS_gettid) == process;
         if (main_thread && main_process == process) {
-            minyar_stack_low = main_low;
-            minyar_stack_high = main_high;
+            stack_low = main_low;
+            stack_high = main_high;
         } else {
             pthread_attr_t attributes;
             void *low = NULL;
             size_t size = 0;
             if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
                 if (pthread_attr_getstack(&attributes, &low, &size) == 0) {
-                    minyar_stack_low = (uintptr_t)low;
-                    if (size <= UINTPTR_MAX - minyar_stack_low)
-                        minyar_stack_high = minyar_stack_low + size;
+                    stack_low = (uintptr_t)low;
+                    if (size <= UINTPTR_MAX - stack_low)
+                        stack_high = stack_low + size;
                 }
                 pthread_attr_destroy(&attributes);
             }
             if (main_thread) {
-                main_low = minyar_stack_low;
-                main_high = minyar_stack_high;
+                main_low = stack_low;
+                main_high = stack_high;
                 main_process = process;
             }
         }
     }
 #endif
+    *low_out = stack_low;
+    *high_out = stack_high;
+}
+
+/* Keep first-use platform queries out of the frequent guard. This also lets
+ * LTO inline the check without importing pthread setup into every caller. */
+static MINYAR_COLD void minyar_find_stack_bounds(void) {
+    minyar_stack_bounds_ready = 1;
+    minyar_query_stack_bounds(&minyar_stack_low, &minyar_stack_high);
     minyar_depth_limit = MINYAR_MAX_CALL_DEPTH;
     if ((!minyar_stack_low || !minyar_stack_high) && MINYAR_FALLBACK_CALL_DEPTH < minyar_depth_limit)
         minyar_depth_limit = MINYAR_FALLBACK_CALL_DEPTH;
@@ -256,6 +264,7 @@ void minyar_stack_leave(void) {
 }
 
 #include "minyar_calldepth.h"
+#include "minyar_stack_guard.h"
 
 static MINYAR_COLD MINYAR_NORETURN void output_error(void) {
     minyar_stop("standard output could not be written.");
@@ -1388,6 +1397,8 @@ void minyar_initialize_arguments(int count, char **values) {
     /* Turn a closed output pipe into the same checked I/O failure as EBADF. */
     signal(SIGPIPE, SIG_IGN);
 #endif
+    /* Stack exhaustion faults in the guard region; report it as call depth. */
+    minyar_stack_guard_attach();
 }
 
 #include "minyar_maps.h"

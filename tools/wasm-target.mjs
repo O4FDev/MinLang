@@ -54,7 +54,7 @@ if (typeof process !== 'undefined' && process.versions?.node &&
         const llvm = path.join(work, 'program.ll');
         const lowered = path.join(work, 'program-wasm.ll');
         const wasm = path.join(work, 'program.wasm');
-        if (run(compiler, [source, llvm, '--library', path.join(root, 'library')])) {
+        if (run(compiler, [source, llvm, '--library', path.join(root, 'library'), '--call-depth-counter'])) {
           await fs.writeFile(lowered, normalizeLLVM(await fs.readFile(llvm, 'utf8')));
           if (run(clang, ['--target=wasm32-wasip1', `--sysroot=${sysroot}`, `-resource-dir=${sysroot}`,
             '-Wno-override-module', args[2] ?? '-O2', '-mllvm', '-wasm-enable-sjlj',

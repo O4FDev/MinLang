@@ -193,7 +193,7 @@ export async function createEngine({ loadBytes, progress = () => {} } = {}) {
     // At most sixteen project roots can collide; library never matches.
     while (tree.has(outputPath)) outputPath = `output-${++outputNumber}.ll`;
     const started = performance.now();
-    const result = await execute(frontend, ['minyarc', normalized.entry, outputPath, '--library', 'library', '--error-format', 'json'], tree);
+    const result = await execute(frontend, ['minyarc', normalized.entry, outputPath, '--library', 'library', '--error-format', 'json', '--call-depth-counter'], tree);
     const diagnostics = parseDiagnostics(result.stderr);
     if (result.exitCode !== 0 && diagnostics.length === 0) throw new Error(`The compiler stopped with status ${result.exitCode}.`);
     const output = tree.get(outputPath);

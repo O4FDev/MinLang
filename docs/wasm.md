@@ -28,7 +28,9 @@ node --no-warnings tests/wasm-target.mjs --run build/lanterns.wasm
 ```
 
 The target currently uses eager reclamation, including cyclic managed
-graphs. It caps language call depth at 1,024. Native stack-trace metadata is
+graphs. WebAssembly has no guard pages, so its programs and the playground
+compiler are compiled with `minyarc --call-depth-counter`, which counts calls;
+the target caps language call depth at 1,024. Native stack-trace metadata is
 omitted because its linker-relative addresses and native unwind mechanism
 do not apply to this target. Runtime failures retain their messages and
 exit status. OS-specific native libraries, managed threads, and arbitrary

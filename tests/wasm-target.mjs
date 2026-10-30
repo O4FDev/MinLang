@@ -134,7 +134,7 @@ if (process.argv[2] === '--run') {
     const llvm = `${directory}/${name}.ll`;
     const lowered = `${directory}/${name}-wasm.ll`;
     writeFileSync(input, source);
-    const compiled = command(compiler, [input, llvm, '--library', 'library']);
+    const compiled = command(compiler, [input, llvm, '--library', 'library', '--call-depth-counter']);
     assert.equal(compiled.status, 0, `${name}: ${compiled.stderr}`);
     writeFileSync(lowered, normalizeLLVM(readFileSync(llvm, 'utf8')));
     for (const optimization of ['0', '2']) {

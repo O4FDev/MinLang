@@ -11,7 +11,11 @@ PLAYGROUND_LIBRARY = $(addsuffix .min,$(addprefix library/,maybe errors text mat
 build/wasm/.prepared: tools/prepare-wasm.py | build
 	python3 tools/prepare-wasm.py
 
-build/wasm/compiler.ll: build/compiler-stage2.ll tools/wasm-target.mjs build/wasm/.prepared
+# WebAssembly has no guard pages: the compiler that runs there counts its calls.
+build/wasm/compiler-counted.ll: build/compiler.min build/minyarc $(COMPILER_LIBRARY_SOURCES) | build/wasm/.prepared
+	$(LIMITED) ./build/minyarc $< $@ --library library --call-depth-counter
+
+build/wasm/compiler.ll: build/wasm/compiler-counted.ll tools/wasm-target.mjs build/wasm/.prepared
 	node tools/wasm-target.mjs --normalize "$<" "$@"
 
 build/wasm/compiler.wasm: build/wasm/compiler.ll tools/wasm-compiler-runtime.c runtime/minyar_runtime.c $(WASM_HEADERS) build/wasm/.prepared

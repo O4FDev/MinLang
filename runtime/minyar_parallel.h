@@ -238,6 +238,7 @@ static void parallel_join_inside(int own, void (*a)(void *), void *a_environment
 }
 
 static void *parallel_worker(void *argument) {
+    minyar_stack_guard_attach_thread();
     minyar_parallel_active = 1;
     size_t own = *(size_t *)argument;
     parallel_participant = (int)own;
@@ -257,6 +258,7 @@ static void *parallel_worker(void *argument) {
             else parallel_idle(&failures);
         }
     }
+    minyar_stack_guard_detach();
     return NULL;
 }
 
@@ -293,12 +295,15 @@ static void parallel_initialize(void) {
     MinyarParallelPool *pool = &parallel_pool;
     if (atexit(parallel_shutdown) != 0)
         minyar_stop("the parallel thread pool could not register its cleanup.");
+    pthread_attr_t storage;
+    pthread_attr_t *attributes = minyar_guarded_thread_attributes(&storage);
     for (size_t index = 1; index < count; ++index) {
         pool->identities[index - 1] = index;
-        if (pthread_create(&pool->threads[index - 1], NULL, parallel_worker,
+        if (pthread_create(&pool->threads[index - 1], attributes, parallel_worker,
                            &pool->identities[index - 1]) != 0) break;
         pool->count = index + 1;
     }
+    if (attributes) pthread_attr_destroy(attributes);
 }
 
 /* Runs one join from a thread outside the pool: it becomes participant 0 for

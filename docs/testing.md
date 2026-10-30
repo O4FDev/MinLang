@@ -1602,30 +1602,45 @@ origin invariants.
 
 ## Checked failure paths
 
-Generated functions check the current thread's actual stack bounds on Linux,
-macOS, and Windows, reserving enough stack to report an error. Platforms where
-bounds are unavailable use a conservative 32,768-call fallback. On Linux, glibc
-finds the main thread's stack by reading `/proc/self/maps`; the runtime keeps
-that answer for the rest of the process, so C hosts that refresh bounds on
-every call into Minyar pay that cost once. A 5,000-deep
-program must run; compiler or program exhaustion must exit with
-`Minyar stopped: the program exceeded the maximum call depth.` rather than a
-signal.
+On Linux and macOS, generated functions pay nothing per call for stack
+safety. The main thread and every thread the runtime starts for language code
+(managed threads, `parallel for` workers) run with a guard region below their
+stack: the kernel's growth gap for the main thread, a 1 MiB guard page range for
+runtime threads, wider than any language frame. A SIGSEGV/SIGBUS handler on a
+64 KiB alternate signal stack recognises a fault within 1 MiB below (or 64 KiB
+above) the thread's lowest stack address and stops with
+`Minyar stopped: the program exceeded the maximum call depth.`, status 1 and
+the usual stack trace, rather than a signal; other faults reach the previous
+handler or the default action. C hosts that call Minyar functions without a
+Minyar `main` install no handler. At O2, LLVM may run self tail recursion as a
+loop, as in C, so only recursion that keeps its frames is guaranteed to stop.
 
-A function that calls no Minyar function (a leaf of at most 256 locals, 1,024
-temporaries and 1,024 labels) has no
-check of its own: it cannot deepen recursion, and its frame fits in the
-128 KiB reserve its caller's check left. Without the check, LLVM can inline
-small accessors. `check-stack-overflow` requires that a leaf has no guard,
-that callers of local and imported functions keep theirs, and that a leaf
-doing Text work at the deepest allowed frame still finishes before the clean
-overflow stop.
+Targets without guard pages count calls instead: `minyarc --call-depth-counter`
+(WebAssembly: the wasm target driver, the playground and the wasm compiler
+build pass it) and `--freestanding` emit `minyar_stack_enter`/`minyar_stack_leave`
+around every function that can deepen recursion, and so does a program that
+uses `calldepth.run`, whose recoverable mode needs the exact count. The counter
+checks the current thread's stack bounds where the platform reports them
+(Linux, macOS, Windows), reserving enough stack to report an error; platforms
+where bounds are unavailable use a conservative 32,768-call fallback. On Linux,
+glibc finds the main thread's stack by reading `/proc/self/maps`; the runtime
+keeps that answer for the rest of the process. A function that calls no Minyar
+function (a leaf of at most 256 locals, 1,024 temporaries and 1,024 labels) has
+no check of its own: it cannot deepen recursion, and its frame fits in the
+128 KiB reserve its caller's check left.
 
-Both native and sanitized compilers are covered. The sanitizer build instruments
-the self-hosted second-stage LLVM, preserving its runtime call-depth guards.
-The bootstrap emitter does not emit those guards and is not the sanitizer build
-input. `check-stack-overflow-sanitize` checks deeply nested parentheses and
-100,000 unary operators, plus safe and exhausting generated-program recursion.
+A 5,000-deep program must run; compiler or program exhaustion must stop with
+the message above. `check-stack-overflow` requires that a guard-page build has
+no counter calls, that a counted build drops the check from leaves and keeps it
+in callers of local and imported functions, that a leaf doing Text work at the
+deepest allowed frame still finishes before the clean stop, that non-tail
+recursion stops cleanly at O0 and O2 in both modes, and that recursion in
+`parallel for` workers stops the same way.
+
+Both native and sanitized compilers are covered. The bootstrap emitter emits no
+counter either. `check-stack-overflow-sanitize` checks deeply nested parentheses
+and 100,000 unary operators, plus safe and exhausting generated-program
+recursion, under ASan/UBSan.
 
 `make check-statement-nesting` requires all nine results from a 50,000-branch
 conditional chain, including an imported function. It also checks deep then

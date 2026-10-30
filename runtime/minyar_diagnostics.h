@@ -92,6 +92,10 @@ _Bool minyar_runtime_diagnosticJSON(void) { return minyar_diagnostic_json; }
 static long long minyar_compiler_kernel_target;
 void minyar_runtime_compilerSetKernelTarget(long long target) { minyar_compiler_kernel_target = target; }
 long long minyar_runtime_compilerKernelTarget(void) { return minyar_compiler_kernel_target; }
+/* Nonzero: count every call with minyar_stack_enter (no guard pages). */
+static long long minyar_compiler_call_depth_counter;
+void minyar_runtime_compilerSetCallDepthCounter(long long enabled) { minyar_compiler_call_depth_counter = enabled; }
+long long minyar_runtime_compilerCallDepthCounter(void) { return minyar_compiler_call_depth_counter; }
 
 /* This private boundary is used by the compiler, never emitted into a user
  * program. Only an explicit diagnostic can jump here; runtime faults remain
