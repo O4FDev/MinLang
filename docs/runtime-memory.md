@@ -389,7 +389,11 @@ The public eager release entry also inlines idle shared decrements and immortal
 returns. Its original general body remains behind a separate noinline helper.
 Public NULL requests, last owners, pending destruction and traced cycle values
 retain that general path, including its service and barrier behavior. The
-external release ABI and bounded release budgets are unchanged.
+external release ABI and bounded release budgets are unchanged. The
+incremental profiles' public release likewise inlines the decrement of a value
+that keeps another owner, followed by its service point's pending-count test;
+a last owner, an immortal value and NULL take the general body, with the same
+units and service.
 
 Linking eager scope output (`--scope-owners` alone) against an incremental
 runtime preserves ownership but performs a separately budgeted release for

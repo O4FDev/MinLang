@@ -886,11 +886,31 @@ static int rc_bounded_step_chunks(RcFrame *frame) {
     return 1;
 }
 
-void minyar_rc_release(void *value) {
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void rc_bounded_release(void *value) {
     unsigned immediate = rc_drop(value);
     rc_service_pending(immediate < MINYAR_RC_POLL_BUDGET
                        ? MINYAR_RC_POLL_BUDGET - immediate : 0);
 #ifdef MINYAR_RC_TESTING
     rc_bounded_last_work += immediate;
 #endif
+}
+
+/* Most releases leave another owner: that decrement and the following
+ * service point's pending test are inlined into callers (generated code and
+ * scope releases); a last owner, an immortal value and NULL take the general
+ * body. Same units and service as the general body. */
+MINYAR_INLINE_ENTRY void minyar_rc_release(void *value) {
+    if (value) {
+        RcObject *object = (RcObject *)value - 1;
+        size_t ownership = object->ownership;
+        if (ownership >= 16) {
+            object->ownership = ownership - 8;
+            rc_service_pending(MINYAR_RC_POLL_BUDGET);
+            return;
+        }
+    }
+    rc_bounded_release(value);
 }
