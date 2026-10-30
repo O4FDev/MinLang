@@ -18,6 +18,12 @@
 #if MINYAR_SYSTEM_SMALL_HEAP
 #include "minyar_system_small_heap.h"
 #endif
+/* Whether every managed object rc_heap_allocate returns sits behind a small-heap
+ * slot header, where the bounded scheduler keeps a dead object's cursor. Thread
+ * programs allocate objects with malloc here, so they encode cursors in the
+ * object instead. A runtime that gives each thread its own small heap for
+ * objects sets this from MINYAR_SYSTEM_SMALL_HEAP alone. */
+#define MINYAR_OBJECT_SLOT_HEADERS (!MINYAR_THREADED && MINYAR_SYSTEM_SMALL_HEAP)
 #ifdef MINYAR_RC_TESTING
 static MINYAR_THREAD_LOCAL size_t rc_heap_allocation_count;
 #endif

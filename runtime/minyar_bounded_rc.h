@@ -39,6 +39,10 @@ static MINYAR_THREAD_LOCAL RcBoundedObjects rc_backlog;
 static MINYAR_THREAD_LOCAL size_t rc_backlog_credit, rc_bounded_owner_tasks;
 static MINYAR_THREAD_LOCAL unsigned rc_bounded_fresh_aged;
 
+#if defined(MINYAR_SYSTEM_HEAP) && !defined(MINYAR_OBJECT_SLOT_HEADERS)
+#error minyar_heap.h must say whether objects carry slot headers
+#endif
+
 /* Dead List capacity is spare. Dead record map bytes retain their low-bit
  * reference flag and store seven cursor bits each. The loop executes at most
  * ceil(sizeof(size_t)*CHAR_BIT/7) iterations, independent of graph size. */
@@ -46,7 +50,7 @@ MINYAR_HOT size_t rc_bounded_saved_cursor(RcObject *object) {
     if ((object->ownership & 7) == RC_TEXT) return 0;
     if ((object->ownership & 7) == RC_REFERENCES)
         return (size_t)((MinyarList *)(object + 1))->capacity;
-#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_SYSTEM_SMALL_HEAP && !MINYAR_THREADED
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_OBJECT_SLOT_HEADERS
     return ((RcSystemSlot *)object - 1)->value.bytes;
 #else
     MinyarRecord *record = (MinyarRecord *)(object + 1);
@@ -66,7 +70,7 @@ MINYAR_HOT void rc_bounded_save_cursor(RcObject *object, size_t cursor) {
         ((MinyarList *)(object + 1))->capacity = (long long)cursor;
         return;
     }
-#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_SYSTEM_SMALL_HEAP && !MINYAR_THREADED
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_OBJECT_SLOT_HEADERS
     ((RcSystemSlot *)object - 1)->value.bytes = cursor;
 #else
     MinyarRecord *record = (MinyarRecord *)(object + 1);
