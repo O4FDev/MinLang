@@ -204,10 +204,16 @@ long long minyar_text_integer(MinyarText *text) {
     if (start < end && (text->bytes[start] == '-' || text->bytes[start] == '+')) start++;
     if (start == end) minyar_stop_program("Integer(Text) requires a signed decimal ASCII integer.");
     unsigned long long value = 0, limit = (unsigned long long)LLONG_MAX + negative;
-    for (long long i = start; i < end; i++) {
-        unsigned char byte = text->bytes[i];
-        if (byte < '0' || byte > '9') minyar_stop_program("Integer(Text) requires a signed decimal ASCII integer.");
-        unsigned digit = byte - '0';
+    /* Eighteen digits always fit, so only later digits need the range check. */
+    long long i = start, unchecked = end - start > 18 ? start + 18 : end;
+    for (; i < unchecked; i++) {
+        unsigned digit = (unsigned)text->bytes[i] - '0';
+        if (digit > 9) minyar_stop_program("Integer(Text) requires a signed decimal ASCII integer.");
+        value = value * 10 + digit;
+    }
+    for (; i < end; i++) {
+        unsigned digit = (unsigned)text->bytes[i] - '0';
+        if (digit > 9) minyar_stop_program("Integer(Text) requires a signed decimal ASCII integer.");
         if (value > (limit - digit) / 10) minyar_stop_program("Integer(Text) is outside the signed 64-bit range.");
         value = value * 10 + digit;
     }
