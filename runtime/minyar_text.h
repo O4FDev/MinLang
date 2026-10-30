@@ -340,6 +340,21 @@ long long minyar_text_integer_range(MinyarText *text, long long start, long long
     return text_integer_bytes(text->bytes, start, end);
 }
 
+/* text.slice(start, end) == other without the slice: the slice's bounds
+ * check and stop, then the byte comparison of minyar_texts_are_equal. */
+_Bool minyar_text_range_equals(MinyarText *text, long long start, long long end, const MinyarText *other) {
+    ensure_text_index(text);
+    if (start < 0 || end < start || end > text->character_length)
+        slice_outside_text();
+    long long first = start, last = end;
+    if (text->character_offsets) {
+        first = indexed_byte_offset(text, start);
+        last = indexed_byte_offset(text, end);
+    }
+    return other->byte_length == last - first &&
+           bytes_are_equal(text->bytes + first, other->bytes, (size_t)(last - first));
+}
+
 /* JSON scanning helpers for library/json.min. Positions are scalar offsets.
  * jsonStringEnd returns the first position at or after `position` holding a
  * quote, a backslash or a control below U+0020 (the Text's length if none);

@@ -314,9 +314,11 @@ every separator shape (one byte, several bytes, empty, Unicode), kept pieces in
 Lists, Maps and records, a reassigned loop variable, early exits, nested
 splits, owned receivers and compaction of kept pieces of a large Text.
 `Integer(text.slice(a, b))` covers Unicode positions, signs and spaces, and
-each slice and parse stop. Inline length and indexing cover ASCII, Unicode,
+each slice and parse stop; `text.slice(a, b) == other` covers literals, locals,
+`!=`, Unicode positions and the slice stop, and keeps the slice when `other`
+runs code. Inline length and indexing cover ASCII, Unicode,
 not-yet-counted Text, a parser record's scanning loop and both position stops.
-LLVM checks require the in-place split scan, the range parse and the inline
+LLVM checks require the in-place split scan, the range parse and compare, the inline
 header reads (with their type tags and runtime slow path), and keep the List
 or slice for stored values. `check-text-basics-models` also streams every model
 case through the runtime split step, kept and unkept.
