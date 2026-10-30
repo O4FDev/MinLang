@@ -152,6 +152,16 @@ reports preserve integer batch durations; exact reconstruction checks include
 repeating fractions and corrupt/noncanonical report rejection. These tests check the
 measurement protocol without asserting wall-clock performance thresholds.
 
+`benchmarks/compare/` holds one directory per program with idiomatic Minyar
+(`main.min`) beside fast C, C++ and Rust peers that print byte-identical output.
+`make check-benchmarks-compare` builds each Minyar program at O0 and release and
+compares it with its C peer on the small workload from `sizes`; it checks
+correctness only. `python3 benchmarks/compare/run.py` measures the full
+workloads on Linux x86-64: cachegrind instructions for all four languages and
+the ratio of Minyar to the fastest peer, with `--only`, `--tree`, `--json`,
+`--perf` (wall time, n=3 interleaved) and `--profile` (top functions).
+Reference counts are cached in `build/compare-cache/`.
+
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and
 ordinary-build exclusion. Successful fixtures and the living-tests gallery

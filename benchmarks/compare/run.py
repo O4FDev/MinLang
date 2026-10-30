@@ -13,6 +13,8 @@ and each program receives the file's path; otherwise it receives N itself.
       ratio minyar / min(c, cpp, rust), with a geomean line. Reference Ir is
       cached by source hash and compiler version in build/compare-cache/.
       --perf adds wall times (n=3, interleaved; median and spread).
+      --profile keeps cg_annotate function tables for Minyar and the fastest
+      reference in build/compare/NAME/*.annotate.txt and prints the top lines.
   run.py --check [--only NAME] [--tree DIR]
       Correctness only, on the host: builds Minyar at O0 (--debug) and release
       and checks each against the C reference on the small workload.
@@ -197,6 +199,16 @@ def measure_program(name, args, results):
         row["identical"] = len(set(row["outputs"].values())) == 1
         row["ratio"] = ir / min(row["ir"][lang] for lang in REFS)
         row["fastest_ref"] = min(REFS, key=lambda lang: row["ir"][lang])
+        if args.profile:
+            row["profile"] = {}
+            for lang in ("minyar", row["fastest_ref"]):
+                out_file = os.path.join(work, f"cachegrind.{lang}.out")
+                if not os.path.exists(out_file):
+                    cachegrind(exes[lang] if os.path.exists(exes[lang]) else build_and_path(lang, name, exes), arg, work, lang)
+                text = subprocess.run(["cg_annotate", "--auto=no", out_file], capture_output=True, text=True).stdout
+                with open(os.path.join(work, f"{lang}.annotate.txt"), "w") as f:
+                    f.write(text)
+                row["profile"][lang] = top_functions(text)
         if args.perf:
             row["wall"] = wall_times(exes, arg)
             best = min(statistics.median(row["wall"][lang]) for lang in REFS)
@@ -205,6 +217,27 @@ def measure_program(name, args, results):
         row["error"] = str(e)
     results[name] = row
     return row
+
+
+def build_and_path(lang, name, exes):
+    build_ref(lang, name, exes[lang])
+    return exes[lang]
+
+
+def top_functions(annotate, count=15):
+    """The leading entries of cg_annotate's Function:file summary."""
+    lines, inside = [], False
+    for line in annotate.splitlines():
+        if line.startswith("-- Function:file summary"):
+            inside = True
+        elif inside and line.startswith(">"):
+            match = re.match(r">\s*([\d,]+)\s+\(\s*([\d.]+)%.*?\)\s+(.*)", line)
+            if match:
+                lines.append({"ir": int(match.group(1).replace(",", "")), "percent": float(match.group(2)),
+                              "function": match.group(3).rsplit(":", 1)[0]})
+            if len(lines) == count:
+                break
+    return lines
 
 
 def wall_times(exes, arg, repeats=3):
@@ -235,6 +268,10 @@ def print_row(row, perf):
                                for lang in LANGS)
         line += f" {row['wall_ratio']:>6.2f}"
     print(line, flush=True)
+    for lang, entries in row.get("profile", {}).items():
+        print(f"    {lang} top functions:")
+        for e in entries:
+            print(f"      {e['percent']:5.1f}% {e['ir'] / 1e6:10.1f}M  {e['function']}")
 
 
 def measure(args):
@@ -248,6 +285,7 @@ def measure(args):
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
             for row in pool.map(lambda n: measure_program(n, args, results), names):
                 print_row(row, False)
+                sys.stdout.flush()
     else:
         for name in names:
             print_row(measure_program(name, args, results), args.perf)
@@ -314,6 +352,7 @@ def main():
     p.add_argument("--tree", default=REPO, help="Minyar tree whose ./minyar builds the programs")
     p.add_argument("--json", help="write results as JSON")
     p.add_argument("--perf", action="store_true", help="also measure wall time, n=3 interleaved")
+    p.add_argument("--profile", action="store_true", help="print cg_annotate top functions for Minyar and the fastest reference")
     p.add_argument("--jobs", type=int, default=0, help="concurrent programs (default: 2 for Ir, CPU count for --check)")
     p.add_argument("--check", action="store_true", help="correctness only: O0 and release Minyar against C, small input")
     args = p.parse_args()
