@@ -313,10 +313,12 @@ at O0/O2 with ownership assertions. `for piece in text.split(separator)` covers
 every separator shape (one byte, several bytes, empty, Unicode), kept pieces in
 Lists, Maps and records, a reassigned loop variable, early exits, nested
 splits, owned receivers and compaction of kept pieces of a large Text.
-LLVM checks require the in-place split scan and keep the List for a stored
-split. `check-text-basics-models` also streams every model case through the
-runtime split step, kept and unkept. `check-text-scanning-sanitize` adds
-ASan/UBSan.
+Inline length and indexing cover ASCII, Unicode, not-yet-counted Text, a
+parser record's scanning loop and both position stops. LLVM checks require the
+in-place split scan and the inline header reads (with their type tags and
+runtime slow path), and keep the List for a stored split.
+`check-text-basics-models` also streams every model case through the runtime
+split step, kept and unkept. `check-text-scanning-sanitize` adds ASan/UBSan.
 
 `make check-iteration-capabilities` checks structural `Iterable` and `Iterator`
 bounds on generic functions over collections, recipes and user cursors. It

@@ -5,7 +5,8 @@ use "io" as io
 // Text scanning without intermediate objects, at O0 and O2 under the exact
 // ownership-debt runtime, with the LLVM shapes that make it so:
 // `for piece in text.split(separator)` scans in place (no List, one reused
-// view while the body keeps nothing).
+// view while the body keeps nothing), and Text length and indexing read the
+// header inline.
 
 function functionBody(llvm: Text, name: Text): Text {
     let body: List<Text> = []
@@ -166,6 +167,58 @@ test.check(test.contains(direct, "@minyar_text_split_next("), "a for over a spli
 test.check(!test.contains(direct, "@minyar_text_split(") && !test.contains(direct, "@minyar_list_"), "a for over a split call must not build a List")
 let stored = functionBody(llvm, "stored")
 test.check(test.contains(stored, "@minyar_text_split(") && !test.contains(stored, "@minyar_text_split_next("), "a stored split keeps its List")
+
+// Inline length and indexing: ASCII, Unicode (runtime path), a Text the
+// runtime has not counted yet, and the scanning loop of a parser record.
+fixtures.executes(frontend, #"""
+    use "text" as textLibrary
+    record Scanner { text: Text; position: Integer }
+    function Scanner.skipSpaces() {
+        while self.position < self.text.length && self.text[self.position] == ' ' { self.position += 1 }
+    }
+    function Scanner.number(): Integer {
+        self.skipSpaces()
+        let start = self.position
+        while self.position < self.text.length && self.text[self.position] >= '0' && self.text[self.position] <= '9' { self.position += 1 }
+        return Integer(self.text.slice(start, self.position))
+    }
+    let scanner = Scanner { text: "  12   345 6"; position: 0 }
+    let sum = 0
+    for count in 0..3 { sum += scanner.number() }
+    print(sum)
+    let unicode = "añ🙂b"
+    let seen: List<Text> = []
+    for index in 0..unicode.length { seen.add(Text(unicode[index])) }
+    print(joinText(seen, "|") + " " + Text(unicode.length))
+    let decoded = textLibrary.decodeOrStop(Bytes("héllo"))
+    print(Text(decoded.length) + " " + Text(decoded[1]) + Text(decoded[4]))
+    let ascii = textLibrary.decodeOrStop(Bytes("plain"))
+    print(Text(ascii[4]) + Text(ascii.length))
+    let uncounted = "xñy🙂z".slice(1, 4)
+    print(Text(uncounted[2]) + Text(uncounted.length) + Text(uncounted[0]))
+    """#, "363\na|ñ|🙂|b 4\n5 éo\nn5\n🙂3ñ\n", levels, 0, "", true)
+fixtures.executes(frontend, "let t = \"abc\"\nlet i = 3\nprint(t[i])\n", "", levels, 1, "Minyar stopped: a Text position was outside the Text.\n", false)
+fixtures.executes(frontend, "let t = \"abc\"\nlet i = -1\nprint(t[i])\n", "", levels, 1, "Minyar stopped: a Text position cannot be negative.\n", false)
+fixtures.executes(frontend, #"""
+    function count(text: Text, wanted: Character): Integer {
+        let found = 0
+        let index = 0
+        while index < text.length {
+            if text[index] == wanted { found += 1 }
+            index += 1
+        }
+        return found
+    }
+    print(count("a,b,,c", ','))
+    """#, "3\n", levels, 0, "", true)
+let indexLLVM = io.readTextFile(frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll")
+let countBody = functionBody(indexLLVM, "count")
+test.check(test.contains(countBody, "call i64 @.minyar.text.length(") && test.contains(countBody, "call i32 @.minyar.text.character("), "Text length and indexing must use the inline header reads")
+test.check(!test.contains(countBody, "@minyar_text_length(") && !test.contains(countBody, "@minyar_text_character_at("), "Text length and indexing must not call the runtime on the fast path")
+test.check(test.contains(indexLLVM, "!\"minyar text header\"") && test.contains(indexLLVM, "!\"minyar text byte\""), "Text header and byte loads need their own type tags")
+test.require(test.run([frontend.compiler.clang, "-O2", "-S", "-emit-llvm", "-Wno-override-module", frontend.compiler.directory + "/case" + Text(frontend.compiler.serial) + ".ll", "-o", frontend.compiler.directory + "/count.opt.ll"], frontend.environment, "", frontend.compiler.directory + "/count.opt", 60), "optimise the Text scanning loop")
+let optimised = io.readTextFile(frontend.compiler.directory + "/count.opt.ll")
+test.check(!test.contains(optimised, "@.minyar.text.character(") && test.contains(optimised, "call i32 @minyar_text_character_at("), "the inline read keeps the runtime only on its slow path")
 
 test.removeTree(frontend.compiler.directory)
 print("Text scanning: passed")
