@@ -211,7 +211,14 @@ both endpoints of traced ownership operations use the physical payload type.
   record patterns read assignable fields and keep their counts. Traced payload
   types keep their counts: a choice or Result counts as untraced when every type on
   a cycle through it is itself a choice or Result, since activation needs a
-  List or field mutation inside that cycle. A function's frame is decided by
+  List or field mutation inside that cycle. When that cycle runs through a List
+  or record, activation is known only at module end, so the binding borrows
+  provisionally: it reserves its owner slot and an empty owner piece. If the
+  program activates the type, the piece becomes a traced local owner; otherwise
+  the slot's clears are removed too (unless code reassigns the binding), and a
+  function whose frame existed only for such slots loses it, with its cleanup
+  service points and idle queries. Such functions use heap frames, never the
+  stack-frame form. A function's frame is decided by
   the owner slots it actually writes, so slots reserved for bindings that
   ended up borrowing, or for guards settled away, need no frame
   (`make check-match-payload-borrows`).

@@ -596,6 +596,162 @@ function untracedValueType(context: CompilerContext, type: Integer): Boolean {
     return result
 }
 
+// Reserve the binding's owner slot (so every exit clears it) and an empty
+// owner piece; finishProvisionalBorrows decides at module end.
+function provisionalBorrow(context: CompilerContext, output: List<Text>, state: List<Integer>, id: Integer, value: Text, type: Integer) {
+    let borrows = context.provisionalBorrows
+    let slot = ownershipSlot(state, id)
+    state[6] = 1
+    noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, output.length, type, 0)
+    borrows.pieces.add(output.length)
+    borrows.slots.add(slot)
+    borrows.values.add(value)
+    borrows.types.add(type)
+    borrows.functions.add(borrows.current)
+    output.add("")
+}
+
+// The owner slot an rc_local family call at this piece names, or -1.
+function provisionalSlotAt(output: List<Text>, piece: Integer): Integer {
+    let text = output[piece]
+    if !text.startsWith("  call void @minyar_rc_local") { return -1 }
+    let open = text.find("(i64 ")
+    if open < 0 { return -1 }
+    if open + 5 == text.length {
+        if piece + 1 >= output.length { return -1 }
+        return decimalOrMinusOne(output[piece + 1])
+    }
+    let rest = text.slice(open + 5, text.length)
+    let comma = rest.find(",")
+    if comma < 0 { comma = rest.find(")") }
+    if comma < 0 { return -1 }
+    return decimalOrMinusOne(rest.slice(0, comma))
+}
+
+function decimalOrMinusOne(text: Text): Integer {
+    if text.length == 0 || text.length > 18 { return -1 }
+    let digits = "0123456789"
+    let value = 0
+    let position = 0
+    while position < text.length {
+        let digit = 0
+        while digit < 10 && text[position] != digits[digit] { digit = digit + 1 }
+        if digit == 10 { return -1 }
+        value = value * 10 + digit
+        position = position + 1
+    }
+    return value
+}
+
+function nullClearAt(output: List<Text>, piece: Integer): Boolean {
+    return piece + 4 < output.length && output[piece] == "  call void @minyar_rc_local(i64 " && output[piece + 2] == ", ptr " && output[piece + 3] == "null" && output[piece + 4] == ")\n"
+}
+
+function rangeUsesFrame(output: List<Text>, start: Integer, end: Integer): Boolean {
+    let piece = start
+    while piece < end {
+        let text = output[piece]
+        let at = text.find("@minyar_rc_")
+        if at >= 0 {
+            let rest = text.slice(at + 11, text.length)
+            if rest.startsWith("keep") || rest.startsWith("borrow") || rest.startsWith("local") || rest.startsWith("scope") || rest.startsWith("enter_stack") || rest.startsWith("leave_stack") { return true }
+        }
+        if text.find("minyar-owned-local-transfer") >= 0 { return true }
+        piece = piece + 1
+    }
+    return false
+}
+
+// The activated cycle roots, as finishCycleFixups computes them.
+function activeCycleRoots(returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>): List<Integer> {
+    let roots: List<Integer> = []
+    let position = counts.length
+    while position + 1 < returnTypes.length {
+        if returnTypes[position] == -3 {
+            let root = -1 - returnTypes[position + 1]
+            let duplicate = false
+            let index = 0
+            while index < roots.length {
+                if roots[index] == root { duplicate = true }
+                index = index + 1
+            }
+            if !duplicate && possibleCycleType(root, counts, fields, returnTypes) { roots.add(root) }
+            position = position + 2
+        } else {
+            if returnTypes[position] == -2 { position = position + 4 } else { position = position + 1 }
+        }
+    }
+    return roots
+}
+
+// Runs before finishCycleFixups, which then marks filled owners as traced.
+function finishProvisionalBorrows(context: CompilerContext, output: List<Text>, returnTypes: List<Integer>, counts: List<Integer>, fields: List<Integer>) {
+    let borrows = context.provisionalBorrows
+    if borrows.pieces.length == 0 { return }
+    let roots = activeCycleRoots(returnTypes, counts, fields)
+    let seenTypes: List<Integer> = []
+    let activeTypes: List<Integer> = []
+    let kept: List<Boolean> = []
+    while kept.length < borrows.starts.length { kept.add(false) }
+    let index = 0
+    while index < borrows.pieces.length {
+        let function = borrows.functions[index]
+        let slot = borrows.slots[index]
+        let type = choiceOwnershipType(context, borrows.types[index])
+        if roots.length > 0 && cycleTypeActive(type, roots, counts, fields, seenTypes, activeTypes) {
+            output[borrows.pieces[index]] = "  call void @minyar_rc_local(i64 " + Text(slot) + ", ptr " + borrows.values[index] + ")\n"
+            kept[function] = true
+        } else {
+            // The slot now starts empty. Its clears go too, unless code that
+            // reassigns or moves the binding still writes the slot.
+            let end = borrows.ends[function]
+            let written = false
+            let clears: List<Integer> = []
+            let piece = borrows.starts[function] + 1
+            while piece < end {
+                if provisionalSlotAt(output, piece) == slot {
+                    if nullClearAt(output, piece) { clears.add(piece) } else { written = true }
+                }
+                piece = piece + 1
+            }
+            if written { kept[function] = true } else {
+                let clear = 0
+                while clear < clears.length {
+                    let at = clears[clear]
+                    output[at] = ""
+                    output[at + 1] = ""
+                    output[at + 2] = ""
+                    output[at + 3] = ""
+                    output[at + 4] = ""
+                    clear = clear + 1
+                }
+            }
+        }
+        index = index + 1
+    }
+    let function = 0
+    while function < borrows.starts.length {
+        let start = borrows.starts[function]
+        let end = borrows.ends[function]
+        if !kept[function] && borrows.elidable[function] && !rangeUsesFrame(output, start + 1, end) {
+            let entry = output[start]
+            let enter = entry.find("  call void @minyar_rc_enter(i64 ")
+            if enter >= 0 {
+                let rest = entry.slice(enter, entry.length)
+                let close = rest.find(")\n")
+                output[start] = entry.slice(0, enter) + rest.slice(close + 2, rest.length)
+                let piece = start + 1
+                while piece < end {
+                    if output[piece] == "  call void @minyar_rc_step()\n" || output[piece] == "  call void @minyar_rc_leave()\n" { output[piece] = "" }
+                    piece = piece + 1
+                }
+                settleIdleQueriesIn(output, start + 1, end)
+            }
+        }
+        function = function + 1
+    }
+}
+
 function blockAssignsName(tokenKinds: List<Integer>, tokenTexts: List<Text>, start: Integer, name: Text): Boolean {
     let position = start
     let depth = 0

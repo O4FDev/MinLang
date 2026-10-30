@@ -50,6 +50,10 @@ let source = #"""
         Branch(kids: List<Tree>)
     }
     record Holder { name: Text }
+    choice Shape {
+        Dot(size: Integer)
+        Group(items: List<Shape>, label: Text)
+    }
 
     function build(depth: Integer): Expr {
         if depth == 0 { return Expr.Name("n" + Text(depth)) }
@@ -123,6 +127,26 @@ let source = #"""
             Leaf(_) { }
         }
     }
+    function area(shape: Shape): Integer {
+        return match shape {
+            Dot(size) { size }
+            Group(items, label) { label.length + total(items) }
+        }
+    }
+    function total(items: List<Shape>): Integer {
+        let sum = 0
+        for item in items { sum += area(item) }
+        return sum
+    }
+    function regroup(shape: Shape): Integer {
+        match shape {
+            Group(items, _) {
+                items = [Shape.Dot(5)]
+                return total(items)
+            }
+            else { return 0 }
+        }
+    }
     function rename(holder: Holder) { holder.name = "renamed" + "!" }
     function product(holder: Holder): Text {
         match holder {
@@ -147,11 +171,14 @@ let source = #"""
     let tree = Tree.Branch([Tree.Leaf(1), Tree.Leaf(2)])
     addKid(tree, Tree.Branch([Tree.Leaf(3)]))
     print(kids(tree))
+    let shape = Shape.Group([Shape.Dot(2), Shape.Group([Shape.Dot(3)], "a" + "b")], "x" + "yz")
+    print(area(shape))
+    print(regroup(shape))
     let holder = Holder { name: "holder" + "!" }
     print(product(holder))
     print(holder.name)
     """#
-let expected = "10\n10\n1\n2\n9\n13\n3\nn0!\n3\nholder!\nrenamed!\n"
+let expected = "10\n10\n1\n2\n9\n13\n3\nn0!\n3\n10\n5\nholder!\nrenamed!\n"
 
 test.require(fixtures.compile(frontend, source), "compile match payload borrow IR")
 let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
@@ -173,6 +200,12 @@ test.check(count(body(ir, "reassigned"), "@minyar_rc_local") > 0, "reassigned: a
 // A traced payload and a record field keep their counts.
 test.check(owners(ir, "kids") > 0 && owners(ir, "addKid") > 0, "Tree: payloads of a traced choice keep their owners")
 test.check(owners(ir, "product") > 0, "product: a record pattern binding keeps its owner across field assignment")
+// Shape's cycle runs through List<Shape>, which nothing mutates: its payloads
+// borrow provisionally, and at module end the unused owners, clears and frame go.
+test.check(owners(ir, "area") == 0 && !test.contains(body(ir, "area"), "@minyar_rc_enter(") && !test.contains(body(ir, "area"), "@minyar_rc_leave("), "area: provisional payload borrows of an inactive cycle leave no owner or frame")
+test.check(owners(ir, "regroup") > 0 && test.contains(body(ir, "regroup"), "@minyar_rc_enter("), "regroup: a reassigned provisional binding keeps its slot and frame")
+// Tree's List<Tree> is mutated, so its provisional owners are filled and traced.
+test.check(count(body(ir, "kids"), "@minyar_rc_local_traced(") > 0, "kids: an activated cycle fills its provisional owners as traced")
 fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
 test.removeTree(compiler.directory)
 print("Match payload borrows: passed")
