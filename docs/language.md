@@ -2346,10 +2346,10 @@ that heap and reference counting stays non-atomic. Scalar arguments are passed
 as they are. Text, Bytes, List and record arguments are copied into the call
 once when the join starts, so a call owns what it receives and the caller keeps
 its own values, as with `startThread`; pass index ranges or `FrozenBytes` rather
-than large Lists. Results move to the caller: a call that ran on the joining
-thread hands its value over without copying, which is always the case with
-`MINYAR_PARALLEL_THREADS=1`, and a call that ran on another worker is copied
-back once. Each call is checked like a thread entry: it cannot reach module
+than large Lists. Results move to the caller without copying: a call that ran
+on another worker allocated on its own heap pages, which the joining thread
+adopts with the result. Programs that use the cycle collector copy a result
+from another worker once instead. Each call is checked like a thread entry: it cannot reach module
 globals holding managed values, `exit`, or native code that threads may not
 use. A program with such a join links the thread runtime.
 

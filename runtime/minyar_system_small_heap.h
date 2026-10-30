@@ -156,5 +156,49 @@ static inline void *rc_system_resize(void *pointer, size_t old_bytes, size_t byt
     return resized;
 }
 
+#if MINYAR_THREADED
+/* A detached set of small pages: a join branch stolen by a pool worker
+ * allocates on fresh pages and hands them, with the live result, to the
+ * joining thread, which adopts them as its own. */
+typedef struct {
+    RcSystemPage *available[RC_SYSTEM_SIZE_CLASSES];
+    size_t live;
+} RcSystemHeap;
+
+/* Exchanges this thread's page lists with `heap`. */
+static void rc_system_swap(RcSystemHeap *heap) {
+    for (unsigned index = 0; index < RC_SYSTEM_SIZE_CLASSES; index++) {
+        RcSystemPage *mine = rc_system_available[index];
+        RcSystemPage *theirs = heap->available[index];
+        rc_system_available[index] = theirs;
+        if (theirs) theirs->link = &rc_system_available[index];
+        heap->available[index] = mine;
+        if (mine) mine->link = &heap->available[index];
+    }
+    size_t live = rc_system_live;
+    rc_system_live = heap->live;
+    heap->live = live;
+}
+
+/* Takes every page of `heap` into this thread's lists. Full pages are on no
+ * list; they join the list of whichever thread later frees into them, which
+ * is this one, since the live objects on them are now this thread's. */
+static void rc_system_adopt(RcSystemHeap *heap) {
+    rc_system_live += heap->live;
+    heap->live = 0;
+    for (unsigned index = 0; index < RC_SYSTEM_SIZE_CLASSES; index++) {
+        RcSystemPage *page = heap->available[index];
+        heap->available[index] = NULL;
+        while (page) {
+            RcSystemPage *next = page->next;
+            page->link = NULL;
+            if (page->live) rc_system_link(page);
+            else free(page);
+            page = next;
+        }
+    }
+}
+#endif
+
 #undef SMALL_HEAP_POISON
 #undef SMALL_HEAP_UNPOISON

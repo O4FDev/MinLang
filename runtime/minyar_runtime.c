@@ -1260,8 +1260,12 @@ _Static_assert(MINYAR_INTEGER_TEXT_CACHE_LIMIT >= 0 && MINYAR_INTEGER_TEXT_CACHE
                "Integer Text cache limit must be between 0 and 32768");
 
 #if MINYAR_THREADED
+/* Nonzero while this thread runs a join branch stolen from another domain:
+ * its pages go to that domain, so it shares no per-thread cached object. */
+static MINYAR_THREAD_LOCAL int rc_join_foreign;
 static MinyarText *integer_text_cached(long long integer, int dispose) {
     (void)dispose;
+    if (rc_join_foreign) return format_integer_text(integer);
 #else
 MinyarText *minyar_integer_text(long long integer) {
 #endif
