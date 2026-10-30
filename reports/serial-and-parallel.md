@@ -208,6 +208,8 @@ The Rust peers generate the records, the per-term posting lists and the per-rang
 | the same records built and summed locally | 179.2M | 2,870 Ir per record: the channel adds ~4,800 Ir per message |
 | one `parallel for` of 64 tiny iterations, 1 thread / 4 threads | 1,435 Ir / 3,580 Ir per loop | wall 116 ns / 1.9 µs per loop (2 threads: 1.2 µs) |
 
+The thread-share rows run in the thread runtime as of 42b1cbc46 (before 4a3140b1f), like any program that uses threads.
+
 Dispatch is cheap enough for per-query loops (neo-db's pkRun); copies and channels are what make "share the index,
 send the request" designs expensive.
 
@@ -233,8 +235,10 @@ connections and run whole search statements, reading one shared immutable index 
 lengths, `mainValid`) — needs shared frozen managed data (cause C3) and a fast thread runtime (cause C2); writes and
 deltas stay on one owner thread and publish a new frozen snapshot per index version; (b) until then, run the
 top-k dispatch without blocking the loop (send the compiled query to search threads over a channel with the frozen
-arenas, merge the reply on the loop) — possible today with `freezeBytesTake` per arena, typed channels and
-`channels.wakeSocket` in the loop, at the measured costs above.
+arenas, merge the reply on the loop) — expressible today with `freezeBytesTake` per arena, typed channels and
+`channels.wakeSocket` in the loop, but FrozenBytes offers only `getUInt8`/`getInt64` (the containers use 16- and
+32-bit fields), reads at 3.3x a List, and the whole server would pay the remaining C2 tax on its 1-client path, so
+the goal-loops REQUESTS row says not to adopt it before C2 is near zero.
 
 ## 2. Causes, ranked by payoff
 
@@ -242,7 +246,7 @@ Payoff = how much of the gap in *both* columns the fix removes, weighted by how 
 
 | # | cause | measurement | costs serial | costs parallel | fix | owner |
 |---|---|---|---|---|---|---|
-| C1 | Parallel code is a scalar sublanguage: no record/Text/List/Map creation, no Text/Map reads, no ordinary callees, no recursive types, no growing outputs, join arguments read-only | probes p1–p10; textindex 84% and mapreduce 44% of Ir forced serial; neo-db pkPlan/pkRun | nothing directly; idiomatic code stays 5–19x behind (hidden) because the fast form is a rewrite | Amdahl: textindex bound 1.14x, mapreduce 1.73x at 4 threads; whole neo-db statements cannot leave the loop | give pool workers managed domains: a task/parallel body may allocate and call ordinary functions; values it creates are owned by the worker's domain and either die there or move to the joining caller (per-iteration owned outputs, `collect`); captured values stay read-only | parallel (PAR-2 remainder) + ownership |
+| C1 | Parallel code is a scalar sublanguage: no record/Text/List/Map creation, no Text/Map reads, no ordinary callees, no recursive types, no growing outputs, join arguments read-only | probes p1–p10; textindex 84% and mapreduce 44% of Ir forced serial; neo-db pkPlan/pkRun | nothing directly; idiomatic code stays 5–20x behind (hidden) because the fast form is a rewrite | Amdahl: textindex bound 1.14x, mapreduce 1.73x at 4 threads; whole neo-db statements cannot leave the loop | give pool workers managed domains: a task/parallel body may allocate and call ordinary functions; values it creates are owned by the worker's domain and either die there or move to the joining caller (per-iteration owned outputs, `collect`); captured values stay read-only | parallel (PAR-2 remainder) + ownership |
 | C2 | The thread runtime is slower for managed code even on one thread | textindex +59.9% / server +74.5% Ir at 1 thread at 42b1cbc46; **+29.1% / +50.5% after 4a3140b1f** (per-thread small heap) | +29–50% today on managed code of any program that mentions a thread or atomic | the same on every thread, plus malloc arena contention | done: per-thread small heap (4a3140b1f). Left: buffer data on small pages with remote free; literal Text shared instead of copied per use; bounded cursor in the slot header in thread mode | parallel (thread runtime) |
 | C3 | No shared read-only managed data: arguments and messages are copied; only FrozenBytes is shared and it reads at 3.3x a List | thread-share: channel +4,800 Ir per small record; FrozenBytes 9.0 vs 2.75 Ir/element | none | every "share the index/table" design pays copies (memory x threads) or slow reads; neo-db cannot run 2 loops over one index | `freeze(value)` for Lists/records/Text graphs: immutable, RC-exempt while frozen (immortal until the last thread scope ends), readable from any thread and from parallel bodies; inline FrozenBytes getters | ownership + parallel |
 | C4 | Outputs must be fixed-width windows indexed by the loop variable; windows exist only inside `parallel for` | p7–p9; topk/neo-db scratch sized to kmax; topk-plain-loop needed fresh Lists | serial path cannot reuse window code (+8.4% in topk-plain-loop) | worst-case scratch, serial grow-before and merge-after phases | per-iteration owned outputs moved back in index order (`parallel for ... collect`), windows over explicit ranges with a disjointness check, windows usable in ordinary code | parallel |
@@ -280,5 +284,6 @@ columns of `benchmarks/bothmodes/run.py` and on `benchmarks/compare`.
   correctness (O0 + release, 1 and 4 threads, small inputs).
 - Variants: `python3 benchmarks/bothmodes/variants/measure.py --profile NAME,...`; micro-measures:
   `sh benchmarks/bothmodes/variants/micro.sh`; rejections: `./minyar --release benchmarks/bothmodes/variants/rejected/pN-*.min`.
-- Caveat on wall times: box D is shared; gates of other lanes run outside the bench lock. Wall columns below were
+- Caveat on wall times: box D is shared; gates of other lanes run outside the bench lock. Wall columns above were
   taken with the load average printed by `--wall-only`; Ir columns are deterministic.
+- Hidden versions of the both-modes programs (Luke's step 4) belong to the judge lane; this suite is the visible half.
