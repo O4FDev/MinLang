@@ -801,7 +801,8 @@ positions and byte values keep the runtime's bounds and range errors. Aliases
 and C-layout views retain their shared storage semantics; a mutating call can
 change the length or storage before the access completes.
 
-`Bytes(text)` is a Text's UTF-8 encoding. Going back can fail, so it is a
+`Bytes(text)` is a Text's UTF-8 encoding; `Bytes` of an interpolation writes
+its parts straight into the Bytes, with no intermediate Text. Going back can fail, so it is a
 library call that says so. `text.decode(bytes)` validates and copies in one
 pass and returns `Result<Text, errors.Error>`; invalid UTF-8 is an
 `errors.invalidDataCode()` error the program must handle. Use it for anything

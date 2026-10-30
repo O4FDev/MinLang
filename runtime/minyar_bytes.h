@@ -80,6 +80,15 @@ MinyarText *minyar_runtime_utf8Text(const MinyarBytes *bytes) {
 }
 
 /* Bytes(text): the text's UTF-8 encoding. */
+/* Bytes(<interpolation>): Bytes of exactly `length` bytes that the compiled
+ * interpolation then writes in full (minyar_text_builder's counterpart), so
+ * no intermediate Text is made and copied. */
+MinyarBytes *minyar_bytes_builder(long long length) {
+    unsigned char *data = new_bytes(length);
+    data[length] = 0;
+    return new_text(data, length, length);
+}
+
 MinyarBytes *minyar_text_bytes(const MinyarText *text) {
     MinyarBytes *bytes = minyar_bytes_new(text->byte_length);
     if (text->byte_length)
