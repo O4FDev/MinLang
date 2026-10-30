@@ -165,7 +165,11 @@ static void *rc_allocate_data(size_t size) {
     rc_service_pending(MINYAR_RC_POLL_BUDGET);
 #endif
     if (size > SIZE_MAX - sizeof(RcData)) out_of_memory();
+#ifdef MINYAR_BOUNDED_RC
+    RcData *data = rc_heap_allocate_data(sizeof(*data) + size);
+#else
     RcData *data = RC_ALLOCATE(sizeof(*data) + size);
+#endif
     if (!data) out_of_memory();
     data->size = size;
     RC_ACCOUNT(rc_bytes += sizeof(*data) + size);
@@ -208,7 +212,7 @@ static void *rc_reallocate_data(void *pointer, size_t size) {
     RcData *data = (RcData *)pointer - 1;
     RC_ACCOUNT(rc_bytes -= data->size);
 #ifdef MINYAR_BOUNDED_RC
-    data = rc_heap_resize(data, sizeof(*data) + data->size, sizeof(*data) + size);
+    data = rc_heap_resize_data(data, sizeof(*data) + data->size, sizeof(*data) + size);
 #else
     data = realloc(data, sizeof(*data) + size);
 #endif

@@ -169,7 +169,7 @@ static void *rc_allocate_data(size_t size) {
     rc_service_allocation();
 #endif
     if (size > SIZE_MAX - sizeof(RcData)) out_of_memory();
-    RcData *data = RC_ALLOCATE(sizeof(*data) + size);
+    RcData *data = rc_heap_allocate_data(sizeof(*data) + size);
     if (!data) out_of_memory();
     data->size = size;
     RC_ACCOUNT(rc_bytes += sizeof(*data) + size);
@@ -213,7 +213,7 @@ static void *rc_reallocate_data(void *pointer, size_t size) {
 #ifdef MINYAR_RC_TESTING
     size_t previous_size = data->size;
 #endif
-    data = rc_heap_resize(data, sizeof(*data) + data->size, sizeof(*data) + size);
+    data = rc_heap_resize_data(data, sizeof(*data) + data->size, sizeof(*data) + size);
     RC_ACCOUNT(rc_bytes -= previous_size);
     data->size = size;
     RC_ACCOUNT(rc_bytes += size);

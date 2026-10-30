@@ -33,9 +33,12 @@ _Static_assert(sizeof(RcSystemSlot) == 16 && sizeof(RcSystemPage) <= RC_SYSTEM_P
                "small system backing requires 64-bit metadata");
 _Static_assert(_Alignof(max_align_t) <= 16,
                "small system backing must preserve malloc alignment");
-static RcSystemPage *rc_system_available[RC_SYSTEM_SIZE_CLASSES];
+/* Pages belong to one thread: in a thread program each thread allocates and
+ * frees only its own slots (buffers that cross threads are moved to large
+ * slots first, see rc_thread_detach). */
+static MINYAR_THREAD_LOCAL RcSystemPage *rc_system_available[RC_SYSTEM_SIZE_CLASSES];
 /* Live small slots in every class. */
-static size_t rc_system_live;
+static MINYAR_THREAD_LOCAL size_t rc_system_live;
 
 static inline void rc_system_unlink(RcSystemPage *page) {
     if (!page->link) abort(); /* An unlinked page must never be removed twice. */

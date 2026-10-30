@@ -105,7 +105,7 @@ static RcThreadLeaf *rc_thread_wrap(void *control) {
 
 /* Permitted profiles both allocate the RcData prefix with libc; preserve
  * provenance explicitly rather than freeing the interior payload address. */
-enum { RC_THREAD_EAGER_DATA = 1, RC_THREAD_SYSTEM_DATA = 2 };
+enum { RC_THREAD_EAGER_DATA = 1, RC_THREAD_SYSTEM_DATA = 2, RC_THREAD_SLOT_DATA = 3 };
 typedef struct {
     RcData *data;
     long long length, capacity;
@@ -120,12 +120,29 @@ static void rc_thread_validate_bytes(const MinyarBytes *b) {
 }
 static RcThreadBuffer rc_thread_detach(MinyarBytes *b, unsigned char *replacement) {
     RcThreadBuffer result = {(RcData *)b->bytes - 1, b->byte_length, b->character_length,
-#ifdef MINYAR_SYSTEM_HEAP
+#if MINYAR_SYSTEM_SMALL_HEAP
+                            RC_THREAD_SLOT_DATA
+#elif defined(MINYAR_SYSTEM_HEAP)
                             RC_THREAD_SYSTEM_DATA
 #else
                             RC_THREAD_EAGER_DATA
 #endif
     };
+#if MINYAR_SYSTEM_SMALL_HEAP
+    /* A small slot lives on this thread's pages; the buffer may be freed by
+     * another thread, so move it into a large slot first (plain malloc). */
+    RcSystemSlot *slot = (RcSystemSlot *)result.data - 1;
+    if (slot->page) {
+        size_t total = sizeof(RcData) + result.data->size;
+        RcSystemSlot *large = malloc(sizeof(*large) + total);
+        if (!large) out_of_memory();
+        large->page = NULL;
+        large->value.bytes = total;
+        memcpy(large + 1, result.data, total);
+        rc_system_deallocate(result.data);
+        result.data = (RcData *)(large + 1);
+    }
+#endif
     RC_ACCOUNT(rc_bytes -= rc_thread_buffer_charge(result));
 #ifdef MINYAR_BOUNDED_RC
     RC_ACCOUNT(rc_heap_allocation_count--);
@@ -135,8 +152,11 @@ static RcThreadBuffer rc_thread_detach(MinyarBytes *b, unsigned char *replacemen
     return result;
 }
 static void rc_thread_buffer_free(RcThreadBuffer b) {
-    if (b.allocator != RC_THREAD_EAGER_DATA && b.allocator != RC_THREAD_SYSTEM_DATA)
+    if (b.allocator != RC_THREAD_EAGER_DATA && b.allocator != RC_THREAD_SYSTEM_DATA && b.allocator != RC_THREAD_SLOT_DATA)
         minyar_stop("a shared buffer has invalid allocator provenance.");
+#if MINYAR_SYSTEM_SMALL_HEAP
+    if (b.allocator == RC_THREAD_SLOT_DATA) { free((RcSystemSlot *)b.data - 1); return; }
+#endif
     free(b.data);
 }
 static void rc_thread_transit_add(RcThreadBuffer b) {
