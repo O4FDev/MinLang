@@ -1,0 +1,84 @@
+// Keep-alive streaming client scenarios against tests/http-client/server.min (argument: its port).
+use "process" as processInfo
+use "http" as http
+use "text" as text
+use "errors" as errors
+
+function show(result: Result<Bytes, errors.Error>): Text {
+    match result {
+        Ok(body) { return text.decodeOrStop(body) }
+        Err(problem) { return "error: " + problem.describe() }
+    }
+}
+
+function scenarios(): Result<Nothing, errors.Error> {
+    let origin = "http://127.0.0.1:" + processInfo.argument(0)
+    let client = try http.connectTo(origin, [], 10000) else "connecting"
+    let head = try client.begin("GET", "/fixed", ["Accept: */*"], Bytes()) else "fixed"
+    print(Text(head.status) + " " + head.reason + " " + show(client.readAll(1024)))
+    // Chunked, read two bytes at a time across chunk boundaries.
+    try client.begin("GET", "/chunked", [], Bytes()) else "chunked"
+    let joined = ""
+    let pieces = 0
+    while true {
+        match try client.read(2) else "chunked read" {
+            Some(piece) { joined += text.decodeOrStop(piece); pieces += 1 }
+            None { break }
+        }
+    }
+    print(joined + " in " + Text(pieces) + " pieces")
+    // A large body streamed in bounded pieces.
+    try client.begin("GET", "/large", [], Bytes()) else "large"
+    let total = 0
+    let largest = 0
+    let ordered = true
+    while true {
+        match try client.read(65536) else "large read" {
+            Some(piece) {
+                for index in 0..piece.length { if piece[index] != (total + index) % 251 { ordered = false } }
+                total += piece.length
+                largest = max(largest, piece.length)
+            }
+            None { break }
+        }
+    }
+    print("large " + Text(total) + " " + Text(ordered) + " " + Text(largest <= 65536))
+    let headOnly = try client.begin("HEAD", "/fixed", [], Bytes()) else "head"
+    match try client.read(10) else "head read" { Some(piece) { print("HEAD had a body") } None { print("HEAD " + Text(headOnly.status) + " no body") } }
+    try client.begin("POST", "/echo", ["Content-Type: text/plain"], Bytes("payload")) else "echo"
+    print("echo " + show(client.readAll(1024)))
+    let informational = try client.begin("GET", "/continue", [], Bytes()) else "continue"
+    print("continue " + Text(informational.status))
+    print("connections " + Text(client.connections()))
+    try client.begin("GET", "/stats", [], Bytes()) else "stats"
+    print("requests on the first connection " + show(client.readAll(64)))
+    // The server closes a kept connection after this response: the next GET reconnects and resends.
+    try client.begin("GET", "/drop-after", [], Bytes()) else "drop"
+    print(show(client.readAll(1024)))
+    try client.begin("GET", "/fixed", [], Bytes()) else "after drop"
+    print("after drop " + show(client.readAll(1024)) + " connections " + Text(client.connections()))
+    // A close-delimited body ends the connection.
+    try client.begin("GET", "/close", [], Bytes()) else "close"
+    print(show(client.readAll(1024)))
+    try client.begin("GET", "/fixed", [], Bytes()) else "after close"
+    print("after close " + show(client.readAll(1024)) + " connections " + Text(client.connections()))
+    // An abandoned body cannot be skipped: the next request uses a new connection.
+    try client.begin("GET", "/large", [], Bytes()) else "abandon"
+    match try client.read(10) else "abandon read" { Some(piece) { print("abandoned after " + Text(piece.length)) } None { print("empty") } }
+    try client.begin("GET", "/stats", [], Bytes()) else "stats"
+    print("requests on a fresh connection " + show(client.readAll(64)) + ", client opened " + Text(client.connections()))
+    match client.begin("GET", "relative", [], Bytes()) { Ok(other) { print("relative target accepted") } Err(problem) { print("rejected: " + problem.message()) } }
+    match http.connectTo("ftp://127.0.0.1/", [], 1000) { Ok(other) { print("ftp accepted") } Err(problem) { print("rejected: " + problem.message()) } }
+    match client.readAll(4) { Ok(body) { print("idle read " + Text(body.length)) } Err(problem) { print(problem.message()) } }
+    try client.begin("POST", "/quit", [], Bytes()) else "quit"
+    print(show(client.readAll(64)))
+    client.close()
+    return Ok()
+}
+
+function main(): Integer {
+    match scenarios() {
+        Ok() { return 0 }
+        Err(problem) { print("failed: " + problem.describe()); return 1 }
+    }
+}

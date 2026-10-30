@@ -1698,6 +1698,18 @@ names, or an empty list when it is unset. `tls.clientWithTrust` accepts up to
 4096 anchors (16 MiB), so a whole bundle is one trust store; on macOS a
 trusting request uses its own NSURLSession.
 
+The portable `http` also has a keep-alive `Client` for one origin with
+streaming bodies: `http.connectTo(origin, roots, timeoutMs)` prepares it,
+`client.begin(method, target, headers, body)` sends a request and returns the
+response `Head` (status, reason, headers), and `client.read(limit)` returns the
+body piece by piece (`Ok(None)` at its end) without buffering it whole;
+`readAll(limit)` collects the rest. A body read to its end leaves the connection
+open for the next request; an abandoned body, `Connection: close` or a
+close-delimited body costs a new connection. A kept connection that the server
+closed or reset before any response byte is reopened and the request resent
+once for idempotent methods. `timeoutMs` bounds each `begin` and `read`.
+`client.connections()` counts the connections opened.
+
 `net.readBytes` returns `Ok(Some(bytes))` for stream data and `Ok(None)` for
 EOF. Would-block is an error with `errors.wouldBlockCode()`. A datagram uses
 `receiveDatagramBytes`: an empty datagram is `Ok(Bytes())`. A truncated read

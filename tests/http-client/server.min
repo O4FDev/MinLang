@@ -1,0 +1,110 @@
+// Plain HTTP/1.1 fixture server for tests/http-client-test.min: one connection at a time, keep-alive, and paths
+// that answer with Content-Length, chunked, close-delimited, informational and dropped-connection responses.
+use "net" as net
+use "files" as files
+use "text" as text
+
+function find(data: Bytes, needle: Text): Integer {
+    let raw = Bytes(needle)
+    let at = 0
+    while at + raw.length <= data.length {
+        let same = true
+        for index in 0..raw.length { if data[at + index] != raw[index] { same = false; break } }
+        if same { return at }
+        at += 1
+    }
+    return -1
+}
+function lower(value: Text): Text {
+    let bytes = Bytes(value)
+    for index in 0..bytes.length { if bytes[index] >= 65 && bytes[index] <= 90 { bytes[index] += 32 } }
+    return text.decodeOrStop(bytes)
+}
+function reply(connection: Integer, head: Text, body: Bytes): Boolean {
+    let message = Bytes(head)
+    message.addBytes(body)
+    return net.send(connection, message) == message.length
+}
+
+let listener = net.listen("127.0.0.1", 0, 16)
+files.writeStandardOutput("READY " + Text(net.localPort(listener)) + "\n")
+let running = true
+while running {
+    if !net.ready(listener, 30000) { break }
+    let connection = net.accept(listener)
+    if connection < 0 { continue }
+    net.nonBlocking(connection, false)
+    let pending = Bytes()
+    let served = 0
+    let open = true
+    while open && running {
+        let end = find(pending, "\r\n\r\n")
+        while end < 0 && open {
+            if !net.ready(connection, 30000) { open = false; break }
+            let chunk = net.receive(connection, 65536)
+            if chunk.length == 0 { open = false; break }
+            pending.addBytes(chunk)
+            end = find(pending, "\r\n\r\n")
+        }
+        if !open { break }
+        let head = text.decodeOrStop(pending.slice(0, end))
+        let lines = head.split("\r\n")
+        let parts = lines[0].split(" ")
+        let method = parts[0]
+        let target = parts[1]
+        let length = 0
+        for index in 1..lines.length {
+            let line = lines[index]
+            if lower(line).startsWith("content-length:") {
+                for character in line.slice(15, line.length) {
+                    if character >= '0' && character <= '9' { length = length * 10 + Integer(character) - 48 }
+                }
+            }
+        }
+        while pending.length < end + 4 + length {
+            if !net.ready(connection, 30000) { open = false; break }
+            let chunk = net.receive(connection, 65536)
+            if chunk.length == 0 { open = false; break }
+            pending.addBytes(chunk)
+        }
+        if !open { break }
+        let body = pending.slice(end + 4, end + 4 + length)
+        served += 1
+        pending = pending.slice(end + 4 + length, pending.length)
+        if target == "/fixed" {
+            if method == "HEAD" { open = reply(connection, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", Bytes()) }
+            else { open = reply(connection, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", Bytes("hello")) }
+        } else if target == "/chunked" {
+            open = reply(connection, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;note=\"x\"\r\nabc\r\n", Bytes())
+            open = open && reply(connection, "5\r\ndefgh\r\n0\r\nX-Trailer: 1\r\n\r\n", Bytes())
+        } else if target == "/large" {
+            let data = Bytes(300000)
+            for index in 0..data.length { data[index] = index % 251 }
+            open = reply(connection, "HTTP/1.1 200 OK\r\nContent-Length: 300000\r\n\r\n", data)
+        } else if target == "/echo" {
+            let answer = Bytes(Text(body.length) + ":")
+            answer.addBytes(body)
+            open = reply(connection, "HTTP/1.1 200 OK\r\nContent-Length: " + Text(answer.length) + "\r\n\r\n", answer)
+        } else if target == "/continue" {
+            open = reply(connection, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n", Bytes())
+        } else if target == "/drop-after" {
+            reply(connection, "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n", Bytes("dropped"))
+            open = false
+        } else if target == "/close" {
+            reply(connection, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", Bytes("until close"))
+            open = false
+        } else if target == "/stats" {
+            // Requests this connection has carried, this one included: evidence of keep-alive reuse.
+            let count = Bytes(Text(served))
+            open = reply(connection, "HTTP/1.1 200 OK\r\nContent-Length: " + Text(count.length) + "\r\n\r\n", count)
+        } else if target == "/quit" {
+            reply(connection, "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\n", Bytes("bye"))
+            running = false
+            open = false
+        } else {
+            open = reply(connection, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", Bytes())
+        }
+    }
+    net.close(connection)
+}
+net.close(listener)
