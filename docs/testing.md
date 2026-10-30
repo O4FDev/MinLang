@@ -1846,9 +1846,18 @@ a linked kernel or execution there. See [JSON numbers](json-numbers.md).
 clear/truncate/pop, replacement and unequal appends. It checks strict, Result,
 optional and permissive access, matched INVALID children, explicit null,
 absent names, duplicate policy and deterministic `pretty` diagnostics at
-O0/O2. Normal returns use exact ownership/debt checks; deliberate fatal stops
+O0/O2, plus `compact` output, its round trip and `quote` escapes. Normal returns use exact ownership/debt checks; deliberate fatal stops
 do not claim unwind cleanup. `check-json-values-sanitize` repeats these with
 a sanitized compiler, emitted-LLVM ASan and C runtime ASan/UBSan.
+
+`make check-stdlib-everyday` runs List `insert`/`removeAt`, `Bytes.addRange`,
+`Map.getOr`, `text.hex`, natural-sort stability and Text byte order, one-byte
+`split` batch edges, and `files.status`/`hardLink` at O0/O2 under the exact
+ownership runtime, with their bounds stops and rejection diagnostics.
+`make check-math-library` checks the C-library-bound `math` functions
+(hyperbolic, error, `expm1`, `log1p`, `cbrt`) by exact special values and
+identities, and `math.toFloat32` against `Bytes.addFloat32` storage. Both are
+part of `check-portable`.
 
 `make check-handles` runs typed generational pools at O0/O2 with exact ownership
 cleanup checks. It covers wrong pools, stale copies, replacement, repeated clear,
