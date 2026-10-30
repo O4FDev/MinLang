@@ -1,0 +1,65 @@
+use "process" as processInfo
+// Parallel reductions: Collatz step counts summed with `reduce` while each
+// iteration also records its own count, then a hash histogram where each
+// chunk of indices fills its own window of bucket counters.
+constant BUCKETS = 16
+constant CHUNK = 4096
+
+parallel function collatzSteps(start: Integer): Integer {
+    let value = start
+    let steps = 0
+    while value != 1 {
+        if value % 2 == 0 { value = value / 2 } else { value = 3 * value + 1 }
+        steps += 1
+    }
+    return steps
+}
+
+parallel function mix(seed: Integer): Integer {
+    let value = seed
+    for round in 0..4 {
+        value = value ^ (value >> 31)
+        value = wrappingMultiply(value, 0x2545F4914F6CDD1D)
+        value = value ^ (value >> 29)
+        value = wrappingAdd(value, round)
+    }
+    return value
+}
+
+let count = Integer(processInfo.argument(0))
+let steps: List<Integer> = []
+for index in 0..count { steps.add(0) }
+let total = 0
+parallel for index in 0..count reduce total {
+    let length = collatzSteps(index + 1)
+    steps[index] = length
+    total += length
+}
+let longest = 0
+let longestStart = 1
+for index in 0..count {
+    if steps[index] > longest {
+        longest = steps[index]
+        longestStart = index + 1
+    }
+}
+print("steps \(total)")
+print("longest \(longestStart) \(longest)")
+
+let samples = count * 8
+let chunks = (samples + CHUNK - 1) / CHUNK
+let counters: List<Integer> = []
+for slot in 0..chunks * BUCKETS { counters.add(0) }
+let width = BUCKETS // a module constant is not accepted as a window width
+parallel for chunk in 0..chunks {
+    let bins = counters.window(chunk, width)
+    for sample in chunk * CHUNK..min(chunk * CHUNK + CHUNK, samples) {
+        bins[(mix(sample) >> 11) & 15] += 1
+    }
+}
+let histogram: List<Integer> = []
+for bucket in 0..BUCKETS { histogram.add(0) }
+for chunk in 0..chunks {
+    for bucket in 0..BUCKETS { histogram[bucket] += counters[chunk * BUCKETS + bucket] }
+}
+for bucket in 0..BUCKETS { print("bucket \(bucket) \(histogram[bucket])") }

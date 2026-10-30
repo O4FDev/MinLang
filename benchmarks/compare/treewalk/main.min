@@ -1,0 +1,191 @@
+use "process" as processInfo
+// A tree-walking interpreter: the AST is made of choices, variables are
+// resolved to frame slots, and each call gets a fresh List of locals. It
+// interprets a prime counter and a recursive Fibonacci sum.
+choice Operator {
+    Add
+    Subtract
+    Multiply
+    Divide
+    Remainder
+    Less
+    LessEqual
+    Equal
+    NotEqual
+}
+
+choice Expr {
+    Number(value: Integer)
+    Local(slot: Integer)
+    Binary(operator: Operator, left: Expr, right: Expr)
+    Call(function: Integer, arguments: List<Expr>)
+}
+
+choice Stmt {
+    Assign(slot: Integer, value: Expr)
+    If(condition: Expr, then: List<Stmt>, otherwise: List<Stmt>)
+    While(condition: Expr, body: List<Stmt>)
+    Return(value: Expr)
+}
+
+record Function { name: Text; parameters: Integer; locals: Integer; body: List<Stmt> }
+
+record Interpreter { functions: List<Function>; calls: Integer }
+
+function apply(operator: Operator, left: Integer, right: Integer): Integer {
+    return match operator {
+        Add { left + right }
+        Subtract { left - right }
+        Multiply { left * right }
+        Divide { left / right }
+        Remainder { left % right }
+        Less { truth(left < right) }
+        LessEqual { truth(left <= right) }
+        Equal { truth(left == right) }
+        NotEqual { truth(left != right) }
+    }
+}
+
+function truth(condition: Boolean): Integer {
+    if condition { return 1 }
+    return 0
+}
+
+function Interpreter.evaluate(expr: Expr, frame: List<Integer>): Integer {
+    return match expr {
+        Number(value) { value }
+        Local(slot) { frame[slot] }
+        Binary(operator, left, right) { apply(operator, self.evaluate(left, frame), self.evaluate(right, frame)) }
+        Call(function, arguments) { self.call(function, arguments, frame) }
+    }
+}
+
+function Interpreter.call(index: Integer, arguments: List<Expr>, caller: List<Integer>): Integer {
+    let function = self.functions[index]
+    let frame: List<Integer> = []
+    for argument in arguments { frame.add(self.evaluate(argument, caller)) }
+    for slot in function.parameters..function.locals { frame.add(0) }
+    self.calls += 1
+    let result = 0
+    match self.execute(function.body, frame) {
+        Some(value) { result = value }
+        None { }
+    }
+    return result
+}
+
+// Runs statements in order; Some(value) means a Return was reached.
+function Interpreter.execute(statements: List<Stmt>, frame: List<Integer>): Maybe<Integer> {
+    for statement in statements {
+        match statement {
+            Assign(slot, value) { frame[slot] = self.evaluate(value, frame) }
+            If(condition, then, otherwise) {
+                let branch = otherwise
+                if self.evaluate(condition, frame) != 0 { branch = then }
+                if self.execute(branch, frame) is Some(value) { return Some(value) }
+            }
+            While(condition, body) {
+                while self.evaluate(condition, frame) != 0 {
+                    if self.execute(body, frame) is Some(value) { return Some(value) }
+                }
+            }
+            Return(value) { return Some(self.evaluate(value, frame)) }
+        }
+    }
+    return None
+}
+
+function number(value: Integer): Expr { return Expr.Number(value) }
+function local(slot: Integer): Expr { return Expr.Local(slot) }
+function binary(operator: Operator, left: Expr, right: Expr): Expr { return Expr.Binary(operator, left, right) }
+
+constant IS_PRIME = 0
+constant COUNT_PRIMES = 1
+constant FIB = 2
+constant FIB_SUM = 3
+
+// isPrime(n): if n < 2 { return 0 }; d = 2; while d * d <= n { if n % d == 0 { return 0 }; d = d + 1 }; return 1
+function isPrime(): Function {
+    let n = local(0)
+    let d = local(1)
+    return Function {
+        name: "isPrime"
+        parameters: 1
+        locals: 2
+        body: [
+            Stmt.If(binary(Operator.Less, n, number(2)), [Stmt.Return(number(0))], []),
+            Stmt.Assign(1, number(2)),
+            Stmt.While(binary(Operator.LessEqual, binary(Operator.Multiply, d, d), n), [
+                Stmt.If(binary(Operator.Equal, binary(Operator.Remainder, n, d), number(0)), [Stmt.Return(number(0))], []),
+                Stmt.Assign(1, binary(Operator.Add, d, number(1)))
+            ]),
+            Stmt.Return(number(1))
+        ]
+    }
+}
+
+// countPrimes(n): count = 0; i = 0; while i < n { count = count + isPrime(i); i = i + 1 }; return count
+function countPrimes(): Function {
+    let n = local(0)
+    let count = local(1)
+    let i = local(2)
+    return Function {
+        name: "countPrimes"
+        parameters: 1
+        locals: 3
+        body: [
+            Stmt.Assign(1, number(0)),
+            Stmt.Assign(2, number(0)),
+            Stmt.While(binary(Operator.Less, i, n), [
+                Stmt.Assign(1, binary(Operator.Add, count, Expr.Call(IS_PRIME, [i]))),
+                Stmt.Assign(2, binary(Operator.Add, i, number(1)))
+            ]),
+            Stmt.Return(count)
+        ]
+    }
+}
+
+// fib(n): if n < 2 { return n }; return fib(n - 1) + fib(n - 2)
+function fib(): Function {
+    let n = local(0)
+    return Function {
+        name: "fib"
+        parameters: 1
+        locals: 1
+        body: [
+            Stmt.If(binary(Operator.Less, n, number(2)), [Stmt.Return(n)], []),
+            Stmt.Return(binary(Operator.Add,
+                Expr.Call(FIB, [binary(Operator.Subtract, n, number(1))]),
+                Expr.Call(FIB, [binary(Operator.Subtract, n, number(2))])))
+        ]
+    }
+}
+
+// fibSum(k): total = 0; j = 0; while j < k { total = total + fib(12 + j % 8); j = j + 1 }; return total
+function fibSum(): Function {
+    let k = local(0)
+    let total = local(1)
+    let j = local(2)
+    return Function {
+        name: "fibSum"
+        parameters: 1
+        locals: 3
+        body: [
+            Stmt.Assign(1, number(0)),
+            Stmt.Assign(2, number(0)),
+            Stmt.While(binary(Operator.Less, j, k), [
+                Stmt.Assign(1, binary(Operator.Add, total,
+                    Expr.Call(FIB, [binary(Operator.Add, number(12), binary(Operator.Remainder, j, number(8)))]))),
+                Stmt.Assign(2, binary(Operator.Add, j, number(1)))
+            ]),
+            Stmt.Return(total)
+        ]
+    }
+}
+
+let n = Integer(processInfo.argument(0))
+let interpreter = Interpreter { functions: [isPrime(), countPrimes(), fib(), fibSum()]; calls: 0 }
+let noLocals: List<Integer> = []
+print("primes below \(n): \(interpreter.call(COUNT_PRIMES, [number(n)], noLocals))")
+print("fib sum \(n / 100): \(interpreter.call(FIB_SUM, [number(n / 100)], noLocals))")
+print("calls \(interpreter.calls)")
