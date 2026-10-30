@@ -2317,6 +2317,45 @@ functions and in `parallel for` bodies; recoverable execution runs the two
 calls in order. Use a cutoff, as above: each join costs a few atomic
 operations, so the work below it should be at least a few microseconds.
 
+To let each call write its own part of one buffer, pass a span:
+`keys.span(first, after)` is the elements `first` up to `after` of a List of
+scalars or Bytes, as a view indexed from zero. A span exists only as a whole
+join argument, and the function receiving it may write it. Before the calls
+start, the join checks that no span overlaps a span or buffer the other call
+receives, and stops with a clear error if one does. This sorts in place:
+
+```minyar
+parallel function swap(keys: List<Integer>, a: Integer, b: Integer): Integer {
+    let value = keys[a]
+    keys[a] = keys[b]
+    keys[b] = value
+    return 0
+}
+
+parallel function quicksort(keys: List<Integer>): Integer {
+    if keys.length < 2 { return 0 }
+    let last = keys.length - 1
+    let store = 0
+    for i in 0..last {
+        if keys[i] < keys[last] {
+            swap(keys, i, store)
+            store += 1
+        }
+    }
+    swap(keys, store, last)
+    let low, high = join(quicksort(keys.span(0, store)), quicksort(keys.span(store + 1, keys.length)))
+    return low + high + 1
+}
+
+let keys = [5, 3, 9, 1, 7]
+quicksort(keys)
+print(keys[0]) // 1
+print(keys[4]) // 9
+```
+
+Spans are not available in `parallel for` bodies, whose iterations take
+windows instead; a parallel function can split a window it receives.
+
 Outside parallel functions and `parallel for` bodies, either call may also name
 an ordinary function. Its body may create and read records, Text, Lists and
 Maps and call other ordinary functions; its parameters and result must be

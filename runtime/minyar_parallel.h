@@ -67,6 +67,27 @@ void minyar_parallel_window_stop(long long index, long long width, long long len
     minyar_stop(message);
 }
 
+/* A join span: elements first..after of a buffer for one call to write. */
+void minyar_parallel_span_stop(long long first, long long after, long long length) {
+    char message[200];
+    snprintf(message, sizeof(message), "span %lld..%lld does not fit in a buffer of length %lld.", first, after, length);
+    minyar_stop(message);
+}
+
+/* Two parts that the calls of one join receive, each a buffer or view with
+ * the { data, length } prefix: one call may write its span while the other
+ * reads or writes its own part, so their storage must not overlap. */
+void minyar_parallel_parts_disjoint(const MinyarList *a, long long scale_a,
+                                    const MinyarList *b, long long scale_b) {
+    if (a->length <= 0 || b->length <= 0) return;
+    uintptr_t first_a = (uintptr_t)a->values, first_b = (uintptr_t)b->values;
+    uint64_t bytes_a = (uint64_t)a->length * (uint64_t)scale_a;
+    uint64_t bytes_b = (uint64_t)b->length * (uint64_t)scale_b;
+    int overlaps = first_a <= first_b ? first_b - first_a < bytes_a : first_a - first_b < bytes_b;
+    if (overlaps)
+        minyar_stop("the calls of a join received overlapping parts of one buffer; give each call its own span.");
+}
+
 #define MINYAR_PARALLEL_LIMIT 64
 #define MINYAR_PARALLEL_GRAIN 128
 
