@@ -113,11 +113,38 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
     /* Pieces are byte ranges between matches. Every piece of ASCII Text is
      * ASCII; other pieces count their scalars once, as their slices record. */
     if (separator->byte_length == 1) {
-        /* Size the List once; this count loop vectorises. */
+        /* Find up to SPLIT_BATCH piece ends with a short inline scan (memchr
+         * for long pieces), reserve them at once, then cut those pieces: one
+         * pass over the bytes, and a line of a few fields grows its List once. */
+        enum { SPLIT_BATCH = 64 };
+        long long ends[SPLIT_BATCH];
+        const unsigned char *bytes = text->bytes;
         unsigned char wanted = separator->bytes[0];
-        long long pieces = 1;
-        for (long long i = 0; i < text->byte_length; i++) pieces += text->bytes[i] == wanted;
-        list_reserve(parts, pieces);
+        long long length = text->byte_length, start = 0;
+        _Bool ascii = !text->character_offsets;
+        for (;;) {
+            long long count = 0, scan = start;
+            _Bool finished = 0;
+            while (count < SPLIT_BATCH) {
+                long long end = scan, limit = length - scan > 16 ? scan + 16 : length;
+                while (end < limit && bytes[end] != wanted) end++;
+                if (end == limit && end < length) {
+                    const unsigned char *found = memchr(bytes + end, wanted, (size_t)(length - end));
+                    end = found ? found - bytes : length;
+                }
+                ends[count++] = end;
+                if (end >= length) { finished = 1; break; }
+                scan = end + 1;
+            }
+            list_reserve(parts, parts->length + count);
+            for (long long piece = 0; piece < count; piece++) {
+                long long end = ends[piece];
+                long long characters = ascii ? end - start : text_scalar_count(bytes + start, end - start);
+                minyar_list_add_take(parts, (long long)(uintptr_t)text_slice_bytes(text, start, end, characters));
+                start = end + 1;
+            }
+            if (finished) return parts;
+        }
     }
     long long small[TEXT_SEARCH_SMALL];
     long long *table = text_search_table(separator, text->byte_length, small);

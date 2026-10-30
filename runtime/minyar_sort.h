@@ -137,7 +137,24 @@ static inline _Bool list_sort_float_less(long long a, long long b) {
     /* NaNs come last and equal one another; signed zeros compare equal. */
     return !isnan(x) && (isnan(y) || x < y);
 }
+/* Unsigned byte order: when both Texts have eight bytes, their first eight
+ * decide most comparisons as one big-endian word compare without memcmp. */
 static inline _Bool list_sort_text_less(long long a, long long b) {
+#if defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    const MinyarText *x = (const void *)(uintptr_t)a, *y = (const void *)(uintptr_t)b;
+    if (x && y && x->byte_length >= 8 && y->byte_length >= 8) {
+        uint64_t left, right;
+        memcpy(&left, x->bytes, sizeof(left));
+        memcpy(&right, y->bytes, sizeof(right));
+        if (left != right) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+            left = __builtin_bswap64(left);
+            right = __builtin_bswap64(right);
+#endif
+            return left < right;
+        }
+    }
+#endif
     return minyar_compare_slots(2, a, b) < 0;
 }
 LIST_SORT_DEFINE(list_sort_integers, LIST_SORT_INTEGER_LESS)
