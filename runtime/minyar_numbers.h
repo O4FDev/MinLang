@@ -131,7 +131,7 @@ static size_t format_float(double value, char *out, size_t capacity) {
      * does not round-trip, the answer has 16 or 17 digits. This gives the same
      * spelling as trying every precision from 1. Subnormals have fewer bits and
      * powers of two may take an adjacent decimal, so they keep the full search. */
-    if (!asymmetric && isnormal(value)) {
+    if (!asymmetric && ((encoding >> 52) & UINT64_C(0x7ff)) != 0) { /* normal: NaN and infinities returned above */
         snprintf(scientific, sizeof(scientific), "%.14e", value);
         precision = strtod(scientific, NULL) == value ? 18 : 16;
     }
