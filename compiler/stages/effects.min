@@ -41,6 +41,98 @@ function finishParallelFunction(output: List<Text>, globals: List<Text>, entrySl
     }
 }
 
+// A parallel function cannot resize a buffer, and its caller waits for it to
+// return, so the length and values pointer of each List parameter stay fixed
+// for the whole call. Load them once at entry; every index of that List then
+// tests the loaded length and reads through the loaded pointer, so LLVM need
+// not reload them after a slot store or inside a conditional block. A failing
+// index still calls the runtime with the List itself, which reports the same
+// error. Runs after the body is complete, so every call is on one line.
+function hoistParallelListHeaders(output: List<Text>, entrySlot: Integer, bodySlot: Integer) {
+    let pieces: List<Text> = []
+    let piece = bodySlot
+    while piece < output.length {
+        pieces.add(output[piece])
+        piece = piece + 1
+    }
+    let text = joinText(pieces)
+    // Without a loop each header is read about as often as it would be here,
+    // and loading every one at entry costs a short recursive function more.
+    if text.find("\nfor.condition.") < 0 && text.find("\nwhile.condition.") < 0 { return }
+    let lines = text.split("\n")
+    let lists: List<Text> = []
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        line = parallelKnownHeader(line, "@.minyar.list.get.checked(", "@.minyar.list.get.known(", lists)
+        line = parallelKnownHeader(line, "@.minyar.list.set.scalar.checked(", "@.minyar.list.set.scalar.known(", lists)
+        let call = " = call i64 @.minyar.list.length(ptr "
+        let length = line.find(call + "%argument.")
+        if length > 2 && line.endsWith(")") {
+            let list = line.slice(length + call.length, line.length - 1)
+            if parallelArgumentName(list) {
+                if loopNamed(lists, list) < 0 { lists.add(list) }
+                line = line.slice(0, length) + " = add i64 " + list + ".length, 0"
+            }
+        }
+        lines[index] = line
+        index = index + 1
+    }
+    if lists.length == 0 { return }
+    output[bodySlot] = joinText(joinLines(lines))
+    piece = bodySlot + 1
+    while piece < output.length {
+        output[piece] = ""
+        piece = piece + 1
+    }
+    let loads: List<Text> = [output[entrySlot]]
+    index = 0
+    while index < lists.length {
+        let list = lists[index]
+        loads.add("  " + list + ".length.pointer = getelementptr inbounds { ptr, i64, i64 }, ptr " + list + ", i32 0, i32 1\n  " + list + ".length = load i64, ptr " + list + ".length.pointer, !tbaa !{!{!\"minyar list header\", !{!\"minyar\"}, i64 0}, !{!\"minyar list header\", !{!\"minyar\"}, i64 0}, i64 0}, !range !{i64 0, i64 -9223372036854775808}\n  " + list + ".values = load ptr, ptr " + list + ", !tbaa !{!{!\"minyar list header\", !{!\"minyar\"}, i64 0}, !{!\"minyar list header\", !{!\"minyar\"}, i64 0}, i64 0}\n")
+        index = index + 1
+    }
+    output[entrySlot] = joinText(loads)
+}
+
+// `%argument.N` and nothing else.
+function parallelArgumentName(name: Text): Boolean {
+    if name.length < 11 || !name.startsWith("%argument.") { return false }
+    let index = 10
+    while index < name.length {
+        if name[index] < '0' || name[index] > '9' { return false }
+        index = index + 1
+    }
+    return true
+}
+
+// Rewrites a call of `checked` on a List parameter to `known`, which takes the
+// parameter's loaded length and values pointer after the List itself.
+function parallelKnownHeader(line: Text, checked: Text, known: Text, lists: List<Text>): Text {
+    let at = line.find(checked + "ptr %argument.")
+    if at < 0 { return line }
+    let start = at + checked.length + 4
+    let rest = line.slice(start, line.length)
+    let comma = rest.find(", ")
+    if comma < 0 { return line }
+    let list = rest.slice(0, comma)
+    if !parallelArgumentName(list) { return line }
+    if loopNamed(lists, list) < 0 { lists.add(list) }
+    return line.slice(0, at) + known + "ptr " + list + ", i64 " + list + ".length, ptr " + list + ".values" + rest.slice(comma, rest.length)
+}
+
+// The lines with their line breaks restored.
+function joinLines(lines: List<Text>): List<Text> {
+    let result: List<Text> = []
+    let index = 0
+    while index < lines.length {
+        result.add(lines[index])
+        if index + 1 < lines.length { result.add("\n") }
+        index = index + 1
+    }
+    return result
+}
+
 function dropCallDepthFrame(output: List<Text>, entrySlot: Integer, bodySlot: Integer) {
     let enter = "  call void @minyar_stack_enter()\n"
     let entry = output[entrySlot]

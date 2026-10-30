@@ -15,6 +15,18 @@ function body(llvm: Text, name: Text): Text {
     fail("missing LLVM helper: " + name)
 }
 
+// Loads of the first parameter's values pointer inside the loop: after the
+// first loop block label in O2 layout order.
+function loopValuesLoads(optimized: Text, name: Text): Integer {
+    let loads = 0
+    let looping = false
+    for line in test.lines(body(optimized, ".minyar.fn." + name)) {
+        if line.startsWith("for.body.") || line.startsWith("for.condition.") { looping = true }
+        if looping && test.contains(line, " = load ptr, ptr %argument.0,") { loads += 1 }
+    }
+    return loads
+}
+
 let compiler = test.compiler()
 let contract = test.replace(io.readTextFile("tests/memory-contracts-runtime.c"), "#include \"../runtime/minyar_runtime.c\"", io.readTextFile("runtime/minyar_runtime.c"))
 io.writeTextFile(compiler.directory + "/runtime.c", contract)
@@ -51,7 +63,7 @@ for name in ["bytes", "list"] {
     test.check(!test.contains(length, "noalias") && !test.contains(length, "invariant.load"), "mutable headers must keep aliasing and mutation")
     test.check(test.contains(length, "!range !{i64 0, i64 -9223372036854775808}"), "length range must stay nonnegative")
 }
-for name in ["bytes.get.checked", "bytes.set.checked", "list.get.checked", "list.set.scalar.checked", "shift.checked", "character.checked", "float.integer.checked", "integer.absolute.checked", "clamp.integer.checked", "clamp.float.checked"] {
+for name in ["bytes.get.checked", "bytes.set.checked", "list.get.checked", "list.set.scalar.checked", "list.get.known", "list.set.scalar.known", "shift.checked", "character.checked", "float.integer.checked", "integer.absolute.checked", "clamp.integer.checked", "clamp.float.checked"] {
     let helper = body(llvm, ".minyar." + name)
     test.check(test.contains(helper, "label %good, label %bad, !prof !{!\"branch_weights\", !\"expected\", i32 2000, i32 1}"), name + " must mark only the failure successor unlikely")
     // A reporting path may do I/O or terminate. Pure-reader attributes belong
@@ -108,6 +120,72 @@ if compiler.flags.length == 0 { for probe in [["field", "1"], ["slot", "1"], ["r
     for line in test.lines(body(optimized, ".minyar.fn." + probe[0])) { if test.contains(line, " = load i64, ptr ") { loads += 1 } }
     test.check(Text(loads) == probe[1], probe[0] + ": expected " + probe[1] + " length loads at O2, found " + Text(loads))
 } }
+
+// A parallel function cannot resize a buffer and its caller waits for it, so
+// it loads each List parameter's length and values pointer once at entry and
+// indexes through them. The ordinary function with the same body reloads the
+// header inside the loop (negative control). A function without a loop keeps
+// reading the header where it indexes. A failing index still reports the
+// List's own position and length at O0 and O2.
+let headers = #"""
+parallel function pick(source: List<Integer>, out: List<Integer>, limit: Integer) {
+    for k in 0..out.length {
+        if source[k % 3] > limit { out[k] = source[k % 3] } else { out[k] = source[(k + 1) % 3] }
+    }
+}
+function plainPick(source: List<Integer>, out: List<Integer>, limit: Integer) {
+    for k in 0..out.length {
+        if source[k % 3] > limit { out[k] = source[k % 3] } else { out[k] = source[(k + 1) % 3] }
+    }
+}
+parallel function fetch(values: List<Integer>, position: Integer): Integer {
+    let total = 0
+    for k in 0..2 { total += values[position - k] }
+    return total + values.length
+}
+parallel function first(values: List<Integer>): Integer { return values[0] }
+let source = [5, 1, 9]
+let out = [0, 0, 0, 0, 0]
+let plain = [0, 0, 0, 0, 0]
+pick(source, out, 4)
+plainPick(source, plain, 4)
+for k in 0..out.length { print(out[k] * 10 + plain[k]) }
+print(fetch(source, 2))
+print(first(source))
+"""#
+test.executes(compiler, headers, "55\n99\n99\n55\n99\n13\n5\n")
+let headersPath = compiler.directory + "/case" + Text(compiler.serial)
+let headersIr = io.readTextFile(headersPath + ".ll")
+let picked = body(headersIr, ".minyar.fn.pick")
+test.check(test.contains(picked, "%argument.0.length = load i64, ptr %argument.0.length.pointer, !tbaa ") && test.contains(picked, "%argument.0.values = load ptr, ptr %argument.0, !tbaa "), "a parallel function must load its List parameter's header at entry")
+test.check(test.contains(picked, "@.minyar.list.get.known(ptr %argument.0, i64 %argument.0.length, ptr %argument.0.values, i64 ") && !test.contains(picked, "@.minyar.list.get.checked(ptr %argument.0,"), "a parallel function must index its List parameter through the loaded header")
+test.check(test.contains(body(headersIr, ".minyar.fn.plainPick"), "@.minyar.list.get.checked(ptr %argument.0,"), "an ordinary function must keep reading the header at each index")
+test.check(test.contains(body(headersIr, ".minyar.fn.fetch"), " = add i64 %argument.0.length, 0"), "a parallel function must measure its List parameter with the loaded length")
+// Without a loop the header is read where it is used.
+test.check(test.contains(body(headersIr, ".minyar.fn.first"), "@.minyar.list.get.checked(ptr %argument.0,"), "a loop-free parallel function must keep reading the header at its index")
+let headersOptimize = [compiler.clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm"]
+for flag in compiler.flags { headersOptimize.add(flag) }
+for item in [headersPath + ".ll", "-o", headersPath + ".optimized.ll"] { headersOptimize.add(item) }
+test.require(test.run(headersOptimize, system.environment(), "", headersPath + ".optimize", compiler.linkTimeout), "optimize parallel header probe")
+let headersOptimized = io.readTextFile(headersPath + ".optimized.ll")
+if compiler.flags.length == 0 {
+    let picks = loopValuesLoads(headersOptimized, "pick")
+    test.check(picks == 0, "pick: expected no values-pointer load of its source inside the loop at O2, found " + Text(picks))
+    let plainPicks = loopValuesLoads(headersOptimized, "plainPick")
+    test.check(plainPicks > 0, "plainPick: the negative control no longer reloads its source header inside the loop; this probe needs a new control")
+}
+test.require(test.compile(compiler, "parallel function fetch(values: List<Integer>, position: Integer): Integer {\n    let total = 0\n    for k in 0..2 { total += values[position - k] }\n    return total\n}\nprint(fetch([7, 8, 9], 5))\n"), "compile failing parallel index")
+test.check(test.contains(io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll"), "@.minyar.list.get.known(ptr %argument.0,"), "the failing parallel index must use the loaded header")
+let failingPath = compiler.directory + "/case" + Text(compiler.serial)
+for optimization in ["-O0", "-O2"] {
+    let command = [compiler.clang, optimization, "-Wno-override-module"]
+    for flag in compiler.flags { command.add(flag) }
+    for item in [failingPath + ".ll", compiler.runtime, "-lm", "-o", failingPath + ".exe"] { command.add(item) }
+    test.require(test.run(command, system.environment(), "", failingPath + ".link", compiler.linkTimeout), "link failing parallel index")
+    let result = test.run([failingPath + ".exe"], system.environment(), "", failingPath + ".run", compiler.runTimeout)
+    test.check(result.status == 1 && result.output == "", "failing parallel index must stop with status 1 at " + optimization)
+    test.check(test.contains(result.errorOutput, "List position 5 is outside its length of 3."), "failing parallel index changed its diagnostic at " + optimization + "\n" + result.errorOutput)
+}
 
 // Verify the actual emitted module independently of execution and optimization.
 test.require(test.run([compiler.clang, "-Wno-override-module", "-c", path + ".ll", "-o", path + ".verify.o"], system.environment(), "", path + ".verify", compiler.linkTimeout), "verify helper attributes and metadata")
