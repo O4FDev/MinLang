@@ -496,13 +496,8 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
     long long value = record->values[field];
 #ifndef MINYAR_COMPILER_ARENA
     RcObject *object = (RcObject *)record - 1;
-    /* A scalar record owns no slot: releasing it frees a unique one now. */
-    if ((object->ownership & 7) == RC_SCALAR_RECORD) {
-        minyar_rc_release(record);
-        return value;
-    }
-    unsigned char *references = (unsigned char *)(record->values + record->length);
     if (object->ownership == (8 | RC_RECORD)) {
+        unsigned char *references = (unsigned char *)(record->values + record->length);
         references[field] = 0;
 #ifdef MINYAR_BOUNDED_RC
         long long owning = 0;
@@ -512,8 +507,10 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
             return value;
         }
 #endif
-    } else if (references[field]) {
-        minyar_rc_retain_traced((void *)(uintptr_t)value);
+    } else if ((object->ownership & 7) != RC_SCALAR_RECORD) {
+        /* Shared: the caller needs its own count. A scalar record has no map. */
+        unsigned char *references = (unsigned char *)(record->values + record->length);
+        if (references[field]) minyar_rc_retain_traced((void *)(uintptr_t)value);
     }
     minyar_rc_release(record);
 #endif
