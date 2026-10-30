@@ -12,7 +12,7 @@ from box D (AMD, 4 vCPU, Linux, LLVM 23.1.3) unless marked laptop; instruction c
    may not grow a buffer, and may write only fixed-width windows indexed by the loop variable. The idiomatic
    Minyar a product is written in (records, Text, Map, recursive choices) cannot be parallelised at all; it has to
    be rewritten into Lists of scalars and Bytes first.
-2. **That sublanguage is also the fast serial Minyar.** Written in it, the six both-modes programs are 2.16x the
+2. **That sublanguage is also the fast serial Minyar.** Written in it, the six both-modes programs are 2.10x the
    best of C/C++/Rust on one thread (geomean Ir), against 4.71x for the idiomatic serial suite. The same work
    written the idiomatic way is 3.1x (sort with `List.sort`) and 3.5x (a tree as a recursive `choice`) *more*
    instructions than the parallel form. So the rule "parallel code pays nothing serially" holds, but only because
@@ -21,6 +21,8 @@ from box D (AMD, 4 vCPU, Linux, LLVM 23.1.3) unless marked laptop; instruction c
    the dictionary of a text index, the posting lists of a search index: 44%, 84% and 6% of the one-thread
    instructions of those programs are forced onto one thread, capping 4-thread speed-up at 1.73x, 1.14x and
    3.4x before any scheduling cost. The Rust peers parallelise those phases with plain `Vec`/`HashMap` per thread.
+   Result on box D: parallel ratio 1.76 (geomean, Minyar@4 / Rust@4 wall) against serial 2.10 (Ir); on mapreduce,
+   sort and textindex Minyar on 4 threads is slower than parallel Rust on 1.
 4. **Using threads anywhere makes all managed code slower.** A program that contains a `thread function` (or an
    atomic cell) links the thread runtime: +60% Ir for the idiomatic text index and +75% for the event-loop server
    *at one thread, on the main thread, with no thread ever started*. The parallel lane's per-thread small heap
@@ -58,21 +60,23 @@ Minyar Ir at 1 thread / min(C, C++, Rust serial Ir). Parallel column: Minyar wal
 
 | program | same | Minyar@1 Ir | best serial Ir | **serial** | Minyar@4 ms | Rust par@4 ms | **parallel** | Minyar@1 ms | Rust par@1 ms | scaling M / R |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| topk | yes | 15,644.6M | 5,942.7M c | 2.63 | 977.1±217.1 | 625.0±79.7 | 1.56 | 2054.2±163.8 | 1398.3±40.7 | 2.10 / 2.24 |
-| server | yes | 707.9M | 275.3M c | 2.57 | 1014.0±114.8 | 1056.8±219.4 | 0.96 | 2636.7±208.1 | 2607.0±154.3 | 2.60 / 2.47 |
-| mapreduce | yes | 1,926.2M | 1,017.1M rust | 1.89 | 879.2±78.1 | 375.0±28.7 | 2.34 | 1097.3±30.4 | 528.0±60.3 | 1.25 / 1.41 |
-| sort | yes | 3,549.8M | 1,686.5M c | 2.10 | 558.8±50.1 | 268.1±38.6 | 2.08 | 1238.2±58.0 | 371.6±20.9 | 2.22 / 1.39 |
-| textindex | yes | 4,267.8M | 1,588.3M c | 2.69 | 3379.4±312.1 | 1321.4±195.4 | 2.56 | 3207.7±2588.7 | 2180.1±250.7 | 0.95 / 1.65 |
-| forkjoin | yes | 3,371.9M | 2,434.2M c | 1.39 | 503.2±61.4 | 481.2±80.5 | 1.05 | 857.0±42.3 | 837.2±101.9 | 1.70 / 1.74 |
-| **geomean** | | | | **2.16** | | | **1.64** | | | |
+| topk | yes | 15,644.6M | 5,942.7M c | 2.63 | 891.5±68.0 | 608.5±42.2 | 1.47 | 1978.4±94.3 | 1384.3±78.4 | 2.22 / 2.28 |
+| server | yes | 610.6M | 275.3M c | 2.22 | 881.9±64.2 | 850.0±48.3 | 1.04 | 2339.6±131.9 | 2227.0±101.7 | 2.65 / 2.62 |
+| mapreduce | yes | 1,926.2M | 1,017.1M rust | 1.89 | 770.2±45.8 | 312.7±42.1 | 2.46 | 960.2±22.1 | 451.0±14.5 | 1.25 / 1.44 |
+| sort | yes | 3,549.8M | 1,686.5M c | 2.10 | 513.3±18.7 | 204.6±7.4 | 2.51 | 1114.6±38.6 | 341.5±20.9 | 2.17 / 1.67 |
+| textindex | yes | 4,267.8M | 1,588.3M c | 2.69 | 3056.1±440.8 | 1034.0±187.5 | 2.96 | 3106.8±345.6 | 2204.2±213.3 | 1.02 / 2.13 |
+| forkjoin | yes | 3,371.9M | 2,434.2M c | 1.39 | 364.8±6.3 | 345.1±46.1 | 1.06 | 716.2±27.7 | 677.3±16.7 | 1.96 / 1.96 |
+| **geomean** | | | | **2.10** | | | **1.76** | | | |
 
-Wall times: `run.py --wall-only --repeats 7` (logs/bothmodes/wall-D-2.log); box D load average 5.3–5.5 during the run
-(other lanes' gates outside the bench lock), so the 4-thread walls and the scaling columns are pessimistic for both
-languages; the first full run (load 4–5, n=5) gave parallel geomean 1.50 with the same ordering. Ir columns are
-deterministic. CPU time / wall at 4 threads (measure.py --cpu): Minyar textindex 1.00 and mapreduce 1.41 (the serial
-phases), topk 2.09 vs Rust 2.26, forkjoin 1.87 vs 2.49 (Rust's join workers spin; Minyar's sleep without a root job).
-The server's serial 2.57 includes the thread-runtime tax of section 1.4: after the parallel lane's 4a3140b1f it is
-610.6M Ir, 2.22x C (serial geomean 2.16 -> 2.10), and the same server without a `thread function` is 405.6M, 1.47x C.
+Tree: bothmodes d4c7215ab (goal/2026-10-30 + parallel lane through 4a3140b1f). Ir: `run.py --repeats 7`
+(logs/bothmodes/run-D-final.log); walls: `run.py --wall-only --repeats 7` (logs/bothmodes/wall-D-3.log) at box D load
+average 2.5–2.9 (other lanes' gates run outside the bench lock; earlier runs at load 4–6 gave parallel geomeans 1.50,
+1.64 and 1.72 with the same ordering, so treat the wall columns as ±15%). Ir columns are deterministic. On mapreduce,
+sort and textindex, Minyar on 4 threads is slower than the parallel Rust peer on 1. CPU time / wall at 4 threads
+(measure.py --cpu, load 5–6): Minyar textindex 1.00 and mapreduce 1.41 (the serial phases), topk 2.09 vs Rust 2.26,
+forkjoin 1.87 vs 2.49 (Rust's join workers spin; Minyar's sleep without a root job). The server's serial ratio
+includes the thread-runtime tax of section 1.4: it was 2.57 before the parallel lane's 4a3140b1f, and the same server
+without a `thread function` is 405.6M Ir, 1.47x C (serial geomean would be 1.94).
 
 What each program had to give up to be one source (the finding, per program):
 
@@ -185,11 +189,11 @@ reused by the serial path of the same program (topk-plain-loop had to allocate f
 
 | program | Ir in parallel bodies | Ir forced serial (what) | 4-thread bound | measured Minyar | parallel Rust |
 |---|---:|---|---:|---:|---:|
-| mapreduce | 56.3% | 43.7% (records built in `main`, allocation) | 1.73x | 1.25x | 1.41x |
-| textindex | 16.0% | 84.0% (`Map` dictionary, posting Lists, sort) | 1.14x | 0.95x | 1.65x |
-| topk | 94.0% | 6.0% (posting lists grown per term) | 3.39x | 2.10x | 2.24x |
-| sort | 81.6% | 18.4% (key generation, checksum) | 2.58x | 2.22x | 1.39x |
-| forkjoin | 83.8% | 16.2% (tree build; also serial in Rust) | 2.68x | 1.70x | 1.74x |
+| mapreduce | 56.3% | 43.7% (records built in `main`, allocation) | 1.73x | 1.25x | 1.44x |
+| textindex | 16.0% | 84.0% (`Map` dictionary, posting Lists, sort) | 1.14x | 1.02x | 2.13x |
+| topk | 94.0% | 6.0% (posting lists grown per term) | 3.39x | 2.22x | 2.28x |
+| sort | 81.6% | 18.4% (key generation, checksum) | 2.58x | 2.17x | 1.67x |
+| forkjoin | 83.8% | 16.2% (tree build; also serial in Rust) | 2.68x | 1.96x | 1.96x |
 
 The Rust peers generate the records, the per-term posting lists and the per-range dictionaries on every thread
 (`Vec`, `HashMap` per thread, merged by partition), which Minyar cannot express.
@@ -244,7 +248,7 @@ Payoff = how much of the gap in *both* columns the fix removes, weighted by how 
 | C4 | Outputs must be fixed-width windows indexed by the loop variable; windows exist only inside `parallel for` | p7–p9; topk/neo-db scratch sized to kmax; topk-plain-loop needed fresh Lists | serial path cannot reuse window code (+8.4% in topk-plain-loop) | worst-case scratch, serial grow-before and merge-after phases | per-iteration owned outputs moved back in index order (`parallel for ... collect`), windows over explicit ranges with a disjointness check, windows usable in ordinary code | parallel |
 | C5 | `join` arguments are read-only, so in-place divide-and-conquer (quicksort, partitioned writes) is not expressible | p6 | none | sort needs merge-path rounds; parallel quicksort/radix impossible | `join` over disjoint sub-windows of one buffer (`keys.split(at)` giving two exclusive views) | parallel |
 | C6 | Idiomatic serial paths are slow where the parallel form avoids them (`List.sort`, recursive choices, records per element) | sort idiom 3.07x, choice tree 3.46x the both-modes form | 3x on these idioms | n/a | codegen/stdlib: unboxed `List<Integer>.sort` fast path, scalar-payload choices without frames (ownership change 5 started this) | stdlib, ownership, codegen |
-| C7 | The event loop was single-threaded by construction | server scales 2.60x (Rust 2.47x) with one loop per thread now | n/a | before e870232d8 no Minyar server could use a second core | landed on the parallel branch (threads own sockets, files, loops); remaining cost is C2 | parallel (done) |
+| C7 | The event loop was single-threaded by construction | server scales 2.65x (Rust 2.62x) with one loop per thread now | n/a | before e870232d8 no Minyar server could use a second core | landed on the parallel branch (threads own sockets, files, loops); remaining cost is C2 | parallel (done) |
 | C8 | Per-call bookkeeping blocks inlining (call-depth counter) | no difference measured in these programs (leaf calls already drop the frame) | small here; large in call-heavy code (calls lane) | same | guard pages instead of the counter (calls lane design) | calls |
 | C9 | Pool dispatch and scheduling | 1,435 Ir / 116 ns per loop at 1 thread; 1.9 µs at 4; Ir identical at 1 and 4 threads for every compute program | none measurable (topk/mapreduce within 3–8%) | 1.9 µs per loop: fine for per-query loops, too much per row | none needed now | — |
 
