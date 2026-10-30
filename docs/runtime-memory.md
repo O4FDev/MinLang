@@ -203,6 +203,18 @@ both endpoints of traced ownership operations use the physical payload type.
   traced owners. A function whose only reference work was such a borrow needs
   no ownership frame, and so has no cleanup service point, like a scalar-only
   function.
+- A `match` whose input is a stable root named directly (a readonly
+  parameter, capture, constant or never-reassigned binding) takes no hidden
+  input owner. Choice and Result payloads are never reassigned, so while the
+  input stays alive (by that root or by the match's own owner) a binding
+  reached only through choice cases borrows its payload like a parameter;
+  record patterns read assignable fields and keep their counts. Traced types
+  keep their counts: a choice or Result counts as untraced when every type on
+  a cycle through it is itself a choice or Result, since activation needs a
+  List or field mutation inside that cycle. A function's frame is decided by
+  the owner slots it actually writes, so slots reserved for bindings that
+  ended up borrowing, or for guards settled away, need no frame
+  (`make check-match-payload-borrows`).
 - `minyar_rc_borrow` retains a borrowed field/element as an expression owner
   when its lifetime may extend across a later call or mutation.
 - A chain of field reads borrows intermediate receivers without count changes.

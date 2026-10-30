@@ -548,6 +548,54 @@ function untracedBorrowType(context: CompilerContext, type: Integer): Boolean {
     return result
 }
 
+// A choice or Result value can become traced only through a reference cycle
+// whose types include a List or an ordinary record: activation needs a List
+// or field mutation inside that cycle, and choice payloads are never
+// reassigned. A cycle made only of choices and Results is built by
+// construction alone, so such a value is never traced. A two-case choice whose
+// payload is the value itself (a niche) is traced as that payload.
+function untracedValueType(context: CompilerContext, type: Integer): Boolean {
+    if untracedBorrowType(context, type) { return true }
+    if !isRecordType(type) || isScalarChoiceType(type) || isCRecord(context, type) { return false }
+    let physical = choiceOwnershipType(context, type)
+    if physical != type { return untracedValueType(context, physical) }
+    if choiceMatchCases(context, type).length == 0 { return false }
+    let known = 0
+    while known < context.untracedChoiceTypes.length {
+        if context.untracedChoiceTypes[known] == type { return context.untracedChoiceResults[known] }
+        known = known + 1
+    }
+    let counts = context.functionParameterCounts
+    let fields = context.functionParameterTypes
+    let visited: List<Boolean> = []
+    while visited.length < counts.length / 2 { visited.add(false) }
+    visited[recordTypeIndex(type)] = true
+    let pending: List<Integer> = []
+    let first = functionParameterOffset(counts, recordTypeIndex(type))
+    let field = 0
+    while field < counts[recordTypeIndex(type)] { pending.add(fields[first + field]); field = field + 1 }
+    let result = true
+    let position = 0
+    while position < pending.length && result {
+        let member = pending[position]
+        position = position + 1
+        while isContainerType(member) && result {
+            if cycleTypeReaches(member, type, counts, fields) { result = false }
+            member = containerValueType(member)
+        }
+        if result && isRecordType(member) && !isScalarChoiceType(member) && !visited[recordTypeIndex(member)] {
+            visited[recordTypeIndex(member)] = true
+            if cycleTypeReaches(member, type, counts, fields) && (isCRecord(context, member) || choiceMatchCases(context, member).length == 0) { result = false }
+            let start = functionParameterOffset(counts, recordTypeIndex(member))
+            field = 0
+            while field < counts[recordTypeIndex(member)] { pending.add(fields[start + field]); field = field + 1 }
+        }
+    }
+    context.untracedChoiceTypes.add(type)
+    context.untracedChoiceResults.add(result)
+    return result
+}
+
 function blockAssignsName(tokenKinds: List<Integer>, tokenTexts: List<Text>, start: Integer, name: Text): Boolean {
     let position = start
     let depth = 0

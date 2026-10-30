@@ -319,6 +319,23 @@ function choiceMatchFields(context: CompilerContext, type: Integer, name: Text):
     return choicePayloadFields(context, type, name)
 }
 
+// Choice and Result payloads are never reassigned: cases and payloads are
+// reached only through constructors and matching. While the match input stays
+// alive (its match owner or a stable root keeps it), a payload reached only
+// through choice cases stays alive too, so its binding can borrow it like a
+// parameter; consumers of the binding create their own count first. Record
+// patterns read assignable fields and keep their counts.
+function patternBorrowsPayloads(nodes: List<MatchPattern>, node: Integer): Boolean {
+    let pattern = nodes[node]
+    if pattern.kind == 3 { return false }
+    let child = 0
+    while child < pattern.children.length {
+        if !patternBorrowsPayloads(nodes, pattern.children[child]) { return false }
+        child = child + 1
+    }
+    return true
+}
+
 function parseMatchExpression(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let location = state[0]
     state[0] = state[0] + 1
@@ -345,9 +362,13 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
     let valueId = -1
     if expression { valueId = nextLocal(state) }
     let outerScope = state[3]
+    // A stable root named directly (a readonly parameter, capture, constant or
+    // never-reassigned binding) already keeps the input alive for every arm.
+    let borrowedInput = state[0] == location + 2 && kinds[location + 1] == 1 && isReferenceType(inputType[0]) && untracedValueType(context, inputType[0]) && stableBorrowRoot(context, localNames, localIds, localLengths, state, texts[location + 1])
+    let borrowPayloads = !recoveryEnabled(state)
     let owner = nextLocal(state)
     addLocal(localNames, localTypes, localIds, localLengths, state, " choice match", inputType[0], owner)
-    assignReference(output, state, owner, input, inputType, counts, types, returns)
+    if !borrowedInput { assignReference(output, state, owner, input, inputType, counts, types, returns) }
     storeLocal(output, owner, inputType[0], input)
     let dispatch = newPatternDispatch(context, cases, inputType[0], input, output, textState, state)
     let nodes: List<MatchPattern> = []
@@ -392,7 +413,9 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
             let id = nextLocal(state)
             addLocal(localNames, localTypes, localIds, localLengths, state, pattern.name, pattern.type, id)
             let payloadType: List<Integer> = [pattern.type]
-            assignReference(output, state, id, bindingValues[index], payloadType, counts, types, returns)
+            if !(borrowPayloads && patternBorrowsPayloads(nodes, node) && untracedValueType(context, pattern.type)) {
+                assignReference(output, state, id, bindingValues[index], payloadType, counts, types, returns)
+            }
             storeLocal(output, id, pattern.type, bindingValues[index])
             emitDebugBinding(context, output, pattern.location, pattern.name, pattern.type, "ptr %local." + Text(id), 0, true)
             bindingIds.add(id)

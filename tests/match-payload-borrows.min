@@ -1,0 +1,178 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.moduleFunction(line, name)) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing match borrow function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let found = 0
+    let rest = source
+    let position = rest.find(needle)
+    while position >= 0 {
+        found += 1
+        rest = rest.slice(position + needle.length, rest.length)
+        position = rest.find(needle)
+    }
+    return found
+}
+
+function owners(ir: Text, name: Text): Integer {
+    let emitted = body(ir, name)
+    return count(emitted, "call void @minyar_rc_local(") + count(emitted, "call void @minyar_rc_local_traced(") + count(emitted, "call void @minyar_rc_local_take(")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+// Expr's only cycle runs through choices, so it is never traced. Tree's cycle
+// runs through List<Tree>, which addKid mutates, so Tree is traced.
+let source = #"""
+    choice Expr {
+        Number(value: Integer)
+        Name(text: Text)
+        Negate(operand: Expr)
+        Binary(op: Character, left: Expr, right: Expr)
+    }
+    choice Tree {
+        Leaf(value: Integer)
+        Branch(kids: List<Tree>)
+    }
+    record Holder { name: Text }
+
+    function build(depth: Integer): Expr {
+        if depth == 0 { return Expr.Name("n" + Text(depth)) }
+        return Expr.Binary('+', build(depth - 1), Expr.Negate(Expr.Number(depth)))
+    }
+    function nodes(expression: Expr): Integer {
+        return match expression {
+            Number(_) { 1 }
+            Name(_) { 1 }
+            Negate(operand) { 1 + nodes(operand) }
+            Binary(_, left, right) { 1 + nodes(left) + nodes(right) }
+        }
+    }
+    function nested(expression: Expr): Integer {
+        match expression {
+            Binary(_, Negate(inner), right) { return nodes(inner) + nodes(right) }
+            Binary(_, left, Negate(Number(value))) { return nodes(left) + value }
+            else { return 0 }
+        }
+    }
+    function leftmost(expression: Expr): Expr {
+        match expression {
+            Binary(_, left, _) { return leftmost(left) }
+            Negate(operand) { return operand }
+            else { return expression }
+        }
+    }
+    function keep(expression: Expr, sink: List<Expr>) {
+        match expression {
+            Binary(_, left, right) { sink.add(left); sink.add(right) }
+            else { }
+        }
+    }
+    function owned(depth: Integer): Integer {
+        match build(depth) {
+            Binary(_, left, right) {
+                let garbage = build(depth)
+                return nodes(left) + nodes(right) + nodes(garbage)
+            }
+            else { return 0 }
+        }
+    }
+    function reassigned(expression: Expr): Integer {
+        match expression {
+            Binary(_, left, right) {
+                left = Expr.Number(7)
+                return nodes(left) + nodes(right)
+            }
+            else { return 0 }
+        }
+    }
+    function label(expression: Expr): Text {
+        match expression {
+            Name(text) { return text + "!" }
+            else { return "?" }
+        }
+    }
+    function kids(tree: Tree): Integer {
+        match tree {
+            Leaf(_) { return 1 }
+            Branch(children) {
+                let total = 0
+                for child in children { total += kids(child) }
+                return total
+            }
+        }
+    }
+    function addKid(tree: Tree, kid: Tree) {
+        match tree {
+            Branch(children) { children.add(kid) }
+            Leaf(_) { }
+        }
+    }
+    function rename(holder: Holder) { holder.name = "renamed" + "!" }
+    function product(holder: Holder): Text {
+        match holder {
+            Holder(name) {
+                rename(holder)
+                return name
+            }
+        }
+    }
+
+    let expression = build(3)
+    print(nodes(expression))
+    print(nested(expression))
+    print(nodes(leftmost(expression)))
+    let sink: List<Expr> = []
+    keep(expression, sink)
+    print(sink.length)
+    print(nodes(sink[0]) + nodes(sink[1]))
+    print(owned(2))
+    print(reassigned(expression))
+    print(label(leftmost(expression)))
+    let tree = Tree.Branch([Tree.Leaf(1), Tree.Leaf(2)])
+    addKid(tree, Tree.Branch([Tree.Leaf(3)]))
+    print(kids(tree))
+    let holder = Holder { name: "holder" + "!" }
+    print(product(holder))
+    print(holder.name)
+    """#
+let expected = "10\n10\n1\n2\n9\n13\n3\nn0!\n3\nholder!\nrenamed!\n"
+
+test.require(fixtures.compile(frontend, source), "compile match payload borrow IR")
+let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+// A readonly parameter input and its choice payloads need no counts, so a
+// reader with nothing else to own has no ownership frame.
+for name in ["nodes", "nested"] {
+    let emitted = body(ir, name)
+    test.check(owners(ir, name) == 0 && !test.contains(emitted, "@minyar_rc_enter(") && !test.contains(emitted, "@minyar_rc_enter_stack_v1("), name + ": a borrowed match input and its payloads need no owner or frame")
+}
+// Returning a borrowed payload gives the caller its own count.
+test.check(owners(ir, "leftmost") == 0 && count(body(ir, "leftmost"), "call void @minyar_rc_retain(") == 2, "leftmost: returned payload borrows retain once for the caller")
+test.check(count(body(ir, "leftmost"), "@minyar_rc_local_move_owner(") == 0, "leftmost: a borrowed binding has no owner to move")
+// Storing a borrowed payload retains it in the List; the binding takes no count.
+test.check(owners(ir, "keep") == 0 && count(body(ir, "keep"), "call void @minyar_list_add(") == 2, "keep: stored payloads are retained by the List only")
+// An owned input keeps its match owner; its payloads still borrow.
+test.check(count(body(ir, "owned"), "call void @minyar_rc_local_take(") == 2 && count(body(ir, "owned"), "call void @minyar_rc_local(") == 0, "owned: only the owned input and the later binding take owners")
+// Reassigning a borrowed binding gives it an owner from then on.
+test.check(count(body(ir, "reassigned"), "@minyar_rc_local") > 0, "reassigned: an assigned binding owns its new value")
+// A traced payload and a record field keep their counts.
+test.check(owners(ir, "kids") > 0 && owners(ir, "addKid") > 0, "Tree: payloads of a traced choice keep their owners")
+test.check(owners(ir, "product") > 0, "product: a record pattern binding keeps its owner across field assignment")
+fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+test.removeTree(compiler.directory)
+print("Match payload borrows: passed")
