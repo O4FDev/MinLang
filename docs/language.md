@@ -906,6 +906,12 @@ children = children.appended(leaf)
 let root = Node { value: 2; children: children }
 ```
 
+`list.addAll(other)` appends every element of another List of the same type,
+in order. When `other` is a call result or a local at its last use and nothing
+else refers to it, its elements move with their existing counts and its storage
+is freed; otherwise both Lists share the elements. Lists whose elements can
+form cycles use `add` instead.
+
 Copying an aliased List is linear in its length; repeated copying can be
 quadratic. The compiler can reuse storage in eligible consuming assignments.
 Use `.add` when shared mutation is intended and List literals when all elements
@@ -2331,7 +2337,7 @@ function buildAll(first: Integer, after: Integer): List<Sale> {
     if after - first <= 1000 { return build(first, after) }
     let middle = first + (after - first) / 2
     let left, right = join(buildAll(first, middle), buildAll(middle, after))
-    for sale in right { left.add(sale) }
+    left.addAll(right)
     return left
 }
 

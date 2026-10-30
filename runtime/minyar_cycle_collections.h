@@ -178,6 +178,18 @@ void minyar_list_add_take(MinyarList *list, long long value) {
 #endif
 }
 
+/* Appends every element of `other` in order (the compiler rejects addAll on
+ * cycle-capable Lists, so every element is an ordinary or immortal value). */
+void minyar_list_add_all(MinyarList *list, const MinyarList *other) {
+    long long count = other->length;
+    for (long long i = 0; i < count; ++i) minyar_list_add(list, other->values[i]);
+}
+
+void minyar_list_add_all_take(MinyarList *list, MinyarList *other) {
+    minyar_list_add_all(list, other);
+    minyar_rc_release(other);
+}
+
 long long minyar_list_length(const MinyarList *list) {
     return list->length;
 }

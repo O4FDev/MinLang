@@ -164,6 +164,61 @@ void minyar_list_add_take(MinyarList *list, long long value) {
 #endif
 }
 
+/* Appends every element of `other` in order; `other` keeps its elements, so
+ * reference elements gain a count. `list` may be `other`. */
+void minyar_list_add_all(MinyarList *list, const MinyarList *other) {
+    long long count = other->length;
+    if (count <= 0) return;
+    if (list->length < 0 || count > LLONG_MAX - list->length ||
+        (unsigned long long)(list->length + count) > SIZE_MAX / sizeof(*list->values))
+        minyar_stop("this List became too large.");
+    long long length = list->length + count;
+    list_reserve(list, length);
+    memcpy(list->values + list->length, other->values, (size_t)count * sizeof(*list->values));
+#ifndef MINYAR_COMPILER_ARENA
+    unsigned kind = ((RcObject *)list - 1)->ownership & 7;
+    if (kind != RC_LIST) {
+        if (kind == RC_REFERENCES_IMMORTAL && (((RcObject *)other - 1)->ownership & 7) != RC_REFERENCES_IMMORTAL)
+            ((RcObject *)list - 1)->ownership = (((RcObject *)list - 1)->ownership & ~(size_t)7) | RC_REFERENCES;
+        for (long long i = list->length; i < length; ++i) minyar_rc_retain((void *)(uintptr_t)list->values[i]);
+    }
+#endif
+    list->length = length;
+#if defined(MINYAR_BOUNDED_RC) && !defined(MINYAR_COMPILER_ARENA)
+    if (rc_pending_count)
+        minyar_rc_poll(MINYAR_RC_POLL_BUDGET);
+#endif
+}
+
+/* The compiler transfers an owned reference to `other`. When it is the only
+ * one, the elements move with their existing counts and `other` is freed
+ * empty; otherwise they are shared as by minyar_list_add_all. */
+void minyar_list_add_all_take(MinyarList *list, MinyarList *other) {
+#ifndef MINYAR_COMPILER_ARENA
+    RcObject *object = (RcObject *)other - 1;
+    if (list != other && (object->ownership >> 3) == 1 && other->length > 0) {
+        long long count = other->length;
+        if (list->length < 0 || count > LLONG_MAX - list->length ||
+            (unsigned long long)(list->length + count) > SIZE_MAX / sizeof(*list->values))
+            minyar_stop("this List became too large.");
+        long long length = list->length + count;
+        list_reserve(list, length);
+        memcpy(list->values + list->length, other->values, (size_t)count * sizeof(*list->values));
+        unsigned kind = ((RcObject *)list - 1)->ownership & 7;
+        if (kind == RC_REFERENCES_IMMORTAL && (object->ownership & 7) != RC_REFERENCES_IMMORTAL)
+            ((RcObject *)list - 1)->ownership = (((RcObject *)list - 1)->ownership & ~(size_t)7) | RC_REFERENCES;
+        list->length = length;
+        other->length = 0;
+        minyar_rc_release(other);
+        return;
+    }
+    minyar_list_add_all(list, other);
+    minyar_rc_release(other);
+#else
+    minyar_list_add_all(list, other);
+#endif
+}
+
 long long minyar_list_length(const MinyarList *list) {
     return list->length;
 }
