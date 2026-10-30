@@ -305,6 +305,19 @@ Memory measurements report maximum child-process RSS, rather than the sum of
 simultaneous parent and child memory. See [incremental builds](incremental-builds.md)
 for cache behavior and platform limits.
 
+## Calls
+
+On Linux and macOS a call costs what it costs in C: generated functions keep
+no call-depth counter. Stack exhaustion faults in the guard region below each
+language thread's stack and the runtime reports it as the usual call-depth stop
+([checked failure paths](testing.md#checked-failure-paths)). Small helpers that
+used to carry `minyar_stack_enter`/`minyar_stack_leave` now inline like any
+other function; on box D (x86-64, cachegrind) the change retired 2-12% fewer
+instructions on call-heavy programs (sortrows -11.9%, treewalk -4.4%, orders
+-4.0%) and 27% fewer on a float4 fused-multiply-add kernel built from two
+helper functions. Programs that use `calldepth.run`, and WebAssembly and
+freestanding builds, still count calls.
+
 ## Function linkage
 
 A whole-program build defines every function of an imported module (a package
