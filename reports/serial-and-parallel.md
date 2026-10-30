@@ -68,7 +68,7 @@ Minyar Ir at 1 thread / min(C, C++, Rust serial Ir). Parallel column: Minyar wal
 | forkjoin | yes | 3,371.9M | 2,434.2M c | 1.39 | 364.8±6.3 | 345.1±46.1 | 1.06 | 716.2±27.7 | 677.3±16.7 | 1.96 / 1.96 |
 | **geomean** | | | | **2.10** | | | **1.76** | | | |
 
-Tree: bothmodes d4c7215ab (goal/2026-10-30 + parallel lane through 4a3140b1f). Ir: `run.py --repeats 7`
+Tree: bothmodes bb09cb359 (goal/2026-10-30 + parallel lane through 4a3140b1f). Ir: `run.py --repeats 7`
 (logs/bothmodes/run-D-final.log); walls: `run.py --wall-only --repeats 7` (logs/bothmodes/wall-D-3.log) at box D load
 average 2.5–2.9 (other lanes' gates run outside the bench lock; earlier runs at load 4–6 gave parallel geomeans 1.50,
 1.64 and 1.72 with the same ordering, so treat the wall columns as ±15%). Ir columns are deterministic. On mapreduce,
