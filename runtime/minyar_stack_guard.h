@@ -17,6 +17,12 @@
  * (calldepth.run) and targets without guard pages (WebAssembly, freestanding)
  * keep the exact counter in minyar_stack_enter.
  */
+/* Only runtimes that start threads use the thread entry points. */
+#if defined(__GNUC__) || defined(__clang__)
+#define MINYAR_GUARD_MAYBE_UNUSED __attribute__((unused))
+#else
+#define MINYAR_GUARD_MAYBE_UNUSED
+#endif
 #if (defined(__linux__) || defined(__APPLE__)) && (!defined(__STDC_HOSTED__) || __STDC_HOSTED__) && \
     !defined(__wasm__)
 #define MINYAR_STACK_GUARD 1
@@ -156,7 +162,7 @@ static pthread_mutex_t minyar_guard_pool_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *minyar_guard_pool;
 
 /* Attributes for a thread that runs language code: a guard no frame skips. */
-static pthread_attr_t *minyar_guarded_thread_attributes(pthread_attr_t *attributes) {
+MINYAR_GUARD_MAYBE_UNUSED static pthread_attr_t *minyar_guarded_thread_attributes(pthread_attr_t *attributes) {
     size_t bytes = 0;
     if (pthread_attr_init(attributes) != 0) return NULL;
     if (pthread_attr_setguardsize(attributes, MINYAR_GUARD_BELOW_BYTES) != 0 ||
@@ -174,7 +180,7 @@ static pthread_attr_t *minyar_guarded_thread_attributes(pthread_attr_t *attribut
  * is within a few KiB of the stack's top, so its address minus the configured
  * size lies just below the lowest usable address, well inside the recognised
  * range. Threads started without the attributes query their bounds. */
-static void minyar_stack_guard_attach_thread(void) {
+MINYAR_GUARD_MAYBE_UNUSED static void minyar_stack_guard_attach_thread(void) {
     size_t stack = __atomic_load_n(&minyar_guard_thread_stack_bytes, __ATOMIC_RELAXED);
     uintptr_t frame = (uintptr_t)__builtin_frame_address(0), low = 0, high = 0;
     if (stack && frame > stack) low = frame - stack;
@@ -206,7 +212,7 @@ static void minyar_stack_guard_attach_thread(void) {
 }
 
 /* Last thing before a runtime-started thread's entry returns. */
-static void minyar_stack_guard_detach(void) {
+MINYAR_GUARD_MAYBE_UNUSED static void minyar_stack_guard_detach(void) {
     minyar_guard_low = minyar_guard_high = 0;
     void *storage = minyar_guard_thread_altstack;
     if (!storage) return;
@@ -222,10 +228,10 @@ static void minyar_stack_guard_detach(void) {
 }
 #else
 static void minyar_stack_guard_attach(void) {}
-static void minyar_stack_guard_attach_thread(void) {}
-static void minyar_stack_guard_detach(void) {}
+MINYAR_GUARD_MAYBE_UNUSED static void minyar_stack_guard_attach_thread(void) {}
+MINYAR_GUARD_MAYBE_UNUSED static void minyar_stack_guard_detach(void) {}
 #if defined(__linux__) || defined(__APPLE__)
-static pthread_attr_t *minyar_guarded_thread_attributes(pthread_attr_t *attributes) {
+MINYAR_GUARD_MAYBE_UNUSED static pthread_attr_t *minyar_guarded_thread_attributes(pthread_attr_t *attributes) {
     (void)attributes;
     return NULL;
 }
