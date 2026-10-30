@@ -255,16 +255,19 @@ function emitMinimumOrMaximum(output: List<Text>, textState: List<Text>, state: 
     return emitInstruction(output, textState, state, "select i1 " + chooseLeft + ", i64 " + values[0] + ", i64 " + values[1])
 }
 
-// One interpolation is one runtime call over its parts. Integer, Boolean and
-// Character parts are formatted straight into the exactly sized result, so
-// they need no temporary Text or parts List. A Text part is borrowed; it gets
+// One interpolation makes one exactly sized result. Integer, Boolean and
+// Character parts are formatted straight into it, so they need no temporary
+// Text or parts List (see emitTextBuilder). A Text part is borrowed; it gets
 // a count only if a later part runs user code that could replace its holder.
 function compileInterpolation(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
     let tokenLines = context.tokenLines
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "[")
-    let arguments: List<Text> = []
+    let partTypes: List<Integer> = []
+    let partValues: List<Text> = []
+    let literals: List<Text> = []
+    let literalParts: List<Integer> = []
     let pieces: List<Integer> = []
     let values: List<Text> = []
     let calls: List<Integer> = []
@@ -291,14 +294,17 @@ function compileInterpolation(context: CompilerContext, localNames: List<Text>, 
         } else {
             requireType(tokenLines, state, type, 2, "an interpolated Text part must be Text")
         }
-        if type == 2 {
+        // A literal part is one constant Text token: its bytes are known here.
+        let literal = !converted && tokenKinds[callLocation] == 3 && state[0] == callLocation + 1 && value.startsWith("getelementptr (i8, ptr @")
+        if type == 2 && !literal {
             pieces.add(output.length)
             output.add("")
             values.add(value)
             calls.add(context.callTargets.length)
         }
-        arguments.add(Text(type))
-        arguments.add(valueAsListSlot(output, textState, state, value, type))
+        partTypes.add(type)
+        partValues.add(value)
+        if literal { literals.add(tokenTexts[callLocation]); literalParts.add(1) } else { literals.add(""); literalParts.add(0) }
         if tokenIs(tokenKinds, tokenTexts, state, ",") { state[0] = state[0] + 1 }
     }
     state[0] = state[0] + 1
@@ -308,16 +314,98 @@ function compileInterpolation(context: CompilerContext, localNames: List<Text>, 
         settleBorrow(context, output, state, pieces[index], values[index], 2, calls[index])
         index = index + 1
     }
-    let value = valueName(textState, newTemporary(state))
-    output.add("  " + value + " = call ptr (i64, ...) @minyar_interpolate(i64 " + Text(arguments.length / 2))
+    setType(resultType, 2)
+    let floats = false
     index = 0
-    while index < arguments.length {
-        output.add(", i64 " + arguments[index])
+    while index < partTypes.length {
+        if partTypes[index] == 7 { floats = true }
         index = index + 1
     }
-    output.add(")\n")
-    setType(resultType, 2)
+    if !floats && partTypes.length <= 512 { return emitTextBuilder(output, textState, state, globals, partTypes, partValues, literals, literalParts) }
+    // A Float part keeps the runtime join, which formats it twice on the stack.
+    let arguments: List<Text> = []
+    index = 0
+    while index < partTypes.length {
+        arguments.add(", i64 " + Text(partTypes[index]) + ", i64 " + valueAsListSlot(output, textState, state, partValues[index], partTypes[index]))
+        index = index + 1
+    }
+    let value = valueName(textState, newTemporary(state))
+    output.add("  " + value + " = call ptr (i64, ...) @minyar_interpolate(i64 " + Text(partTypes.length) + joinText(arguments) + ")\n")
     return value
+}
+
+// One interpolation without Float parts, written by the compiler: the byte
+// lengths are added up (literal lengths are constants, Integer digits are
+// counted), the result is made once, each part is written at its offset, and
+// the result is ASCII when every part is. Text parts are borrowed.
+function emitTextBuilder(output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, types: List<Integer>, values: List<Text>, literals: List<Text>, literalParts: List<Integer>): Text {
+    let lengths: List<Text> = []
+    let constant = 0
+    let ascii = "true"
+    let total = ""
+    let index = 0
+    while index < types.length {
+        let type = types[index]
+        let length = ""
+        if literalParts[index] == 1 {
+            constant = constant + literals[index].byteLength
+            if literals[index].length != literals[index].byteLength { ascii = "false" }
+        } else if type == 2 {
+            length = emitCall(output, textState, state, 1, "minyar_text_byte_length", [values[index]], [2])
+            if ascii != "false" {
+                let part = emitCall(output, textState, state, 4, "minyar_text_is_ascii", [values[index]], [2])
+                if ascii == "true" { ascii = part } else { ascii = emitInstruction(output, textState, state, "and i1 " + ascii + ", " + part) }
+            }
+        } else if type == 1 {
+            length = emitCall(output, textState, state, 1, "minyar_integer_text_length", [values[index]], [1])
+        } else if type == 3 {
+            length = emitCall(output, textState, state, 1, "minyar_character_text_length", [values[index]], [3])
+            if ascii != "false" {
+                let part = emitInstruction(output, textState, state, "icmp eq i64 " + length + ", 1")
+                if ascii == "true" { ascii = part } else { ascii = emitInstruction(output, textState, state, "and i1 " + ascii + ", " + part) }
+            }
+        } else {
+            length = emitInstruction(output, textState, state, "select i1 " + values[index] + ", i64 4, i64 5")
+        }
+        if length != "" {
+            if total == "" { total = length } else { total = emitInstruction(output, textState, state, "add nuw nsw i64 " + total + ", " + length) }
+        }
+        lengths.add(length)
+        index = index + 1
+    }
+    if total == "" { total = Text(constant) } else if constant > 0 { total = emitInstruction(output, textState, state, "add nuw nsw i64 " + total + ", " + Text(constant)) }
+    let result = emitCall(output, textState, state, 2, "minyar_text_builder", [total], [1])
+    let at = emitInstruction(output, textState, state, "load ptr, ptr " + result)
+    index = 0
+    while index < types.length {
+        let type = types[index]
+        let length = lengths[index]
+        if literalParts[index] == 1 {
+            let size = literals[index].byteLength
+            if size > 0 {
+                output.add("  call void @llvm.memcpy.p0.p0.i64(ptr " + at + ", ptr @" + literalName(textState[2], genericInstanceDigest(literals[index]), true) + ", i64 " + Text(size) + ", i1 false)\n")
+                length = Text(size)
+            }
+        } else if type == 2 {
+            emitCall(output, textState, state, 5, "minyar_text_builder_text", [at, values[index]], [2, 2])
+        } else if type == 1 {
+            emitCall(output, textState, state, 5, "minyar_text_builder_integer", [at, values[index], length], [2, 1, 1])
+        } else if type == 3 {
+            emitCall(output, textState, state, 5, "minyar_text_builder_character", [at, values[index]], [2, 3])
+        } else {
+            emitCall(output, textState, state, 5, "minyar_text_builder_boolean", [at, values[index]], [2, 4])
+        }
+        if length != "" { at = emitInstruction(output, textState, state, "getelementptr inbounds i8, ptr " + at + ", i64 " + length) }
+        index = index + 1
+    }
+    emitCall(output, textState, state, 5, "minyar_text_builder_finish", [result, ascii], [2, 4])
+    let declarations = ["declare i64 @minyar_integer_text_length(i64)\n", "declare i64 @minyar_character_text_length(i32)\n", "declare zeroext i1 @minyar_text_is_ascii(ptr)\n", "declare ptr @minyar_text_builder(i64)\n", "declare void @minyar_text_builder_finish(ptr, i1 zeroext)\n", "declare void @minyar_text_builder_text(ptr, ptr)\n", "declare void @minyar_text_builder_integer(ptr, i64, i64)\n", "declare void @minyar_text_builder_character(ptr, i32)\n", "declare void @minyar_text_builder_boolean(ptr, i1 zeroext)\n", "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n"]
+    index = 0
+    while index < declarations.length {
+        if findText(globals, declarations[index]) < 0 { globals.add(declarations[index]) }
+        index = index + 1
+    }
+    return result
 }
 
 function parseCall(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {

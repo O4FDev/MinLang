@@ -646,10 +646,12 @@ run once, from left to right. For records, Lists and Bytes, choose a Text
 representation explicitly before inserting it. `\\(` writes a literal `\(`.
 Other text escapes keep their usual meaning.
 
-One interpolation is one runtime call over its literal and value parts, with
-one exactly sized output byte buffer and one Text header. Integer, Boolean and
-Character values are written straight into that buffer; a Float is formatted
-twice on the stack, once to measure it. There is no parts List and no
+One interpolation makes one exactly sized output byte buffer and one Text
+header. The compiler adds up the parts' byte lengths (literal lengths are
+constants and Integer digits are counted), then writes literal, Text,
+Integer, Boolean and Character parts straight into that buffer. An
+interpolation with a Float part is one runtime call instead, which formats the
+Float twice on the stack, once to measure it. There is no parts List and no
 temporary Text per scalar. Text parts are borrowed; one read from a field or
 element is counted only when a later part calls code that could replace it.
 A chain of three or more Text values joined with `+`, such as

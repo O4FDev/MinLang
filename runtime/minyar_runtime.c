@@ -1408,6 +1408,56 @@ void minyar_initialize_arguments(int count, char **values) {
 #include "minyar_maps.h"
 #include "minyar_numbers.h"
 
+/* Compiled interpolation (compiler/stages/calls.min, emitTextBuilder): the
+ * compiler adds up the parts' byte lengths (literal lengths are constants),
+ * makes the result once, writes every part at its offset and decides
+ * ASCII-ness, with no per-part dispatch. These entries are tiny on purpose:
+ * link-time optimisation inlines them into the generated code. */
+long long minyar_integer_text_length(long long value) {
+    static const unsigned long long powers[20] = {
+        1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL, 1000000ULL, 10000000ULL, 100000000ULL,
+        1000000000ULL, 10000000000ULL, 100000000000ULL, 1000000000000ULL, 10000000000000ULL,
+        100000000000000ULL, 1000000000000000ULL, 10000000000000000ULL, 100000000000000000ULL,
+        1000000000000000000ULL, 10000000000000000000ULL};
+    unsigned long long magnitude =
+        (value < 0 ? 0 - (unsigned long long)value : (unsigned long long)value) | 1;
+    /* bits * 1233 / 4096 is floor(log10(2^bits)): the digit count or one less. */
+    unsigned bits = 64 - (unsigned)__builtin_clzll(magnitude);
+    unsigned guess = (bits * 1233) >> 12;
+    return (long long)guess + (magnitude >= powers[guess]) + (value < 0);
+}
+long long minyar_character_text_length(int character) {
+    if (character < 0 || character > 0x10ffff || (character >= 0xd800 && character <= 0xdfff))
+        minyar_stop_program("this Character is not valid Unicode.");
+    return character < 0x80 ? 1 : character < 0x800 ? 2 : character < 0x10000 ? 3 : 4;
+}
+_Bool minyar_text_is_ascii(const MinyarText *text) {
+    return text->character_length == text->byte_length;
+}
+/* A Text of `length` bytes to be written in full by the caller, terminated
+ * and recorded as ASCII until minyar_text_builder_finish says otherwise. */
+MinyarText *minyar_text_builder(long long length) {
+    MinyarText *text = new_text_storage(length, length);
+    ((unsigned char *)text->bytes)[length] = 0;
+    return text;
+}
+void minyar_text_builder_finish(MinyarText *text, _Bool ascii) {
+    if (!ascii) text->character_length = -1;
+}
+void minyar_text_builder_text(unsigned char *at, const MinyarText *text) {
+    copy_bytes(at, text->bytes, (size_t)text->byte_length);
+}
+/* `length` is minyar_integer_text_length(value): the digits end exactly there. */
+void minyar_text_builder_integer(unsigned char *at, long long value, long long length) {
+    write_integer_digits(value, (char *)at + length);
+}
+void minyar_text_builder_character(unsigned char *at, int character) {
+    encode_character(character, at);
+}
+void minyar_text_builder_boolean(unsigned char *at, _Bool value) {
+    memcpy(at, value ? "true" : "false", value ? 4 : 5);
+}
+
 /* Formats one interpolation part into buffer when it is a scalar, and points
  * bytes at the part's encoding. */
 static long long interpolation_bytes(long long kind, long long slot, char buffer[48],

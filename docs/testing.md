@@ -1464,7 +1464,10 @@ controls.
 delimiters, continuation, exact rejection locations and the text gallery at
 O0/O2 with ownership cleanup assertions. Its runtime probe measures one output
 buffer of exactly the joined byte length plus its terminator; scalar conversion
-and List allocations remain separate. `check-text-literals-sanitize` adds
+and List allocations remain separate. LLVM checks require the compiled builder
+(constant literal copies, counted Integer digits, no runtime join) and keep the
+runtime join for a Float part; Integer parts at every power-of-ten boundary and
+Unicode character counts are executed. `check-text-literals-sanitize` adds
 compiler/program ASan/UBSan. `check-text-bootstrap` runs the same literal forms
 through stage0 at O0/O2; `check-cold-bootstrap` proves the clean public launcher.
 
