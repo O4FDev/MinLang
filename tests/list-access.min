@@ -145,19 +145,23 @@ looping = utf8.decodeOrStop(Bytes(looping).slice(0, looping.find("\n}\n")))
 test.check(test.contains(looping, "call i64 @.minyar.list.length(") && !test.contains(looping, "@minyar_list_length("), "List for loop must read its length inline")
 // A List loop whose body makes no calls and assigns only plain locals borrows
 // its source and each element; an indexed store keeps the element's owner and
-// reassigning the source keeps the loop's own count on the List.
+// reassigning the source keeps the loop's own count on the List. A readonly
+// parameter source is kept alive by its caller, so it never needs that count.
 test.executes(compiler, "record Point { x: Integer; y: Integer }\nfunction sum(points: List<Point>): Integer { let total = 0; for point in points { total += point.x + point.y }; return total }\nfunction churn(points: List<Point>): Integer { let total = 0; for point in points { points[0] = Point { x: 100; y: 0 }; total += point.x }; return total }\nfunction keep(points: List<Point>): Point { let last = points[0]; for point in points { last = point }; return last }\nfunction drop(): Integer { let items = [Point { x: 5; y: 0 }, Point { x: 6; y: 0 }]; let total = 0; for point in items { items = []; total += point.x }; return total }\nlet points = [Point { x: 1; y: 2 }, Point { x: 3; y: 4 }]\nprint(sum(points))\nprint(churn(points))\nprint(keep(points).x)\nprint(sum(points))\nprint(drop())\n", "10\n4\n3\n107\n11\n")
 let walking = generated(compiler)
 test.check(elementOwners(walking, "sum") == 0, "a call-free List loop must borrow its source and elements")
 test.check(elementOwners(walking, "drop") >= 1, "a loop that reassigns its source must keep its own count on the List")
-test.check(elementOwners(walking, "churn") == 2, "a List loop with an indexed store must keep each element's owner")
+test.check(elementOwners(walking, "churn") == 1, "a List loop with an indexed store must keep each element's owner, and only that owner for a readonly parameter source")
 // Scalar field and element stores release nothing, so the loop still borrows;
 // a path store that replaces a reference keeps the loop's owners.
-test.executes(compiler, "record Point { x: Integer; y: Integer }\nrecord Holder { points: List<Point>; label: Text }\nfunction tally(points: List<Point>, totals: List<Integer>): Integer { let total = 0; for point in points { totals[point.x % 2] += point.y; point.y = 0; total += point.x }; return total }\nfunction clear(holder: Holder, points: List<Point>): Integer { let total = 0; for point in points { holder.points = []; total += point.x }; return total }\nfunction label(holder: Holder, points: List<Point>): Integer { let total = 0; for point in points { holder.label += \"!\"; total += point.x }; return total }\nlet totals = [0, 0]\nprint(tally([Point { x: 1; y: 2 }, Point { x: 2; y: 5 }, Point { x: 3; y: 4 }], totals))\nprint(totals[0])\nprint(totals[1])\nlet holder = Holder { points: [Point { x: 7; y: 0 }, Point { x: 8; y: 0 }]; label: \"a\" }\nprint(clear(holder, holder.points))\nholder.points = [Point { x: 1; y: 0 }]\nprint(label(holder, holder.points))\nprint(holder.label)\n", "6\n5\n6\n15\n1\na!\n")
+test.executes(compiler, "record Point { x: Integer; y: Integer }\nrecord Holder { points: List<Point>; label: Text }\nfunction tally(points: List<Point>, totals: List<Integer>): Integer { let total = 0; for point in points { totals[point.x % 2] += point.y; point.y = 0; total += point.x }; return total }\nfunction clear(holder: Holder, points: List<Point>): Integer { let total = 0; for point in points { holder.points = []; total += point.x }; return total }\nfunction label(holder: Holder, points: List<Point>): Integer { let total = 0; for point in points { holder.label += \"!\"; total += point.x }; return total }\nfunction labelLocal(holder: Holder): Integer { let points = holder.points; let total = 0; for point in points { holder.label += \"?\"; total += point.x }; points = []; return total + points.length }\nfunction plainLocal(holder: Holder): Integer { let points = holder.points; let total = 0; for point in points { total += point.x }; points = []; return total + points.length }\nlet totals = [0, 0]\nprint(tally([Point { x: 1; y: 2 }, Point { x: 2; y: 5 }, Point { x: 3; y: 4 }], totals))\nprint(totals[0])\nprint(totals[1])\nlet holder = Holder { points: [Point { x: 7; y: 0 }, Point { x: 8; y: 0 }]; label: \"a\" }\nprint(clear(holder, holder.points))\nholder.points = [Point { x: 1; y: 0 }]\nprint(label(holder, holder.points))\nprint(holder.label)\nprint(labelLocal(holder))\nprint(plainLocal(holder))\nprint(holder.label)\n", "6\n5\n6\n15\n1\na!\n1\n1\na!?\n")
 let paths = generated(compiler)
 test.check(elementOwners(paths, "tally") == 0, "a List loop with only scalar path stores must borrow its elements")
 test.check(elementOwners(paths, "clear") >= 1, "a List loop that replaces a reference field must keep its owners")
-test.check(elementOwners(paths, "label") >= 1, "a List loop that appends to a Text field must keep its owners")
+// A readonly parameter source is kept alive by its caller and a Text field
+// append releases no element; a local source still takes the loop's owner.
+test.check(elementOwners(paths, "label") == 0, "a List loop over a readonly parameter that appends to a Text field needs no owners")
+test.check(elementOwners(paths, "labelLocal") > elementOwners(paths, "plainLocal"), "a List loop over a local that appends to a Text field must keep the loop's owner on the List")
 // A loop body that assigns the loop name keeps each element's owner, so later
 // moves out of that name never consume the List's own count.
 test.executes(compiler, "record Point { x: Integer; y: Integer }\nrecord Marker { let: Integer }\nfunction shout(words: List<Text>) { for word in words { word = word + \"!\" } }\nfunction masked(words: List<Text>, marker: Marker) { for word in words { let ignored = marker.let; word = word + \"!\" } }\nfunction maskedLiteral(words: List<Text>) { for word in words { let marker = Marker { let: 0 }; word = word + \"!\" } }\nfunction dropMasked(): Integer { let words = [Text(10), Text(20)]; let marker = Marker { let: 0 }; let total = 0; for word in words { let ignored = marker.let; words = []; total += word.byteLength }; return total }\nfunction second(items: List<Text>): Text { let turn = 0; for item in items { if turn == 1 { return item }; item = \"x\"; turn = turn + 1 }; return \"\" }\nfunction swap(points: List<Point>) { for p in points { p = Point { x: p.y; y: p.x } } }\nlet words = [Text(10), Text(20)]\nshout(words)\nprint(words[1])\nlet maskedWords = [Text(10), Text(20)]\nmasked(maskedWords, Marker { let: 0 })\nprint(maskedWords[1])\nlet literalWords = [Text(30), Text(40)]\nmaskedLiteral(literalWords)\nprint(literalWords[1])\nprint(dropMasked())\nlet picked = second(words)\nprint(picked)\nprint(words[1])\nlet points = [Point { x: 1; y: 2 }, Point { x: 3; y: 4 }]\nswap(points)\nprint(points[1].x)\n", "20\n20\n40\n4\n20\n20\n3\n")
@@ -220,8 +224,10 @@ let mapped = generated(compiler)
 let counting = mapped.slice(mapped.find("count(ptr %argument.0"), mapped.length)
 counting = counting.slice(0, counting.find("\n}\n"))
 test.check(!test.contains(counting, "call void @minyar_rc_borrow("), "Map operations on plain keys took a temporary count")
-// The borrowed parameter source keeps one loop count: Map stores may release it.
-test.check(elementOwners(mapped, "count") == 1, "a List loop whose calls cannot release List slots must borrow its elements")
+// A readonly parameter source needs no loop count, even across Map stores: its
+// caller keeps the List alive. Map stores cannot release List slots, so the
+// elements borrow too.
+test.check(elementOwners(mapped, "count") == 0, "a List loop whose calls cannot release List slots must borrow its elements")
 // An element or field value read inside a statement takes no count when the
 // rest of the statement cannot release its holder; a later user call can.
 test.executes(compiler, "record Holder { name: Text; parts: List<Text> }\nfunction rename(holder: Holder): Text { holder.name = \"z\" + Text(9); holder.parts = []; return \"!\" }\nfunction parse(fields: List<Text>): Integer { let total = Integer(fields[1]) + Integer(fields[2]); if fields[0] == \"add\" { total += 1 }; return total }\nlet holder = Holder { name: \"a\" + Text(1); parts: [\"p\" + Text(2)] }\nprint(parse([\"add\", \"40\", \"1\"]))\nprint(holder.name + rename(holder))\nholder.parts = [\"q\" + Text(3)]\nprint(holder.parts[0] + rename(holder))\nprint(holder.name)\n", "42\na1!\nq3!\nz9\n")
@@ -254,7 +260,9 @@ let advancing = guarded.slice(guarded.find("advance(ptr %argument.0"), guarded.l
 advancing = advancing.slice(0, advancing.find("\n}\n"))
 let advanceOwners = 0
 for line in test.lines(advancing) { if test.contains(line, "call void @minyar_rc_local(i64 ") && !test.contains(line, ", ptr null)") { advanceOwners += 1 } }
-test.check(advanceOwners == 0 && test.contains(advancing, "call i1 @minyar_rc_idle()"), "an unreleased element binding must borrow, and its loop must stay call-free")
+// With no owner slot written, the function needs no frame either; its pure
+// loop's idle test is then settled to true rather than asked at run time.
+test.check(advanceOwners == 0 && test.contains(advancing, "%loop.idle.") && !test.contains(advancing, "@minyar_rc_enter("), "an unreleased element binding must borrow, its loop must stay call-free, and the function needs no frame")
 let swapping = guarded.slice(guarded.find("swap(ptr %argument.0"), guarded.length)
 swapping = swapping.slice(0, swapping.find("\n}\n"))
 test.check(test.contains(swapping, "call void @minyar_rc_local(i64 "), "a binding whose element is replaced must keep a guard count")
