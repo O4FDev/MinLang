@@ -198,9 +198,9 @@ function parseValue(cursor: Cursor, depth: Integer): Value {
     if c == '{' { return parseObject(cursor, depth) }
     if c == '[' { return parseArray(cursor, depth) }
     if c == '"' { return leaf(STRING, parseString(cursor), 0.0, false) }
-    if literal(cursor, "true") { return leaf(BOOLEAN, "true", 0.0, true) }
-    if literal(cursor, "false") { return leaf(BOOLEAN, "false", 0.0, false) }
-    if literal(cursor, "null") { return leaf(NULL, "null", 0.0, false) }
+    if c == 't' && literal(cursor, "true") { return leaf(BOOLEAN, "true", 0.0, true) }
+    if c == 'f' && literal(cursor, "false") { return leaf(BOOLEAN, "false", 0.0, false) }
+    if c == 'n' && literal(cursor, "null") { return leaf(NULL, "null", 0.0, false) }
     return parseNumber(cursor)
 }
 
@@ -374,7 +374,26 @@ function parseString(cursor: Cursor): Text {
 // decimal once, without a host locale or intermediate floating-point powers.
 function jsonNumber(source: Text): Float { native "runtime" }
 
+// The end of a valid JSON number starting at the position, or -1; the
+// scanner below then reproduces the exact diagnostic for invalid input.
+function jsonNumberEnd(source: Text, position: Integer): Integer { native "runtime" }
+
 function parseNumber(cursor: Cursor): Value {
+    let text = cursor.text
+    let start = cursor.position
+    let end = jsonNumberEnd(text, start)
+    if end < 0 { return scanNumber(cursor) }
+    cursor.position = end
+    return numberLeaf(cursor, text.slice(start, end))
+}
+
+function numberLeaf(cursor: Cursor, spelling: Text): Value {
+    let value = jsonNumber(spelling)
+    if value != value || value - value != 0.0 { return failure(cursor, "number is not finite") }
+    return leaf(NUMBER, spelling, value, false)
+}
+
+function scanNumber(cursor: Cursor): Value {
     let text = cursor.text
     let start = cursor.position
     if cursor.position < text.length && text[cursor.position] == '-' {
@@ -407,10 +426,7 @@ function parseNumber(cursor: Cursor): Value {
         }
         if cursor.position == exponentStart { return failure(cursor, "unfinished exponent") }
     }
-    let spelling = text.slice(start, cursor.position)
-    let value = jsonNumber(spelling)
-    if value != value || value - value != 0.0 { return failure(cursor, "number is not finite") }
-    return leaf(NUMBER, spelling, value, false)
+    return numberLeaf(cursor, text.slice(start, cursor.position))
 }
 
 // ----- Access -----
@@ -483,9 +499,23 @@ public function string(value: Value, name: Text): Text {
 /// "a\nb"
 /// ```
 public function quote(text: Text): Text {
-    let parts: List<Text> = ["\""]
+    let parts: List<Text> = []
+    appendQuoted(text, parts)
+    return joinText(parts)
+}
+
+// Runs without a quote, backslash or control character are copied as one
+// slice each; only those characters are escaped.
+function appendQuoted(text: Text, parts: List<Text>) {
     let hex = "0123456789abcdef"
-    for c in text {
+    parts.add("\"")
+    let start = 0
+    let length = text.length
+    while start < length {
+        let stop = jsonStringEnd(text, start)
+        if stop > start { parts.add(text.slice(start, stop)) }
+        if stop >= length { break }
+        let c = text[stop]
         let code = Integer(c)
         if c == '"' { parts.add("\\\"") }
         else if c == '\\' { parts.add("\\\\") }
@@ -494,11 +524,52 @@ public function quote(text: Text): Text {
         else if c == '\r' { parts.add("\\r") }
         else if code == 8 { parts.add("\\b") }
         else if code == 12 { parts.add("\\f") }
-        else if code < 32 { parts.add("\\u00" + Text(hex[code / 16]) + Text(hex[code % 16])) }
-        else { parts.add(Text(c)) }
+        else { parts.add("\\u00" + Text(hex[code / 16]) + Text(hex[code % 16])) }
+        start = stop + 1
     }
     parts.add("\"")
+}
+
+/// Write JSON without insignificant whitespace, for files and the wire.
+/// Numbers keep their parsed spelling; unequal object key/item lengths stop
+/// with a diagnostic, as in `pretty`.
+///
+/// ```minyar
+/// let tree = api.parse(#"{ "name": "Ada", "lights": [1, 2.50, true, null] }"#)
+/// print(api.compact(tree))
+/// ```
+/// ```output
+/// {"name":"Ada","lights":[1,2.50,true,null]}
+/// ```
+public function compact(value: Value): Text {
+    let parts: List<Text> = []
+    appendCompact(value, parts)
     return joinText(parts)
+}
+
+function appendCompact(value: Value, parts: List<Text>) {
+    if value.kind == STRING {
+        appendQuoted(value.text, parts)
+    } else if value.kind == OBJECT {
+        if !objectShapeMatches(value) { fail(OBJECT_SHAPE_ERROR) }
+        parts.add("{")
+        for index in 0..value.items.length {
+            if index > 0 { parts.add(",") }
+            appendQuoted(value.keys[index], parts)
+            parts.add(":")
+            appendCompact(value.items[index], parts)
+        }
+        parts.add("}")
+    } else if value.kind == ARRAY {
+        parts.add("[")
+        for index in 0..value.items.length {
+            if index > 0 { parts.add(",") }
+            appendCompact(value.items[index], parts)
+        }
+        parts.add("]")
+    } else {
+        parts.add(value.text)
+    }
 }
 
 // Indented JSON text, for showing a response to people.
@@ -548,6 +619,8 @@ public function Value.requireBoolean(name: Text): Value { return requireBoolean(
 public function Value.requireNumber(name: Text): Value { return requireNumber(self, name) }
 /// Readable JSON with two-space indentation. Pass an empty `indent` for a complete document.
 public function Value.pretty(indent: Text): Text { return pretty(self, indent) }
+/// Compact JSON text for this value; see `compact`.
+public function Value.compact(): Text { return compact(self) }
 
 // Typed decoding and access. parse/lookup/require*/member/string retain their
 // deprecated INVALID/null/empty compatibility contracts above. Both families

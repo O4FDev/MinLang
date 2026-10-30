@@ -176,7 +176,11 @@ promise a universal bound on OS or TLS memory. See RFC 9112 sections
 ## JSON validation
 
 `json.quote` preserves control characters with JSON escapes, including embedded
-zero bytes. `json.pretty` uses the same writer. To distinguish absent keys,
+zero bytes. `json.pretty` uses the same writer, and `json.compact(value)` writes
+the same document without insignificant whitespace, keeping each number's
+parsed spelling. Quoting copies each run of characters that needs no escape as
+one slice. Parsing scans whitespace, strings and numbers a byte at a time in the
+runtime and slices unescaped strings from the source. To distinguish absent keys,
 explicit nulls and type errors, use the strict lookup helpers:
 
 ```minyar
@@ -220,8 +224,8 @@ if result.ok() { print(result.value()) }
 ```
 
 JSON Values offer `hasMember(name)`, `lookup(name)`, `member(name)`,
-`requireString(name)`, `requireBoolean(name)`, `requireNumber(name)` and
-`pretty(indent)`. Existing module functions continue to work.
+`requireString(name)`, `requireBoolean(name)`, `requireNumber(name)`,
+`pretty(indent)` and `compact()`. Existing module functions continue to work.
 
 ## Scalability and rebuilds
 

@@ -242,6 +242,30 @@ long long minyar_runtime_jsonStringEnd(MinyarText *text, long long position) {
     }
     return position + (text->character_offsets ? text_scalar_count(bytes + start, i - start) : i - start);
 }
+/* JSON number grammar: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)? */
+long long minyar_runtime_jsonNumberEnd(MinyarText *text, long long position) {
+    long long start = json_scan_start(text, position), i = start, length = text->byte_length;
+    const unsigned char *bytes = text->bytes;
+#define JSON_DIGIT(at) ((at) < length && (unsigned char)(bytes[at] - '0') < 10)
+    if (i < length && bytes[i] == '-') i++;
+    long long digits = i;
+    while (JSON_DIGIT(i)) i++;
+    if (i == digits || (i - digits > 1 && bytes[digits] == '0')) return -1;
+    if (i < length && bytes[i] == '.') {
+        long long fraction = ++i;
+        while (JSON_DIGIT(i)) i++;
+        if (i == fraction) return -1;
+    }
+    if (i < length && (bytes[i] == 'e' || bytes[i] == 'E')) {
+        i++;
+        if (i < length && (bytes[i] == '-' || bytes[i] == '+')) i++;
+        long long exponent = i;
+        while (JSON_DIGIT(i)) i++;
+        if (i == exponent) return -1;
+    }
+#undef JSON_DIGIT
+    return position + (i - start);
+}
 long long minyar_runtime_jsonSpaceEnd(MinyarText *text, long long position) {
     long long start = json_scan_start(text, position), i = start, length = text->byte_length;
     const unsigned char *bytes = text->bytes;
