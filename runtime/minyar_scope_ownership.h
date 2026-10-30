@@ -9,6 +9,8 @@ void minyar_rc_scope_leave_empty_v1(void) {}
 void minyar_rc_scope_move_v1(void *slot, void *value) { (void)slot; (void)value; }
 void minyar_rc_scope_poll_v1(void) {}
 void minyar_rc_scope_release_v1(void *value) { (void)value; }
+void minyar_rc_scope_drop_v1(void *value) { (void)value; }
+void minyar_rc_scope_service_v1(long long units) { (void)units; }
 #else
 void minyar_rc_scope_enter_v1(void *header, void *values, long long count) {
     MinyarRcScope *scope = header;
@@ -77,6 +79,44 @@ MINYAR_INLINE_ENTRY void minyar_rc_scope_release_v1(void *value) {
     }
 #endif
     minyar_rc_release(value);
+}
+
+/* Bounded scope cleanup (scope cells lowered with --bounded-owners K). Each
+ * cell a cleanup point visits is one work unit: the drop decrements, frees an
+ * unshared leaf at once or queues a dead aggregate, and never services. The
+ * cleanup point then calls minyar_rc_scope_service_v1 with the number of
+ * cells it visited (at most K, checked by the compiler), which services the
+ * rest of that one K budget. Eager runtimes release and poll as before. */
+MINYAR_INLINE_ENTRY void minyar_rc_scope_drop_v1(void *value) {
+#ifdef MINYAR_BOUNDED_RC
+    if (!value) return;
+#ifndef MINYAR_CYCLE_RC
+    RcObject *object = (RcObject *)value - 1;
+    size_t ownership = object->ownership;
+    if (ownership >= 16) {
+        object->ownership = ownership - 8;
+        return;
+    }
+#endif
+    (void)rc_drop(value);
+#else
+    minyar_rc_scope_release_v1(value);
+#endif
+}
+
+MINYAR_INLINE_ENTRY void minyar_rc_scope_service_v1(long long units) {
+#ifdef MINYAR_BOUNDED_RC
+    size_t used = (size_t)units;
+    rc_service_pending(used < MINYAR_RC_POLL_BUDGET ? MINYAR_RC_POLL_BUDGET - used : 0);
+#ifdef MINYAR_RC_TESTING
+    if (used > MINYAR_RC_POLL_BUDGET || rc_bounded_last_work > MINYAR_RC_POLL_BUDGET - used)
+        minyar_stop("a scope cleanup point exceeded the cleanup budget.");
+    rc_bounded_last_work += used;
+#endif
+#else
+    (void)units;
+    minyar_rc_scope_poll_v1();
+#endif
 }
 
 static void rc_scope_unwind(MinyarRcScope *boundary) {

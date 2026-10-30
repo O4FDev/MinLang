@@ -23,8 +23,13 @@ For example:
 ```
 
 A single launcher setting controls both compiler ownership lowering and runtime
-configuration. Eligible leaf functions with at most `min(8, K−1)` owner slots
-use compiler-generated stack storage; K1 retains ordinary ownership frames.
+configuration. For K above 1 the launcher lowers owners to stack scope cells
+(`--scope-owners --bounded-owners K`, see
+[scope cells](#scope-cells-under-a-cleanup-budget)); a function with a cleanup
+point that would drop more than K cells keeps an ordinary heap frame. K1
+retains ordinary ownership frames. The direct compiler's `--bounded-owners K`
+alone keeps frames, with compiler-generated stack storage for eligible leaf
+functions with at most `min(8, K−1)` owner slots.
 The optional incremental module cache includes this effective policy in its
 identity. No ownership annotation is required in Minyar source.
 
@@ -131,6 +136,7 @@ The limits for individual runtime operations are:
 | Public release | K, including immediate leaf destruction |
 | Managed object/data allocation or data resize | K queued units |
 | Frame entry, frame exit, or statement cleanup | K each |
+| Scope-cell statement cleanup or return | K each, including one unit per cell |
 | Local assignment or indexed replacement in an ordinary reference List | K total immediate and queued units |
 | Reference List append | K after storing the value; growth can service another K beforehand |
 | Mixed-record field write | K after storing the value |
@@ -237,7 +243,24 @@ Batching reduces scheduler overhead under specific conditions:
   paths' complete transcripts at K 1, 2, 4, 7, 32 and 1,024, with no
   backlog and with a K/8 one.
 
-These paths require non-reentrant runtime and allocator hooks. Intermediate
+These paths require non-reentrant runtime and allocator hooks.
+
+### Scope cells under a cleanup budget
+
+With scope cells a function keeps its owners in initialized-null stack cells
+instead of a frame (the lowering is described in
+[runtime memory](runtime-memory.md#scope-ownership-lowering)). Entering a scope
+and storing a temporary are not service points. Each statement cleanup and
+return is one: it visits each of its n cells (at most K, checked by the
+compiler) for one unit, releasing the cell's value without servicing (an
+unshared leaf is freed in that unit; a dead aggregate joins the object queue),
+then services up to K − n queued units. Cells never enter a queue or cache, so
+a cleanup point never defers its own cells; it may finish them before older
+queued work that the frame scheduler would have interleaved with them. That
+order is not part of this contract; the K units per service point are.
+Replacing a local's value releases the old value with its own service, as
+`minyar_rc_local` does (K total). Diagnostic unwinding releases each live cell
+like an ordinary release. Intermediate
 pending ownership remains local to the poll; batching neither raises K nor
 delays a competing queue.
 

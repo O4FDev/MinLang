@@ -16,6 +16,21 @@ function ownershipLimitForBudget(text: Text): Integer {
     return budget - 1
 }
 
+// The cleanup budget K itself, saturated above the runtime's 1,024 limit.
+function cleanupBudgetValue(text: Text): Integer {
+    let budget = 0
+    let position = 0
+    let digits = "0123456789"
+    while position < text.length {
+        let digit = 0
+        while digit < 10 && text[position] != digits[digit] { digit = digit + 1 }
+        if digit == 10 { failCompiler("cleanup budget must be a positive decimal integer") }
+        if budget < 100000 { budget = budget * 10 + digit }
+        position = position + 1
+    }
+    return budget
+}
+
 function freestandingModule(llvm: Text): Text {
     let pieces: List<Text> = []
     let start = 0
@@ -52,6 +67,7 @@ function main() {
         let stackOwnerLimit = 0
         let scopeOwners = false
         let boundedOwners = false
+        let cleanupBudget = 32
         let library = ""
         let freestanding = false
         let callDepthCounter = false
@@ -113,6 +129,7 @@ function main() {
                     stackOwnerLimit = 8
                     if options + 1 < processInfo.argumentCount() && processInfo.argument(options + 1) != "--library" && processInfo.argument(options + 1) != "--bounded-owners" && processInfo.argument(options + 1) != "--scope-owners" && processInfo.argument(options + 1) != "--freestanding" && processInfo.argument(options + 1) != "--call-depth-counter" && processInfo.argument(options + 1) != "--kernel-target" && processInfo.argument(options + 1) != "--test-mode" && processInfo.argument(options + 1) != "--list-tests" && processInfo.argument(options + 1) != "--benchmark-mode" && processInfo.argument(options + 1) != "--list-benchmarks" && processInfo.argument(options + 1) != "--error-format" && processInfo.argument(options + 1) != "--doc-json" && processInfo.argument(options + 1) != "--release" && processInfo.argument(options + 1) != "--explain-ownership" && processInfo.argument(options + 1) != "--export-modules" {
                         stackOwnerLimit = ownershipLimitForBudget(processInfo.argument(options + 1))
+                        cleanupBudget = cleanupBudgetValue(processInfo.argument(options + 1))
                         options = options + 1
                     }
                 } else {
@@ -121,15 +138,21 @@ function main() {
                         library = library + processInfo.argument(options + 1)
                         options = options + 1
                     } else {
-                        failCompiler("usage: compiler SOURCE OUTPUT [--bounded-owners [BUDGET] | --scope-owners] [--library DIRECTORY] [--freestanding] [--call-depth-counter] [--kernel-target x86_64|arm64] [--error-format text|json] [--explain-ownership] [--export-modules]")
+                        failCompiler("usage: compiler SOURCE OUTPUT [--bounded-owners [BUDGET]] [--scope-owners] [--library DIRECTORY] [--freestanding] [--call-depth-counter] [--kernel-target x86_64|arm64] [--error-format text|json] [--explain-ownership] [--export-modules]")
                     }
                 }
             }
             options = options + 1
         }
-        if scopeOwners && boundedOwners { failCompiler("scope ownership cannot be combined with bounded ownership") }
         // Scope lowering derives its cells from the frame protocol's borrows.
-        if scopeOwners { stackOwnerLimit = -1 }
+        // Alone it targets the eager runtime. With --bounded-owners K it targets
+        // the incremental runtimes: the bounded frame lowering's borrows without
+        // stack frames, then cells whose every cleanup point fits K units.
+        let scopeBudget = 0
+        if scopeOwners && boundedOwners {
+            stackOwnerLimit = 0
+            scopeBudget = cleanupBudget
+        } else if scopeOwners { stackOwnerLimit = -1 }
         if explainOwnership && (moduleState || docJSON || listTests || listBenchmarks) { failCompiler("ownership explanations require a whole-source compilation") }
         let pieces: List<Text> = []
         // Piece ranges of the compiled functions, for the scope-ownership lowering.
@@ -160,7 +183,7 @@ function main() {
             pieces = compileEntryMode(processInfo.argument(0), stackOwnerLimit, library, 0, !exportModules, functionPieces)
         }
         if scopeOwners && !listTests && !listBenchmarks && !docJSON {
-            pieces = lowerScopeOwnershipParts(pieces, functionPieces)
+            pieces = lowerScopeOwnershipParts(pieces, functionPieces, scopeBudget)
         }
         if freestanding && !listTests && !listBenchmarks && !docJSON {
             let module: List<Text> = []

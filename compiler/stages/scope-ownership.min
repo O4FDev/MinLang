@@ -505,19 +505,39 @@ function scopeCell(slot: Integer): Text {
     return "%rc.scope.slot." + Text(slot)
 }
 
-function scopeDrop(output: List<Text>, line: Integer, slot: Integer) {
+// An eager drop releases at once. A bounded drop (budget > 0) is one work
+// unit; its cleanup point then services what remains of the budget.
+function scopeDrop(output: List<Text>, line: Integer, slot: Integer, budget: Integer) {
     let value = "%rc.scope.drop." + Text(line) + "." + Text(slot)
     let cell = scopeCell(slot)
     output.add("  " + value + " = load ptr, ptr " + cell + "\n")
     output.add("  store ptr null, ptr " + cell + "\n")
-    output.add("  call void @minyar_rc_scope_release_v1(ptr " + value + ")\n")
+    if budget > 0 { output.add("  call void @minyar_rc_scope_drop_v1(ptr " + value + ")\n") }
+    else { output.add("  call void @minyar_rc_scope_release_v1(ptr " + value + ")\n") }
+}
+
+// Whether every cleanup point drops at most budget cells, so it can charge
+// one unit per cell and service the rest within the same K. A function with a
+// larger cleanup point keeps its frame, whose exit and statement cleanup
+// queue owners beyond K.
+function scopeCleanupsFit(body: ScopeOwnershipBody, budget: Integer): Boolean {
+    if budget <= 0 { return true }
+    let line = 0
+    while line < body.lines.length {
+        let operation = body.operations[line]
+        let cells = body.cleanups[line].length
+        if operation == 2 || operation == 13 { cells = cells + body.owners }
+        if (operation == 2 || operation == 3 || operation == 13) && cells > budget { return false }
+        line = line + 1
+    }
+    return true
 }
 
 // Analysis reads neighbouring instructions, so LLVM comments such as debug
 // descriptions are set aside; they stay in place before the same instruction.
 // Each replaced line first emits the unchanged module text before it as one
 // view, so unchanged lines are never copied. Returns the new copied offset.
-function lowerScopeBody(module: Text, source: List<Text>, sourceStarts: List<Integer>, copied: Integer, output: List<Text>): Integer {
+function lowerScopeBody(module: Text, source: List<Text>, sourceStarts: List<Integer>, copied: Integer, output: List<Text>, budget: Integer): Integer {
     let lines: List<Text> = []
     let starts: List<Integer> = []
     let sourceIndex = 0
@@ -536,6 +556,7 @@ function lowerScopeBody(module: Text, source: List<Text>, sourceStarts: List<Int
         count = body.owners + body.producers.length
     }
     if body.entry < 0 || count > 256 || !scopeCleanupPaths(body) { return copied }
+    if !scopeCleanupsFit(body, budget) { return copied }
     count = body.owners + scopeReuseCells(body)
     let index = 0
     while index < lines.length {
@@ -560,17 +581,22 @@ function lowerScopeBody(module: Text, source: List<Text>, sourceStarts: List<Int
             }
         } else if operation == 2 || operation == 3 || operation == 13 {
             let temporary = body.cleanups[index].length
+            let units = temporary
             while temporary > 0 {
                 temporary = temporary - 1
-                scopeDrop(output, index, body.cleanups[index][temporary])
+                scopeDrop(output, index, body.cleanups[index][temporary], budget)
             }
             if operation != 3 {
                 let owner = 0
-                while owner < body.owners { scopeDrop(output, index, owner); owner = owner + 1 }
-                if operation == 13 { output.add("  call void @minyar_rc_scope_poll_v1()\n") }
+                while owner < body.owners { scopeDrop(output, index, owner, budget); owner = owner + 1 }
+                units = units + body.owners
+                // A bounded return is a service point like a frame exit.
+                if budget > 0 { output.add("  call void @minyar_rc_scope_service_v1(i64 " + Text(units) + ")\n") }
+                else if operation == 13 { output.add("  call void @minyar_rc_scope_poll_v1()\n") }
                 if count == 0 { output.add("  call void @minyar_rc_scope_leave_empty_v1()\n") }
                 else { output.add("  call void @minyar_rc_scope_leave_v1(ptr %rc.scope.header)\n") }
-            } else { output.add("  call void @minyar_rc_scope_poll_v1()\n") }
+            } else if budget > 0 { output.add("  call void @minyar_rc_scope_service_v1(i64 " + Text(units) + ")\n") }
+            else { output.add("  call void @minyar_rc_scope_poll_v1()\n") }
         } else if operation == 4 || operation == 5 || operation == 10 {
             if operation != 4 {
                 let suffix = ""
@@ -603,7 +629,7 @@ function lowerScopeBody(module: Text, source: List<Text>, sourceStarts: List<Int
 // of text: copying each line or body would keep several copies alive in an
 // arena that never frees. For the same reason every call reuses the caller's
 // empty body Lists.
-function lowerScopeText(module: Text, output: List<Text>, body: List<Text>, bodyStarts: List<Integer>) {
+function lowerScopeText(module: Text, output: List<Text>, body: List<Text>, bodyStarts: List<Integer>, budget: Integer) {
     let inFunction = false
     let scoped = false
     let lines = module.split("\n")
@@ -621,7 +647,7 @@ function lowerScopeText(module: Text, output: List<Text>, body: List<Text>, body
             if scopeStarts(line, "  call void @minyar_rc_enter(") { scoped = true }
             if line == "}" {
                 if scoped {
-                    copied = lowerScopeBody(module, body, bodyStarts, copied, output)
+                    copied = lowerScopeBody(module, body, bodyStarts, copied, output, budget)
                     // A lowered body always ends its closing line.
                     if index == lines.length - 1 {
                         output.add(module.slice(copied, module.length))
@@ -643,7 +669,7 @@ function lowerScopeText(module: Text, output: List<Text>, body: List<Text>, body
 }
 
 function scopeCheckDeclaration(line: Text) {
-    let names = ["enter", "leave", "leave_empty", "move", "poll", "release"]
+    let names = ["enter", "leave", "leave_empty", "move", "poll", "release", "drop", "service"]
     let name = 0
     while name < names.length {
         let symbol = "minyar_rc_scope_" + names[name] + "_v1"
@@ -675,7 +701,7 @@ function scopeCheckDeclarations(text: Text) {
 // constant initializers, closures, bridges and tables. It is cut where each
 // definition starts; only stretches that call minyar_rc_enter are split into
 // lines and lowered, the rest pass through as views.
-function lowerScopeGap(text: Text, output: List<Text>, body: List<Text>, bodyStarts: List<Integer>) {
+function lowerScopeGap(text: Text, output: List<Text>, body: List<Text>, bodyStarts: List<Integer>, budget: Integer) {
     scopeCheckDeclarations(text)
     let enter = "\n  call void @minyar_rc_enter("
     if text.find(enter) < 0 {
@@ -689,7 +715,7 @@ function lowerScopeGap(text: Text, output: List<Text>, body: List<Text>, bodySta
         let end = text.length
         if found >= 0 { end = start + found + 1 }
         let stretch = text.slice(start, end)
-        if stretch.find(enter) >= 0 { lowerScopeText(stretch, output, body, bodyStarts) } else { output.add(stretch) }
+        if stretch.find(enter) >= 0 { lowerScopeText(stretch, output, body, bodyStarts, budget) } else { output.add(stretch) }
         start = end
         if found >= 0 {
             rest = text.slice(start, text.length)
@@ -713,7 +739,8 @@ function joinScopePieces(pieces: List<Text>, start: Integer, end: Integer, part:
 // bodies are split into lines; other functions keep their pieces, and the code
 // between functions goes through lowerScopeGap. Without a table (a module
 // build), the whole module is one such stretch.
-function lowerScopeOwnershipParts(pieces: List<Text>, functionPieces: List<Integer>): List<Text> {
+// budget is 0 for the eager runtime, or the incremental runtime's K.
+function lowerScopeOwnershipParts(pieces: List<Text>, functionPieces: List<Integer>, budget: Integer): List<Text> {
     let output: List<Text> = []
     let part: List<Text> = []
     let body: List<Text> = []
@@ -733,11 +760,11 @@ function lowerScopeOwnershipParts(pieces: List<Text>, functionPieces: List<Integ
     while piece < pieces.length {
         let next = pieces.length
         if entry < ranges.length { next = ranges[entry] }
-        if next > piece { lowerScopeGap(joinScopePieces(pieces, piece, next, part), output, body, bodyStarts) }
+        if next > piece { lowerScopeGap(joinScopePieces(pieces, piece, next, part), output, body, bodyStarts, budget) }
         piece = next
         if entry < ranges.length {
             let end = ranges[entry + 1]
-            if ranges[entry + 2] != 0 { lowerScopeText(joinScopePieces(pieces, next, end, part), output, body, bodyStarts) } else {
+            if ranges[entry + 2] != 0 { lowerScopeText(joinScopePieces(pieces, next, end, part), output, body, bodyStarts, budget) } else {
                 while piece < end { output.add(pieces[piece]); piece = piece + 1 }
             }
             piece = end
@@ -750,11 +777,15 @@ function lowerScopeOwnershipParts(pieces: List<Text>, functionPieces: List<Integ
     output.add("declare void @minyar_rc_scope_move_v1(ptr, ptr)\n")
     output.add("declare void @minyar_rc_scope_poll_v1()\n")
     output.add("declare void @minyar_rc_scope_release_v1(ptr)\n")
+    if budget > 0 {
+        output.add("declare void @minyar_rc_scope_drop_v1(ptr)\n")
+        output.add("declare void @minyar_rc_scope_service_v1(i64)\n")
+    }
     return output
 }
 
 function lowerScopeOwnership(llvm: Text): Text {
     let pieces: List<Text> = [llvm]
     let noFunctions: List<Integer> = []
-    return joinText(lowerScopeOwnershipParts(pieces, noFunctions))
+    return joinText(lowerScopeOwnershipParts(pieces, noFunctions, 0))
 }

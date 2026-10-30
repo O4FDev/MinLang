@@ -499,6 +499,17 @@ static int owner_limit_for_budget(const char *text, unsigned *limit) {
     *limit = value - 1;
     return 1;
 }
+
+/* The cleanup budget K itself, saturated as the compiler does. Scope cells
+ * lowered for the incremental runtimes depend on K, not only on the stack
+ * owner limit, because a function falls back to a frame above K cells. */
+static unsigned long cleanup_budget_value(const char *text) {
+    unsigned long value = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++)
+        if (value < 100000)
+            value = value * 10 + (*p - '0');
+    return value;
+}
 int main(int argc, char **argv) {
     checksum_self_test();
     if (argc == 2 && !strcmp(argv[1], "--checksum-self-test"))
@@ -550,15 +561,12 @@ int main(int argc, char **argv) {
     }
     if (argc < 5 || next != argc) {
         fputs("usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS] [--bounded-owners "
-              "BUDGET | --scope-owners] [--library DIRECTORY]... [--error-format text|json] [--release] "
+              "BUDGET] [--scope-owners] [--library DIRECTORY]... [--error-format text|json] [--release] "
               "[--export-modules]\n",
               stderr);
         return 2;
     }
-    if (scope_owners && budget) {
-        fputs("module build: --scope-owners and --bounded-owners cannot be combined\n", stderr);
-        return 2;
-    }
+    unsigned long scope_budget = scope_owners && budget ? cleanup_budget_value(budget) : 0;
     char *libraries[MAX_LIBRARIES];
     for (size_t i = 0; i < library_count; i++)
         libraries[i] = absolute_source(library_options[i]);
@@ -570,7 +578,13 @@ int main(int argc, char **argv) {
     if (!compiler_bytes.data)
         stop("compiler identity");
     char *compiler_hex = hexadecimal(compiler_bytes);
-    if (owner_limit) {
+    if (scope_budget) {
+        size_t length = strlen(compiler_hex);
+        char *identity = allocate(length + 48);
+        snprintf(identity, length + 48, "%s:scope-bounded-owners-v1:%lu", compiler_hex, scope_budget);
+        free(compiler_hex);
+        compiler_hex = identity;
+    } else if (owner_limit) {
         size_t length = strlen(compiler_hex);
         char *identity = allocate(length + 40);
         snprintf(identity, length + 40, "%s:stack-owners-v1:%u", compiler_hex, owner_limit);
@@ -611,7 +625,10 @@ int main(int argc, char **argv) {
     ensure_directory(argv[4]);
     char key[96];
     uint64_t entry_hash = artifact_hash((const unsigned char *)entry, strlen(entry));
-    if (owner_limit)
+    if (scope_budget)
+        snprintf(key, sizeof key, "%016" PRIx64 "-scope-bounded-owners-v1-%lu%s%s.cache", entry_hash,
+                 scope_budget, release ? "-release-v1" : "", export_modules ? "-export-modules-v1" : "");
+    else if (owner_limit)
         snprintf(key, sizeof key, "%016" PRIx64 "-stack-owners-v1-%u%s%s.cache", entry_hash,
                  owner_limit, release ? "-release-v1" : "", export_modules ? "-export-modules-v1" : "");
     else if (scope_owners)

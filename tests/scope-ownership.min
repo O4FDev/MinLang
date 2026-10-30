@@ -228,10 +228,20 @@ function executesLLVM(compiler: test.Compiler, path: Text, expected: Text, envir
 }
 
 function executes(compiler: test.Compiler, source: Text, expected: Text, environment: List<Text>, ordinary: Text, cycle: Text): Text {
+    return executesWith(compiler, source, expected, environment, ordinary, cycle, 0)
+}
+
+// budget 0 lowers for the eager runtime, otherwise for an incremental K.
+function executesWith(compiler: test.Compiler, source: Text, expected: Text, environment: List<Text>, ordinary: Text, cycle: Text, budget: Integer): Text {
     compiler.serial += 1
     let path = compiler.directory + "/case" + Text(compiler.serial)
     io.writeTextFile(path + ".min", test.sourceModules(source))
-    let compiled = test.run([compiler.executable, path + ".min", path + ".ll", "--scope-owners", "--library", "library"], environment, "", path + ".compile", compiler.compileTimeout)
+    let command = [compiler.executable, path + ".min", path + ".ll", "--scope-owners", "--library", "library"]
+    if budget > 0 {
+        command.add("--bounded-owners")
+        command.add(Text(budget))
+    }
+    let compiled = test.run(command, environment, "", path + ".compile", compiler.compileTimeout)
     test.require(compiled, "compile scope ownership fixture")
     test.check(compiled.output == "" && compiled.errorOutput == "", "unexpected scope compiler output\n" + compiled.output + compiled.errorOutput)
     return executesLLVM(compiler, path, expected, environment, ordinary, cycle)
@@ -250,6 +260,7 @@ names.add("test_temporary_cells_reuse_only_disjoint_cfg_ranges")
 names.add("test_projected_borrows_publish_one_lasting_owner")
 names.add("test_empty_scopes_finish_recovery_without_losing_roots")
 names.add("test_stable_field_paths_borrow_without_cells")
+names.add("test_bounded_scope_cleanup_points_fit_the_budget")
 fixtures.validate("ScopeOwnership", names)
 let compiler = test.compiler()
 compiler.compileTimeout = 30
@@ -489,19 +500,47 @@ if fixtures.selected("ScopeOwnership", "test_large_function_keeps_legacy_fallbac
 
 if fixtures.selected("ScopeOwnership", "test_scope_modes_and_private_symbols") {
     let path = compiler.directory + "/modes"
-    io.writeTextFile(path + ".min", "print(42)\n")
-    for budget in ["1", "32"] {
+    // Combined, the two options select bounded scope cells in either order:
+    // the same LLVM, with cleanup drops and budgeted service points.
+    io.writeTextFile(path + ".min", program([
+        "function joined(left: Text, right: Text): Text {",
+        "    let first = left + \"-\"",
+        "    let second = first + right",
+        "    let third = second + left",
+        "    return third + \"!\"",
+        "}",
+        "print(joined(\"a\" + \"b\", \"c\"))"
+    ]))
+    // joined returns through three owner cells: K2 keeps its frame.
+    for budget in ["2", "32"] {
+        let emitted: List<Text> = []
         for reverse in [false, true] {
             let command = [compiler.executable, path + ".min", path + ".ll"]
             if reverse { command.add("--scope-owners") }
             command.add("--bounded-owners")
             command.add(budget)
             if !reverse { command.add("--scope-owners") }
-            let observed = test.run(command, environment, "", path + ".reject", compiler.compileTimeout)
-            test.check(observed.status == 1 && observed.output == "" && test.contains(observed.errorOutput, "scope ownership cannot be combined with bounded ownership"), "scope/bounded modes must reject every budget and flag order")
+            let observed = test.run(command, environment, "", path + ".combined", compiler.compileTimeout)
+            test.check(observed.status == 0 && observed.output == "" && observed.errorOutput == "", "scope/bounded modes must combine in every flag order\n" + observed.errorOutput)
+            emitted.add(io.readTextFile(path + ".ll"))
+        }
+        test.check(emitted[0] == emitted[1], "bounded scope LLVM must not depend on the flag order")
+        let llvm = emitted[0]
+        test.check(test.contains(llvm, "declare void @minyar_rc_scope_drop_v1(ptr)") && test.contains(llvm, "declare void @minyar_rc_scope_service_v1(i64)"), "bounded scope must declare its cleanup entries")
+        let joined = body(llvm, "joined")
+        if budget == "32" {
+            checkLowered(llvm, "joined")
+            test.check(test.contains(joined, "call void @minyar_rc_scope_drop_v1(") && test.contains(joined, "call void @minyar_rc_scope_service_v1(i64 "), "bounded scope cleanup must drop cells and service the rest of K")
+            test.check(!test.contains(joined, "call void @minyar_rc_scope_poll_v1()"), "bounded scope cleanup must not poll a second full budget")
+        } else {
+            test.check(test.contains(joined, "call void @minyar_rc_enter(") && !test.contains(joined, "@minyar_rc_scope_"), "a cleanup point above K cells must keep the frame")
         }
     }
-    for name in ["enter", "leave", "leave_empty", "move", "poll", "release"] {
+    let eager = test.run([compiler.executable, path + ".min", path + ".eager.ll", "--scope-owners"], environment, "", path + ".eager", compiler.compileTimeout)
+    test.require(eager, "compile eager scope mode")
+    let eagerLLVM = io.readTextFile(path + ".eager.ll")
+    test.check(!test.contains(eagerLLVM, "@minyar_rc_scope_drop_v1") && !test.contains(eagerLLVM, "@minyar_rc_scope_service_v1"), "eager scope mode must keep its release and poll entries")
+    for name in ["enter", "leave", "leave_empty", "move", "poll", "release", "drop", "service"] {
         let symbol = name + "_v1"
         io.writeTextFile(path + ".min", "function " + symbol + "() { native \"rc_scope\" }\n")
         let observed = test.run([compiler.executable, path + ".min", path + ".ll", "--scope-owners"], environment, "", path + ".native", compiler.compileTimeout)
@@ -701,11 +740,13 @@ if fixtures.selected("ScopeOwnership", "test_eager_launcher_selects_scope_owners
                 test.check(observed.output == "root.!/root.!?\nroot.\n" && observed.errorOutput == "", "public scope launcher changed alias output " + label + "\n" + observed.output + observed.errorOutput)
                 let llvm = io.readTextFile(path + ".ll")
                 test.check(test.contains(llvm, "; Generated by the compiler written in Minyar.\n"), "public launcher did not pass generated program LLVM to the capture shim " + label)
-                if profile == "eager" { checkLowered(llvm, "owned") }
-                else {
-                    let emitted = body(llvm, "owned")
-                    test.check(!test.contains(emitted, "@minyar_rc_scope_"), "system launcher must retain bounded ownership lowering " + label)
-                    test.check(test.contains(emitted, "call void @minyar_rc_enter(") || test.contains(emitted, "call void @minyar_rc_enter_stack_v1("), "system launcher must retain an ownership frame " + label)
+                checkLowered(llvm, "owned")
+                let emitted = body(llvm, "owned")
+                if profile == "eager" {
+                    test.check(!test.contains(emitted, "@minyar_rc_scope_drop_v1(") && !test.contains(emitted, "@minyar_rc_scope_service_v1("), "eager launcher must keep eager scope cleanup " + label)
+                } else {
+                    test.check(test.contains(emitted, "call void @minyar_rc_scope_drop_v1(") && test.contains(emitted, "call void @minyar_rc_scope_service_v1(i64 "), "system launcher must lower bounded scope cells " + label)
+                    test.check(!test.contains(emitted, "call void @minyar_rc_scope_poll_v1()"), "system launcher cleanup must service within one budget " + label)
                 }
             }
         }
@@ -1844,6 +1885,77 @@ if fixtures.selected("ScopeOwnership", "test_stable_field_paths_borrow_without_c
         test.check(!test.contains(emitted, "%rc.scope.cells") && !test.contains(emitted, "@minyar_rc_scope_enter_v1("), name + ": stable field paths need no scope cells")
     }
     test.check(test.contains(body(llvm, "unstable"), "@minyar_rc_scope_enter_v1("), "unstable: an assigned field keeps its scope owner")
+}
+
+// Scope cells lowered for an incremental runtime: every cleanup point charges
+// one unit per cell it drops and services only the rest of K (the runtime's
+// testing build stops when a cleanup point exceeds K). A function with a
+// cleanup point above K cells keeps its frame. The runtime drains and checks
+// that every object, byte and queue is gone at exit, at O0 and O2.
+if fixtures.selected("ScopeOwnership", "test_bounded_scope_cleanup_points_fit_the_budget") {
+    let lines = [
+        "record Node { name: Text; children: List<Node> }",
+        "function build(depth: Integer, label: Text): Node {",
+        "    let node = Node { name: label + \"/\" + Text(depth); children: [] }",
+        "    if depth > 0 {",
+        "        for i in 0..3 { node.children.add(build(depth - 1, label + Text(i))) }",
+        "    }",
+        "    return node",
+        "}",
+        "function count(node: Node): Integer {",
+        "    let total = node.name.length",
+        "    for child in node.children { total += count(child) }",
+        "    return total",
+        "}",
+        "function wide(a: Text, b: Text): Text {",
+        "    let one = a + \"1\"",
+        "    let two = one + b",
+        "    let three = two + a",
+        "    let four = three + b",
+        "    let five = four + a",
+        "    return five + \"!\"",
+        "}",
+        "function early(flag: Boolean, base: Text): Text {",
+        "    let kept = base + \"?\"",
+        "    if flag { return kept + \"yes\" }",
+        "    let other = kept + \"no\"",
+        "    return other",
+        "}",
+        "let total = 0",
+        "for round in 0..20 {",
+        "    let tree = build(4, \"r\" + Text(round))",
+        "    total += count(tree)",
+        "    total += wide(\"x\" + Text(round), \"y\").length",
+        "    total += early(round % 2 == 0, \"b\" + Text(round)).length",
+        "}",
+        "print(total)"
+    ]
+    for budget in [1, 4, 32] {
+        let boundedOrdinary = buildRuntimeWithBudget(compiler, false, environment, budget)
+        let boundedCycle = buildRuntimeWithBudget(compiler, true, environment, budget)
+        let llvm = executesWith(compiler, program(lines), "19760\n", environment, boundedOrdinary, boundedCycle, budget)
+        let wide = body(llvm, "wide")
+        if budget < 5 {
+            test.check(test.contains(wide, "call void @minyar_rc_enter(") && !test.contains(wide, "@minyar_rc_scope_"), "five owner cells above K must keep the frame at K" + Text(budget))
+        } else {
+            checkLowered(llvm, "wide")
+            test.check(test.contains(wide, "call void @minyar_rc_scope_service_v1(i64 5)"), "the return of five owners must charge five units")
+            checkLowered(llvm, "build")
+            checkLowered(llvm, "early")
+        }
+        test.check(!test.contains(llvm, "call void @minyar_rc_scope_poll_v1()"), "bounded scope cleanup must not poll a second budget at K" + Text(budget))
+        // A traced graph selects the cycle runtime with the same lowering.
+        let cyclic: List<Text> = ["record Graph { name: Text; edges: List<Graph> }"]
+        for line in lines { cyclic.add(line) }
+        cyclic.add("for round in 0..10 {")
+        cyclic.add("    let graph = Graph { name: \"g\" + Text(round); edges: [] }")
+        cyclic.add("    graph.edges.add(graph)")
+        cyclic.add("    total += graph.edges[0].name.length")
+        cyclic.add("}")
+        cyclic.add("print(total)")
+        let traced = executesWith(compiler, program(cyclic), "19760\n19780\n", environment, boundedOrdinary, boundedCycle, budget)
+        test.check(test.contains(traced, "; minyar-cycle-runtime: 1"), "the cyclic fixture must select the cycle runtime")
+    }
 }
 
 test.removeTree(compiler.directory)

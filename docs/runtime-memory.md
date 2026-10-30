@@ -305,9 +305,17 @@ both endpoints of traced ownership operations use the physical payload type.
 
 ## Scope ownership lowering
 
-The launcher selects scope ownership for `--memory-profile eager`, including
-incremental module builds and release builds. The direct compiler exposes the
-same lowering as `--scope-owners`. It replaces local-frame lookups with explicit
+The launcher selects scope ownership for every memory profile except a
+cleanup budget of 1, including incremental module builds and release builds.
+The direct compiler exposes the eager lowering as `--scope-owners` and the
+incremental one as `--scope-owners --bounded-owners K` (either order). The
+incremental form first compiles with every borrow of the bounded frame
+lowering (stable roots, provisional choice payload borrows, frameless
+temporaries) but without stack frames, then lowers the remaining frames to
+cells; a function with a cleanup point of more than K cells keeps its heap
+frame. Its cleanup points drop their cells with `minyar_rc_scope_drop_v1` and
+service the rest of K with `minyar_rc_scope_service_v1(n)` (see
+[the bounded contract](bounded-runtime-contract.md#scope-cells-under-a-cleanup-budget)). It replaces local-frame lookups with explicit
 retain, store and release operations. Each remaining expression producer uses an initialized-null stack
 cell. A control-flow walk places its release at the first statement cleanup or
 return on every reachable path, including both sides of a conditional and loop
@@ -383,12 +391,11 @@ Public NULL requests, last owners, pending destruction and traced cycle values
 retain that general path, including its service and barrier behavior. The
 external release ABI and bounded release budgets are unchanged.
 
-The direct compiler rejects combining this mode with `--bounded-owners`. The
-system, fixed and lazy launcher profiles retain ordinary bounded lowering.
-Linking scope output against an incremental runtime preserves ownership but performs a separately budgeted
-release for each live cell, followed by a service batch. The ordinary frame's
-single K-total limit for statement cleanup or frame exit therefore does not apply
-to this experimental sequence. It is not a replacement for that bounded contract.
+Linking eager scope output (`--scope-owners` alone) against an incremental
+runtime preserves ownership but performs a separately budgeted release for
+each live cell, followed by a service batch, so the K-total limit per cleanup
+point does not apply to it; the incremental profiles use the budgeted form
+above instead.
 
 ## Scalar record replacement
 

@@ -468,10 +468,11 @@ reduced decode time by 22–35%:
 The left column is the direct compiler's default ownership lowering, which
 those products used; the right is `--scope-owners` with the eager runtime.
 Libraries and embedders that call `build/minyarc` directly get that legacy
-heap-frame lowering unless they pass the launcher's choice: `--bounded-owners
-32` with a runtime that includes `minyar_stack_frames.h` (as
-`runtime/minyar_default_runtime.c` does), or `--scope-owners` with the eager
-runtime.
+heap-frame lowering unless they pass the launcher's choice: `--scope-owners
+--bounded-owners 32` with the default incremental runtime
+(`runtime/minyar_default_runtime.c`), or `--scope-owners` with the eager
+runtime. (`--bounded-owners 32` alone keeps frames, with stack frames for small
+leaves, which needs a runtime that includes `minyar_stack_frames.h`.)
 Both remain 18–37 times slower than the system zlib, libpng and libjpeg-turbo.
 
 `experiments/codegen/byte-access-study.py` compares two frozen compilers with
