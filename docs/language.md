@@ -1631,12 +1631,20 @@ paths. Importing these generic module declarations currently selects the
 whole-graph compilation fallback described above, including for compatibility
 calls; caching individual generic module bodies remains future work.
 
-`files` also exposes `startSyncer`, `syncerSocket`, `requestSync`, `syncedOffset`,
-`drainSyncer`, `waitForSync`, `switchSyncer`, `stopSyncer` and the corresponding
+`files` also exposes `startSyncer`, `startFullSyncer`, `syncerSocket`, `requestSync`,
+`syncNow`, `syncedOffset`, `drainSyncer`, `waitForSync`, `switchSyncer`, `stopSyncer` and the corresponding
 `startPreparation`, `preparationSocket`, `preparationDone`, `drainPreparation`,
 `waitForPreparation`, `stopPreparation` operations as Results. Their native
 handle lifetime, completion-socket borrowing and durability contracts stay
-the same. A preparation still in progress is `Ok(false)`.
+the same. A preparation still in progress is `Ok(false)`. `syncNow(handle, upTo)`
+syncs on the calling thread when the syncer thread is idle (no thread handoff,
+no notification byte) and otherwise queues the request and returns the current
+synced offset. `startFullSyncer` runs fsync instead of fdatasync; on a directory
+descriptor it makes renames and creations durable off the loop thread.
+`files.open` also takes `DIRECT` (O_DIRECT on Linux, F_NOCACHE on macOS) and
+`DATA_SYNC` (O_DSYNC). On Linux direct reads and writes need positions and
+lengths that are multiples of `directAlignment(file)`; the package aligns the
+memory side itself, copying a misaligned Bytes range through an aligned buffer.
 
 `eventloop` is a single-owner readiness loop (epoll, kqueue, WSAPoll) whose
 `wait` returns a `Batch` of `Event` records. Hot loops use the allocation-free

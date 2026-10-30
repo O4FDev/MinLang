@@ -102,8 +102,29 @@ MinyarText *minyar_files_errorText(long long code) {
 
 /* ---------------------------------------------------------------- files */
 
-enum { FILES_WRITE = 2, FILES_CREATE = 4, FILES_APPEND = 8, FILES_TRUNCATE = 16, FILES_EXCLUSIVE = 32 };
+enum {
+    FILES_WRITE = 2, FILES_CREATE = 4, FILES_APPEND = 8, FILES_TRUNCATE = 16, FILES_EXCLUSIVE = 32,
+    FILES_DIRECT = 64, FILES_DATA_SYNC = 128
+};
 
+/* What files.open knows about the descriptors it returned, so writeAt can skip its per-call F_GETFL check.
+ * files.open records the descriptor it returns and files.close clears it before closing; every other
+ * descriptor is unknown and checked with fcntl as before. A descriptor number reused by another API was first
+ * closed by files.close (which cleared it), or it was never recorded. */
+enum { FILES_KNOWN_DESCRIPTORS = 4096, FILES_KNOWN = 1, FILES_KNOWN_APPEND = 2, FILES_KNOWN_DIRECT = 4 };
+static _Atomic unsigned char files_descriptors[FILES_KNOWN_DESCRIPTORS];
+static void files_remember(int fd, unsigned char known) {
+    if (fd >= 0 && fd < FILES_KNOWN_DESCRIPTORS)
+        atomic_store_explicit(&files_descriptors[fd], known, memory_order_relaxed);
+}
+static unsigned char files_known(long long fd) {
+    return fd >= 0 && fd < FILES_KNOWN_DESCRIPTORS ? atomic_load_explicit(&files_descriptors[fd], memory_order_relaxed)
+                                                   : 0;
+}
+
+/* Direct I/O transfers need memory aligned to the device; Bytes storage is not. Positions and lengths stay the
+ * caller's responsibility (files.directAlignment), memory alignment is handled here with an aligned copy. */
+enum { FILES_DIRECT_MEMORY = 4096, FILES_DIRECT_CHUNK = 1 << 20 };
 long long minyar_files_open(const MinyarText *path, long long flags) {
     char p[PATH_MAX];
     int rc = files_path(path, p);
@@ -113,40 +134,83 @@ long long minyar_files_open(const MinyarText *path, long long flags) {
     if (flags & FILES_APPEND) f |= O_APPEND;
     if (flags & FILES_TRUNCATE) f |= O_TRUNC;
     if (flags & FILES_EXCLUSIVE) f |= O_EXCL;
+    if (flags & FILES_DATA_SYNC) f |= O_DSYNC;
+#if defined(O_DIRECT)
+    if (flags & FILES_DIRECT) f |= O_DIRECT;
+#elif !defined(F_NOCACHE)
+    if (flags & FILES_DIRECT) return -EINVAL;
+#endif
     int fd;
     do { fd = open(p, f, 0644); } while (fd < 0 && errno == EINTR);
-    return fd < 0 ? -errno : fd;
+    if (fd < 0) return -errno;
+#if !defined(O_DIRECT) && defined(F_NOCACHE)
+    /* Darwin has no O_DIRECT; F_NOCACHE keeps this descriptor's data out of the unified buffer cache. */
+    if ((flags & FILES_DIRECT) && fcntl(fd, F_NOCACHE, 1) != 0) {
+        int error = errno;
+        close(fd);
+        return -error;
+    }
+#endif
+    unsigned char known = FILES_KNOWN | ((f & O_APPEND) ? FILES_KNOWN_APPEND : 0);
+#ifdef O_DIRECT
+    if (f & O_DIRECT) known |= FILES_KNOWN_DIRECT;
+#endif
+    files_remember(fd, known);
+    return fd;
 }
 
 long long minyar_files_close(long long fd) {
     if (!files_valid_fd(fd)) return -EBADF;
+    files_remember((int)fd, 0);
     return close((int)fd) == 0 ? 0 : -errno;
 }
 
-/* Write all of data[offset, offset+length); position < 0 means write() at the current file position. */
+/* Write all of data[offset, offset+length); position < 0 means write() at the current file position. A direct
+ * descriptor's misaligned source is copied through an aligned buffer, at most FILES_DIRECT_CHUNK at a time. */
 static long long files_write_all(long long fd, const MinyarBytes *data, long long offset, long long length,
-                                 long long position) {
+                                 long long position, bool direct) {
     if (!files_valid_fd(fd)) return -EBADF;
     if (!files_valid_range(data, offset, length)) return -EINVAL;
     const unsigned char *p = data->bytes + offset;
+    unsigned char *aligned = NULL;
+    size_t aligned_size = 0;
+    if (direct && length > 0 && ((uintptr_t)p % FILES_DIRECT_MEMORY) != 0) {
+        aligned_size = length < FILES_DIRECT_CHUNK ? (size_t)length : FILES_DIRECT_CHUNK;
+        aligned_size = (aligned_size + FILES_DIRECT_MEMORY - 1) / FILES_DIRECT_MEMORY * FILES_DIRECT_MEMORY;
+        void *buffer = NULL;
+        if (posix_memalign(&buffer, FILES_DIRECT_MEMORY, aligned_size) != 0) return -ENOMEM;
+        aligned = buffer;
+    }
     long long done = 0;
     while (done < length) {
         size_t chunk = (size_t)(length - done);
         if (chunk > (1u << 30)) chunk = 1u << 30;
-        ssize_t n = position < 0 ? write((int)fd, p + done, chunk)
-                                 : pwrite((int)fd, p + done, chunk, (off_t)(position + done));
+        const unsigned char *source = p + done;
+        if (aligned) {
+            if (chunk > aligned_size) chunk = aligned_size;
+            memcpy(aligned, source, chunk);
+            source = aligned;
+        }
+        ssize_t n = position < 0 ? write((int)fd, source, chunk)
+                                 : pwrite((int)fd, source, chunk, (off_t)(position + done));
         if (n < 0) {
             if (errno == EINTR) continue;
-            return -errno;
+            int error = errno;
+            free(aligned);
+            return -error;
         }
-        if (n == 0) return -EIO;
+        if (n == 0) {
+            free(aligned);
+            return -EIO;
+        }
         done += n;
     }
+    free(aligned);
     return length;
 }
 
 long long minyar_files_write(long long fd, const MinyarBytes *data, long long offset, long long length) {
-    return files_write_all(fd, data, offset, length, -1);
+    return files_write_all(fd, data, offset, length, -1, (files_known(fd) & FILES_KNOWN_DIRECT) != 0);
 }
 
 long long minyar_files_writeAt(long long fd, const MinyarBytes *data, long long offset, long long length,
@@ -156,15 +220,22 @@ long long minyar_files_writeAt(long long fd, const MinyarBytes *data, long long 
     if (!files_valid_range(data, offset, length)) return -EINVAL;
     if (position > LLONG_MAX - length || (long long)(off_t)(position + length) != position + length)
         return -EOVERFLOW;
-    int flags = fcntl((int)fd, F_GETFL);
-    if (flags < 0) return -errno;
-    if (flags & O_APPEND) return -EINVAL;
-    return files_write_all(fd, data, offset, length, position);
+    unsigned char known = files_known(fd);
+    if (!known) {
+        int flags = fcntl((int)fd, F_GETFL);
+        if (flags < 0) return -errno;
+        known = FILES_KNOWN | ((flags & O_APPEND) ? FILES_KNOWN_APPEND : 0);
+#ifdef O_DIRECT
+        if (flags & O_DIRECT) known |= FILES_KNOWN_DIRECT;
+#endif
+    }
+    if (known & FILES_KNOWN_APPEND) return -EINVAL;
+    return files_write_all(fd, data, offset, length, position, (known & FILES_KNOWN_DIRECT) != 0);
 }
 
 long long minyar_files_writeStandardOutput(const MinyarText *text) {
     if (!text) return -EINVAL;
-    return files_write_all(1, text, 0, text->byte_length, -1);
+    return files_write_all(1, text, 0, text->byte_length, -1, false);
 }
 
 /* Read up to length bytes into an existing buffer (shorter at end of file). */
@@ -178,7 +249,8 @@ long long minyar_files_readAppend(long long fd, long long position, MinyarBytes 
         return -EOVERFLOW;
     }
     long long before = buffer->byte_length;
-    unsigned char chunk_buffer[65536];
+    /* Aligned so direct descriptors can read into it (positions and lengths stay the caller's to align). */
+    _Alignas(FILES_DIRECT_MEMORY) unsigned char chunk_buffer[65536];
     long long done = 0;
     while (done < length) {
         size_t chunk = (size_t)(length - done);
@@ -209,7 +281,7 @@ MinyarBytes *minyar_files_readAt(long long fd, long long position, long long len
     struct stat st;
     if (fstat((int)fd, &st) != 0) return files_empty(-errno);
     MinyarBytes *b = minyar_bytes_new(0);
-    unsigned char buffer[65536];
+    _Alignas(FILES_DIRECT_MEMORY) unsigned char buffer[65536];
     long long done = 0;
     while (done < length) {
         size_t chunk = (size_t)(length - done);
@@ -373,6 +445,24 @@ long long minyar_files_preallocate(long long fd, long long length) {
 #endif
 }
 
+/* The position and length alignment direct I/O needs on this file: Linux reports it through statx
+ * (STATX_DIOALIGN, 0 when the file system has no direct I/O); Darwin's F_NOCACHE has no requirement. */
+long long minyar_files_directAlignment(long long fd) {
+    if (!files_valid_fd(fd)) return -EBADF;
+#if defined(__linux__) && defined(STATX_DIOALIGN)
+    struct statx st;
+    if (statx((int)fd, "", AT_EMPTY_PATH, STATX_DIOALIGN, &st) != 0) return -errno;
+    if (!(st.stx_mask & STATX_DIOALIGN)) return 4096;
+    return st.stx_dio_offset_align;
+#elif defined(F_NOCACHE)
+    struct stat st;
+    return fstat((int)fd, &st) == 0 ? 1 : -errno;
+#else
+    struct stat st;
+    return fstat((int)fd, &st) == 0 ? 4096 : -errno;
+#endif
+}
+
 long long minyar_files_rename(const MinyarText *from, const MinyarText *to) {
     char a[PATH_MAX], b[PATH_MAX];
     int rc = files_path(from, a);
@@ -506,6 +596,8 @@ typedef struct {
     _Atomic long long synced;
     _Atomic int error;
     bool stop;
+    bool busy; /* protected by mu: the thread is syncing outside the lock */
+    bool full; /* fsync (data and metadata, directory entries) instead of fdatasync */
     int notify_read, notify_write;
 } FilesSyncer;
 
@@ -550,12 +642,14 @@ static void *files_syncer_main(void *arg) {
         } else {
             target = s->requested;
         }
+        s->busy = true;
         pthread_mutex_unlock(&s->mu);
         int rc;
-        do { rc = files_datasync(fd); } while (rc != 0 && errno == EINTR);
+        do { rc = s->full ? files_fullsync(fd) : files_datasync(fd); } while (rc != 0 && errno == EINTR);
         int err = rc == 0 ? 0 : -errno;
         if (switching) close(fd);
         pthread_mutex_lock(&s->mu);
+        s->busy = false;
         if (switching) s->fd = next.fd;
         if (err) {
             atomic_store(&s->error, err);
@@ -569,7 +663,7 @@ static void *files_syncer_main(void *arg) {
     return NULL;
 }
 
-long long minyar_files_syncerStart(long long fd) {
+static long long files_syncer_start(long long fd, bool full) {
     if (!files_valid_fd(fd)) return -EBADF;
     int slot = -1;
     for (int i = 0; i < FILES_MAX_SYNCERS; i++)
@@ -596,6 +690,7 @@ long long minyar_files_syncerStart(long long fd) {
     s->notify_read = sv[0];
     s->notify_write = sv[1];
     s->fd = dupfd;
+    s->full = full;
     atomic_store(&s->synced, 0);
     atomic_store(&s->error, 0);
     error = -pthread_mutex_init(&s->mu, NULL);
@@ -629,6 +724,9 @@ fail_descriptors:
     free(s);
     return error;
 }
+
+long long minyar_files_syncerStart(long long fd) { return files_syncer_start(fd, false); }
+long long minyar_files_syncerStartFull(long long fd) { return files_syncer_start(fd, true); }
 
 long long minyar_files_syncerNotifySocket(long long handle) {
     FilesSyncer *s = files_syncer(handle);
@@ -669,12 +767,55 @@ long long minyar_files_syncerDrain(long long handle) {
         ssize_t n = read(s->notify_read, buf, sizeof(buf));
         if (n > 0) {
             total += n;
+            /* A short read emptied the stream socket; another read would only report EAGAIN. */
+            if ((size_t)n < sizeof(buf)) break;
             continue;
         }
         if (n < 0 && errno == EINTR) continue;
         break;
     }
     return total;
+}
+
+/* Sync on the calling thread when the syncer thread is idle: no request in flight, no queued rotation and no
+ * sticky error. Holding the mutex across the sync keeps the thread idle and orders this with every other call.
+ * Publishes synced (and wakes syncerWait) without a notification byte: the caller already has the result.
+ * When the thread is busy the request is queued as syncerRequest would, and the current synced offset (below
+ * upTo) is returned; the completion is then notified as usual. */
+long long minyar_files_syncerSyncNow(long long handle, long long upTo) {
+    FilesSyncer *s = files_syncer(handle);
+    if (!s) return -EBADF;
+    if (upTo < 0) return -EINVAL;
+    long long synced = atomic_load_explicit(&s->synced, memory_order_acquire);
+    if (upTo <= synced) return synced;
+    pthread_mutex_lock(&s->mu);
+    int err = atomic_load(&s->error);
+    if (err) {
+        pthread_mutex_unlock(&s->mu);
+        return err;
+    }
+    synced = atomic_load(&s->synced);
+    if (s->busy || s->npending > 0 || s->requested > synced) {
+        if (upTo > s->requested) {
+            s->requested = upTo;
+            pthread_cond_signal(&s->wake);
+        }
+        pthread_mutex_unlock(&s->mu);
+        return synced;
+    }
+    int rc;
+    do { rc = s->full ? files_fullsync(s->fd) : files_datasync(s->fd); } while (rc != 0 && errno == EINTR);
+    if (rc != 0) {
+        err = -errno;
+        atomic_store(&s->error, err);
+    } else if (upTo > synced) {
+        atomic_store_explicit(&s->synced, upTo, memory_order_release);
+        synced = upTo;
+    }
+    if (upTo > s->requested) s->requested = upTo;
+    pthread_cond_broadcast(&s->done);
+    pthread_mutex_unlock(&s->mu);
+    return err ? err : synced;
 }
 
 long long minyar_files_syncerWait(long long handle, long long upTo, long long timeoutMs) {
