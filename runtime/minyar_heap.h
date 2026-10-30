@@ -63,7 +63,8 @@ static inline void *rc_heap_allocate_data(size_t bytes) {
     if (!slot) out_of_memory();
     slot->page = NULL;
     slot->value.bytes = bytes;
-    RC_ACCOUNT(rc_heap_allocation_count++);
+    /* Thread programs only; spelled apart from rc_heap_allocate's event, which tools probe. */
+    RC_ACCOUNT(rc_heap_allocation_count += 1);
     return slot + 1;
 }
 static inline void *rc_heap_resize_data(void *pointer, size_t old_bytes, size_t bytes) {
