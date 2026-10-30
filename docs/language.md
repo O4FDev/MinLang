@@ -1751,6 +1751,11 @@ existing caller-driven state machine and never open sockets. `Session.read`
 drains authenticated plaintext before reporting a later sticky failure;
 closed input yields None, and pending input is a would-block error. Managed
 Result/Maybe wrappers allocate containers and share their reference payloads.
+On Linux `tls`, `aes` and `tlsverify` load OpenSSL's libcrypto with `dlopen` on
+their first call rather than at program start: a program that imports them but
+makes no TLS connection does not map or relocate libcrypto (about 430 KiB less
+idle PSS). A missing libcrypto is then reported at that first call. Static
+links keep libcrypto linked in.
 The runnable `examples/gallery/replies.min` reads a weather station's reply
 without a network dependency.
 

@@ -1,0 +1,29 @@
+// Programs that import tls/aes keep libcrypto out of DT_NEEDED on Linux and load it on first use.
+use "../tools/testing.min" as test
+use "system" as system
+use "io" as io
+
+let work = test.scratch()
+let uname = test.run(["uname", "-s"], system.environment(), "", work + "/uname", 10)
+test.require(uname, "platform query")
+if test.lines(uname.output)[0] != "Linux" {
+    test.removeTree(work)
+    print("lazy libcrypto: Linux only, skipped")
+    exit(0)
+}
+let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10).output)[0]
+let clang = test.realClang("clang")
+let readelf = test.replace(clang, "/clang", "/llvm-readelf")
+for mode in ["--debug", "--release"] {
+    let program = work + "/program" + mode
+    let built = test.run([root + "/minyar", mode, root + "/tests/lazy-crypto/program.min", "-o", program], system.environment(), work, program + ".build", 600)
+    test.require(built, "build lazy libcrypto program " + mode)
+    let dynamic = test.run([readelf, "--dynamic", program], system.environment(), "", program + ".dynamic", 30)
+    test.require(dynamic, "read dynamic section " + mode)
+    test.check(test.contains(dynamic.output, "NEEDED") && !test.contains(dynamic.output, "libcrypto"), "libcrypto must not be DT_NEEDED " + mode + "\n" + dynamic.output)
+    let run = test.run([program], system.environment(), "", program + ".run", 30)
+    test.require(run, "run lazy libcrypto program " + mode)
+    test.check(run.output == "false\n66e94bd4ef8a2c3b884cfa59ca342b2e\ntrue\n1 lantern\ntrue\n", "lazy libcrypto output " + mode + "\n" + run.output + run.errorOutput)
+}
+test.removeTree(work)
+print("lazy libcrypto: no DT_NEEDED, loaded on first aes/tlsverify call at O0/release")

@@ -87,6 +87,22 @@ function compileObject(project: Text, command: List<Text>, source: Text, output:
     if files.rename(staged, output) != 0 { host.stop(host.osError(files.lastError(), output)) }
     host.release(staging)
 }
+// libcrypto for the aes and tlsverify natives. On Linux it loads on first use: crypto_lazy.c's trampolines
+// satisfy their libcrypto calls, so -lcrypto stays --as-needed (no DT_NEEDED, nothing mapped or relocated at
+// start) and only covers symbols the trampolines lack. Static links keep libcrypto linked in as before.
+function cryptoLibrary(project: Text, clang: Text, base: Bytes, nativeFlags: List<Text>, linkFlags: List<Text>, platform: Text, native: List<Text>) {
+    let static = false
+    for flag in linkFlags { if flag == "-static" || flag == "-static-pie" { static = true } }
+    if platform != "Linux" || static {
+        if !host.listed(native, "-lcrypto") { native.add("-lcrypto") }
+        return
+    }
+    let lazy = nativeObject(project, clang, base, "crypto_lazy.c", nativeFlags)
+    if host.listed(native, lazy) { return }
+    native.add(lazy)
+    for item in ["-Wl,--push-state,--as-needed", "-lcrypto", "-ldl", "-Wl,--pop-state"] { native.add(item) }
+}
+
 function nativeObject(project: Text, clang: Text, base: Bytes, name: Text, compileFlags: List<Text>): Text {
     let source = "runtime/native/" + name
     let dependencies = [source]
@@ -1191,7 +1207,7 @@ function linkCommand(arguments: List<Text>) {
             for item in selected.libraries { native.add(item) }
         } else if library == "aes" {
             native.add(nativeObject(project, clang, base, "aes.c", nativeFlags))
-            if isWindows { native.add("-lbcrypt") } else if !darwin { native.add("-lcrypto") }
+            if isWindows { native.add("-lbcrypt") } else if !darwin { cryptoLibrary(project, clang, base, nativeFlags, linkFlags, platform, native) }
         } else if library == "zstd" || library == "deflate" {
             let selected = providers.codecProvider(library, clang, nativeFlags, linkFlags)
             native.add(nativeObject(project, clang, base, library + ".c", host.extended(nativeFlags, selected.cflags)))
@@ -1202,7 +1218,7 @@ function linkCommand(arguments: List<Text>) {
             native.add(nativeObject(project, clang, base, "tlsverify.c", nativeFlags))
             if darwin { for item in ["-framework", "Security", "-framework", "CoreFoundation"] { native.add(item) } }
             else if isWindows { for item in ["-lcrypt32", "-lbcrypt", "-lncrypt", "-lws2_32"] { native.add(item) } }
-            else { native.add("-lcrypto") }
+            else { cryptoLibrary(project, clang, base, nativeFlags, linkFlags, platform, native) }
         } else if library == "keychain" {
             if !darwin { host.stop("the keychain package requires macOS") }
             native.add(nativeObject(project, clang, base, "keychain.c", nativeFlags))
