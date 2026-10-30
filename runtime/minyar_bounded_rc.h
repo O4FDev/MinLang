@@ -7,11 +7,24 @@
  * Pool frees have at most log2(heap/minimum-block) merge steps. System
  * allocator calls have no runtime-imposed execution-time bound.
  * Work bounds exclude startup, data copying and OS scheduling/page faults. */
-static MINYAR_THREAD_LOCAL RcObject *rc_bounded_head, *rc_bounded_tail, *rc_bounded_active;
-static MINYAR_THREAD_LOCAL size_t rc_bounded_cursor;
+/* The object scheduler's state is one struct. Units take it by pointer, so
+ * the object-only scheduler loop runs on a local copy (registers) and
+ * publishes it once per service point; elsewhere the pointer names the
+ * thread's own instance. The old names stay as views of its fields. */
+typedef struct {
+    RcObject *head, *tail, *active, *recent_head, *recent_tail;
+    size_t cursor;
+    unsigned recent_turn;
+} RcBoundedObjects;
+static MINYAR_THREAD_LOCAL RcBoundedObjects rc_objects;
+#define rc_bounded_head (rc_objects.head)
+#define rc_bounded_tail (rc_objects.tail)
+#define rc_bounded_active (rc_objects.active)
+#define rc_bounded_cursor (rc_objects.cursor)
 #define MINYAR_RC_RECENT_OBJECTS 1
-static MINYAR_THREAD_LOCAL RcObject *rc_bounded_recent_head, *rc_bounded_recent_tail;
-static MINYAR_THREAD_LOCAL unsigned rc_bounded_recent_turn;
+#define rc_bounded_recent_head (rc_objects.recent_head)
+#define rc_bounded_recent_tail (rc_objects.recent_tail)
+#define rc_bounded_recent_turn (rc_objects.recent_turn)
 
 /* The old-object backlog: object tasks still pending at the end of the
  * service point after the one that queued them. It is a second instance of the object scheduler
@@ -21,11 +34,6 @@ static MINYAR_THREAD_LOCAL unsigned rc_bounded_recent_turn;
  * tasks only, so ordinary service points ignore the backlog's
  * rc_backlog_count tasks; rc_bounded_owner_tasks counts queued frames and
  * temporary chunks, so fresh object tasks are the remainder. */
-typedef struct {
-    RcObject *head, *tail, *active, *recent_head, *recent_tail;
-    size_t cursor;
-    unsigned recent_turn;
-} RcBoundedObjects;
 #define MINYAR_RC_BACKLOG 1
 static MINYAR_THREAD_LOCAL RcBoundedObjects rc_backlog;
 static MINYAR_THREAD_LOCAL size_t rc_backlog_credit, rc_bounded_owner_tasks;
@@ -105,15 +113,25 @@ MINYAR_HOT void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
     return text_backing;
 }
 
-MINYAR_HOT void rc_bounded_enqueue(RcObject *object) {
+#if defined(__GNUC__) || defined(__clang__)
+#define RC_QUEUE_INLINE static inline __attribute__((always_inline))
+#else
+#define RC_QUEUE_INLINE static inline
+#endif
+
+RC_QUEUE_INLINE void rc_bounded_enqueue_in(RcBoundedObjects *q, size_t *pending, RcObject *object) {
     rc_bounded_save_cursor(object, 0);
-    object->ownership |= (size_t)(uintptr_t)rc_bounded_recent_head;
-    rc_bounded_recent_head = object;
-    if (!rc_bounded_recent_tail) rc_bounded_recent_tail = object;
-    rc_pending_count++;
+    object->ownership |= (size_t)(uintptr_t)q->recent_head;
+    q->recent_head = object;
+    if (!q->recent_tail) q->recent_tail = object;
+    ++*pending;
 }
 
-MINYAR_HOT unsigned rc_drop(void *value) {
+MINYAR_HOT void rc_bounded_enqueue(RcObject *object) {
+    rc_bounded_enqueue_in(&rc_objects, &rc_pending_count, object);
+}
+
+RC_QUEUE_INLINE unsigned rc_drop_in(RcBoundedObjects *q, size_t *pending, void *value) {
     if (!value) return 0;
     RcObject *object = (RcObject *)value - 1;
     size_t ownership = object->ownership;
@@ -151,7 +169,7 @@ MINYAR_HOT unsigned rc_drop(void *value) {
             RcObject *root = (RcObject *)backing - 1;
             if (root->ownership >> 3) {
                 root->ownership -= 8;
-                if (!(root->ownership >> 3)) rc_bounded_enqueue(root);
+                if (!(root->ownership >> 3)) rc_bounded_enqueue_in(q, pending, root);
             }
         }
         return 1;
@@ -162,8 +180,12 @@ MINYAR_HOT unsigned rc_drop(void *value) {
         rc_bounded_finish_object(object, kind);
         return 1;
     }
-    rc_bounded_enqueue(object);
+    rc_bounded_enqueue_in(q, pending, object);
     return 0;
+}
+
+MINYAR_HOT unsigned rc_drop(void *value) {
+    return rc_drop_in(&rc_objects, &rc_pending_count, value);
 }
 
 static MINYAR_THREAD_LOCAL RcFrame *rc_bounded_frame_head, *rc_bounded_frame_tail;
@@ -189,41 +211,41 @@ static void rc_bounded_retire_temporaries(RcFrame *frame) {
 #define RC_BOUNDED_INLINE static inline
 #endif
 
-RC_BOUNDED_INLINE void rc_bounded_old_object_unit(void) {
-    if (!rc_bounded_active) {
-        rc_bounded_active = rc_bounded_head;
-        rc_bounded_head = (RcObject *)(uintptr_t)(rc_bounded_active->ownership & ~(size_t)7);
-        if (!rc_bounded_head) rc_bounded_tail = NULL;
-        rc_bounded_active->ownership &= 7;
-        rc_bounded_cursor = rc_bounded_saved_cursor(rc_bounded_active);
+RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t *pending) {
+    if (!q->active) {
+        q->active = q->head;
+        q->head = (RcObject *)(uintptr_t)(q->active->ownership & ~(size_t)7);
+        if (!q->head) q->tail = NULL;
+        q->active->ownership &= 7;
+        q->cursor = rc_bounded_saved_cursor(q->active);
     }
-    RcObject *object = rc_bounded_active;
+    RcObject *object = q->active;
     unsigned kind = object->ownership & 7;
     if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
-        if (rc_bounded_cursor < (size_t)list->length) {
-            rc_drop((void *)(uintptr_t)list->values[rc_bounded_cursor++]);
+        if (q->cursor < (size_t)list->length) {
+            rc_drop_in(q, pending, (void *)(uintptr_t)list->values[q->cursor++]);
             return;
         }
     } else if (kind == RC_RECORD) {
         MinyarRecord *record = (MinyarRecord *)(object + 1);
-        if (rc_bounded_cursor < (size_t)record->length) {
+        if (q->cursor < (size_t)record->length) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
-            size_t index = rc_bounded_cursor++;
-            if (map[index] & 1) rc_drop((void *)(uintptr_t)record->values[index]);
+            size_t index = q->cursor++;
+            if (map[index] & 1) rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
             return;
         }
     }
     rc_bounded_finish_object(object, kind);
-    rc_pending_count--;
-    rc_bounded_active = NULL;
+    --*pending;
+    q->active = NULL;
 }
 
 /* A recent task remains linked while visiting its next owner. Saving the
  * cursor before dropping that owner lets newly dead children preempt it without
  * recursion or an auxiliary allocation. */
-RC_BOUNDED_INLINE void rc_bounded_recent_object_unit(void) {
-    RcObject *object = rc_bounded_recent_head;
+RC_BOUNDED_INLINE void rc_bounded_recent_object_unit_in(RcBoundedObjects *q, size_t *pending) {
+    RcObject *object = q->recent_head;
     unsigned kind = object->ownership & 7;
     size_t cursor = rc_bounded_saved_cursor(object);
     if (kind == RC_REFERENCES) {
@@ -231,7 +253,7 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit(void) {
         if (cursor < (size_t)list->length) {
             void *child = (void *)(uintptr_t)list->values[cursor];
             rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop(child);
+            rc_drop_in(q, pending, child);
             return;
         }
     } else if (kind == RC_RECORD) {
@@ -240,14 +262,14 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit(void) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
             void *child = (map[cursor] & 1) ? (void *)(uintptr_t)record->values[cursor] : NULL;
             rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop(child);
+            rc_drop_in(q, pending, child);
             return;
         }
     }
-    rc_bounded_recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
-    if (!rc_bounded_recent_head) rc_bounded_recent_tail = NULL;
+    q->recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
+    if (!q->recent_head) q->recent_tail = NULL;
     rc_bounded_finish_object(object, kind);
-    rc_pending_count--;
+    --*pending;
 }
 
 /* Reserve alternating object units for the oldest finite batch. Whenever that
@@ -255,26 +277,30 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit(void) {
  * enter the captured batch, so every captured task has finite predecessors.
  * Recent service follows freshly dead children promptly, while oldest service
  * cannot be starved by a stream of new tasks. */
-RC_BOUNDED_INLINE void rc_bounded_object_unit(void) {
-    if (!rc_bounded_active && !rc_bounded_head) {
-        rc_bounded_head = rc_bounded_recent_head;
-        rc_bounded_tail = rc_bounded_recent_tail;
-        rc_bounded_recent_head = rc_bounded_recent_tail = NULL;
+RC_BOUNDED_INLINE void rc_bounded_object_unit_in(RcBoundedObjects *q, size_t *pending) {
+    if (!q->active && !q->head) {
+        q->head = q->recent_head;
+        q->tail = q->recent_tail;
+        q->recent_head = q->recent_tail = NULL;
     }
-    unsigned recent = rc_bounded_recent_turn;
-    rc_bounded_recent_turn ^= 1;
-    if (recent && rc_bounded_recent_head) {
+    unsigned recent = q->recent_turn;
+    q->recent_turn ^= 1;
+    if (recent && q->recent_head) {
         /* Finish the sole captured unary parent before its recent child.
          * This is still one unit. With no captured successors, the next
          * object unit captures the recent stack and services its head, so
          * recent progress is delayed by at most one object unit here. */
-        RcObject *active = rc_bounded_active;
-        if (rc_bounded_cursor == 1 && !rc_bounded_head && active &&
+        RcObject *active = q->active;
+        if (q->cursor == 1 && !q->head && active &&
             (active->ownership & 7) == RC_RECORD &&
             ((MinyarRecord *)(active + 1))->length == 1)
-            rc_bounded_old_object_unit();
-        else rc_bounded_recent_object_unit();
-    } else rc_bounded_old_object_unit();
+            rc_bounded_old_object_unit_in(q, pending);
+        else rc_bounded_recent_object_unit_in(q, pending);
+    } else rc_bounded_old_object_unit_in(q, pending);
+}
+
+RC_BOUNDED_INLINE void rc_bounded_object_unit(void) {
+    rc_bounded_object_unit_in(&rc_objects, &rc_pending_count);
 }
 
 #undef RC_BOUNDED_INLINE
@@ -333,27 +359,32 @@ static void rc_bounded_chunk_unit(void) {
 static size_t rc_bounded_schedule(size_t budget) {
     size_t work = 0;
     if (!rc_bounded_frame_head && !rc_bounded_chunk_head) {
+        /* Run on a local copy of the object queue so its state stays in
+         * registers across frees; publish it once below. Units here only
+         * touch the object queue (no frame or chunk task can appear). */
+        RcBoundedObjects local = rc_objects, *q = &local;
+        size_t queued = rc_pending_count, *pending = &queued;
         /* Object processing can only enqueue objects. With no frame/chunk
          * tasks, skip repeated three-way selection for this entire poll.
          * Match the general scheduler's next queue after any object work;
          * empty and zero-budget polls leave that state unchanged. */
-        while (work < budget && rc_pending_count) {
+        while (work < budget && (*pending)) {
             /* With one unvisited unary record, locality makes its field visit
              * and finalization the next two units. There is no competing old
              * task to bypass, and dropping one child creates at most one task.
              * Keep per-unit state updates around rc_drop in reference order. */
-            if (budget - work >= 2 && rc_pending_count == 1 && !rc_bounded_active) {
-                RcObject *single = rc_bounded_head ? rc_bounded_head : rc_bounded_recent_head;
+            if (budget - work >= 2 && (*pending) == 1 && !q->active) {
+                RcObject *single = q->head ? q->head : q->recent_head;
                 if (single && (single->ownership & 7) == RC_RECORD) {
                     MinyarRecord *record = (MinyarRecord *)(single + 1);
                     if (record->length == 1) {
                         unsigned char *map = (unsigned char *)(record->values + 1);
                         if (!rc_bounded_saved_cursor(single)) {
-                            rc_bounded_head = rc_bounded_tail = NULL;
-                            rc_bounded_recent_head = rc_bounded_recent_tail = NULL;
+                            q->head = q->tail = NULL;
+                            q->recent_head = q->recent_tail = NULL;
                             single->ownership = RC_RECORD;
-                            rc_bounded_active = single;
-                            rc_bounded_cursor = 1;
+                            q->active = single;
+                            q->cursor = 1;
                             for (;;) {
                                 RcObject *next = NULL;
                                 /* Carry a unique unary child only when this
@@ -378,15 +409,15 @@ static size_t rc_bounded_schedule(size_t budget) {
                                     single = next;
                                     record = (MinyarRecord *)(single + 1);
                                     map = (unsigned char *)(record->values + 1);
-                                    rc_bounded_active = single;
+                                    q->active = single;
                                     continue;
                                 }
-                                rc_bounded_recent_turn ^= 1;
-                                if (map[0] & 1) rc_drop((void *)(uintptr_t)record->values[0]);
-                                rc_bounded_recent_turn ^= 1;
+                                q->recent_turn ^= 1;
+                                if (map[0] & 1) rc_drop_in(q, pending, (void *)(uintptr_t)record->values[0]);
+                                q->recent_turn ^= 1;
                                 rc_bounded_finish_object(single, RC_RECORD);
-                                rc_pending_count--;
-                                rc_bounded_active = NULL;
+                                --*pending;
+                                q->active = NULL;
                                 work += 2;
                                 break;
                             }
@@ -396,30 +427,30 @@ static size_t rc_bounded_schedule(size_t budget) {
                 }
             }
 
-            if (!rc_bounded_recent_head && rc_bounded_active &&
-                (rc_bounded_active->ownership & 7) == RC_RECORD) {
-                MinyarRecord *record = (MinyarRecord *)(rc_bounded_active + 1);
+            if (!q->recent_head && q->active &&
+                (q->active->ownership & 7) == RC_RECORD) {
+                MinyarRecord *record = (MinyarRecord *)(q->active + 1);
                 unsigned char *map = (unsigned char *)(record->values + record->length);
-                size_t available = (size_t)record->length - rc_bounded_cursor;
+                size_t available = (size_t)record->length - q->cursor;
                 size_t count = budget - work;
                 if (count > available) count = available;
-                size_t end = rc_bounded_cursor + count;
-                while (rc_bounded_cursor < end) {
-                    rc_bounded_recent_turn ^= 1;
-                    size_t index = rc_bounded_cursor++;
+                size_t end = q->cursor + count;
+                while (q->cursor < end) {
+                    q->recent_turn ^= 1;
+                    size_t index = q->cursor++;
                     work++;
-                    if (map[index] & 1) rc_drop((void *)(uintptr_t)record->values[index]);
-                    if (rc_bounded_recent_head) break;
+                    if (map[index] & 1) rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
+                    if (q->recent_head) break;
                 }
                 if (count) {
 
-                    if (!rc_bounded_recent_head && rc_bounded_cursor == (size_t)record->length &&
+                    if (!q->recent_head && q->cursor == (size_t)record->length &&
                         work < budget) {
-                        RcObject *finished = rc_bounded_active;
-                        rc_bounded_recent_turn ^= 1;
+                        RcObject *finished = q->active;
+                        q->recent_turn ^= 1;
                         rc_bounded_finish_object(finished, RC_RECORD);
-                        rc_pending_count--;
-                        rc_bounded_active = NULL;
+                        --*pending;
+                        q->active = NULL;
                         work++;
                     }
                     continue;
@@ -429,16 +460,16 @@ static size_t rc_bounded_schedule(size_t budget) {
              * one, consume a bounded run of the active List's owner slots.
              * A newly dead nonleaf immediately ends this run, restoring the
              * ordinary scheduler before any further work. */
-            if (!rc_bounded_recent_head && rc_bounded_active &&
-                (rc_bounded_active->ownership & 7) == RC_REFERENCES) {
-                MinyarList *list = (MinyarList *)(rc_bounded_active + 1);
-                size_t available = (size_t)list->length - rc_bounded_cursor;
+            if (!q->recent_head && q->active &&
+                (q->active->ownership & 7) == RC_REFERENCES) {
+                MinyarList *list = (MinyarList *)(q->active + 1);
+                size_t available = (size_t)list->length - q->cursor;
                 size_t count = budget - work;
                 if (count > available) count = available;
-                size_t end = rc_bounded_cursor + count;
-                while (rc_bounded_cursor < end) {
-                    rc_bounded_recent_turn ^= 1;
-                    void *value = (void *)(uintptr_t)list->values[rc_bounded_cursor++];
+                size_t end = q->cursor + count;
+                while (q->cursor < end) {
+                    q->recent_turn ^= 1;
+                    void *value = (void *)(uintptr_t)list->values[q->cursor++];
                     RcObject *child = value ? (RcObject *)value - 1 : NULL;
                     work++;
                     /* Inline only the common unique scalar leaf. Its free
@@ -447,15 +478,17 @@ static size_t rc_bounded_schedule(size_t budget) {
                     if (child && child->ownership == (8 | RC_SCALAR_RECORD))
                         rc_bounded_finish_object(child, RC_SCALAR_RECORD);
                     else {
-                        rc_drop(value);
-                        if (rc_bounded_recent_head) break;
+                        rc_drop_in(q, pending, value);
+                        if (q->recent_head) break;
                     }
                 }
                 if (count) continue;
             }
-            rc_bounded_object_unit();
+            rc_bounded_object_unit_in(q, pending);
             work++;
         }
+        rc_objects = local;
+        rc_pending_count = queued;
         if (work) rc_bounded_next_queue = 1;
     } else {
         while (work < budget && rc_pending_count) {
