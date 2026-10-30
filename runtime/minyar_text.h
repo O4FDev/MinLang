@@ -112,6 +112,13 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
     }
     /* Pieces are byte ranges between matches. Every piece of ASCII Text is
      * ASCII; other pieces count their scalars once, as their slices record. */
+    if (separator->byte_length == 1) {
+        /* Size the List once; this count loop vectorises. */
+        unsigned char wanted = separator->bytes[0];
+        long long pieces = 1;
+        for (long long i = 0; i < text->byte_length; i++) pieces += text->bytes[i] == wanted;
+        list_reserve(parts, pieces);
+    }
     long long small[TEXT_SEARCH_SMALL];
     long long *table = text_search_table(separator, text->byte_length, small);
     _Bool ascii = !text->character_offsets;
@@ -132,12 +139,31 @@ static _Bool text_white_space(unsigned int scalar) {
            scalar == 0xa0 || scalar == 0x1680 || (scalar >= 0x2000 && scalar <= 0x200a) ||
            scalar == 0x2028 || scalar == 0x2029 || scalar == 0x202f || scalar == 0x205f || scalar == 0x3000;
 }
+/* Scans bytes from both ends: ASCII bytes are tested directly and other
+ * scalars are decoded in place, so trimming never builds the offset index. */
 MinyarText *minyar_text_trim(MinyarText *text) {
     ensure_text_index(text);
-    long long first = 0, last = text->character_length;
-    while (first < last && text_white_space((unsigned)minyar_text_character_at(text, first))) first++;
-    while (last > first && text_white_space((unsigned)minyar_text_character_at(text, last - 1))) last--;
-    return minyar_text_slice(text, first, last);
+    const unsigned char *bytes = text->bytes;
+    long long first = 0, last = text->byte_length, dropped = 0;
+    while (first < last) {
+        long long width = 1;
+        unsigned scalar = bytes[first];
+        if (scalar >= 0x80) scalar = decode_character(bytes + first, last - first, &width);
+        if (!text_white_space(scalar)) break;
+        first += width;
+        dropped++;
+    }
+    while (last > first) {
+        long long start = last - 1;
+        while (start > first && (bytes[start] & 0xc0) == 0x80) start--;
+        long long width = last - start;
+        unsigned scalar = bytes[start];
+        if (scalar >= 0x80) scalar = decode_character(bytes + start, width, &width);
+        if (!text_white_space(scalar)) break;
+        last = start;
+        dropped++;
+    }
+    return text_slice_bytes(text, first, last, text->character_length - dropped);
 }
 static _Bool integer_ascii_space(unsigned char byte) {
     return byte == ' ' || (byte >= '\t' && byte <= '\r');
@@ -161,3 +187,38 @@ long long minyar_text_integer(MinyarText *text) {
     if (negative && value == (unsigned long long)LLONG_MAX + 1) return LLONG_MIN;
     return negative ? -(long long)value : (long long)value;
 }
+
+/* JSON scanning helpers for library/json.min. Positions are scalar offsets.
+ * jsonStringEnd returns the first position at or after `position` holding a
+ * quote, a backslash or a control below U+0020 (the Text's length if none);
+ * jsonSpaceEnd returns the first position that is not JSON whitespace. Both
+ * scan bytes: every byte they stop on or skip within ASCII is one scalar. */
+static long long json_scan_start(MinyarText *text, long long position) {
+    ensure_text_index(text);
+    if (position < 0 || position > text->character_length) slice_outside_text();
+    return text->character_offsets ? indexed_byte_offset(text, position) : position;
+}
+long long minyar_runtime_jsonStringEnd(MinyarText *text, long long position) {
+    long long start = json_scan_start(text, position), i = start, length = text->byte_length;
+    const unsigned char *bytes = text->bytes;
+    const uint64_t ones = 0x0101010101010101ULL, highs = 0x8080808080808080ULL;
+    for (; length - i >= 8; i += 8) {
+        uint64_t word;
+        memcpy(&word, bytes + i, sizeof(word));
+        uint64_t quote = word ^ (ones * '"'), slash = word ^ (ones * '\\');
+        uint64_t stop = ((quote - ones) & ~quote) | ((slash - ones) & ~slash) | ((word - ones * 0x20) & ~word);
+        if (stop & highs) break;
+    }
+    for (; i < length; i++) {
+        unsigned char byte = bytes[i];
+        if (byte == '"' || byte == '\\' || byte < 0x20) break;
+    }
+    return position + (text->character_offsets ? text_scalar_count(bytes + start, i - start) : i - start);
+}
+long long minyar_runtime_jsonSpaceEnd(MinyarText *text, long long position) {
+    long long start = json_scan_start(text, position), i = start, length = text->byte_length;
+    const unsigned char *bytes = text->bytes;
+    while (i < length && (bytes[i] == ' ' || bytes[i] == '\n' || bytes[i] == '\r' || bytes[i] == '\t')) i++;
+    return position + (i - start);
+}
+

@@ -124,6 +124,17 @@ static size_t format_float(double value, char *out, size_t capacity) {
         (encoding & UINT64_C(0xfffffffffffff)) == 0 && ((encoding >> 52) & UINT64_C(0x7ff)) > 1;
     char scientific[40];
     int precision = 1;
+    /* A decimal of at most 15 significant digits survives a trip through the
+     * nearest normal double and back at 15 digits (DBL_DIG). So when the
+     * shortest correctly rounded spelling has p <= 15 digits, the 15-digit
+     * spelling is that one padded with zeros, which are trimmed below; when it
+     * does not round-trip, the answer has 16 or 17 digits. This gives the same
+     * spelling as trying every precision from 1. Subnormals have fewer bits and
+     * powers of two may take an adjacent decimal, so they keep the full search. */
+    if (!asymmetric && isnormal(value)) {
+        snprintf(scientific, sizeof(scientific), "%.14e", value);
+        precision = strtod(scientific, NULL) == value ? 18 : 16;
+    }
     for (; precision <= 17; precision++) {
         snprintf(scientific, sizeof(scientific), "%.*e", precision - 1, value);
         if (precision == 17 || strtod(scientific, NULL) == value ||

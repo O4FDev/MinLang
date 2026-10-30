@@ -73,6 +73,79 @@ static void list_sort_merge(long long *values, size_t count, long long *scratch,
     if (left < left_count) memcpy(values + output, scratch + left, (left_count - left) * sizeof(*values));
 }
 
+/* Natural orders get one merge sort per slot kind with the comparison inlined:
+ * runs of up to LIST_SORT_SMALL slots use insertion sort, an ordered pair of
+ * halves skips its merge, and a wholly non-descending or strictly descending
+ * List is finished in one scan. Taking the left slot unless the right one is
+ * strictly smaller keeps every merge stable, and reversing only a strictly
+ * descending List never reorders equal slots. The scratch bound is unchanged. */
+enum { LIST_SORT_SMALL = 20 };
+#define LIST_SORT_DEFINE(NAME, LESS)                                                          \
+    static void NAME##_insert(long long *values, size_t count) {                             \
+        for (size_t i = 1; i < count; i++) {                                                  \
+            long long value = values[i];                                                      \
+            size_t j = i;                                                                     \
+            for (; j > 0 && LESS(value, values[j - 1]); j--) values[j] = values[j - 1];      \
+            values[j] = value;                                                                \
+        }                                                                                     \
+    }                                                                                         \
+    static void NAME##_merge(long long *values, size_t count, long long *scratch) {          \
+        if (count <= LIST_SORT_SMALL) {                                                       \
+            NAME##_insert(values, count);                                                     \
+            return;                                                                           \
+        }                                                                                     \
+        size_t left_count = count / 2;                                                        \
+        NAME##_merge(values, left_count, scratch);                                            \
+        NAME##_merge(values + left_count, count - left_count, scratch);                       \
+        if (!LESS(values[left_count], values[left_count - 1])) return;                       \
+        memcpy(scratch, values, left_count * sizeof(*scratch));                               \
+        size_t left = 0, right = left_count, output = 0;                                      \
+        while (left < left_count && right < count) {                                          \
+            long long candidate = values[right], held = scratch[left];                        \
+            _Bool take_right = LESS(candidate, held);                                         \
+            values[output++] = take_right ? candidate : held;                                 \
+            right += take_right;                                                              \
+            left += !take_right;                                                              \
+        }                                                                                     \
+        if (left < left_count)                                                                \
+            memcpy(values + output, scratch + left, (left_count - left) * sizeof(*values));   \
+    }                                                                                         \
+    static void NAME(long long *values, size_t count, long long *scratch) {                  \
+        size_t ordered = 1;                                                                   \
+        while (ordered < count && !LESS(values[ordered], values[ordered - 1])) ordered++;    \
+        if (ordered == count) return;                                                         \
+        if (ordered == 1) {                                                                   \
+            size_t descending = 1;                                                            \
+            while (descending < count && LESS(values[descending], values[descending - 1]))   \
+                descending++;                                                                 \
+            if (descending == count) {                                                        \
+                for (size_t i = 0, j = count - 1; i < j; i++, j--) {                          \
+                    long long held = values[i];                                               \
+                    values[i] = values[j];                                                    \
+                    values[j] = held;                                                         \
+                }                                                                             \
+                return;                                                                       \
+            }                                                                                 \
+        }                                                                                     \
+        NAME##_merge(values, count, scratch);                                                 \
+    }
+
+#define LIST_SORT_INTEGER_LESS(a, b) ((a) < (b))
+static inline _Bool list_sort_float_less(long long a, long long b) {
+    double x, y;
+    memcpy(&x, &a, sizeof(x)); memcpy(&y, &b, sizeof(y));
+    /* NaNs come last and equal one another; signed zeros compare equal. */
+    return !isnan(x) && (isnan(y) || x < y);
+}
+static inline _Bool list_sort_text_less(long long a, long long b) {
+    return minyar_compare_slots(2, a, b) < 0;
+}
+LIST_SORT_DEFINE(list_sort_integers, LIST_SORT_INTEGER_LESS)
+LIST_SORT_DEFINE(list_sort_floats, list_sort_float_less)
+LIST_SORT_DEFINE(list_sort_texts, list_sort_text_less)
+#undef LIST_SORT_INTEGER_LESS
+#undef LIST_SORT_DEFINE
+
 static size_t list_sort_count(const MinyarList *list) {
     if (list->length < 0 || (unsigned long long)list->length > SIZE_MAX / sizeof(long long))
         minyar_stop("this List became too large.");
@@ -116,9 +189,10 @@ void minyar_list_sort(MinyarList *list, long long kind) {
         minyar_stop("this List element type has no natural order.");
     size_t count = list_sort_count(list);
     if (count < 2) return;
-    long long *scratch = list_sort_allocate(count / 2 + count % 2);
-    MinyarSortOrder order = {kind, NULL, NULL, NULL};
-    list_sort_merge(list->values, count, scratch, &order);
+    long long *scratch = count > LIST_SORT_SMALL ? list_sort_allocate(count / 2 + count % 2) : NULL;
+    if (kind == 2) list_sort_texts(list->values, count, scratch);
+    else if (kind == 7) list_sort_floats(list->values, count, scratch);
+    else list_sort_integers(list->values, count, scratch);
     free(scratch);
 }
 

@@ -1203,10 +1203,23 @@ static char *write_integer_digits(long long integer, char *end) {
     char *cursor = end;
     unsigned long long magnitude =
         integer < 0 ? 0 - (unsigned long long)integer : (unsigned long long)integer;
-    do {
-        *--cursor = (char)('0' + magnitude % 10);
-        magnitude /= 10;
-    } while (magnitude);
+    /* Two digits per division, from a 200-byte pair table. */
+    static const char pairs[201] =
+        "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+        "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+        "8081828384858687888990919293949596979899";
+    while (magnitude >= 100) {
+        unsigned pair = (unsigned)(magnitude % 100) * 2;
+        magnitude /= 100;
+        cursor -= 2;
+        memcpy(cursor, pairs + pair, 2);
+    }
+    if (magnitude >= 10) {
+        cursor -= 2;
+        memcpy(cursor, pairs + magnitude * 2, 2);
+    } else {
+        *--cursor = (char)('0' + magnitude);
+    }
     if (integer < 0)
         *--cursor = '-';
     return cursor;

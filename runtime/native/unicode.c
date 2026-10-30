@@ -267,11 +267,31 @@ static bool unicode_following_cased(const MinyarText *source, utf8proc_ssize_t p
 /* Preserve the original scalar order: display casing does not normalize.
  * Only sigma needs lookahead. Its ignorable run ends before the next sigma,
  * so the lookahead runs do not overlap and each pass remains linear. */
+/* ASCII has no special or context-dependent mapping: only A-Z and a-z are
+ * Cased, and Case_Ignorable holds exactly ' . : ^ and `. Those facts let the
+ * pass map ASCII bytes inline and keep the final-sigma context exact. */
+static inline unsigned char unicode_ascii_case(unsigned char byte, bool upper) {
+    if (upper) return byte >= 'a' && byte <= 'z' ? (unsigned char)(byte - 32) : byte;
+    return byte >= 'A' && byte <= 'Z' ? (unsigned char)(byte + 32) : byte;
+}
+static inline bool unicode_ascii_case_ignorable(unsigned char byte) {
+    return byte == '\'' || byte == '.' || byte == ':' || byte == '^' || byte == '`';
+}
+
 static size_t unicode_case_pass(const MinyarText *source, bool upper, unsigned char *output) {
     utf8proc_ssize_t position = 0, length = unicode_length(source);
     size_t used = 0;
     bool preceding_cased = false;
     while (position < length) {
+        unsigned char byte = source->bytes[position];
+        if (byte < 0x80) {
+            position++;
+            if (output) output[used] = unicode_ascii_case(byte, upper);
+            used++;
+            if (!unicode_ascii_case_ignorable(byte))
+                preceding_cased = (unsigned char)((byte | 0x20) - 'a') < 26;
+            continue;
+        }
         utf8proc_int32_t scalar = unicode_next(source, &position);
         const UnicodeCaseMapping *special = unicode_case_mapping((uint32_t)scalar);
         uint32_t simple;
@@ -301,7 +321,31 @@ static size_t unicode_case_pass(const MinyarText *source, bool upper, unsigned c
     return used;
 }
 
+static bool unicode_all_ascii(const MinyarText *source) {
+    utf8proc_ssize_t length = unicode_length(source), i = 0;
+    if (source->character_length == source->byte_length) return true;
+    uint64_t high = 0;
+    for (; length - i >= 8; i += 8) {
+        uint64_t word;
+        memcpy(&word, source->bytes + i, sizeof(word));
+        high |= word;
+    }
+    for (; i < length; i++) high |= source->bytes[i];
+    return !(high & 0x8080808080808080ULL);
+}
+
 static MinyarText *unicode_case(const MinyarText *source, bool upper) {
+    if (unicode_all_ascii(source)) {
+        /* Same length; one pass and the runtime's validating copy. */
+        size_t count = (size_t)unicode_length(source);
+        unsigned char small[256];
+        unsigned char *output = count < sizeof(small) ? small : malloc(count + 1);
+        if (!output) minyar_native_stop("there is not enough memory for cased Text.");
+        for (size_t i = 0; i < count; i++) output[i] = unicode_ascii_case(source->bytes[i], upper);
+        MinyarText *result = minyar_native_copy_text(output, (long long)count);
+        if (output != small) free(output);
+        return result;
+    }
     size_t length = unicode_case_pass(source, upper, NULL);
     unsigned char *output = malloc(length + 1);
     if (!output) minyar_native_stop("there is not enough memory for cased Text.");
