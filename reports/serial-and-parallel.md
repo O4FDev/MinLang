@@ -22,9 +22,11 @@ from box D (AMD, 4 vCPU, Linux, LLVM 23.1.3) unless marked laptop; instruction c
    instructions of those programs are forced onto one thread, capping 4-thread speed-up at 1.73x, 1.14x and
    3.4x before any scheduling cost. The Rust peers parallelise those phases with plain `Vec`/`HashMap` per thread.
 4. **Using threads anywhere makes all managed code slower.** A program that contains a `thread function` (or an
-   atomic cell) links the thread runtime, which replaces Minyar's small-object heap with glibc `malloc`/`free`:
-   +60% Ir for the idiomatic text index and +75% for the event-loop server *at one thread, on the main thread,
-   with no thread ever started*. This is the one place where serial code pays for parallelism it does not use.
+   atomic cell) links the thread runtime: +60% Ir for the idiomatic text index and +75% for the event-loop server
+   *at one thread, on the main thread, with no thread ever started*. The parallel lane's per-thread small heap
+   (4a3140b1f, landed during this investigation) cut that to +29% and +50%; the rest is buffer data still on
+   `malloc`, Text literals copied on every use and a slower RC scheduler cursor. This is the one place where serial
+   code pays for parallelism it does not use.
 5. **Crossing threads copies.** `startThread` copies every argument into the new heap and a typed channel
    rebuilds every message: ~7,650 Ir per small record (`{Integer, Text, List of 8}`) through a channel against
    ~2,870 Ir to build and use it locally; only `FrozenBytes` is shared, and reading it costs 3.3x a List read.
@@ -69,8 +71,8 @@ Wall times: `run.py --wall-only --repeats 7` (logs/bothmodes/wall-D-2.log); box 
 languages; the first full run (load 4–5, n=5) gave parallel geomean 1.50 with the same ordering. Ir columns are
 deterministic. CPU time / wall at 4 threads (measure.py --cpu): Minyar textindex 1.00 and mapreduce 1.41 (the serial
 phases), topk 2.09 vs Rust 2.26, forkjoin 1.87 vs 2.49 (Rust's join workers spin; Minyar's sleep without a root job).
-The server's serial 2.57 includes the thread-runtime tax of section 1.4: the same server without a `thread function`
-is 405.6M Ir, 1.47x C.
+The server's serial 2.57 includes the thread-runtime tax of section 1.4: after the parallel lane's 4a3140b1f it is
+610.6M Ir, 2.22x C (serial geomean 2.16 -> 2.10), and the same server without a `thread function` is 405.6M, 1.47x C.
 
 What each program had to give up to be one source (the finding, per program):
 
@@ -97,12 +99,12 @@ What each program had to give up to be one source (the finding, per program):
 | mapreduce | serial idiom (one plain loop per pass) | 1,870.0M | 0.971 |
 | textindex | both-modes form (Bytes, hashes into windows, Map of hashes) | 4,267.8M | 1.000 |
 | textindex | serial idiom (`split`, `Map<Text, Integer>`) | 4,444.4M | 1.041 |
-| textindex | serial idiom + one never-started `thread function` | 6,822.4M | **1.599** |
+| textindex | serial idiom + one never-started `thread function` | 6,822.4M | **1.599** (5,737.4M, 1.344 after 4a3140b1f) |
 | topk | `parallel for` + parallel functions | 15,644.6M | 1.000 |
 | topk | plain `for` + same parallel functions (fresh Lists per query: windows exist only in `parallel for`) | 16,965.2M | 1.084 |
 | topk | plain `for` + ordinary functions | 16,965.2M | 1.084 |
 | server | both-modes form (`thread function` per shard; 1 shard at 1 thread) | 707.9M | 1.000 |
-| server | same server, no `thread function` | 405.6M | **0.573** |
+| server | same server, no `thread function` | 405.6M | **0.573** (main.min 610.6M after 4a3140b1f: 0.664) |
 
 Readings:
 - The work-stealing pool costs nothing measurable at one thread (topk, mapreduce within 3-8%, both directions).
@@ -114,7 +116,8 @@ Readings:
 
 ### 1.4 The thread-runtime tax, attributed
 
-Top functions (cachegrind, 1 thread), textindex serial idiom without / with a never-started thread function:
+Top functions (cachegrind, 1 thread, at 42b1cbc46), textindex serial idiom without / with a never-started thread
+function:
 
 | without thread function | Ir | with thread function | Ir |
 |---|---:|---|---:|
@@ -129,12 +132,33 @@ Top functions (cachegrind, 1 thread), textindex serial idiom without / with a ne
 Server, main.min (thread function present) vs no thread function: `_int_free` 76.2M, `malloc` 63.5M, `free` 43.7M
 appear only in the threaded build; `rc_bounded_step_chunks` 69.2M vs 19.0M.
 
-Cause in the source: `runtime/minyar_heap.h` compiles `rc_heap_allocate/deallocate/resize` to `rc_system_allocate`
-(the size-class small heap) only `#if !MINYAR_THREADED && MINYAR_SYSTEM_SMALL_HEAP`; thread programs fall back to
-`malloc`/`free`/`realloc`, and `rc_bounded_saved_cursor` (minyar_bounded_rc.h:41,61) loses the slot header that
-holds the scheduler cursor, so it walks the record's map bytes instead. Every RC global is already
-`_Thread_local` in thread mode, and no managed object is ever reachable from two threads (transfer copies), so a
-per-thread small heap needs no cross-thread free path.
+Cause in the source (at 42b1cbc46): `runtime/minyar_heap.h` compiled `rc_heap_allocate/deallocate/resize` to
+`rc_system_allocate` (the size-class small heap) only `#if !MINYAR_THREADED && MINYAR_SYSTEM_SMALL_HEAP`; thread
+programs fell back to `malloc`/`free`/`realloc`.
+
+**Update, parallel lane 4a3140b1f (per-thread small-object heap), re-measured on box D:**
+
+| variant (1 thread) | at 42b1cbc46 | after 4a3140b1f | tax left vs no thread function |
+|---|---:|---:|---:|
+| textindex serial idiom, no thread function | 4,444.4M | 4,444.4M | — |
+| textindex serial idiom + never-started thread function | 6,822.4M (+59.9%) | 5,737.4M | **+29.1%** |
+| server without thread function | 405.6M | 405.6M | — |
+| server main.min (thread function, 1 shard) | 707.9M (+74.5%) | 610.6M | **+50.5%** |
+
+What is left, from the profiles after 4a3140b1f:
+- Buffer storage (Bytes, Text and List data) still uses glibc `malloc`/`realloc`/`free` in thread programs, because a
+  buffer can move to another thread (`sendBytes`, `freezeBytesTake`) and be freed there: textindex `_int_malloc`
+  224M, `realloc` + `_int_realloc` 302M, `_int_free` 159M. Fix: keep buffers on the owner's small pages and free
+  remotely (a per-page or per-thread atomic return list, as mimalloc does), or copy a small buffer at the moment it
+  moves; only moved buffers would pay.
+- Every Text literal is copied on use in thread programs (`minyar_thread_text_literal` →
+  `minyar_native_copy_text`, runtime/minyar_thread_domain.h:69), because compiler literals carry lazily built
+  character indexes: server `minyar_native_copy_text` 34.6M + `utf8_scan` 18.7M, absent without threads. Fix: build
+  literal indexes at compile time (or publish them once with an atomic), then share literals as immortal objects.
+- The bounded scheduler keeps its cursor in the small-heap slot header only `#if ... && !MINYAR_THREADED`
+  (runtime/minyar_bounded_rc.h:41, 61), so thread programs walk the record's map bytes: server
+  `rc_bounded_step_chunks` 69.2M vs 19.0M. Objects now live on small pages in thread mode too, so the condition can
+  probably be lifted.
 
 ### 1.5 What the compiler rejects (the idiomatic attempt, verbatim diagnostics)
 
@@ -215,7 +239,7 @@ Payoff = how much of the gap in *both* columns the fix removes, weighted by how 
 | # | cause | measurement | costs serial | costs parallel | fix | owner |
 |---|---|---|---|---|---|---|
 | C1 | Parallel code is a scalar sublanguage: no record/Text/List/Map creation, no Text/Map reads, no ordinary callees, no recursive types, no growing outputs, join arguments read-only | probes p1–p10; textindex 84% and mapreduce 44% of Ir forced serial; neo-db pkPlan/pkRun | nothing directly; idiomatic code stays 5–19x behind (hidden) because the fast form is a rewrite | Amdahl: textindex bound 1.14x, mapreduce 1.73x at 4 threads; whole neo-db statements cannot leave the loop | give pool workers managed domains: a task/parallel body may allocate and call ordinary functions; values it creates are owned by the worker's domain and either die there or move to the joining caller (per-iteration owned outputs, `collect`); captured values stay read-only | parallel (PAR-2 remainder) + ownership |
-| C2 | Thread runtime replaces the small-object heap with glibc malloc/free | textindex +59.9%, server +74.5% Ir at 1 thread; `_int_free`/`malloc` top functions | +60–75% on managed code of any program that mentions a thread or atomic | the same on every thread; malloc arena contention on top | per-thread small heap (`rc_system_*` state `_Thread_local`, pages released at domain end; no cross-thread frees exist) and keep the slot header for the bounded cursor | parallel (thread runtime) |
+| C2 | The thread runtime is slower for managed code even on one thread | textindex +59.9% / server +74.5% Ir at 1 thread at 42b1cbc46; **+29.1% / +50.5% after 4a3140b1f** (per-thread small heap) | +29–50% today on managed code of any program that mentions a thread or atomic | the same on every thread, plus malloc arena contention | done: per-thread small heap (4a3140b1f). Left: buffer data on small pages with remote free; literal Text shared instead of copied per use; bounded cursor in the slot header in thread mode | parallel (thread runtime) |
 | C3 | No shared read-only managed data: arguments and messages are copied; only FrozenBytes is shared and it reads at 3.3x a List | thread-share: channel +4,800 Ir per small record; FrozenBytes 9.0 vs 2.75 Ir/element | none | every "share the index/table" design pays copies (memory x threads) or slow reads; neo-db cannot run 2 loops over one index | `freeze(value)` for Lists/records/Text graphs: immutable, RC-exempt while frozen (immortal until the last thread scope ends), readable from any thread and from parallel bodies; inline FrozenBytes getters | ownership + parallel |
 | C4 | Outputs must be fixed-width windows indexed by the loop variable; windows exist only inside `parallel for` | p7–p9; topk/neo-db scratch sized to kmax; topk-plain-loop needed fresh Lists | serial path cannot reuse window code (+8.4% in topk-plain-loop) | worst-case scratch, serial grow-before and merge-after phases | per-iteration owned outputs moved back in index order (`parallel for ... collect`), windows over explicit ranges with a disjointness check, windows usable in ordinary code | parallel |
 | C5 | `join` arguments are read-only, so in-place divide-and-conquer (quicksort, partitioned writes) is not expressible | p6 | none | sort needs merge-path rounds; parallel quicksort/radix impossible | `join` over disjoint sub-windows of one buffer (`keys.split(at)` giving two exclusive views) | parallel |
@@ -232,7 +256,8 @@ Ir at 4 threads equals Ir at 1 thread for every compute program).
 
 The cheapest path to "write it once, fast on one core and on many" is to make the fast form the idiomatic one, in
 this order:
-1. C2 (per-thread small heap): removes the only serial tax of using threads; small, local to the runtime.
+1. C2 (finish the thread runtime: buffers on small pages with remote free, shared literals, slot-header cursor):
+   removes the only serial tax of using threads; local to the runtime. The per-thread small heap (4a3140b1f) did half.
 2. C1 + C4 (managed domains for pool tasks, owned per-iteration outputs): lets the idiomatic program be the parallel
    program, so the serial phases in mapreduce/textindex/topk/neo-db become parallel without a rewrite. Serial code
    pays nothing as long as task domains exist only inside pool work.
