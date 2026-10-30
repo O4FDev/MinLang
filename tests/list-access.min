@@ -93,6 +93,7 @@ for expected in ["define internal i64 @.minyar.list.get.checked", "define intern
 }
 let helpers: List<Text> = []
 let knownHelpers: List<Text> = []
+let appendHelpers: List<Text> = []
 let active = false
 let helper = ""
 for line in test.lines(llvm) {
@@ -103,7 +104,7 @@ for line in test.lines(llvm) {
     if active {
         helper += line + "\n"
         if startsWith(line, "}") {
-            if test.contains(helper, ".known(") { knownHelpers.add(helper) } else { helpers.add(helper) }
+            if test.contains(helper, ".known(") { knownHelpers.add(helper) } else if test.contains(helper, "@.minyar.list.add.scalar(") { appendHelpers.add(helper) } else { helpers.add(helper) }
             active = false
         }
     }
@@ -112,6 +113,15 @@ test.check(helpers.length == 3, "expected exactly three internal List helpers th
 // The parallel-function forms take an already loaded length and values
 // pointer; they keep the strict test and report through the List itself.
 test.check(knownHelpers.length == 2, "expected the two known-header List helpers")
+// Scalar append stores in place only below a positive capacity and otherwise
+// calls the runtime append, which grows, handles views and reports errors.
+test.check(appendHelpers.length == 1, "expected one scalar List append helper")
+for body in appendHelpers {
+    test.check(test.contains(body, "%room = icmp slt i64 %length, %capacity\n  br i1 %room, label %good, label %grow\n"), "scalar append must take the runtime path without room")
+    test.check(test.contains(body, "grow:\n  call void @minyar_list_add(ptr %list, i64 %value)\n  ret void"), "scalar append lost its runtime growth path")
+    test.check(test.contains(body, "store i64 %value, ptr %slot") && test.contains(body, "%next = add nuw nsw i64 %length, 1\n  store i64 %next, ptr %length.pointer"), "scalar append must store the value and then the length")
+    test.check(!test.contains(body, "!prof"), "ordinary append growth must not inherit a trap likelihood")
+}
 for body in knownHelpers {
     test.check(test.contains(body, "valid = icmp ult i64 %position, %length"), "known-header List helper lost its strict bounds predicate")
     test.check(test.contains(body, "@minyar_list_get(ptr %list, i64 %position)\n  unreachable") || test.contains(body, "@minyar_list_set(ptr %list, i64 %position, i64 %value)\n  unreachable"), "known-header List helper lost its runtime diagnostic")
@@ -134,6 +144,14 @@ for body in helpers {
     }
 }
 test.check(!test.contains(llvm, "noalias"), "List IR incorrectly claims noalias")
+// Scalar appends grow through the runtime and are seen by every alias;
+// reference elements keep the runtime append, which retains them.
+test.executes(compiler, "function fill(values: List<Integer>, count: Integer) { for index in 0..count { values.add(index * 3) } }\nlet values: List<Integer> = []\nlet alias = values\nfill(values, 5000)\nlet floats: List<Float> = [0.5]\nfloats.add(1.25)\nlet flags: List<Boolean> = []\nflags.add(true)\nflags.add(false)\nlet letters: List<Character> = ['a']\nletters.add('🙂')\nlet words: List<Text> = []\nwords.add(\"w\" + Text(alias.length))\nprint(alias.length)\nprint(alias[4999])\nprint(floats[1])\nprint(flags[0])\nprint(flags[1])\nprint(letters[1])\nprint(words[0])\n", "5000\n14997\n1.25\ntrue\nfalse\n🙂\nw5000\n")
+let appended = test.withoutRuntimeHelpers(generated(compiler))
+let filling = appended.slice(appended.find(" @.minyar.fn.fill("), appended.length)
+filling = filling.slice(0, filling.find("\n}\n"))
+test.check(test.contains(filling, "call void @.minyar.list.add.scalar(ptr ") && !test.contains(filling, "@minyar_list_add"), "scalar appends must use the inline append")
+test.check(test.contains(appended, "call void @minyar_list_add_take(ptr ") || test.contains(appended, "call void @minyar_list_add(ptr "), "a Text append must keep the retaining runtime append")
 if processInfo.argumentCount() == 0 {
 test.executes(compiler, "let integers = [0]\nintegers[0] = -9223372036854775808\nprint(integers[0])\nlet floats = [1.0]\nfloats[0] = -0.0\nprint(floats[0])\nfloats[0] = 2.5\nfloats[0] *= 4.0\nprint(floats[0])\nlet booleans = [false]\nbooleans[0] = true\nprint(booleans[0])\nlet characters = ['a']\ncharacters[0] = '🙂'\nprint(characters[0])\n", "-9223372036854775808\n-0.0\n10.0\ntrue\n🙂\n")
 for length in [0, 2] {
