@@ -1,0 +1,161 @@
+use "io" as io
+use "process" as processInfo
+use "text" as textLibrary
+use "unicode" as unicode
+// HTTP/1.1 request handler over a recorded byte stream: frame concatenated
+// requests, parse request lines and headers (case-insensitive names), read
+// Content-Length bodies, route, and build complete responses.
+
+record Request {
+    method: Text
+    target: Text
+    valid: Boolean
+    headers: Map<Text, Text>
+    body: Text
+    badLength: Boolean
+}
+
+record Response { status: Integer; body: Text; location: Text }
+
+record Server { created: Integer }
+
+function reason(status: Integer): Text {
+    return match status {
+        200 { "OK" }
+        201 { "Created" }
+        400 { "Bad Request" }
+        404 { "Not Found" }
+        405 { "Method Not Allowed" }
+        _ { "Length Required" }
+    }
+}
+
+function failure(status: Integer, message: Text): Response {
+    return Response { status: status; body: "{\"error\":\"\(message)\"}"; location: "" }
+}
+
+function queryParameters(query: Text): Map<Text, Text> {
+    let parameters: Map<Text, Text> = Map()
+    if query.length == 0 { return parameters }
+    for pair in query.split("&") {
+        let equals = pair.find("=")
+        if equals < 0 {
+            parameters[pair] = ""
+        } else {
+            parameters[pair.slice(0, equals)] = pair.slice(equals + 1, pair.length)
+        }
+    }
+    return parameters
+}
+
+function Server.handle(request: Request): Response {
+    if !request.valid { return failure(400, "bad request line") }
+    if request.badLength { return failure(400, "bad content length") }
+    if !request.headers.has("host") { return failure(400, "missing host") }
+    let path = request.target
+    let query = ""
+    let mark = path.find("?")
+    if mark >= 0 {
+        query = path.slice(mark + 1, path.length)
+        path = path.slice(0, mark)
+    }
+    if path.startsWith("/users/") {
+        if request.method != "GET" { return failure(405, "method not allowed") }
+        match textLibrary.integer(path.slice(7, path.length)) {
+            Ok(id) {
+                if id >= 0 && id < 50000 {
+                    return Response { status: 200; body: "{\"id\":\(id),\"name\":\"user-\(id)\",\"tier\":\(id % 5)}"; location: "" }
+                }
+            }
+            Err(_) { }
+        }
+        return failure(404, "no such user")
+    }
+    if path == "/search" {
+        if request.method != "GET" { return failure(405, "method not allowed") }
+        let parameters = queryParameters(query)
+        if !parameters.has("q") { return failure(400, "missing q") }
+        let term = parameters["q"]
+        let limit = 10
+        if parameters.has("limit") { limit = textLibrary.integer(parameters["limit"]).unwrapOr(10) }
+        let results: List<Text> = []
+        for k in 0..min(limit, 5) { results.add("\"\(term)-\(k)\"") }
+        let joined = ""
+        for k in 0..results.length {
+            if k > 0 { joined = joined + "," }
+            joined = joined + results[k]
+        }
+        return Response { status: 200; body: "{\"query\":\"\(term)\",\"limit\":\(limit),\"results\":[\(joined)]}"; location: "" }
+    }
+    if path == "/items" {
+        if request.method != "POST" { return failure(405, "method not allowed") }
+        if !request.headers.has("content-length") { return failure(411, "length required") }
+        self.created += 1
+        return Response { status: 201; body: "{\"created\":true,\"bytes\":\(request.body.byteLength)}"; location: "/items/\(self.created)" }
+    }
+    return failure(404, "not found")
+}
+
+function render(request: Request, response: Response): Text {
+    let head = "HTTP/1.1 \(response.status) \(reason(response.status))\r\nContent-Type: application/json\r\nContent-Length: \(response.body.byteLength)\r\n"
+    if request.headers.has("x-request-id") { head = head + "X-Request-Id: \(request.headers["x-request-id"])\r\n" }
+    if response.location.length > 0 { head = head + "Location: \(response.location)\r\n" }
+    let connection = "keep-alive"
+    if request.headers.has("connection") && request.headers["connection"] == "close" { connection = "close" }
+    return head + "Connection: \(connection)\r\n\r\n" + response.body
+}
+
+let pieces = io.readTextFile(processInfo.argument(0)).split("\r\n")
+let server = Server { created: 0 }
+let statuses: Map<Integer, Integer> = Map()
+let requests = 0
+let responseBytes = 0
+let checksum = 0
+let samples: List<Text> = []
+let last = ""
+let index = 0
+while index < pieces.length && pieces[index].length > 0 {
+    let parts = pieces[index].split(" ")
+    index += 1
+    let request = Request { method: ""; target: ""; valid: parts.length == 3; headers: Map(); body: ""; badLength: false }
+    if request.valid {
+        request.method = parts[0]
+        request.target = parts[1]
+    }
+    while index < pieces.length && pieces[index].length > 0 {
+        let line = pieces[index]
+        index += 1
+        let colon = line.find(":")
+        if colon > 0 { request.headers[unicode.lowercased(line.slice(0, colon))] = line.slice(colon + 1, line.length).trim() }
+    }
+    index += 1
+    if request.headers.has("content-length") {
+        match textLibrary.integer(request.headers["content-length"]) {
+            Ok(length) {
+                let piece = pieces[index]
+                request.body = piece.slice(0, length)
+                pieces[index] = piece.slice(length, piece.length)
+            }
+            Err(_) { request.badLength = true }
+        }
+    }
+    let response = server.handle(request)
+    let output = render(request, response)
+    requests += 1
+    if statuses.has(response.status) { statuses[response.status] += 1 } else { statuses[response.status] = 1 }
+    responseBytes += output.byteLength
+    checksum = (checksum * 131 + output.byteLength * 7 + response.status) % 1000000007
+    if samples.length < 3 { samples.add(output) }
+    last = output
+}
+print("requests \(requests)")
+for status in [200, 201, 400, 404, 405, 411] {
+    let count = 0
+    if statuses.has(status) { count = statuses[status] }
+    print("status \(status) \(count)")
+}
+print("response bytes \(responseBytes)")
+print("items created \(server.created)")
+print("checksum \(checksum)")
+for sample in samples { print(sample) }
+print(last)

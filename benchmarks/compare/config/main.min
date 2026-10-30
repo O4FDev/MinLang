@@ -1,0 +1,177 @@
+use "io" as io
+use "process" as processInfo
+use "text" as textLibrary
+// INI/TOML-like configuration: sections, typed `key = value` entries and
+// comments. Bad lines become line-numbered errors and parsing continues.
+// The parsed settings are then queried the way a service reads its config.
+
+choice Value {
+    IntegerValue(number: Integer)
+    BooleanValue(flag: Boolean)
+    TextValue(content: Text)
+    ListValue(items: List<Integer>)
+}
+
+record Config { sections: Map<Text, Map<Text, Value>>; errors: List<Text> }
+
+function integerValue(source: Text): Result<Integer, Text> {
+    return match textLibrary.integer(source) {
+        Ok(number) { Ok(number) }
+        Err(_) { Err("invalid integer '\(source)'") }
+    }
+}
+
+function parseValue(raw: Text): Result<Value, Text> {
+    let value = raw.trim()
+    if value.startsWith("\"") {
+        let close = value.slice(1, value.length).find("\"")
+        if close < 0 { return Err("unterminated string") }
+        let rest = value.slice(close + 2, value.length).trim()
+        if rest.length > 0 && !rest.startsWith("#") { return Err("unexpected text after string") }
+        return Ok(TextValue(value.slice(1, close + 1)))
+    }
+    let comment = value.find("#")
+    if comment >= 0 { value = value.slice(0, comment).trim() }
+    if value.startsWith("[") {
+        if !value.endsWith("]") { return Err("unterminated list") }
+        let inner = value.slice(1, value.length - 1).trim()
+        let items: List<Integer> = []
+        if inner.length > 0 {
+            for part in inner.split(",") { items.add(try integerValue(part.trim())) }
+        }
+        return Ok(ListValue(items))
+    }
+    if value == "true" { return Ok(BooleanValue(true)) }
+    if value == "false" { return Ok(BooleanValue(false)) }
+    if value.length > 0 && (value[0] == '-' || (value[0] >= '0' && value[0] <= '9')) {
+        return Ok(IntegerValue(try integerValue(value)))
+    }
+    return Err("unknown value '\(value)'")
+}
+
+function parseConfig(source: Text): Config {
+    let config = Config { sections: Map(); errors: [] }
+    let current = ""
+    let inSection = false
+    let lineNumber = 0
+    for rawLine in source.split("\n") {
+        lineNumber += 1
+        let line = rawLine.trim()
+        if line.length == 0 || line.startsWith("#") { continue }
+        if line.startsWith("[") {
+            if !line.endsWith("]") {
+                config.errors.add("line \(lineNumber): unterminated section header")
+                continue
+            }
+            current = line.slice(1, line.length - 1).trim()
+            inSection = true
+            if !config.sections.has(current) { config.sections[current] = Map() }
+            continue
+        }
+        let equals = line.find("=")
+        if equals < 0 {
+            config.errors.add("line \(lineNumber): expected '=' after a key")
+            continue
+        }
+        let key = line.slice(0, equals).trim()
+        if key.length == 0 {
+            config.errors.add("line \(lineNumber): missing key")
+            continue
+        }
+        if !inSection {
+            config.errors.add("line \(lineNumber): entry outside a section")
+            continue
+        }
+        match parseValue(line.slice(equals + 1, line.length)) {
+            Ok(value) { config.sections[current][key] = value }
+            Err(message) { config.errors.add("line \(lineNumber): \(message)") }
+        }
+    }
+    return config
+}
+
+function Config.integer(section: Text, key: Text): Maybe<Integer> {
+    if !self.sections.has(section) || !self.sections[section].has(key) { return None }
+    return match self.sections[section][key] {
+        IntegerValue(number) { Some(number) }
+        else { None }
+    }
+}
+
+function Config.flag(section: Text, key: Text): Maybe<Boolean> {
+    if !self.sections.has(section) || !self.sections[section].has(key) { return None }
+    return match self.sections[section][key] {
+        BooleanValue(flag) { Some(flag) }
+        else { None }
+    }
+}
+
+function Config.text(section: Text, key: Text): Maybe<Text> {
+    if !self.sections.has(section) || !self.sections[section].has(key) { return None }
+    return match self.sections[section][key] {
+        TextValue(content) { Some(content) }
+        else { None }
+    }
+}
+
+function Config.list(section: Text, key: Text): Maybe<List<Integer>> {
+    if !self.sections.has(section) || !self.sections[section].has(key) { return None }
+    return match self.sections[section][key] {
+        ListValue(items) { Some(items) }
+        else { None }
+    }
+}
+
+let config = parseConfig(io.readTextFile(processInfo.argument(0)))
+let entries = 0
+for name in config.sections { entries += config.sections[name].length }
+print("sections \(config.sections.length)")
+print("entries \(entries)")
+print("errors \(config.errors.length)")
+for i in 0..min(8, config.errors.length) { print(config.errors[i]) }
+
+let queries = config.sections.length * 3
+let space = config.sections.length + config.sections.length / 10 + 1
+let missingSections = 0
+let missingKeys = 0
+let portSum = 0
+let enabled = 0
+let nameBytes = 0
+let weightSum = 0
+let weightCount = 0
+let timeoutSum = 0
+for q in 0..queries {
+    let section = "service.\((q * 7919) % space)"
+    if !config.sections.has(section) {
+        missingSections += 1
+        continue
+    }
+    match config.integer(section, "port") {
+        Some(port) { portSum += port }
+        None { missingKeys += 1 }
+    }
+    match config.flag(section, "enabled") {
+        Some(flag) { if flag { enabled += 1 } }
+        None { missingKeys += 1 }
+    }
+    match config.text(section, "name") {
+        Some(name) { nameBytes += name.byteLength }
+        None { missingKeys += 1 }
+    }
+    match config.list(section, "weights") {
+        Some(items) {
+            weightCount += items.length
+            for item in items { weightSum += item }
+        }
+        None { missingKeys += 1 }
+    }
+    timeoutSum += config.integer(section, "timeout").unwrapOr(30)
+}
+print("queries \(queries)")
+print("missing sections \(missingSections)")
+print("missing keys \(missingKeys)")
+print("port sum \(portSum)")
+print("enabled \(enabled)")
+print("name bytes \(nameBytes)")
+print("weights \(weightCount) \(weightSum)")
+print("timeout sum \(timeoutSum)")

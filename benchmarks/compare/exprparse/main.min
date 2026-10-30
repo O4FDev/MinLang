@@ -1,0 +1,180 @@
+use "io" as io
+use "process" as processInfo
+// Recursive-descent parser for arithmetic and comparison expressions, one per
+// line. Each line becomes an expression tree that is then evaluated; parse
+// errors and division by zero are reported through Result.
+
+choice Expr {
+    Number(value: Integer)
+    Negate(operand: Expr)
+    Binary(op: Character, left: Expr, right: Expr)
+    Compare(op: Text, left: Expr, right: Expr)
+}
+
+record Parser { text: Text; position: Integer; line: Integer }
+
+function Parser.skipSpaces() {
+    while self.position < self.text.length && self.text[self.position] == ' ' { self.position += 1 }
+}
+
+function Parser.peek(): Character {
+    self.skipSpaces()
+    if self.position >= self.text.length { return '\n' }
+    return self.text[self.position]
+}
+
+function Parser.fail(expected: Text): Text {
+    return "line \(self.line): expected \(expected) at column \(self.position + 1)"
+}
+
+function Parser.expression(): Result<Expr, Text> {
+    let left = try self.sum()
+    let c = self.peek()
+    if c == '<' || c == '>' || c == '=' || c == '!' {
+        let width = 1
+        if self.position + 1 < self.text.length && self.text[self.position + 1] == '=' { width = 2 }
+        let op = self.text.slice(self.position, self.position + width)
+        if op == "=" || op == "!" { return Err(self.fail("a comparison")) }
+        self.position += width
+        let right = try self.sum()
+        return Ok(Compare(op, left, right))
+    }
+    return Ok(left)
+}
+
+function Parser.sum(): Result<Expr, Text> {
+    let left = try self.term()
+    while true {
+        let c = self.peek()
+        if c != '+' && c != '-' { break }
+        self.position += 1
+        left = Binary(c, left, try self.term())
+    }
+    return Ok(left)
+}
+
+function Parser.term(): Result<Expr, Text> {
+    let left = try self.unary()
+    while true {
+        let c = self.peek()
+        if c != '*' && c != '/' && c != '%' { break }
+        self.position += 1
+        left = Binary(c, left, try self.unary())
+    }
+    return Ok(left)
+}
+
+function Parser.unary(): Result<Expr, Text> {
+    if self.peek() == '-' {
+        self.position += 1
+        return Ok(Negate(try self.unary()))
+    }
+    return self.primary()
+}
+
+function Parser.primary(): Result<Expr, Text> {
+    let c = self.peek()
+    if c >= '0' && c <= '9' {
+        let start = self.position
+        while self.position < self.text.length && self.text[self.position] >= '0' && self.text[self.position] <= '9' {
+            self.position += 1
+        }
+        return Ok(Number(Integer(self.text.slice(start, self.position))))
+    }
+    if c == '(' {
+        self.position += 1
+        let inner = try self.expression()
+        if self.peek() != ')' { return Err(self.fail("')'")) }
+        self.position += 1
+        return Ok(inner)
+    }
+    return Err(self.fail("a number"))
+}
+
+function parseLine(text: Text, line: Integer): Result<Expr, Text> {
+    let parser = Parser { text: text; position: 0; line: line }
+    let expression = try parser.expression()
+    if parser.peek() != '\n' { return Err(parser.fail("the end of the line")) }
+    return Ok(expression)
+}
+
+function evaluate(expression: Expr, line: Integer): Result<Integer, Text> {
+    return match expression {
+        Number(value) { Ok(value) }
+        Negate(operand) { Ok(0 - try evaluate(operand, line)) }
+        Binary(op, left, right) { arithmetic(op, try evaluate(left, line), try evaluate(right, line), line) }
+        Compare(op, left, right) { Ok(comparison(op, try evaluate(left, line), try evaluate(right, line))) }
+    }
+}
+
+function arithmetic(op: Character, a: Integer, b: Integer, line: Integer): Result<Integer, Text> {
+    if op == '+' { return Ok(a + b) }
+    if op == '-' { return Ok(a - b) }
+    if op == '*' { return Ok(a * b) }
+    if b == 0 { return Err("line \(line): division by zero") }
+    if op == '/' { return Ok(a / b) }
+    return Ok(a % b)
+}
+
+function comparison(op: Text, a: Integer, b: Integer): Integer {
+    let holds = match op {
+        "<" { a < b }
+        ">" { a > b }
+        "<=" { a <= b }
+        ">=" { a >= b }
+        "==" { a == b }
+        _ { a != b }
+    }
+    if holds { return 1 }
+    return 0
+}
+
+function nodeCount(expression: Expr): Integer {
+    return match expression {
+        Number(_) { 1 }
+        Negate(operand) { 1 + nodeCount(operand) }
+        Binary(_, left, right) { 1 + nodeCount(left) + nodeCount(right) }
+        Compare(_, left, right) { 1 + nodeCount(left) + nodeCount(right) }
+    }
+}
+
+let lines = io.readTextFile(processInfo.argument(0)).split("\n")
+let evaluated = 0
+let divisionErrors = 0
+let syntaxErrors = 0
+let comparisonsTrue = 0
+let nodes = 0
+let total = 0
+let messages: List<Text> = []
+let lineNumber = 0
+for text in lines {
+    lineNumber += 1
+    if text.length == 0 { continue }
+    match parseLine(text, lineNumber) {
+        Ok(expression) {
+            nodes += nodeCount(expression)
+            match evaluate(expression, lineNumber) {
+                Ok(value) {
+                    evaluated += 1
+                    total = (total + value % 1000000007) % 1000000007
+                    if expression is Compare(_, _, _) { comparisonsTrue += value }
+                }
+                Err(message) {
+                    divisionErrors += 1
+                    if messages.length < 6 { messages.add(message) }
+                }
+            }
+        }
+        Err(message) {
+            syntaxErrors += 1
+            if messages.length < 6 { messages.add(message) }
+        }
+    }
+}
+print("evaluated \(evaluated)")
+print("division errors \(divisionErrors)")
+print("syntax errors \(syntaxErrors)")
+print("true comparisons \(comparisonsTrue)")
+print("nodes \(nodes)")
+print("total \(total)")
+for message in messages { print(message) }
