@@ -586,7 +586,16 @@ compiler lowering. Adoption also needs live/stable collection storage and
 unchanged diagnostic, ownership and effect ordering; the arithmetic proof alone
 does not permit hoisting across mutation or reassociating arbitrary signed sums.
 
-Broader tag ranges, TBAA, noalias and explicit noundef contracts remain deferred.
+The inline List and record helpers carry type-based alias tags in a Minyar
+TBAA tree: `minyar list header` (length and values pointer), `minyar list slot`
+and `minyar record field`. A List slot or record field store therefore keeps an
+already loaded List length or values pointer valid, and LLVM can keep them in
+registers or hoist them. The tags state only that these are different objects:
+every other access, Bytes (which may be shifted native views) and the runtime's
+C accesses stay outside the tree, and LLVM treats accesses from different trees
+as possibly aliasing. `make check-llvm-helper-contracts` checks the tags and that
+O2 reuses a List length across a field or slot store but not across a Bytes store.
+Broader tag ranges, noalias and explicit noundef contracts remain deferred.
 Native scalar boundaries, nullable choice niches, shared native views and
 partially initialized payloads require more precise proofs; explicit noundef
 also needs matching ABI treatment at call sites for MemorySanitizer. Existing

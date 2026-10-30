@@ -67,11 +67,47 @@ let append = body(llvm, ".minyar.bytes.add.checked")
 test.check(!test.contains(append, "!prof"), "ordinary append growth must not inherit a trap likelihood")
 for name in ["bytes.get.checked", "bytes.set.checked", "list.get.checked", "list.set.scalar.checked"] {
     let helper = body(llvm, ".minyar." + name)
-    let storage = "%data = load ptr, ptr %bytes"
-    if name.startsWith("list.") { storage = "%values = load ptr, ptr %list" }
-    test.check(test.contains(helper, "good:\n  " + storage + ", !nonnull !{}\n"), name + " must expose storage only in its successful block")
-    test.check(!test.contains(helper, "dereferenceable(") && !test.contains(helper, "!tbaa") && !test.contains(helper, "!alias.scope"), name + " must preserve native-view aliasing")
+    let storage = "%data = load ptr, ptr %bytes, !nonnull !{}\n"
+    if name.startsWith("list.") { storage = "%values = load ptr, ptr %list, !nonnull !{}, !tbaa " }
+    test.check(test.contains(helper, "good:\n  " + storage), name + " must expose storage only in its successful block")
+    test.check(!test.contains(helper, "dereferenceable(") && !test.contains(helper, "!alias.scope"), name + " must preserve native-view aliasing")
+    // Bytes may be shifted native views and stay untagged. List headers, List
+    // slots and record fields are distinct Minyar objects, tagged in their own
+    // TBAA tree; runtime C uses another tree, which LLVM treats as may-alias.
+    if name.startsWith("bytes.") { test.check(!test.contains(helper, "!tbaa"), name + " must not claim type-based aliasing") }
+    else {
+        test.check(test.contains(helper, "%length = load i64, ptr %length.pointer, !tbaa !{!{!\"minyar list header\", !{!\"minyar\"}, i64 0}"), name + " must tag the List length")
+        test.check(test.contains(helper, "%values = load ptr, ptr %list, !nonnull !{}, !tbaa !{!{!\"minyar list header\""), name + " must tag the List values pointer")
+        test.check(test.contains(helper, "ptr %slot, !tbaa !{!{!\"minyar list slot\", !{!\"minyar\"}, i64 0}"), name + " must tag the List slot")
+    }
 }
+for name in ["record.get", "record.set.scalar"] {
+    test.check(test.contains(body(llvm, ".minyar." + name), "ptr %slot, !tbaa !{!{!\"minyar record field\", !{!\"minyar\"}, i64 0}"), name + " must tag the record field")
+}
+test.check(test.contains(body(llvm, ".minyar.list.length"), "!tbaa !{!{!\"minyar list header\""), "List length must tag the header")
+
+// The tags let O2 keep a List length across a record field or List slot store;
+// a Bytes store (untagged) still forces the reload.
+let alias = #"""
+record P { x: Integer }
+function field(p: P, xs: List<Integer>): Integer { let a = xs.length; p.x = 5; return a + xs.length }
+function slot(xs: List<Integer>): Integer { let a = xs.length; xs[0] = 7; return a + xs.length }
+function raw(b: Bytes): Integer { let a = b.length; b[0] = 7; return a + b.length }
+print(field(P { x: 1 }, [1, 2])); print(slot([1, 2])); print(raw(Bytes(2)))
+"""#
+test.executes(compiler, alias, "4\n4\n4\n")
+let aliasPath = compiler.directory + "/case" + Text(compiler.serial)
+let optimize = [compiler.clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm"]
+for flag in compiler.flags { optimize.add(flag) }
+for item in [aliasPath + ".ll", "-o", aliasPath + ".optimized.ll"] { optimize.add(item) }
+test.require(test.run(optimize, system.environment(), "", aliasPath + ".optimize", compiler.linkTimeout), "optimize alias probe")
+let optimized = io.readTextFile(aliasPath + ".optimized.ll")
+// Sanitizer builds instrument every access, so only plain builds count loads.
+if compiler.flags.length == 0 { for probe in [["field", "1"], ["slot", "1"], ["raw", "2"]] {
+    let loads = 0
+    for line in test.lines(body(optimized, ".minyar.fn." + probe[0])) { if test.contains(line, " = load i64, ptr ") { loads += 1 } }
+    test.check(Text(loads) == probe[1], probe[0] + ": expected " + probe[1] + " length loads at O2, found " + Text(loads))
+} }
 
 // Verify the actual emitted module independently of execution and optimization.
 test.require(test.run([compiler.clang, "-Wno-override-module", "-c", path + ".ll", "-o", path + ".verify.o"], system.environment(), "", path + ".verify", compiler.linkTimeout), "verify helper attributes and metadata")
