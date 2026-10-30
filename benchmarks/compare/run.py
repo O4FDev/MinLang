@@ -13,6 +13,9 @@ and each program receives the file's path; otherwise it receives N itself.
       ratio minyar / min(c, cpp, rust), with a geomean line. Reference Ir is
       cached by source hash and compiler version in build/compare-cache/.
       --perf adds wall times (n=3, interleaved; median and spread).
+      --minyar-args passes extra launcher options to the measured release build
+      (e.g. "--memory-profile eager"); MINYAR_TARGET_CPU=x86-64-v3 in the
+      environment matches the references' -march.
       --profile keeps cg_annotate function tables for Minyar and the fastest
       reference in build/compare/NAME/*.annotate.txt and prints the top lines.
   run.py --check [--only NAME] [--tree DIR]
@@ -27,6 +30,7 @@ import math
 import os
 import platform
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -95,10 +99,10 @@ def build_ref(lang, name, out, optimise=True):
     run(cmd, stdout=subprocess.DEVNULL)
 
 
-def build_minyar(tree, name, out, mode):
+def build_minyar(tree, name, out, mode, extra=()):
     log = out + ".log"
     with open(log, "w") as f:
-        r = subprocess.run([os.path.join(tree, "minyar"), mode, os.path.join(HERE, name, "main.min"), "-o", out],
+        r = subprocess.run([os.path.join(tree, "minyar"), mode, *extra, os.path.join(HERE, name, "main.min"), "-o", out],
                            stdout=f, stderr=subprocess.STDOUT, cwd=tree)
     if r.returncode != 0:
         with open(log) as f:
@@ -173,7 +177,7 @@ def measure_program(name, args, results):
     row = {"name": name, "ir": {}, "identical": True, "outputs": {}}
     exes = {}
     try:
-        build_minyar(args.tree, name, os.path.join(work, "minyar"), "--release")
+        build_minyar(args.tree, name, os.path.join(work, "minyar"), "--release", shlex.split(args.minyar_args))
         exes["minyar"] = os.path.join(work, "minyar")
         for lang in REFS:
             exes[lang] = os.path.join(work, lang)
@@ -294,7 +298,8 @@ def measure(args):
         geo = math.exp(sum(math.log(r["ratio"]) for r in ok) / len(ok))
         print(f"{'geomean':<16} {'':<4} " + " " * (13 * len(LANGS)) + f" {geo:>7.2f}  ({len(ok)} programs)")
     if args.json:
-        doc = {"tree": os.path.abspath(args.tree), "threads": THREADS,
+        doc = {"tree": os.path.abspath(args.tree), "threads": THREADS, "minyar_args": args.minyar_args,
+               "minyar_target_cpu": os.environ.get("MINYAR_TARGET_CPU", ""),
                "tree_commit": subprocess.run(["git", "-C", args.tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip(),
                "toolchains": {"c": tool_version([cc(), "--version"]), "cpp": tool_version([cxx(), "--version"]),
                               "rust": tool_version(["rustc", "--version"]), "valgrind": tool_version(["valgrind", "--version"])},
@@ -354,6 +359,7 @@ def main():
     p.add_argument("--perf", action="store_true", help="also measure wall time, n=3 interleaved")
     p.add_argument("--profile", action="store_true", help="print cg_annotate top functions for Minyar and the fastest reference")
     p.add_argument("--jobs", type=int, default=0, help="concurrent programs (default: 2 for Ir, CPU count for --check)")
+    p.add_argument("--minyar-args", default="", help="extra launcher options for the measured release build, e.g. '--memory-profile eager'")
     p.add_argument("--check", action="store_true", help="correctness only: O0 and release Minyar against C, small input")
     args = p.parse_args()
     args.tree = os.path.abspath(args.tree)
