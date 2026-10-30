@@ -18,6 +18,11 @@ receives its path, otherwise it receives N itself.
       at 1 thread are measured in the same interleaving, for scaling. Prints a
       geomean line for each column. Reference Ir is cached by source hash and
       toolchain in build/bothmodes-cache/.
+  run.py --wall-only [--only NAME] [--repeats N] [--threads N]
+      Only the wall-time columns, reusing the binaries of the last full run
+      (build/bothmodes/NAME; built when missing, e.g. on a host without
+      valgrind); prints /proc/loadavg before and after, because
+      wall times at N threads mean little on a loaded machine.
   run.py --check [--only NAME] [--tree DIR]
       Correctness only, on the host: Minyar at O0 (--debug) and release, each at
       1 and 4 threads, against the C reference on the small workload.
@@ -245,8 +250,45 @@ def geomean(values):
     return math.exp(sum(math.log(v) for v in values) / len(values))
 
 
+def load_average():
+    try:
+        with open("/proc/loadavg") as f:
+            return f.read().strip()
+    except OSError:
+        return " ".join(f"{x:.2f}" for x in os.getloadavg())
+
+
+def wall_only(args):
+    names = programs(args.only)
+    n = args.threads
+    print(f"load before: {load_average()}", flush=True)
+    print(f"{'program':<10} {f'minyar@{n} ms':>13} {f'rust@{n} ms':>13} {'par':>6} | {'minyar@1 ms':>13} {'rust@1 ms':>13} "
+          f"{'m-scl':>5} {'r-scl':>5}", flush=True)
+    ratios = []
+    for name in names:
+        work = os.path.join(REPO, "build", "bothmodes", name)
+        full, _ = sizes(name)
+        arg = prepare_input(name, full, work)
+        exes = {"minyar": os.path.join(work, "minyar"), "par": os.path.join(work, "par")}
+        if not os.path.exists(exes["minyar"]):
+            build_minyar(args.tree, name, exes["minyar"], "--release")
+        if not os.path.exists(exes["par"]):
+            build_ref("par", name, exes["par"])
+        w = wall_times(exes, arg, n, args.repeats)
+        med = {k: statistics.median(v) for k, v in w.items()}
+        ratio = med[f"minyar@{n}"] / med[f"par@{n}"]
+        ratios.append(ratio)
+        print(f"{name:<10} {fmt_wall(w[f'minyar@{n}']):>13} {fmt_wall(w[f'par@{n}']):>13} {ratio:>6.2f} | "
+              f"{fmt_wall(w['minyar@1']):>13} {fmt_wall(w['par@1']):>13} {med['minyar@1'] / med[f'minyar@{n}']:>5.2f} "
+              f"{med['par@1'] / med[f'par@{n}']:>5.2f}", flush=True)
+    print(f"{'geomean':<10} {'':>13} {'':>13} {geomean(ratios):>6.2f}", flush=True)
+    print(f"load after: {load_average()}", flush=True)
+    return 0
+
+
 def measure(args):
     names = programs(args.only)
+    print(f"load before: {load_average()}", flush=True)
     n = args.threads
     print(f"{'program':<10} {'same':<4} {'minyar@1 Ir':>10} {'serial Ir':>10} {'best':<4} {'serial':>6} | "
           f"{f'minyar@{n} ms':>13} {f'rust@{n} ms':>13} {'par':>6} | {f'minyar@{n} Ir':>10} {f'rust@{n} Ir':>10} {'Ir x':>6} | "
@@ -267,6 +309,7 @@ def measure(args):
         doc["parallel_geomean"] = geomean([r["parallel_ratio"] for r in ok])
         print(f"{'geomean':<10} {'':<4} {'':>10} {'':>10} {'':<4} {doc['serial_geomean']:>6.2f} | {'':>13} {'':>13} "
               f"{doc['parallel_geomean']:>6.2f}   ({len(ok)} programs; serial = Ir at 1 thread, parallel = wall at {n})")
+    print(f"load after: {load_average()}", flush=True)
     if args.json:
         os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
         with open(args.json, "w") as f:
@@ -326,10 +369,13 @@ def main():
     p.add_argument("--repeats", type=int, default=5, help="interleaved wall-time runs per configuration (default 5)")
     p.add_argument("--jobs", type=int, default=0, help="concurrent programs for --check (default: CPU count, at most 6)")
     p.add_argument("--check", action="store_true", help="correctness only: O0 and release Minyar against C, small input")
+    p.add_argument("--wall-only", action="store_true", help="only wall times, reusing the last full run's binaries")
     args = p.parse_args()
     args.tree = os.path.abspath(args.tree)
     if args.jobs == 0:
         args.jobs = min(6, os.cpu_count() or 2)
+    if args.wall_only:
+        sys.exit(wall_only(args))
     if not args.check and not shutil.which("valgrind"):
         sys.exit("run.py needs valgrind (cachegrind); use --check for correctness only")
     sys.exit(check(args) if args.check else measure(args))

@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
         setup(c->client);
         setup(c->server);
 #ifdef __linux__
-        struct epoll_event ev = {.events = EPOLLIN, .data.u64 = (uint64_t)(2 * i)};
+        struct epoll_event ev{}; ev.events = EPOLLIN; ev.data.u64 = (uint64_t)(2 * i);
         epoll_ctl(loop, EPOLL_CTL_ADD, c->client, &ev);
         ev.data.u64 = (uint64_t)(2 * i + 1);
         epoll_ctl(loop, EPOLL_CTL_ADD, c->server, &ev);

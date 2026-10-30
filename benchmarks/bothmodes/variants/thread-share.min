@@ -1,0 +1,77 @@
+use "process" as processInfo
+use "channels" as channels
+// Micro-measure of what crossing threads costs. Mode `copy`: four threads each
+// receive the same N-element List<Integer> (copied into every thread) and sum
+// it. Mode `frozen`: the table is frozen once into FrozenBytes, shared without
+// copying, and summed with getInt64. Mode `channel`: main sends N/64 records
+// {id, Text, List of 8 Integers} through a typed channel to one worker that
+// sums them; mode `local` sums the same records on main. Prints the sums.
+record Job { id: Integer; name: Text; values: List<Integer> }
+
+thread function sumList(table: List<Integer>, part: Integer): Integer {
+    let sum = 0
+    for v in table { sum += v }
+    return sum + part
+}
+
+thread function sumFrozen(table: FrozenBytes, part: Integer): Integer {
+    let sum = 0
+    for i in 0..table.length / 8 { sum += table.getInt64(i * 8) }
+    return sum + part
+}
+
+function jobSum(job: Job): Integer {
+    let sum = job.id + job.name.length
+    for v in job.values { sum += v }
+    return sum
+}
+
+thread function consume(jobs: channels.Channel<Job>, unused: Integer): Integer {
+    let sum = 0
+    let more = true
+    while more {
+        match channels.receive(jobs) {
+            Some(job) { sum += jobSum(job) }
+            None { more = false }
+        }
+    }
+    return sum
+}
+
+function makeJob(i: Integer): Job {
+    let values: List<Integer> = []
+    for k in 0..8 { values.add(i + k) }
+    return Job { id: i; name: "job" + Text(i % 100); values: values }
+}
+
+let mode = processInfo.argument(0)
+let n = Integer(processInfo.argument(1))
+let total = 0
+if mode == "copy" || mode == "frozen" {
+    let frozenMode = mode == "frozen"
+    let table: List<Integer> = []
+    let bytes = Bytes()
+    for i in 0..n {
+        if frozenMode { bytes.addInt64(i % 1000) } else { table.add(i % 1000) }
+    }
+    let threads: List<Thread> = []
+    if !frozenMode {
+        for part in 0..4 { threads.add(startThread(sumList, table, part)) }
+    } else {
+        let frozen = freezeBytesTake(bytes)
+        for part in 0..4 { threads.add(startThread(sumFrozen, frozen, part)) }
+    }
+    for t in threads { total += joinThread(t) }
+} else {
+    let count = n / 64
+    if mode == "channel" {
+        let jobs: channels.Channel<Job> = channels.bounded(256)
+        let worker = startThread(consume, jobs, 0)
+        for i in 0..count { channels.send(jobs, makeJob(i)) }
+        channels.close(jobs)
+        total = joinThread(worker)
+    } else {
+        for i in 0..count { total += jobSum(makeJob(i)) }
+    }
+}
+print("\(mode) \(total)")
