@@ -88,8 +88,12 @@ build/stage0: bootstrap/stage0.c vendor/stb_ds.h build/.toolchain.json | build
 build/compiler-stage1.ll: build/compiler.min build/stage0
 	$(LIMITED) ./build/stage0 $< -o $@
 
+# Stage1 only compiles the compiler into build/compiler-stage2.ll, which does not depend on how stage1 itself was
+# optimised (as with GCC's unoptimised stage1). Unoptimised, it links in about 2 s instead of about 45 s of ThinLTO
+# and emits byte-identical stage2 IR.
+BOOTSTRAP_LLVM_FLAGS ?= -O0 -Wno-override-module
 build/compiler-stage1: build/compiler-stage1.ll build/minyar-compiler-runtime.ll
-	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
+	$(LIMITED) "$(LLVM_CC)" $(BOOTSTRAP_LLVM_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 build/compiler-stage2-sanitize.ll: build/compiler-stage2.ll build/tooling/tools/clang-driver
 	$(SANITIZER_LIMITED) ./build/tooling/tools/clang-driver sanitize-llvm $< $@
