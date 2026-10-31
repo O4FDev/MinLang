@@ -37,6 +37,15 @@ record LoopCopy {
     variable: Text
     lists: List<Text>
     values: List<Text>
+    lengths: List<Text>
+    valueLoads: List<Boolean>
+    positionLists: List<Boolean>
+    windowLengths: List<Text>
+    windowLists: List<Integer>
+    windowOffsets: List<Text>
+    windowCode: List<Text>
+    windowNames: List<Text>
+    windowHoisted: List<Text>
 }
 
 function loopNameCharacter(character: Character): Boolean {
@@ -269,28 +278,224 @@ function loopTruncated(values: List<Text>, length: Integer): List<Text> {
     return result
 }
 
-// The values buffer of an invariant List indexed at the loop position.
+function loopTruncatedIntegers(values: List<Integer>, length: Integer): List<Integer> {
+    let result: List<Integer> = []
+    let index = 0
+    while index < length {
+        result.add(values[index])
+        index = index + 1
+    }
+    return result
+}
+
+// Whether a text is an Integer literal.
+function loopLiteral(text: Text): Boolean {
+    if text.length == 0 { return false }
+    let index = 0
+    if text[0] == '-' {
+        if text.length == 1 { return false }
+        index = 1
+    }
+    while index < text.length {
+        let character = text[index]
+        if character < '0' || character > '9' { return false }
+        index = index + 1
+    }
+    return true
+}
+
+// The loop position plus an offset that every iteration computes identically:
+// the offset's value before the loop, or "" when the index is not such a
+// window or its offset is not loop-invariant. A plain position has offset 0.
+function loopWindowOffset(copy: LoopCopy, value: Text): Text {
+    if loopAtPosition(copy, value) { return "0" }
+    let defined = loopDefinitionLine(copy, value)
+    if defined < 0 { return "" }
+    let line = copy.lines[defined]
+    if line.find(" = extractvalue { i64, i1 } ") < 0 && line.find(" = add i64 ") < 0 && line.find(" = sub i64 ") < 0 { return "" }
+    let sum = line
+    if line.find(" = extractvalue { i64, i1 } ") >= 0 {
+        if !line.endsWith(", 0") { return "" }
+        let source = line.slice(line.find(" = extractvalue { i64, i1 } ") + 28, line.length - 3)
+        let sumLine = loopDefinitionLine(copy, source)
+        if sumLine < 0 { return "" }
+        sum = copy.lines[sumLine]
+    }
+    let at = sum.find("i64 ")
+    if at < 0 || !sum.endsWith(")") { return "" }
+    let parts = sum.slice(at + 4, sum.length - 1).split(", i64 ")
+    if parts.length != 2 { return "" }
+    let subtraction = sum.find("@llvm.ssub.with.overflow.i64(") >= 0 || sum.find(" = sub i64 ") >= 0
+    if loopAtPosition(copy, parts[0]) {
+        if subtraction {
+            // The position minus a value is a window only for a literal.
+            if !loopLiteral(parts[1]) { return "" }
+            return "-" + parts[1]
+        }
+        return parts[1]
+    }
+    if !subtraction && loopAtPosition(copy, parts[1]) { return parts[0] }
+    return ""
+}
+
+// The offset as a value available in the test block: unchanged when the loop
+// does not define it, otherwise recomputed there with wrapping arithmetic. A
+// wrapped offset only makes the test stricter; the copy still computes the
+// index with the checked arithmetic of the region, which reports an overflow
+// exactly as the checked loop does.
+function loopWindowValue(copy: LoopCopy, value: Text): Text {
+    if !value.startsWith("%") { return value }
+    if loopNamed(copy.invariant, value) >= 0 { return copy.hoisted[loopNamed(copy.invariant, value)] }
+    let known = loopNamed(copy.windowNames, value)
+    if known >= 0 { return copy.windowHoisted[known] }
+    let defined = loopDefinitionLine(copy, value)
+    if defined == -1 { return value }
+    if defined < 0 { return "" }
+    let line = copy.lines[defined]
+    let sum = line
+    if line.find(" = extractvalue { i64, i1 } ") >= 0 {
+        if !line.endsWith(", 0") { return "" }
+        let source = line.slice(line.find(" = extractvalue { i64, i1 } ") + 28, line.length - 3)
+        let sumLine = loopDefinitionLine(copy, source)
+        if sumLine < 0 { return "" }
+        sum = copy.lines[sumLine]
+    }
+    let at = sum.find("i64 ")
+    if at < 0 || !sum.endsWith(")") { return "" }
+    let parts = sum.slice(at + 4, sum.length - 1).split(", i64 ")
+    if parts.length != 2 { return "" }
+    let operator = "add"
+    if sum.find("@llvm.ssub.with.overflow.i64(") >= 0 || sum.find(" = sub i64 ") >= 0 { operator = "sub" }
+    if sum.find("@llvm.smul.with.overflow.i64(") >= 0 || sum.find(" = mul i64 ") >= 0 { operator = "mul" }
+    let left = loopWindowValue(copy, parts[0])
+    let right = loopWindowValue(copy, parts[1])
+    if left == "" || right == "" { return "" }
+    let name = value + ".window"
+    copy.windowCode.add("  " + name + " = " + operator + " i64 " + left + ", " + right + "\n")
+    copy.windowNames.add(value)
+    copy.windowHoisted.add(name)
+    return name
+}
+
+// One window test: the position plus `offset` stays inside a List of `length`
+// elements for every position from `first` below `limit`. Returns the name of
+// the condition that covers it, or `all` when the bound test already does.
+function loopWindowTest(test: List<Text>, loop: Text, listIndex: Integer, slot: Integer, offset: Text, length: Text, first: Text, limit: Text, all: Text): Text {
+    if offset == "0" { return all }
+    let name = "%loop.window." + loop + "." + Text(listIndex) + "." + Text(slot)
+    if loopLiteral(offset) {
+        if offset[0] == '-' {
+            // A position at or above the distance from the start of the List.
+            let distance = offset.slice(1, offset.length)
+            test.add("  " + name + ".low = icmp sle i64 " + distance + ", " + first + "\n  " + name + ".all = and i1 " + all + ", " + name + ".low\n")
+            return name + ".all"
+        }
+        // The last position plus the offset stays below the length, so the
+        // subtraction cannot wrap below it.
+        test.add("  " + name + ".rest = sub i64 " + length + ", " + offset + "\n  " + name + ".high = icmp sle i64 " + limit + ", " + name + ".rest\n  " + name + ".all = and i1 " + all + ", " + name + ".high\n")
+        return name + ".all"
+    }
+    // An offset of unknown sign: a non-negative one is inside when the length
+    // covers it from the last position; a negative one runs the checked loop,
+    // which reports what the checked accesses report.
+    test.add("  " + name + ".nonnegative = icmp sgt i64 " + offset + ", -1\n  " + name + ".rest = sub i64 " + length + ", " + offset + "\n  " + name + ".high = icmp sle i64 " + limit + ", " + name + ".rest\n  " + name + ".ok = and i1 " + name + ".nonnegative, " + name + ".high\n  " + name + ".all = and i1 " + all + ", " + name + ".ok\n")
+    return name + ".all"
+}
+
+// The List accessor a line calls, "" when it is not one this stage can prove:
+// `@.minyar.list.get.checked`, `...get.known`, `...set.scalar.checked`,
+// `...set.scalar.known`.
+function loopAccessCallee(line: Text, prefix: Text): Text {
+    let at = line.find(prefix)
+    if at < 0 { return "" }
+    let rest = line.slice(at + prefix.length, line.length)
+    if rest.startsWith("checked(") { return prefix + "checked" }
+    if rest.startsWith("known(") { return prefix + "known" }
+    return ""
+}
+
+function loopAccessWrite(callee: Text): Boolean {
+    return callee.startsWith("@.minyar.list.set")
+}
+
+// The index operand of an access: the last one a read takes, the one before
+// the stored value for a write. A known header passes length and values first.
+function loopAccessIndex(arguments: List<Text>, write: Boolean): Text {
+    if write { return arguments[arguments.length - 2] }
+    return arguments[arguments.length - 1]
+}
+
+function loopAccessValue(arguments: List<Text>): Text {
+    return arguments[arguments.length - 1]
+}
+
+// The values buffer of an invariant List indexed inside the loop window.
 function loopCheckedList(copy: LoopCopy, line: Text, callee: Text): Text {
     let arguments = loopCallArguments(line, callee)
-    if arguments.length < 2 || !loopAtPosition(copy, arguments[1]) { return "" }
+    let write = loopAccessWrite(callee)
+    if arguments.length < 2 { return "" }
+    let offset = loopWindowOffset(copy, loopAccessIndex(arguments, write))
+    if offset == "" { return "" }
     let mark = copy.guard.length
     let blocks = copy.blocks
     let invariantCount = copy.invariant.length
+    let windows = copy.windowOffsets.length
+    let code = copy.windowCode.length
+    let names = copy.windowNames.length
     let list = loopInvariant(copy, arguments[0], false)
-    if list == "" {
+    let hoisted = loopWindowValue(copy, offset)
+    if list == "" || hoisted == "" {
         // Drop the partial test; nothing in it is used.
         copy.guard = loopTruncated(copy.guard, mark)
         copy.invariant = loopTruncated(copy.invariant, invariantCount)
         copy.hoisted = loopTruncated(copy.hoisted, invariantCount)
+        copy.windowLists = loopTruncatedIntegers(copy.windowLists, windows)
+        copy.windowOffsets = loopTruncated(copy.windowOffsets, windows)
+        copy.windowCode = loopTruncated(copy.windowCode, code)
+        copy.windowNames = loopTruncated(copy.windowNames, names)
+        copy.windowHoisted = loopTruncated(copy.windowHoisted, names)
         copy.blocks = blocks
         return ""
     }
+    // A known-header access already carries the List's length and values buffer,
+    // loaded once on entry with their range: reuse them so the test loads
+    // nothing and sees the same bounds.
+    let header = callee.endsWith("known") && arguments.length >= 4
     let known = loopNamed(copy.lists, list)
-    if known >= 0 { return copy.values[known] }
-    let values = list + ".values" + copy.loop
-    copy.lists.add(list)
-    copy.values.add(values)
-    return values
+    if known < 0 {
+        known = copy.lists.length
+        copy.lists.add(list)
+        if header {
+            copy.lengths.add(arguments[1])
+            copy.values.add(arguments[2])
+            copy.valueLoads.add(false)
+        } else {
+            copy.lengths.add("")
+            copy.values.add(list + ".values" + copy.loop)
+            copy.valueLoads.add(true)
+        }
+        copy.positionLists.add(false)
+    } else if header && copy.lengths[known] == "" {
+        copy.lengths[known] = arguments[1]
+        copy.values[known] = arguments[2]
+        copy.valueLoads[known] = false
+    }
+    if offset == "0" { copy.positionLists[known] = true }
+    // The position itself is covered by the bound test; every other offset
+    // needs one more test that covers the window the loop visits.
+    if hoisted != "0" {
+        let existing = 0
+        let present = false
+        while existing < copy.windowOffsets.length {
+            if copy.windowLists[existing] == known && copy.windowOffsets[existing] == hoisted { present = true }
+            existing = existing + 1
+        }
+        if !present {
+            copy.windowLists.add(known)
+            copy.windowOffsets.add(hoisted)
+        }
+    }
+    return copy.values[known]
 }
 
 // The copy's text for a line: region labels and names get the copy's suffix;
@@ -325,7 +530,7 @@ function loopRename(copy: LoopCopy, line: Text): Text {
 // the condition. Returns false, changing nothing, when no access qualifies.
 function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Text, loopLabel: Integer, counter: Integer, variable: Integer, position: Text, bound: Text): Boolean {
     let loop = Text(loopLabel)
-    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".fast" + loop, loop: loop, blocks: 0, position: position, variable: "", lists: [], values: [] }
+    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".fast" + loop, loop: loop, blocks: 0, position: position, variable: "", lists: [], values: [], lengths: [], valueLoads: [], positionLists: [], windowLengths: [], windowLists: [], windowOffsets: [], windowCode: [], windowNames: [], windowHoisted: [] }
     loopClassify(copy)
     // The loop variable is an alias of the position only if the region stores
     // nothing else into it.
@@ -346,17 +551,19 @@ function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Tex
     if limit == "" { return false }
     // Find every qualifying access first, so the copy uses one value for each
     // hoisted name throughout.
-    let getting: List<Boolean> = []
-    let setting: List<Boolean> = []
+    let getting: List<Text> = []
+    let setting: List<Text> = []
     index = 0
     while index < copy.lines.length {
         let line = copy.lines[index]
-        let reads = copy.defined[index] != "" && line.find(" = call i64 @.minyar.list.get.checked(") >= 0
-        let writes = !reads && line.startsWith("  call void @.minyar.list.set.scalar.checked(")
+        let reads = ""
+        if copy.defined[index] != "" { reads = loopAccessCallee(line, "@.minyar.list.get.") }
+        let writes = ""
+        if reads == "" { writes = loopAccessCallee(line, "@.minyar.list.set.scalar.") }
         getting.add(reads)
         setting.add(writes)
-        if reads { let ignored = loopCheckedList(copy, line, "@.minyar.list.get.checked") }
-        if writes { let ignored = loopCheckedList(copy, line, "@.minyar.list.set.scalar.checked") }
+        if reads != "" { let ignored = loopCheckedList(copy, line, reads) }
+        if writes != "" { let ignored = loopCheckedList(copy, line, writes) }
         index = index + 1
     }
     if copy.lists.length == 0 { return false }
@@ -367,34 +574,54 @@ function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Tex
         let line = copy.lines[index]
         let name = copy.defined[index]
         let values = ""
-        if getting[index] { values = loopCheckedList(copy, line, "@.minyar.list.get.checked") }
-        if setting[index] { values = loopCheckedList(copy, line, "@.minyar.list.set.scalar.checked") }
+        if getting[index] != "" { values = loopCheckedList(copy, line, getting[index]) }
+        if setting[index] != "" { values = loopCheckedList(copy, line, setting[index]) }
         // Hoisted values are computed once before the loop.
         if name != "" && loopNamed(copy.invariant, name) >= 0 {
             values = ""
-        } else if getting[index] && values != "" {
-            let arguments = loopCallArguments(line, "@.minyar.list.get.checked")
+        } else if getting[index] != "" && values != "" {
+            let arguments = loopCallArguments(line, getting[index])
             let renamed = name + copy.suffix
-            body.add("  " + renamed + ".slot = getelementptr inbounds i64, ptr " + values + ", i64 " + loopRename(copy, arguments[1]) + "\n  " + renamed + " = load i64, ptr " + renamed + ".slot\n")
-        } else if setting[index] && values != "" {
-            let arguments = loopCallArguments(line, "@.minyar.list.set.scalar.checked")
+            body.add("  " + renamed + ".slot = getelementptr inbounds i64, ptr " + values + ", i64 " + loopRename(copy, loopAccessIndex(arguments, false)) + "\n  " + renamed + " = load i64, ptr " + renamed + ".slot\n")
+        } else if setting[index] != "" && values != "" {
+            let arguments = loopCallArguments(line, setting[index])
             let slot = "%loop.slot" + copy.suffix + "." + Text(slots)
             slots = slots + 1
-            body.add("  " + slot + " = getelementptr inbounds i64, ptr " + values + ", i64 " + loopRename(copy, arguments[1]) + "\n  store i64 " + loopRename(copy, arguments[2]) + ", ptr " + slot + "\n")
+            body.add("  " + slot + " = getelementptr inbounds i64, ptr " + values + ", i64 " + loopRename(copy, loopAccessIndex(arguments, true)) + "\n  store i64 " + loopRename(copy, loopAccessValue(arguments)) + ", ptr " + slot + "\n")
         } else {
             body.add(loopRename(copy, line) + "\n")
         }
         index = index + 1
     }
     let first = "%loop.first." + loop
-    let test: List<Text> = ["  " + first + " = load i64, ptr %local." + Text(counter) + "\n  %loop.from." + loop + " = icmp sge i64 " + first + ", 0\n"]
+    let test: List<Text> = [joinText(copy.windowCode), "  " + first + " = load i64, ptr %local." + Text(counter) + "\n  %loop.from." + loop + " = icmp sge i64 " + first + ", 0\n"]
     let all = "%loop.from." + loop
     index = 0
     while index < copy.lists.length {
         let list = copy.lists[index]
         let part = "%loop.fits." + loop + "." + Text(index)
-        test.add("  " + part + ".pointer = getelementptr inbounds { ptr, i64, i64 }, ptr " + list + ", i32 0, i32 1\n  " + part + ".length = load i64, ptr " + part + ".pointer\n  " + part + " = icmp sle i64 " + limit + ", " + part + ".length\n  " + part + ".all = and i1 " + all + ", " + part + "\n  " + copy.values[index] + " = load ptr, ptr " + list + "\n")
-        all = part + ".all"
+        let length = copy.lengths[index]
+        if length == "" {
+            // Named so a parallel function can read its entry-loaded header.
+            test.add("  " + part + ".length = call i64 @.minyar.list.length(ptr " + list + ")\n")
+            length = part + ".length"
+        }
+        if copy.valueLoads[index] { test.add("  " + copy.values[index] + " = call ptr @.minyar.list.values(ptr " + list + ")\n") }
+        // Only an access at the loop position needs the bound test; a window
+        // test of its own already covers the whole range the loop visits.
+        if copy.positionLists[index] {
+            test.add("  " + part + " = icmp sle i64 " + limit + ", " + length + "\n  " + part + ".all = and i1 " + all + ", " + part + "\n")
+            all = part + ".all"
+        }
+        copy.windowLengths.add(length)
+        index = index + 1
+    }
+    // Each List accessed away from the loop position needs one more test that
+    // covers every position the loop visits.
+    index = 0
+    while index < copy.windowOffsets.length {
+        let listIndex = copy.windowLists[index]
+        all = loopWindowTest(test, loop, listIndex, index, copy.windowOffsets[index], copy.windowLengths[listIndex], first, limit, all)
         index = index + 1
     }
     output[entryPiece + 1] = "  br i1 %loop.idle." + loop + ", label %for.guard." + loop + ", label %for.checked." + loop + "\n\nfor.guard." + loop + ":\n" + joinText(copy.guard) + joinText(test) + "  br i1 " + all + ", label %for.condition." + loop + copy.suffix + ", label %for.checked." + loop + "\n\n" + joinText(body) + "\nfor.checked." + loop + ":\n" + output[entryPiece + 1]
