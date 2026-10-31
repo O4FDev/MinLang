@@ -34,6 +34,16 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
     goals = {goal["name"]: goal for goal in plan["goals"]}
     prebuilt = set(plan.get("prebuilt", []))
     checks = plan["checks"]
+    # A check split into pieces keeps its old name as their aggregate: until the pieces have times of their own, each
+    # gets an equal share of the old check's time.
+    check_ms, wall_ms = dict(check_ms), dict(wall_ms)
+    for check in checks:
+        label, children = check["label"], check["children"]
+        if label in check_ms and children and not any(child in check_ms for child in children):
+            for child in children:
+                check_ms[child] = check_ms[label] // len(children)
+                wall_ms[child] = wall_ms.get(label, check_ms[label]) // len(children)
+            check_ms[label], wall_ms[label] = 1000, 1000
 
     def cost(check):
         label = check["label"]
