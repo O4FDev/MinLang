@@ -82,7 +82,12 @@ profile runtime plus a small object that also writes the profile on `_exit`,
 each `make -j1 check-x` to that check's directory. A process killed with
 SIGKILL loses its counts; LLVM 23's function-entry-only and continuous modes
 produced unreadable profiles for runtime-linked programs and are not used. The index also keeps a function
-snapshot of `compiler/**/*.min` and `runtime/**/*.{c,h}`.
+snapshot of `compiler/**/*.min` and `runtime/**/*.{c,h}`. IR and assembly emitted
+for runtime or compiler code is instrumented too, so a program later built from
+an emitted file still reports its functions; only uses no counter can cover stay
+uncovered: a target that cannot link the profile runtime, and preprocessed text.
+A dependency list (`-M`) names only files and `-E -dM` prints only the macro
+table, so neither is a function-body dependency and neither is logged.
 
 For a change to those files, dev-check compares each file with the snapshot.
 When only function bodies changed (comments and whitespace are ignored), it
@@ -92,7 +97,12 @@ selects the checks that executed one of those functions at base, plus:
   an unreadable profile, or compiled runtime or compiler code to IR or assembly
   that they read as text rather than run);
 - checks that open a changed compiler or runtime file, or a rebuilt compiler or
-  runtime artefact, as data (anything but a compiler or linker reading it);
+  runtime artefact, as data (anything but a compiler or linker reading it). A
+  reader that also wrote build outputs in the tree during the check is building
+  from the file rather than asserting on it (the clang driver and the cycle test
+  harnesses read the runtime sources to generate a program): the generated
+  outputs are measured by the cut-off and instrumented, so that read does not
+  select. `--all-inspects` counts it again;
 - checks selected the usual way by every other changed file or output. Build
   outputs whose only change is compiler or runtime code (the compilers, runtime
   objects, and programs linked from them) are explained by the coverage; a
@@ -110,6 +120,48 @@ Compiler and runtime-core changes without a coverage index are honest rather tha
 check compiles or links Minyar code, so the selection is close to the full
 gate. dev-check says so, and Make rebuilds `build/minyarc` through its normal
 self-host stages (stage0 only when `bootstrap/` changed).
+
+## What a run costs
+
+Every run prints where its work goes:
+
+```
+Selected work: about 2,640 s of base CPU in 78 check(s), slowest check-peer-regressions-python-swift-ruby-lua
+  1,222 s   26  no complete function coverage
+  1,050 s   42  executes a changed function
+    260 s   10  reads a changed artefact as data
+  costliest: check-library-documentation 269 s, check-simulation-cli 224 s
+```
+
+CPU is the check's base CPU from the index, so the categories add up to roughly
+`--jobs`-th of the wall time; the cut-off build is printed separately.
+
+## Reusing results of a run with the same inputs
+
+`run` records, for every check it passed, a signature of everything the check's
+result is a function of: the files it read or executed, the build outputs it
+built, the directories it listed, its Make rule and the environment variables
+that choose compilers and modes (`CC`, `LLVM_CC`, `MINYAR_*`, `ASAN_OPTIONS`,
+...) in `build/dev-check/results.json`. A later run whose selection includes
+that check with the same signature reuses the pass instead of running it, and
+says how many results it reused. A check is never reused when it failed, when
+it had no clean trace, or when it read state outside the tree (`/tmp` scratch,
+`/proc`, another tree): those results are not a function of the tree. `--no-cache`
+runs everything.
+
+## Sharding one selection across boxes
+
+`--shard K/N` runs only shard K of N, the selected checks bin-packed
+longest-first by base CPU, so `N` idle boxes can take one shard each:
+
+```
+BB_HOST=agent@box1 bb lane1 './minyar dev check --shard 0/3'
+BB_HOST=agent@box2 bb lane2 './minyar dev check --shard 1/3'
+BB_HOST=agent@box3 bb lane3 './minyar dev check --shard 2/3'
+```
+
+`--shard-plan` prints the shards without running them. Each shard builds the
+stale outputs (the cut-off) itself, and its verdict covers only its own checks.
 
 ## Using it on a build box
 

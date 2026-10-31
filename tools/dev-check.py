@@ -24,7 +24,7 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 STATE = ROOT / "build" / "dev-check"
 SKIP_TOP = {".git", "build", "target"}
-INDEX_SCHEMA = 2
+INDEX_SCHEMA = 2  # extra keys (inspectors, writes) are optional so older tools read newer indexes
 GATE_REMINDER = "Run the full gate (make check-in-parallel CHECKS=check-portable) before merging."
 
 
@@ -181,6 +181,12 @@ RESULT = re.compile(r"= (-?\d+)(?: [A-Z]+.*)?$")
 PATH_CALLS = {"open", "openat", "openat2", "creat", "stat", "lstat", "newfstatat", "fstatat64", "statx", "access",
               "faccessat", "faccessat2", "readlink", "readlinkat", "execve", "execveat", "truncate", "chdir"}
 CLONES = {"clone", "clone3", "fork", "vfork"}
+# Outside-tree paths a check may read and still be reproducible from the tree alone: the toolchain, system libraries and
+# the process image. Anything else (/tmp scratch, another tree on the box, /proc, the clock through /dev) makes the
+# check's result depend on more than the inputs `run` hashes, so it is never reused from the result cache.
+SYSTEM_PATH = re.compile(r"^(?:/usr/|/lib/|/lib64/|/bin/|/sbin/|/opt/llvm-|/etc/ld\.so|/etc/localtime$|/dev/null$"
+                         r"|/dev/tty$|/dev/urandom$|/proc/self/(?:maps|status|exe|cwd|fd/|stat)|/proc/self$"
+                         r"|/sys/fs/cgroup/[^/]+/(?:cpu\.max|memory\.max)$)")
 
 
 def unescape(text):
@@ -271,6 +277,10 @@ def parse_trace(trace, root, checks):
             goals[check].update(targets)
     cache = {}
     inspected = {name: set() for name in checks}
+    inspectors = {name: {} for name in checks}
+    writes = {name: set() for name in checks}
+    writers = {name: set() for name in checks}
+    outside = {name: set() for name in checks}
     reads = {name: set() for name in checks}
     listed = {name: set() for name in checks}
     executed = {name: set() for name in checks}
@@ -337,6 +347,8 @@ def parse_trace(trace, root, checks):
             if check is None:
                 continue
             if path != root and not path.startswith(root + "/"):
+                if not SYSTEM_PATH.match(path) and len(outside[check]) < 8:
+                    outside[check].add(path)
                 continue
             relative = path[len(root) + 1:] if path != root else "."
             if relative.startswith("build/check-in-parallel/") or relative.startswith("build/dev-check/"):
@@ -345,6 +357,10 @@ def parse_trace(trace, root, checks):
             if exe == "make" and (relative == "Makefile" or relative.endswith(".mk") or relative.endswith(".d")):
                 if pid in root_make or relative.endswith(".d"):
                     continue  # the check's own Make parse; covered by the rule comparison
+            if name != "chdir" and ("O_WRONLY" in rest or "O_RDWR" in rest or "O_CREAT" in rest or "O_TRUNC" in rest
+                                    or name == "creat"):
+                writes[check].add(relative)
+                writers[check].add(exe or "?")
             if "O_DIRECTORY" in rest:
                 listed[check].add(relative)
             elif name in ("execve", "execveat"):
@@ -352,9 +368,11 @@ def parse_trace(trace, root, checks):
                 reads[check].add(relative)
             else:
                 reads[check].add(relative)
-                if name in ("open", "openat", "openat2") and exe not in BUILD_TOOLS and "clang" not in exe:
+                if (name in ("open", "openat", "openat2") and exe not in BUILD_TOOLS and "clang" not in exe
+                        and "O_WRONLY" not in rest and "O_RDWR" not in rest):
                     inspected[check].add(relative)
-    return reads, listed, executed, goals, inspected
+                    inspectors[check].setdefault(relative, set()).add(exe or "?")
+    return reads, listed, executed, goals, inspected, inspectors, writes, writers, outside
 
 
 def make_goals(argv, root):
@@ -634,7 +652,80 @@ def load_index(path):
     for check in data["checks"].values():
         for key in ("reads", "listed", "executed", "inspected"):
             check[key] = {paths[item] for item in check.get(key, [])}
+        check["inspectors"] = {paths[int(item)]: names for item, names in check.get("inspectors", {}).items()}
+        check["writes"] = {paths[item] for item in check.get("writes", [])}
+        check["outside"] = list(check.get("outside", []))
     return data
+
+
+# ---------------------------------------------------------------------------- result cache
+
+ENVIRONMENT_KEY = re.compile(r"^(?:CC|CXX|CPP|LD|AR|LLVM_CC|MINYAR_[A-Z_]+|ASAN_OPTIONS|UBSAN_OPTIONS|MSAN_OPTIONS"
+                             r"|CHECK_[A-Z_]+|TEST_[A-Z_]+)$")
+
+
+def cached_results(root):
+    path = STATE / "results.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text()).get("checks", {})
+    except ValueError:
+        return {}
+
+
+def check_signature(root, index, database, check, current, manifest_now):
+    """A digest of everything a check's result is a function of: the files it read and executed, the outputs it built,
+    the directory listings it saw, its Make rule, and the environment variables that select compilers and modes. A
+    check whose signature matches its cached entry and that passed then cannot have a different verdict."""
+    entry = index["checks"].get(check) or {}
+    names = set(entry.get("reads") or ()) | set(entry.get("executed") or ())
+    for goal in entry.get("goals") or ():
+        seen, stack = set(), [goal]
+        while stack:
+            name = stack.pop()
+            rule = database["rules"].get(name)
+            if not rule or name in seen:
+                continue
+            seen.add(name)
+            stack.extend(rule["prerequisites"] + rule["order_only"])
+        names |= {item for item in seen if item.startswith("build/")}
+    for item in database["rules"].get(check, {"prerequisites": []})["prerequisites"]:
+        if item.startswith("build/"):
+            names.add(item)
+    inputs = {}
+    for path in sorted(names):
+        known = manifest_now.get(path)
+        inputs[path] = known[0] if known else file_digest(root / path)
+    listings = {}
+    for directory in sorted(entry.get("listed") or ()):
+        try:
+            listings[directory] = sorted(os.listdir(root / directory))
+        except OSError:
+            listings[directory] = None
+    environment = {name: os.environ[name] for name in sorted(os.environ) if ENVIRONMENT_KEY.match(name)}
+    text = json.dumps({"inputs": inputs, "listings": listings, "environment": environment,
+                       "rule": rule_text(database, check), "goals": sorted(entry.get("goals") or ())}, sort_keys=True)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def reusable(index, cache, check, signature):
+    """A cached pass can be reused when the check passed at base, everything it observed is inside the tree (a check
+    that reads /tmp scratch, /proc or another tree depends on more than the signature covers), and its signature is
+    unchanged."""
+    entry = index["checks"].get(check) or {}
+    if entry.get("static") or not entry.get("traced") or not entry.get("passed") or entry.get("outside"):
+        return False
+    cached = cache.get(check)
+    return bool(cached and cached.get("passed") and cached.get("signature") == signature)
+
+
+def save_results(root, cache, signatures, passed):
+    """Keep the pass results of this run for the next one; a failed check is never kept."""
+    kept = {check: {"signature": signature, "passed": passed.get(check, False)} for check, signature in signatures.items()
+            if passed.get(check)}
+    kept.update({check: entry for check, entry in cache.items() if check not in signatures})
+    (STATE / "results.json").write_text(json.dumps({"checks": kept}, sort_keys=True))
 
 
 # ---------------------------------------------------------------------------- commands
@@ -702,12 +793,19 @@ def command_index(arguments):
                     untraced_pass[name] = timing["passed"]
     elif arguments.reuse_trace and trace.with_name(trace.stem + "-retry.log").exists():
         traces.append(trace.with_name(trace.stem + "-retry.log"))
-    reads, listed, executed, goals, inspected = ({name: set() for name in checks} for _ in range(5))
+    reads, listed, executed, goals, inspected, writes, outside = ({name: set() for name in checks} for _ in range(7))
+    inspectors, writers = {name: {} for name in checks}, {name: set() for name in checks}
     for item in traces:
         more = parse_trace(item, root, checks)
         for target, extra in zip((reads, listed, executed, goals, inspected), more):
             for name in checks:
                 target[name] |= extra[name]
+        for name in checks:
+            for path, names in more[5][name].items():
+                inspectors[name].setdefault(path, set()).update(names)
+            writes[name] |= more[6][name]
+            writers[name] |= more[7][name]
+            outside[name] |= more[8][name]
     table, numbers = [], {}
 
     def number(path):
@@ -730,8 +828,15 @@ def command_index(arguments):
             "executed": sorted(number(path) for path in executed[check]),
             "goals": sorted(goals[check]),
             "inspected": sorted(number(path) for path in inspected[check]),
+            # Which program read each inspected path as data (the compiler driver, a shell, sha256sum, ...).
+            "inspectors": {str(number(path)): sorted(names) for path, names in inspectors[check].items()},
+            "writes": sorted(number(path) for path in writes[check]),
+            "writers": sorted(writers[check]),
+            # Tree-external state this check read: it cannot be reproduced from the tree, so never cache its result.
+            "outside": sorted(outside[check]),
         }
-    index = {"schema": INDEX_SCHEMA, "aggregate": aggregate, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    index = {"schema": INDEX_SCHEMA, "features": ["inspectors", "writers"],
+             "aggregate": aggregate, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
              "gate_wall_s": round(time.time() - started), "manifest": base, "paths": table,
              "rules": {name: rule_text(database, name) for name in database["rules"]},
              "variables": database["variables"], "checks": entries}
@@ -1091,7 +1196,24 @@ def explained_outputs(root, outputs):
     return explained
 
 
-def function_selection(root, index, coverage, checks, core, outputs):
+def asserts_on_data(index, check, path, all_inspects=False):
+    """Whether a check uses a changed compiler or runtime file as data rather than as a build input.
+    A check whose program also wrote build outputs in this tree during the check is building from that file (the
+    clang driver and the cycle test harnesses read the runtime sources to generate a program); the generated
+    outputs are measured by the content cutoff and instrumented, so the use is covered. Only a reader that wrote
+    nothing in the tree can compare, print or assert on the file's content. Without recorded inspectors (older
+    index) every read counts."""
+    if all_inspects:
+        return True
+    entry = index["checks"].get(check, {})
+    names = (entry.get("inspectors") or {}).get(path)
+    if not names:
+        return True
+    generators = set(entry.get("writers") or [])
+    return any(name not in generators for name in names)
+
+
+def function_selection(root, index, coverage, checks, core, outputs, all_inspects=False):
     """(note, reasons, explained outputs): the checks that executed a changed compiler or runtime function, or
     a note saying why function-level selection cannot be used for this change (then every reader is selected)."""
     names, widen = changed_functions(root, coverage["snapshots"], core)
@@ -1129,13 +1251,53 @@ def function_selection(root, index, coverage, checks, core, outputs):
             hit = sorted({label[number] for number in ids & set(entry["covered"])})
             if hit:
                 why.append("executes " + ", ".join(hit[:4]) + (f" (+{len(hit) - 4})" if len(hit) > 4 else ""))
-        inspected = sorted(index["checks"].get(check, {}).get("inspected", set()) & observed)
+        inspected = sorted(path for path in index["checks"].get(check, {}).get("inspected", set()) & observed
+                           if asserts_on_data(index, check, path, all_inspects))
         if inspected:
             why.append("inspects " + ", ".join(inspected[:3]))
         if why:
             reasons[check] = why
     changed = sum(len(items) for items in names.values())
     return None, reasons, explained
+
+
+CATEGORIES = (("executes ", "executes a changed function"), ("inspects ", "reads a changed artefact as data"),
+              ("no complete function coverage", "no complete function coverage"), ("uses ", "read a changed source"),
+              ("lists ", "list a directory that changed"), ("builds ", "build changed outputs"),
+              ("make ", "a make rule or variable changed"), ("", "other"))
+
+
+def print_cost(index, selected, reasons):
+    """Where the selected work goes: base CPU per reason category and the costliest checks, so a slow
+    dev-check can be attributed to selection breadth (fix coverage) or to one expensive check."""
+    groups = {}
+    for check in selected:
+        cpu = index["checks"].get(check, {}).get("cpu_ms", 0)
+        text = "; ".join(reasons.get(check) or [])
+        label = next(name for prefix, name in CATEGORIES if not prefix or prefix in text)
+        entry = groups.setdefault(label, [0, 0])
+        entry[0] += 1
+        entry[1] += cpu
+    total = sum(cpu for _, cpu in groups.values()) / 1000
+    print(f"Selected work: about {total:.0f} s of base CPU in {len(selected)} check(s)" +
+          (f", slowest {max(selected, key=lambda c: index['checks'].get(c, {}).get('cpu_ms', 0))}" if selected else ""))
+    for label, (count, cpu) in sorted(groups.items(), key=lambda item: -item[1][1]):
+        print(f"  {cpu / 1000:6.0f} s  {count:3d}  {label}")
+    slowest = sorted(selected, key=lambda c: -index["checks"].get(c, {}).get("cpu_ms", 0))[:5]
+    if slowest:
+        print("  costliest: " + ", ".join(f"{c} {index['checks'].get(c, {}).get('cpu_ms', 0) / 1000:.0f} s" for c in slowest))
+
+
+def shard_plan(index, selected, count):
+    """Bin-pack the selected checks longest-first into `count` bins by their base CPU, so each shard costs about the
+    same and `--shard k/n` can run one shard per idle box."""
+    bins = [[] for _ in range(count)]
+    loads = [0] * count
+    for check in sorted(selected, key=lambda name: (-index["checks"].get(name, {}).get("cpu_ms", 0), name)):
+        target = min(range(count), key=lambda number: (loads[number], number))
+        bins[target].append(check)
+        loads[target] += index["checks"].get(check, {}).get("cpu_ms", 0)
+    return bins
 
 
 def command_run(arguments):
@@ -1174,7 +1336,8 @@ def command_run(arguments):
     core = [path for path in changed if attributable(path)]
     coverage = index.get("coverage")
     if core and coverage and not arguments.no_functions:
-        function_note, function_reasons, explained = function_selection(root, index, coverage, checks, core, stale_build)
+        function_note, function_reasons, explained = function_selection(root, index, coverage, checks, core, stale_build,
+                                                                       arguments.all_inspects)
     if function_note is None and core and coverage and not arguments.no_functions:
         v1_changed = [path for path in changed if path not in core]
         v1_stale = [path for path in stale_build if path not in explained]
@@ -1187,6 +1350,20 @@ def command_run(arguments):
     if runner_changed:
         reasons = {check: (reasons.get(check) or []) + ["the check runner itself changed"] for check in checks}
     selected = [check for check in checks if check in reasons]
+    signatures, reused = {}, []
+    cache = {} if arguments.no_cache else cached_results(root)
+    if selected and not arguments.plan and cache:
+        built_known = current
+        for check in selected:
+            entry = index["checks"].get(check) or {}
+            if entry.get("static") or not entry.get("traced") or not entry.get("passed") or entry.get("outside"):
+                continue
+            signatures[check] = check_signature(root, index, database, check, current, built_known)
+            if reusable(index, cache, check, signatures[check]):
+                reused.append(check)
+        if reused:
+            for check in reused:
+                reasons[check].append("cached pass: same inputs as its recorded run")
     base_red = [check for check in checks if check in index["checks"] and not index["checks"][check]["passed"]]
     if base_red and not arguments.include_base_red:
         print(f"Red at the indexed base, not run unless this change touches what they read: {' '.join(base_red)}")
@@ -1215,6 +1392,7 @@ def command_run(arguments):
     print(f"Selected {len(selected)} of {len(checks)} checks (base CPU about {estimate:.0f} s):")
     for check in selected:
         print(f"  {check}: " + "; ".join(reasons[check]))
+    print_cost(index, selected, reasons)
     benchmarks = select_benchmarks(root, changed, stale_build)
     if benchmarks:
         print(f"Affected benchmark programs ({len(benchmarks)}): " + " ".join(benchmarks[:30]) + (" ..." if len(benchmarks) > 30 else ""))
@@ -1222,10 +1400,24 @@ def command_run(arguments):
         print(f"Plan only ({time.time() - started:.1f} s). " + GATE_REMINDER)
         return 0
     status, failed = 0, [f"(build of {item} failed)" for item in build_failed]
-    if selected:
+    to_run = [check for check in selected if check not in reused]
+    if arguments.shard:
+        number, count = arguments.shard
+        bins = shard_plan(index, selected, count)
+        if arguments.shard_plan:
+            for position, items in enumerate(bins):
+                cpu = sum(index["checks"].get(check, {}).get("cpu_ms", 0) for check in items) / 1000
+                print(f"Shard {position} of {count}: {len(items)} check(s), about {cpu:.0f} s base CPU: " + " ".join(items))
+            return 0
+        shard = set(bins[number])
+        print(f"Shard {number} of {count}: running {len(shard)} of the {len(selected)} selected check(s)")
+        selected = [check for check in selected if check in shard]
+        to_run = [check for check in to_run if check in shard]
+        reused = [check for check in reused if check in shard]
+    if to_run:
         environment = clean_environment()
         targets, own = [], []
-        for check in selected:
+        for check in to_run:
             if index["checks"].get(check, {}).get("static"):
                 # An aggregate goal's own recipe, run alone: the runner would otherwise run every prerequisite check.
                 rule = database["rules"][check]
@@ -1244,6 +1436,17 @@ def command_run(arguments):
         failed += [item["target"] for item in (results or {}).get("checks", []) if not item["passed"]]
         if status != 0 and not failed:
             failed = ["(runner failed before reporting checks)"]
+        if not arguments.no_cache:
+            # Signatures after the run: a check that builds its own inputs changes files a pre-run signature hashed.
+            after = changed_sources(root, index, None, built_path)[4]
+            save = {}
+            for check in to_run:
+                entry = index["checks"].get(check) or {}
+                if check in failed or entry.get("static") or not entry.get("traced") or entry.get("outside"):
+                    continue
+                save[check] = check_signature(root, index, database, check, after, after)
+            if save:
+                save_results(root, cache, save, {check: True for check in save})
     if arguments.bench and benchmarks:
         bench_status = run_benchmarks(root, benchmarks, arguments.bench_base)
         if bench_status != 0 and not failed:
@@ -1256,8 +1459,9 @@ def command_run(arguments):
     (STATE / "last.json").write_text(json.dumps({
         "verdict": verdict, "seconds": round(elapsed, 1), "changed": changed, "ignored": ignored,
         "stale": stale_build, "selected": {check: reasons[check] for check in selected}, "failed": failed,
+        "reused": sorted(reused),
         "considered": len(checks), "benchmarks": benchmarks}, indent=1))
-    scope = f"{len(selected)} affected check(s)"
+    scope = f"{len(selected)} affected check(s)" + (f" ({len(reused)} reused from cache)" if reused else "")
     if arguments.only and ignored:
         scope += f" for --only {' '.join(arguments.only)} ({len(ignored)} other changed path(s) NOT covered)"
     if failed:
@@ -1349,6 +1553,13 @@ def select_benchmarks(root, changed, stale_build):
     return result
 
 
+def shard_argument(text):
+    match = re.match(r"^(\d+)/(\d+)$", text or "")
+    if not match or int(match.group(2)) < 1 or int(match.group(1)) >= int(match.group(2)):
+        raise argparse.ArgumentTypeError("expected K/N with 0 <= K < N")
+    return int(match.group(1)), int(match.group(2))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command")
@@ -1357,8 +1568,15 @@ def main():
     run.add_argument("--plan", action="store_true", help="print the selection without running checks")
     run.add_argument("--jobs", type=int, default=int(os.environ.get("CHECK_JOBS", "4")))
     run.add_argument("--index", help="dependency index (default build/dev-check/index.json or $DEV_CHECK_INDEX)")
+    run.add_argument("--shard", type=shard_argument, metavar="K/N",
+                     help="run only shard K (0-based) of N, the selected checks bin-packed longest-first by base CPU")
+    run.add_argument("--shard-plan", action="store_true", help="with --shard K/N: print every shard and exit")
+    run.add_argument("--no-cache", action="store_true", help="run every selected check, ignoring cached pass results")
     run.add_argument("--no-cutoff", action="store_true", help="select by Make staleness alone, without building first")
     run.add_argument("--no-functions", action="store_true", help="ignore the function index for compiler and runtime changes")
+    run.add_argument("--all-inspects", action="store_true",
+                     help="count every read of a changed compiler or runtime file as a data use, even when the reader "
+                          "also wrote build outputs in the tree (the default treats those as build inputs)")
     run.add_argument("--include-base-red", action="store_true", help="also run checks that failed at the indexed base")
     run.add_argument("--bench", action="store_true", help="also measure Ir of affected benchmarks/compare programs")
     run.add_argument("--bench-base", default=os.environ.get("DEV_CHECK_BENCH_BASE"),

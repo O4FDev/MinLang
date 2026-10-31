@@ -1,21 +1,38 @@
 #!/bin/sh
-# dev-check coverage clang: IR profile counters (entry instrumented) for runtime C and compiler IR compiled to objects,
-# profile runtime on every link. Uninstrumentable runtime/compiler compiles are logged per check.
+# dev-check coverage clang: IR profile counters (entry instrumented) for runtime C and compiler IR, compiled to objects
+# or emitted as IR/assembly, and the profile runtime on every link. Emitted IR and assembly carry counters, so a program
+# built from an emitted file is still covered. Uses that no counter can compensate for are logged per check: a target
+# that cannot link the profile runtime, and preprocessed text. A dependency list (-M) names only files and -E -dM prints
+# only the macro table, so neither can change when a function body does; they are not logged.
 real=${DEVCHECK_REAL_CLANG:?}
 lost=${DEVCHECK_COV_DATA:?}/_lost
-emit=0 link=1 skip=0 inst=0
+emit=0 link=1 skip=0 inst=0 preprocess=0 macros=0 deps=0
 for a in "$@"; do
     case "$a" in
         -c) link=0 ;;
-        -S|-E|-M|-MM|-fsyntax-only|-emit-llvm|--version|-v|-print-*|-dumpversion) emit=1; link=0 ;;
+        -S|-fsyntax-only|-emit-llvm|--version|-v|-print-*|-dumpversion) emit=1; link=0 ;;
+        -E) emit=1; link=0; preprocess=1 ;;
+        -M|-MM) emit=1; link=0; deps=1 ;;
+        -dM|-dD) macros=1 ;;
         -ffreestanding|-nostdlib|-nostartfiles|-nodefaultlibs|--target=*|-target|-fprofile-*|-fcoverage-*|-r|-Wl,-r|-shared|-mkernel|-fno-builtin) skip=1 ;;
         *.c|*.ll|*.bc) case "$a" in *runtime*|*/runtime/*|*compiler*) inst=1 ;; esac ;;
     esac
 done
 if [ $# -eq 0 ]; then exec "$real"; fi
-if [ $inst = 1 ] && [ $emit = 1 ] && [ -n "${DEVCHECK_COV_CHECK:-}" ]; then
-    # IR or assembly of runtime/compiler code read as text: function coverage cannot see this use.
-    printf '%s\t%s\n' "${LLVM_PROFILE_FILE:-}" "emitted, not run: $*" >> "${DEVCHECK_COV_DATA}/_uninstrumented.log"
+if [ $inst = 1 ] && [ -n "${DEVCHECK_COV_CHECK:-}" ]; then
+    if [ $emit = 1 ]; then
+        exit_log=1
+        if [ $deps = 1 ] || { [ $macros = 1 ] && [ $preprocess = 1 ]; }; then
+            exit_log=0
+        fi
+        if [ $exit_log = 1 ] && [ $skip = 0 ] && [ $preprocess = 0 ]; then
+            # IR or assembly: instrument it so the program built from it keeps its counters.
+            exec "$real" "$@" -fprofile-generate="$lost" -mllvm -pgo-instrument-entry -mllvm -disable-preinline
+        fi
+        if [ $exit_log = 1 ]; then
+            printf '%s\t%s\n' "${LLVM_PROFILE_FILE:-}" "emitted, not run: $*" >> "${DEVCHECK_COV_DATA}/_uninstrumented.log"
+        fi
+    fi
 fi
 if [ $inst = 1 ] && [ $emit = 0 ]; then
     if [ $skip = 0 ]; then

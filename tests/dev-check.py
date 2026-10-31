@@ -35,6 +35,7 @@ def trace_attribution(tree):
         f'200 clone(child_stack=NULL) = 202',
         f'202 execve("{root}/build/tooling/tests/a", ["a"], 0x1 /* 3 vars */) = 0',
         f'202 openat(AT_FDCWD, "{root}/tests/a.min", O_RDONLY) = 4',
+        f'202 openat(AT_FDCWD, "{root}/build/tooling/tests/a.out", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 4',
         f'202 openat(AT_FDCWD, "docs", O_RDONLY|O_DIRECTORY <unfinished ...>',
         f'202 <... openat resumed>) = 5',
         f'202 openat(5, "guide.md", O_RDONLY) = 6',
@@ -58,7 +59,7 @@ def trace_attribution(tree):
     ]
     trace = tree / "trace.log"
     trace.write_text("\n".join(lines) + "\n")
-    reads, listed, executed, goals, inspected = dev.parse_trace(trace, tree, ["check-a"])
+    reads, listed, executed, goals, inspected, inspectors, writes, writers, outside = dev.parse_trace(trace, tree, ["check-a"])
     reads, listed = reads["check-a"], listed["check-a"]
     expect(goals["check-a"] == {"build/minyarc"}, f"nested Make goals: {goals['check-a']}")
     expect("build-support/a.mk" not in reads and "compiler/compiler.min" not in reads, "a building Make's parse leaked")
@@ -71,6 +72,13 @@ def trace_attribution(tree):
     expect(listed == {"docs"}, f"only the recipe's listing counts, got {sorted(listed)}")
     expect("Makefile" not in reads and "build/tooling/tests/a.ll.d" not in reads, "Make parse leaked into reads")
     expect("compiler/compiler.min" not in reads, "a shared build was attributed to a check")
+    expect(inspectors["check-a"] == {path: {"a"} for path in ("tests/a.min", "docs/guide.md", "library/json.min",
+                                                             "library/missing.min")},
+           f"an inspector of a data read is recorded: {inspectors['check-a']}")
+    expect(outside["check-a"] == {"/tmp/scratch/x.min"},
+           f"tree-external reads are recorded (a cache must not reuse this check): {outside['check-a']}")
+    expect(writers["check-a"] == {"a"} and "build/tooling/tests/a.out" in writes["check-a"],
+           f"a check's own writing programs are recorded: {writers['check-a']}")
 
 
 def database(rules, variables=None, phony=()):
@@ -203,14 +211,92 @@ def diff(base, text, language):
         return (names or {}).get(language, set()), why
 
 
+def coverage_shim(tree):
+    """The instrumented-gate clang shim: what it instruments, and which runtime/compiler uses it must keep logged so
+    the check is never treated as covered by function counters it does not have."""
+    import subprocess
+    real, data = tree / "real-clang", tree / "cov"
+    (data / "_lost").mkdir(parents=True)
+    real.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{tree}/calls.log"\n')
+    real.chmod(0o755)
+    shim = ROOT / "tools" / "dev-check-coverage" / "clang"
+    environment = {"DEVCHECK_REAL_CLANG": str(real), "DEVCHECK_COV_DATA": str(data), "DEVCHECK_COV_CHECK": "check-x",
+                   "PATH": os.environ.get("PATH", "/bin:/usr/bin")}
+
+    def run(*arguments):
+        (tree / "calls.log").unlink(missing_ok=True)
+        subprocess.run(["sh", str(shim), *arguments], env=environment, check=True)
+        call = (tree / "calls.log").read_text().strip() if (tree / "calls.log").exists() else ""
+        log = (data / "_uninstrumented.log")
+        return call, (log.read_text() if log.exists() else "")
+
+    call, log = run("-O2", "-S", "-emit-llvm", "runtime/minyar_runtime.c", "-o", "x.ll")
+    expect("-fprofile-generate" in call and "pgo-instrument-entry" in call,
+           f"emitted IR of runtime code is instrumented, so a program built from it keeps its counters: {call}")
+    expect("emitted, not run" not in log, f"an instrumented emit is covered: {log}")
+    call, log = run("-E", "-dM", "-iquote", "runtime", "runtime.c")
+    expect("fprofile" not in call and "emitted, not run" not in log,
+           f"-E -dM prints only the macro table: no counters, and no uncovered use to report: {call} {log}")
+    call, log = run("-M", "runtime.c")
+    expect("fprofile" not in call and "emitted, not run" not in log, f"-M names only files: {call} {log}")
+    call, log = run("-E", "runtime.c")
+    expect("emitted, not run" in log, f"preprocessed text can show a function body: {log}")
+    call, log = run("-O2", "--target=x86_64-unknown-none-elf", "-c", "runtime.c", "-o", "y.o")
+    expect("fprofile" not in call and "emitted, not run" in log,
+           f"a freestanding target cannot link the profile runtime: {call} {log}")
+    call, log = run("-O2", "runtime.c", "-o", "prog")
+    expect("--wrap=_exit" in call and "-fprofile-generate" in call, f"a link gets the profile runtime: {call}")
+
+
+def generator_reads(tree):
+    """A check whose program also writes build outputs is building from the changed compiler or runtime source: the
+    cut-off measures what it generates and the coverage index sees what it runs, so the read is not a data assertion.
+    A reader that wrote nothing in the tree (sha256sum for a cache key, a printer) still selects its check."""
+    (tree / "runtime").mkdir()
+    source = "int keep(void) { return 1; }\nint change(void) { return 2; }\n"
+    before = dev.function_snapshot(source, "c")
+    (tree / "runtime" / "a.c").write_text(source.replace("return 2;", "return 3;"))
+    coverage = {"names": ["runtime/a.c;keep", "runtime/a.c;change"], "universe": [0, 1], "top": [], "lost": [],
+                "snapshots": {"runtime/a.c": before},
+                "checks": {name: {"covered": [], "complete": True, "why": ""} for name in ("check-build", "check-hash")}}
+    index = {"checks": {
+        "check-build": {"inspected": {"runtime/a.c"}, "inspectors": {"runtime/a.c": ["clang-driver"]},
+                        "writers": ["clang-driver", "make"]},
+        "check-hash": {"inspected": {"runtime/a.c"}, "inspectors": {"runtime/a.c": ["sha256sum"]},
+                       "writers": ["minyar"]},
+        "check-plain": {"inspected": {"runtime/a.c"}},
+    }}
+    note, reasons, _ = dev.function_selection(tree, index, coverage, ["check-build", "check-hash", "check-plain"],
+                                              ["runtime/a.c"], [])
+    expect(note is None and "check-build" not in reasons, f"a generating reader is not a data use: {note} {reasons}")
+    expect("inspects runtime/a.c" in "; ".join(reasons.get("check-hash", [])),
+           f"a hashing reader still selects: {reasons}")
+    expect("inspects runtime/a.c" in "; ".join(reasons.get("check-plain", [])),
+           f"without recorded inspectors the read counts: {reasons}")
+
+
+def shards():
+    """--shard K/N: the selected checks, bin-packed longest-first, cost about the same on each box."""
+    index = {"checks": {f"check-{i}": {"cpu_ms": cpu} for i, cpu in enumerate([100, 90, 80, 70, 60, 50])}}
+    bins = dev.shard_plan(index, list(index["checks"]), 3)
+    loads = [sum(index["checks"][check]["cpu_ms"] for check in items) for items in bins]
+    expect(sorted(check for items in bins for check in items) == sorted(index["checks"]),
+           f"every selected check lands in exactly one shard: {bins}")
+    expect(max(loads) - min(loads) <= 100, f"shards are balanced: {loads}")
+
+
 functions()
 with tempfile.TemporaryDirectory(prefix="dev-check-test ") as temporary:
     tree = Path(temporary)
     trace_attribution(tree)
+    coverage_shim(tree)
+    (tree / "gen").mkdir()
+    generator_reads(tree / "gen")
     selection()
     (tree / "t").mkdir()
     timestamps(tree / "t")
 
+shards()
 for failure in failures:
     print("FAIL:", failure)
 print("dev-check selector tests:", "failed" if failures else "passed")
