@@ -123,13 +123,33 @@ static inline uint64_t map_hash_key(const MinyarRecord *map, long long key) {
     if (minyar_recovery_pending()) return 0;
     return value ? value : UINT64_C(0x9e3779b97f4a7c15);
 }
+/* Equal byte runs of one length. Keys are mostly short: up to 16 bytes compare
+ * as two overlapping words (or halves, or three bytes) with no library call. */
+static inline int map_bytes_equal(const unsigned char *a, const unsigned char *b, size_t n) {
+    if (n >= 8) {
+        if (n > 16) return !memcmp(a, b, n);
+        uint64_t a0, b0, a1, b1;
+        memcpy(&a0, a, 8); memcpy(&b0, b, 8);
+        memcpy(&a1, a + n - 8, 8); memcpy(&b1, b + n - 8, 8);
+        return !((a0 ^ b0) | (a1 ^ b1));
+    }
+    if (n >= 4) {
+        uint32_t a0, b0, a1, b1;
+        memcpy(&a0, a, 4); memcpy(&b0, b, 4);
+        memcpy(&a1, a + n - 4, 4); memcpy(&b1, b + n - 4, 4);
+        return !((a0 ^ b0) | (a1 ^ b1));
+    }
+    /* Positions 0, n/2 and n-1 cover every byte of a run of at most three. */
+    return !n || (a[0] == b[0] && a[n / 2] == b[n / 2] && a[n - 1] == b[n - 1]);
+}
 static inline int map_key_equal(long long kind, long long a, long long b) {
     if (a == b) return 1;
     if (kind != 2) return 0;
     const MinyarText *left = (const MinyarText *)(uintptr_t)a;
     const MinyarText *right = (const MinyarText *)(uintptr_t)b;
     return left->byte_length == right->byte_length &&
-        (!left->byte_length || !memcmp(left->bytes, right->bytes, (size_t)left->byte_length));
+        (left->bytes == right->bytes ||
+         map_bytes_equal(left->bytes, right->bytes, (size_t)left->byte_length));
 }
 
 static inline int map_keys_equal(const MinyarRecord *map, long long a, long long b) {
