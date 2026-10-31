@@ -106,7 +106,7 @@ function resultBoxFunction(flags: Text): Text {
     return "@minyar_result_box"
 }
 
-// The field of a `@.minyar.record.get` or `@minyar_record_take_field` of value
+// The field of a `@.minyar.record.get`, `@minyar_record_take_field` or consumed take of value
 // on line (as `X = call i64 @...(ptr VALUE, i64 FIELD)`), or "".
 function resultReadField(line: Text, value: Text): Text {
     // A tagged field position has its own accessor (`@.minyar.record.get.K(ptr VALUE)`).
@@ -126,6 +126,17 @@ function resultReadField(line: Text, value: Text): Text {
             if field == "0" || field == "1" || field == "2" { return field }
         }
         which = which + 1
+    }
+    // A consumed take: `X = call i64 @.minyar.record.result.take(ptr VALUE, i64 FIELD, i64 REFERENCE)`.
+    let take = " = call i64 @.minyar.record.result.take(ptr " + value + ", i64 "
+    let at = line.find(take)
+    if at > 2 && line.startsWith("  %") && line.endsWith(")") && resultNameUses(line, value) == 1 {
+        let rest = line.slice(at + take.length, line.length - 1)
+        let comma = rest.find(", i64 ")
+        if comma > 0 {
+            let field = rest.slice(0, comma)
+            if field == "0" || field == "1" || field == "2" { return field }
+        }
     }
     return ""
 }
@@ -310,6 +321,34 @@ function resultReturnsLocal(lines: List<Text>): Boolean {
     return true
 }
 
+// The boxing tail of a wrapper: the record is built inline for each tag with
+// the stores ordinary construction uses, so a caller that keeps the value pays
+// what it paid before the pair ABI (no out-of-line box call).
+function resultWrapperCase(flags: Text, tag: Integer): Text {
+    let values = flags.split(", ")
+    let count = "3"
+    let field = "2"
+    let reference = values[0].slice(4, values[0].length)
+    if tag == 1 { field = "1" } else { reference = values[1].slice(4, values[1].length) }
+    if values.length == 5 {
+        count = values[0].slice(4, values[0].length)
+        field = values[1 + tag].slice(4, values[1 + tag].length)
+        reference = values[3 + tag].slice(4, values[3 + tag].length)
+    }
+    let name = "%result.record." + Text(tag)
+    let label = "result.case." + Text(tag) + ":\n"
+    if field != "0" && reference == "1" {
+        return label + "  " + name + " = call ptr @minyar_record_new(i64 " + count + ")\n  call void @minyar_record_set(ptr " + name + ", i64 0, i64 " + Text(tag) + ")\n  call void @minyar_record_set_take(ptr " + name + ", i64 " + field + ", i64 %result.slot)\n  ret ptr " + name + "\n"
+    }
+    let body = label + "  " + name + " = call ptr @minyar_record_new_scalar(i64 " + count + ")\n  call void @minyar_record_set(ptr " + name + ", i64 0, i64 " + Text(tag) + ")\n"
+    if field != "0" { body = body + "  call void @minyar_record_set(ptr " + name + ", i64 " + field + ", i64 %result.slot)\n" }
+    return body + "  ret ptr " + name + "\n"
+}
+
+function resultWrapperBox(flags: Text): Text {
+    return "  %result.first = icmp eq i64 %result.tag, 0\n  br i1 %result.first, label %result.case.0, label %result.case.1\n" + resultWrapperCase(flags, 0) + resultWrapperCase(flags, 1)
+}
+
 function resultLowerFunction(lines: List<Text>, functions: ResultRegisterFunctions, flags: Text): Boolean {
     let changed = false
     let define = lines[0]
@@ -323,7 +362,7 @@ function resultLowerFunction(lines: List<Text>, functions: ResultRegisterFunctio
             let parameters = define.slice(open + 1, close)
             lines[0] = "define internal [2 x i64] @" + name + ".r(" + parameters + define.slice(close, define.length)
             if resultLowerReturns(lines, functions) { failCompiler("Result register lowering: an unboxed return in " + name) }
-            functions.wrappers.add(define.slice(0, at) + " ptr @" + name + "(" + parameters + ") uwtable {\nentry:\n  %result.pair = call [2 x i64] @" + name + ".r(" + parameters + ")\n  %result.tag = extractvalue [2 x i64] %result.pair, 0\n  %result.slot = extractvalue [2 x i64] %result.pair, 1\n  %result.record = call ptr " + resultBoxFunction(flags) + "(i64 %result.tag, i64 %result.slot, " + flags + ")\n  ret ptr %result.record\n}\n\n")
+            functions.wrappers.add(define.slice(0, at) + " ptr @" + name + "(" + parameters + ") uwtable {\nentry:\n  %result.pair = call [2 x i64] @" + name + ".r(" + parameters + ")\n  %result.tag = extractvalue [2 x i64] %result.pair, 0\n  %result.slot = extractvalue [2 x i64] %result.pair, 1\n" + resultWrapperBox(flags) + "}\n\n")
             changed = true
         }
     }
