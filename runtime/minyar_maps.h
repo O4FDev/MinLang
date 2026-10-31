@@ -547,8 +547,8 @@ MINYAR_HOT size_t map_builtin_find(const MinyarRecord *map, long long kind, long
 }
 static MINYAR_COLD MINYAR_NORETURN void map_key_absent(void) { minyar_stop_program("Map key is absent."); }
 /* Insert an absent built-in key whose probe ended at the empty bucket. */
-static MAP_GENERAL void map_builtin_insert(MinyarRecord *map, long long kind, long long key, long long value,
-                                           uint64_t hash, size_t bucket) {
+MINYAR_HOT void map_builtin_insert(MinyarRecord *map, long long kind, long long key, long long value,
+                                   uint64_t hash, size_t bucket) {
     long long capacity = map->values[MAP_CAPACITY];
     if (!capacity || map->values[MAP_LENGTH] >= capacity - capacity / 4) {
         map_grow(map);
