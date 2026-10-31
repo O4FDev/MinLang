@@ -173,7 +173,23 @@ benchmarks/bothmodes/run.py` measures the full workloads on Linux x86-64: the
 serial ratio (Minyar cachegrind instructions at 1 thread over the fewest of C,
 C++ and Rust) and the parallel ratio (Minyar wall time at 4 threads over
 `par.rs` at 4, n=5 interleaved, median and spread), each with a geomean, plus
-both programs' wall time at 1 thread for scaling.
+both programs' wall time at 1 thread for scaling. Both scripts also print each
+ratio against Rust alone and a `worst` line beside the geomeans.
+
+Ablation builds are an experimental measurement tool, never a supported mode
+or default: they price one language guarantee at a time by turning it off. A
+tree whose root holds `ablation.conf` (or the file named by
+`MINYAR_ABLATION_FILE`) with lines `MINYAR_ABLATE_<NAME>=1` makes the unchanged
+`./minyar --release prog.min -o prog` build the ablated program; absent or empty,
+builds are byte-identical. `tools/ablation.sh` lists the switches: `OVERFLOW`
+(checked `+ - *` become `nsw`), `BOUNDS` (inline List/Bytes position checks
+always pass), `UNICODE` (`text[i]` and `text.length` use bytes; identical only
+on ASCII data), `RECLAIM` (never free: the arena runtime), `SCHEDULER` (free
+immediately: the eager profile) and `THREADS` (a program carrying the
+thread-runtime marker links the plain runtime; starting a thread traps).
+Ablated programs may misbehave on exactly the inputs the guarantee exists for.
+`make check-ablation-switches` checks that an empty file changes nothing, that
+every switch keeps a probe's output and that each removes the cost it names.
 
 `make check-module-tests` checks contextual in-module tests, private access,
 single evaluation, source/value failure reports, rejection diagnostics and

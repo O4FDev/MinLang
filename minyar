@@ -320,6 +320,13 @@ if [ "$memory_profile" = eager ] && [ "$budget_requested" -ne 0 ]; then usage; f
 if [ -n "$heap_bytes" ]; then
     case "$memory_profile" in fixed|lazy) ;; *) usage ;; esac
 fi
+# Experimental ablation builds (measurement only, docs/testing.md): absent file = normal build.
+ablations=
+ablation_file=${MINYAR_ABLATION_FILE:-$project_dir/ablation.conf}
+if [ -f "$ablation_file" ]; then ablations=$(sh "$project_dir/tools/ablation.sh" switches "$ablation_file"); fi
+case " $ablations " in *" SCHEDULER "*) [ "$memory_profile" != system ] || [ "$budget_requested" -ne 0 ] || memory_profile=eager ;; esac
+ablation_runtime=
+if [ -n "$ablations" ]; then ablation_runtime=$(sh "$project_dir/tools/ablation.sh" runtime $ablations); fi
 [ "$#" -ge 1 ] && [ "$#" -le 3 ] || usage
 case "$1" in --*) usage ;; esac
 source_file=$1
@@ -370,7 +377,7 @@ elif [ "$memory_profile" = eager ]; then
     else runtime_file=build/minyar-runtime-eager.o; fi
     set -- "$@" "$runtime_file"
     runtime_file="$project_dir/$runtime_file"
-elif [ "$memory_profile" = system ] && [ "$cleanup_budget" -eq 32 ] &&
+elif [ "$memory_profile" = system ] && [ "$cleanup_budget" -eq 32 ] && [ -z "$ablation_runtime" ] &&
      [ "${MINYAR_CLANG+x}" != x ] && [ "${MINYAR_RUNTIME_FLAGS+x}" != x ]; then
     configured_runtime=0
     if [ "$release" -eq 1 ]; then runtime_file=build/minyar-default-runtime-release.ll
@@ -457,6 +464,7 @@ if [ "$check_only" -eq 1 ]; then
     exit 0
 fi
 
+if [ -n "$ablations" ]; then sh "$project_dir/tools/ablation.sh" ir "$llvm_file" $ablations; fi
 if [ "$configured_runtime" -eq 1 ]; then
     runtime_source="$llvm_dir/runtime.c"
     # Configuration follows command-line preprocessing, so -D/-U options in
@@ -477,6 +485,7 @@ CONFIG
         system) printf '#define MINYAR_SYSTEM_HEAP 1\n' >> "$runtime_source" ;;
     esac
     printf '#define MINYAR_RC_POLL_BUDGET %s\n' "$cleanup_budget" >> "$runtime_source"
+    if [ -n "$ablation_runtime" ]; then printf '%s\n' "$ablation_runtime" >> "$runtime_source"; fi
     if [ -n "$heap_bytes" ]; then
         printf '#define MINYAR_BOUNDED_HEAP_BYTES %sULL\n' "$heap_bytes" >> "$runtime_source"
     fi

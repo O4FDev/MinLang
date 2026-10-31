@@ -35,3 +35,8 @@ check-benchmarks-compare: build/minyarc build/tooling/tools/clang-driver
 # benchmarks/bothmodes/run.py.
 check-benchmarks-bothmodes: build/minyarc build/tooling/tools/clang-driver
 	$(LIMITED) env CC="$(LLVM_CC)" python3 benchmarks/bothmodes/run.py --check
+
+# Experimental ablation switches (tools/ablation.sh): measurement tools only.
+.PHONY: check-ablation-switches
+check-ablation-switches: build/minyarc build/tooling/tools/clang-driver
+	$(LIMITED) env MINYAR_CLANG="$(LLVM_CC)" sh tests/ablation/switches.sh

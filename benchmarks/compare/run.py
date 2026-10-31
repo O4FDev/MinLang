@@ -203,6 +203,7 @@ def measure_program(name, args, results):
         row["identical"] = len(set(row["outputs"].values())) == 1
         row["ratio"] = ir / min(row["ir"][lang] for lang in REFS)
         row["fastest_ref"] = min(REFS, key=lambda lang: row["ir"][lang])
+        row["rust_ratio"] = ir / row["ir"]["rust"]
         if args.profile:
             row["profile"] = {}
             for lang in ("minyar", row["fastest_ref"]):
@@ -265,7 +266,7 @@ def print_row(row, perf):
     ir = row["ir"]
     line = (f"{row['name']:<16} {'yes' if row['identical'] else 'NO':<4} "
             + " ".join(f"{fmt_ir(ir[lang]):>12}" for lang in LANGS)
-            + f" {row['ratio']:>7.2f}  {row['fastest_ref']}")
+            + f" {row['ratio']:>7.2f}  {row['fastest_ref']:<4} {row['rust_ratio']:>6.2f}")
     if perf:
         w = row["wall"]
         line += " " + " ".join(f"{statistics.median(w[lang]) * 1000:>8.1f}ms±{(max(w[lang]) - min(w[lang])) * 500:.1f}"
@@ -280,7 +281,7 @@ def print_row(row, perf):
 
 def measure(args):
     names = programs(args.only)
-    header = f"{'program':<16} {'same':<4} " + " ".join(f"{lang + ' Ir':>12}" for lang in LANGS) + f" {'ratio':>7}  best"
+    header = f"{'program':<16} {'same':<4} " + " ".join(f"{lang + ' Ir':>12}" for lang in LANGS) + f" {'ratio':>7}  best {'rust':>6}"
     if args.perf:
         header += " " + " ".join(f"{lang + ' wall':>14}" for lang in LANGS) + "  wallx"
     print(header, flush=True)
@@ -296,7 +297,12 @@ def measure(args):
     ok = [r for r in results.values() if "ratio" in r]
     if ok:
         geo = math.exp(sum(math.log(r["ratio"]) for r in ok) / len(ok))
-        print(f"{'geomean':<16} {'':<4} " + " " * (13 * len(LANGS)) + f" {geo:>7.2f}  ({len(ok)} programs)")
+        geo_rust = math.exp(sum(math.log(r["rust_ratio"]) for r in ok) / len(ok))
+        worst = max(ok, key=lambda r: r["ratio"])
+        worst_rust = max(ok, key=lambda r: r["rust_ratio"])
+        print(f"{'geomean':<16} {'':<4} " + " " * (13 * len(LANGS)) + f" {geo:>7.2f}  {'':<4} {geo_rust:>6.2f}  ({len(ok)} programs)")
+        print(f"{'worst':<16} {'':<4} " + " " * (13 * len(LANGS)) + f" {worst['ratio']:>7.2f}  {'':<4} {worst_rust['rust_ratio']:>6.2f}"
+              f"  (fastest: {worst['name']}, Rust: {worst_rust['name']})")
     if args.json:
         doc = {"tree": os.path.abspath(args.tree), "threads": THREADS, "minyar_args": args.minyar_args,
                "minyar_target_cpu": os.environ.get("MINYAR_TARGET_CPU", ""),
@@ -306,6 +312,9 @@ def measure(args):
                "programs": [results[n] for n in names]}
         if ok:
             doc["geomean_ratio"] = geo
+            doc["geomean_rust_ratio"] = geo_rust
+            doc["worst"] = {"ratio": worst["ratio"], "name": worst["name"],
+                            "rust_ratio": worst_rust["rust_ratio"], "rust_name": worst_rust["name"]}
         os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
         with open(args.json, "w") as f:
             json.dump(doc, f, indent=1)

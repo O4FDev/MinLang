@@ -202,6 +202,7 @@ def measure_program(name, args):
         best = min(REFS, key=lambda lang: row["ir"][lang])
         row["fastest_serial_ref"] = best
         row["serial_ratio"] = row["ir"]["minyar@1"] / row["ir"][best]
+        row["serial_rust_ratio"] = row["ir"]["minyar@1"] / row["ir"]["rust"]
         row["parallel_ir_ratio"] = row["ir"][f"minyar@{args.threads}"] / row["ir"][f"par@{args.threads}"]
         row["wall"] = wall_times(exes, arg, args.threads, args.repeats)
         med = {k: statistics.median(v) for k, v in row["wall"].items()}
@@ -239,7 +240,7 @@ def print_row(row):
     ir, w, n = row["ir"], row["wall"], row["threads"]
     best = row["fastest_serial_ref"]
     print(f"{row['name']:<10} {'yes' if row['identical'] else 'NO':<4} "
-          f"{fmt_ir(ir['minyar@1']):>10} {fmt_ir(ir[best]):>10} {best:<4} {row['serial_ratio']:>6.2f} | "
+          f"{fmt_ir(ir['minyar@1']):>10} {fmt_ir(ir[best]):>10} {best:<4} {row['serial_ratio']:>6.2f} {row['serial_rust_ratio']:>6.2f} | "
           f"{fmt_wall(w[f'minyar@{n}']):>13} {fmt_wall(w[f'par@{n}']):>13} {row['parallel_ratio']:>6.2f} | "
           f"{fmt_ir(ir[f'minyar@{n}']):>10} {fmt_ir(ir[f'par@{n}']):>10} {row['parallel_ir_ratio']:>6.2f} | "
           f"{fmt_wall(w['minyar@1']):>13} {fmt_wall(w['par@1']):>13} {row['minyar_scaling']:>5.2f} {row['par_scaling']:>5.2f}",
@@ -290,7 +291,7 @@ def measure(args):
     names = programs(args.only)
     print(f"load before: {load_average()}", flush=True)
     n = args.threads
-    print(f"{'program':<10} {'same':<4} {'minyar@1 Ir':>10} {'serial Ir':>10} {'best':<4} {'serial':>6} | "
+    print(f"{'program':<10} {'same':<4} {'minyar@1 Ir':>10} {'serial Ir':>10} {'best':<4} {'serial':>6} {'s-rust':>6} | "
           f"{f'minyar@{n} ms':>13} {f'rust@{n} ms':>13} {'par':>6} | {f'minyar@{n} Ir':>10} {f'rust@{n} Ir':>10} {'Ir x':>6} | "
           f"{'minyar@1 ms':>13} {'rust@1 ms':>13} {'m-scl':>5} {'r-scl':>5}", flush=True)
     rows = []
@@ -307,8 +308,16 @@ def measure(args):
     if ok:
         doc["serial_geomean"] = geomean([r["serial_ratio"] for r in ok])
         doc["parallel_geomean"] = geomean([r["parallel_ratio"] for r in ok])
-        print(f"{'geomean':<10} {'':<4} {'':>10} {'':>10} {'':<4} {doc['serial_geomean']:>6.2f} | {'':>13} {'':>13} "
-              f"{doc['parallel_geomean']:>6.2f}   ({len(ok)} programs; serial = Ir at 1 thread, parallel = wall at {n})")
+        doc["serial_rust_geomean"] = geomean([r["serial_rust_ratio"] for r in ok])
+        worst = {k: max(ok, key=lambda r: r[k]) for k in ("serial_ratio", "serial_rust_ratio", "parallel_ratio")}
+        doc["worst"] = {k: {"ratio": r[k], "name": r["name"]} for k, r in worst.items()}
+        print(f"{'geomean':<10} {'':<4} {'':>10} {'':>10} {'':<4} {doc['serial_geomean']:>6.2f} {doc['serial_rust_geomean']:>6.2f} | "
+              f"{'':>13} {'':>13} {doc['parallel_geomean']:>6.2f}   ({len(ok)} programs; serial = Ir at 1 thread vs fastest"
+              f" and vs Rust, parallel = wall at {n} vs par.rs)")
+        print(f"{'worst':<10} {'':<4} {'':>10} {'':>10} {'':<4} {worst['serial_ratio']['serial_ratio']:>6.2f} "
+              f"{worst['serial_rust_ratio']['serial_rust_ratio']:>6.2f} | {'':>13} {'':>13} "
+              f"{worst['parallel_ratio']['parallel_ratio']:>6.2f}   ({worst['serial_ratio']['name']}, "
+              f"{worst['serial_rust_ratio']['name']}, {worst['parallel_ratio']['name']})")
     print(f"load after: {load_average()}", flush=True)
     if args.json:
         os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
