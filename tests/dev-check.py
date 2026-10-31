@@ -58,7 +58,7 @@ def trace_attribution(tree):
     ]
     trace = tree / "trace.log"
     trace.write_text("\n".join(lines) + "\n")
-    reads, listed, executed, goals = dev.parse_trace(trace, tree, ["check-a"])
+    reads, listed, executed, goals, inspected = dev.parse_trace(trace, tree, ["check-a"])
     reads, listed = reads["check-a"], listed["check-a"]
     expect(goals["check-a"] == {"build/minyarc"}, f"nested Make goals: {goals['check-a']}")
     expect("build-support/a.mk" not in reads and "compiler/compiler.min" not in reads, "a building Make's parse leaked")

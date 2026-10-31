@@ -186,6 +186,12 @@ def unescape(text):
     return text.encode("latin-1", "backslashreplace").decode("unicode_escape").encode("latin-1", "replace").decode("utf-8", "replace")
 
 
+# Processes that read files only to compile or link them. A file any other process opens is inspected as
+# data (hashed, compared, parsed), which function coverage cannot see.
+BUILD_TOOLS = {"clang", "clang-23", "clang++", "cc", "c++", "gcc", "g++", "ld", "ld.lld", "lld", "ld.bfd", "ld.gold",
+               "as", "opt", "llc", "llvm-link", "ar", "llvm-ar", "make"}
+
+
 def parse_trace(trace, root, checks):
     root = str(root).rstrip("/")
     checks = set(checks)
@@ -262,6 +268,7 @@ def parse_trace(trace, root, checks):
         if check is not None:
             goals[check].update(targets)
     cache = {}
+    inspected = {name: set() for name in checks}
     reads = {name: set() for name in checks}
     listed = {name: set() for name in checks}
     executed = {name: set() for name in checks}
@@ -343,7 +350,9 @@ def parse_trace(trace, root, checks):
                 reads[check].add(relative)
             else:
                 reads[check].add(relative)
-    return reads, listed, executed, goals
+                if name in ("open", "openat", "openat2") and exe not in BUILD_TOOLS:
+                    inspected[check].add(relative)
+    return reads, listed, executed, goals, inspected
 
 
 def make_goals(argv, root):
@@ -428,8 +437,8 @@ def load_index(path):
         raise SystemExit(f"dev-check: index {path} has schema {data.get('schema')}, expected {INDEX_SCHEMA}; rebuild it")
     paths = data["paths"]
     for check in data["checks"].values():
-        for key in ("reads", "listed", "executed"):
-            check[key] = {paths[item] for item in check[key]}
+        for key in ("reads", "listed", "executed", "inspected"):
+            check[key] = {paths[item] for item in check.get(key, [])}
     return data
 
 
@@ -498,10 +507,10 @@ def command_index(arguments):
                     untraced_pass[name] = timing["passed"]
     elif arguments.reuse_trace and trace.with_name(trace.stem + "-retry.log").exists():
         traces.append(trace.with_name(trace.stem + "-retry.log"))
-    reads, listed, executed, goals = ({name: set() for name in checks} for _ in range(4))
+    reads, listed, executed, goals, inspected = ({name: set() for name in checks} for _ in range(5))
     for item in traces:
         more = parse_trace(item, root, checks)
-        for target, extra in zip((reads, listed, executed, goals), more):
+        for target, extra in zip((reads, listed, executed, goals, inspected), more):
             for name in checks:
                 target[name] |= extra[name]
     table, numbers = [], {}
@@ -525,6 +534,7 @@ def command_index(arguments):
             "listed": sorted(number(path) for path in listed[check]),
             "executed": sorted(number(path) for path in executed[check]),
             "goals": sorted(goals[check]),
+            "inspected": sorted(number(path) for path in inspected[check]),
         }
     index = {"schema": INDEX_SCHEMA, "aggregate": aggregate, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
              "gate_wall_s": round(time.time() - started), "manifest": base, "paths": table,
