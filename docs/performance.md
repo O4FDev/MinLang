@@ -458,7 +458,13 @@ share the parent tag, which aliases every tagged position. A tagged position is
 byte offset 8 + 8K in any record, so the separation holds without type
 information. The accessors are chosen where the call is emitted: a shared
 helper switching on the field would be simplified before inlining and would
-merge the tags. Reference fields keep their ownership-aware runtime setters.
+merge the tags. A scalar store written directly through a method receiver
+(`self.field = …`) keeps the shared parent tag: every access through one `self`
+is already separated by its constant offset, and a per-position tag there let
+LLVM promote a receiver counter into a loop-carried value whose register copies
+cost more than the reloads it saved (an interpreter dispatch loop measured +7.5%
+instructions). This is a measured codegen heuristic, not an aliasing rule.
+Reference fields keep their ownership-aware runtime setters.
 `make check-record-access` checks the helper IR, its inlining at O2, the absence
 of a failure path and the arena layout; `check-llvm-helper-contracts` proves at
 O2 that a store to field A keeps a load of field B, while a store to the same
