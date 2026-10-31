@@ -13,14 +13,35 @@ static long long text_scalar_count(const unsigned char *bytes, long long length)
     return count;
 }
 
+/* The first `wanted` byte at or after `start`, or `length`. Split pieces are
+ * usually short: one eight-byte test finds most separators before the call
+ * to memchr. Only the lowest flagged byte is exact, and it is the one used. */
+static inline long long text_byte_find(const unsigned char *bytes, long long start, long long length,
+                                       unsigned char wanted) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if (length - start >= 8) {
+        uint64_t word;
+        memcpy(&word, bytes + start, sizeof(word));
+        word ^= 0x0101010101010101ULL * wanted;
+        uint64_t found = (word - 0x0101010101010101ULL) & ~word & 0x8080808080808080ULL;
+        if (found) return start + (__builtin_ctzll(found) >> 3);
+        start += 8;
+    }
+#endif
+    const unsigned char *hit = memchr(bytes + start, wanted, (size_t)(length - start));
+    return hit ? hit - bytes : length;
+}
 /* KMP avoids quadratic scans of repeated prefixes. One table is reused for
  * all split matches; one-byte separators take the allocation-free path, and
- * needles of up to TEXT_SEARCH_SMALL bytes use the caller's stack table. */
-enum { TEXT_SEARCH_SMALL = 32 };
+ * needles of up to TEXT_SEARCH_SMALL bytes use the caller's stack table.
+ * Needles of up to TEXT_SEARCH_SHORT bytes need no table at all: candidates
+ * are found by their first byte and compared in place, at most that many
+ * byte comparisons per text byte, so the search stays linear. */
+enum { TEXT_SEARCH_SMALL = 32, TEXT_SEARCH_SHORT = 16 };
 static long long *text_search_table(const MinyarText *needle, long long available,
                                     long long small[TEXT_SEARCH_SMALL]) {
     long long length = needle->byte_length;
-    if (length <= 1 || length > available) return NULL;
+    if (length <= TEXT_SEARCH_SHORT || length > available) return NULL;
     if ((unsigned long long)length > SIZE_MAX / sizeof(long long))
         minyar_stop("the Text search pattern is too large.");
     long long *table = small;
@@ -60,6 +81,17 @@ static long long text_search_next(const MinyarText *text, const MinyarText *need
                                            (size_t)(text->byte_length - start));
         return found ? found - text->bytes : -1;
     }
+    if (needle->byte_length <= TEXT_SEARCH_SHORT) {
+        const unsigned char *bytes = text->bytes, *wanted = needle->bytes;
+        long long rest = needle->byte_length - 1, last = text->byte_length - needle->byte_length;
+        for (long long i = start; i <= last;) {
+            long long at = text_byte_find(bytes, i, last + 1, wanted[0]);
+            if (at > last) return -1;
+            if (bytes_are_equal(bytes + at + 1, wanted + 1, (size_t)rest)) return at;
+            i = at + 1;
+        }
+        return -1;
+    }
     for (long long i = start, matched = 0; i < text->byte_length; i++) {
         while (matched && text->bytes[i] != needle->bytes[matched]) matched = table[matched - 1];
         if (text->bytes[i] == needle->bytes[matched]) {
@@ -85,7 +117,9 @@ long long minyar_text_find(MinyarText *text, MinyarText *needle) {
     long long *table = text_search_table(needle, text->byte_length, small);
     long long byte = text_search_next(text, needle, 0, table);
     text_search_free(table, small);
-    return byte < 0 ? -1 : text_scalar_count(text->bytes, byte);
+    if (byte < 0) return -1;
+    /* A counted Text without offsets is ASCII: the byte is the position. */
+    return text->character_offsets ? text_scalar_count(text->bytes, byte) : byte;
 }
 _Bool minyar_text_starts_with(MinyarText *text, MinyarText *needle) {
     ensure_text_index(text);
@@ -99,24 +133,6 @@ _Bool minyar_text_ends_with(MinyarText *text, MinyarText *needle) {
     return needle->byte_length <= text->byte_length &&
            bytes_are_equal(text->bytes + text->byte_length - needle->byte_length,
                            needle->bytes, (size_t)needle->byte_length);
-}
-/* The first `wanted` byte at or after `start`, or `length`. Split pieces are
- * usually short: one eight-byte test finds most separators before the call
- * to memchr. Only the lowest flagged byte is exact, and it is the one used. */
-static inline long long text_byte_find(const unsigned char *bytes, long long start, long long length,
-                                       unsigned char wanted) {
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    if (length - start >= 8) {
-        uint64_t word;
-        memcpy(&word, bytes + start, sizeof(word));
-        word ^= 0x0101010101010101ULL * wanted;
-        uint64_t found = (word - 0x0101010101010101ULL) & ~word & 0x8080808080808080ULL;
-        if (found) return start + (__builtin_ctzll(found) >> 3);
-        start += 8;
-    }
-#endif
-    const unsigned char *hit = memchr(bytes + start, wanted, (size_t)(length - start));
-    return hit ? hit - bytes : length;
 }
 MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
     ensure_text_index(text);

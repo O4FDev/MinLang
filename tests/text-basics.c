@@ -186,6 +186,36 @@ static void split_iteration_compaction(void) {
     drain();
 }
 #endif
+/* Short needles (no table) and long ones (KMP) find the same first match,
+ * including overlapping prefixes, matches at either end and the size limit. */
+static void search_lengths(void) {
+    char text[200], needle[40];
+    for (int size = 2; size <= 20; size++) {
+        int length = 3 * size + 7;
+        for (int i = 0; i < length; i++) text[i] = 'a';
+        text[length] = 0;
+        for (int i = 0; i < size; i++) needle[i] = 'a';
+        needle[size - 1] = 'b';
+        needle[size] = 0;
+        for (int at = 0; at + size <= length; at += size + 1) {
+            text[at + size - 1] = 'b';
+            MinyarText *haystack = copy_c_text(text), *wanted = copy_c_text(needle);
+            assert(minyar_text_find(haystack, wanted) == at);
+            assert(minyar_text_contains(haystack, wanted));
+            MinyarList *parts = minyar_text_split(haystack, wanted);
+            assert(parts->length == 2);
+            minyar_rc_release(parts);
+            minyar_rc_release(haystack);
+            minyar_rc_release(wanted);
+            text[at + size - 1] = 'a';
+        }
+        MinyarText *haystack = copy_c_text(text), *wanted = copy_c_text(needle);
+        assert(minyar_text_find(haystack, wanted) == -1);
+        minyar_rc_release(haystack);
+        minyar_rc_release(wanted);
+        drain();
+    }
+}
 int main(int argc, char **argv) {
     if (argc == 4) {
         MinyarText *text = hex_text(argv[2]), *needle = hex_text(argv[3]);
@@ -201,6 +231,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     ownership();
+    search_lengths();
 #ifndef MINYAR_COMPILER_ARENA
     split_iteration_compaction();
     assert(rc_object_count == 0 && rc_bytes == 0);
