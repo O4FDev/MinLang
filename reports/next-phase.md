@@ -208,3 +208,13 @@ Reproduce: `.prof/profile-all.sh` (callgrind all 28 at 1/10), `.prof/classify.py
 and `.prof/refasm.sh NAME` (the `-O3 -march=x86-64-v3 -emit-llvm` C IR). Raw callgrind files, `hotasm.txt` (per
 instruction Ir), `files.txt` and `self.txt` are under `/home/agent/swarm/prof/build/prof/` on box M; the execution log
 is `~/prof-all.log`.
+
+### Lane delta profiles (keep updated as lanes land)
+
+Same callgrind setup, profiled against the run-2 base with `.prof/prof-commit.sh REF [programs...]`; full-workload
+points re-measured with `.prof/fullir.sh` (which reproduces `base-results` exactly: intmap 1,554,954,638 and httpparse
+5,397,662,659 on the base).
+
+| lane commit | programs | Ir delta vs base | reading |
+|---|---|---|---|
+| map `e96c61f1e` (packed Map control bytes) | intmap, httpparse, config, wordfreq, tokenizer, json, sorttext | intmap **+1.46%** (full: 1,554.95M → 1,577.62M), httpparse **+2.04%** (full: 5,397.66M → 5,507.84M), config **+0.74%** (full: 2,765.3M → 2,785.8M); at 1/10: wordfreq +1.1%, tokenizer +0.7%, json +0.04%, sorttext 0.0% | slower on every visible Map user: the packed probe is not paying for its extra per-bucket work. Flagged to the map lane; not a candidate for landing as-is. |
