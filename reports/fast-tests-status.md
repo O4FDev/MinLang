@@ -43,8 +43,12 @@ checks) in ≤ 300 s wall with the same pass/fail as a single-box gate. Command:
 - Cache box `shard-cache`: builds and plans at t=0 while shards boot (written, not yet run).
 
 ### Blockers / asks for Luke
-- **Droplet limit 10** (account): at most 8 shards + shard-cache. A higher limit would let a cold gate fit 300 s
-  without depending on cache hits.
+- **Capacity until Sun 1 Nov 21:45 UTC: 3 droplets.** The account limit is 10; brief-crawl-1 and the six
+  `goal-run2` boxes use 7. The ≤ 300 s run needs about 8 × s-8vcpu shards (64 vCPU: the gate is ~9,800 CPU-s), so
+  it waits for the droplet-limit increase to ~20 (already on the list) or for the run-2 boxes to go at Sun 21:45
+  (the account offers no CPU droplet above 8 vCPU, so fewer, bigger shards are not possible).
+  Meanwhile: agreement proofs on 2 shards (same machinery, same verdict logic), the dev box for check splits, the
+  compile-cache image.
 - **Guard accounting:** test-shard-guard charges every shard a full hour (8 shards = $1.33 per gate, so ~6 gates a
   day inside $10 with shard-cache), while DigitalOcean bills per second since 2026-01-01 (a 6-min 8-shard gate costs
   ~$0.13). Counting per second (60 s minimum) would allow ~60 gates a day for the same money. Luke's call.
