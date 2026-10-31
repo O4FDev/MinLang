@@ -63,7 +63,7 @@ check-typed-assignment-reuse: build/minyarc build/minyarc-sanitize build/tooling
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/typed-assignment-reuse
 
 check-smoke: build/minyarc build/minyar-runtime.o
-	$(LIMITED) sh tests/smoke.sh
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) sh tests/smoke.sh
 
 .PHONY: check-memory-contracts check-memory-contracts-harness
 .PHONY: check-foundation-baseline
