@@ -157,7 +157,8 @@ function compileAtomicStatementBody(context: CompilerContext, localNames: List<T
         }
         // A scan-mode binding has no value to store: its reads compute pieces.
         let deferred = splitMode == 2
-        let borrowed = !deferred && initializerStart >= 0 && stableFieldBorrow(context, localNames, localTypes, localIds, localLengths, state, initializerStart, state[0], valueType)
+        let stablePath = !deferred && initializerStart >= 0 && stableFieldBorrow(context, localNames, localTypes, localIds, localLengths, state, initializerStart, state[0], valueType)
+        let borrowed = stablePath
         // A split piece is a value of its own, not an element of the root the
         // initializer's token shape names, so a binding guard would hold the
         // wrong lifetime.
@@ -176,7 +177,12 @@ function compileAtomicStatementBody(context: CompilerContext, localNames: List<T
         // binding is too: its guard keeps the value if the block could release it.
         if !immutable && plainRecordType(context, type) && !blockAssignsName(tokenKinds, tokenTexts, state[0], name) { localLengths[bound] = -name.byteLength }
         if !deferred {
-        if !borrowed { assignReference(output, state, id, value, valueType, functionParameterCounts, functionParameterTypes, functionReturnTypes) }
+        if !borrowed { assignReference(output, state, id, value, valueType, functionParameterCounts, functionParameterTypes, functionReturnTypes) } else if isReferenceType(type) {
+            markBorrowFrame(state)
+            // A value read from a stable field path stays while its root lives,
+            // so a later copy of this binding can borrow too.
+            if stablePath { markStableCopy(context, state, id) }
+        }
         output.add("  store ")
         output.add(llvmType(type))
         output.add(" ")
@@ -249,13 +255,18 @@ function compileAtomicStatementBody(context: CompilerContext, localNames: List<T
                             valueType.add(localIds[local])
                             valueType.add(state[0])
                         }
+                        let valueStart = state[0]
                         let value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
                         if valueType[0] != localTypes[local] {
                             failCompiler("an assignment to '" + name + "' has the wrong type")
                         }
+                        if borrowedCopyAssignment(context, localNames, localTypes, localIds, localLengths, state, valueStart, state[0], valueType, localIds[local]) {
+                            releaseOwnedBinding(output, state, localIds[local], valueType[0])
+                        } else {
                         if isReferenceType(valueType[0]) { takeTerminalReuse(context, localNames, localIds, localLengths, state, output, localIds[local]) }
                         if isRecordType(valueType[0]) && isReferenceType(valueType[0]) { takeRecordReconstruction(context, state, textState, output, localIds[local], valueType) }
                         assignReference(output, state, localIds[local], value, valueType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+                        }
                         output.add("  store ")
                         output.add(llvmType(valueType[0]))
                         output.add(" ")

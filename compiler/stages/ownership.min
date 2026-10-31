@@ -1048,6 +1048,41 @@ function stableRecordField(context: CompilerContext, type: Integer, name: Text):
     return findIndexedSymbol(context.assignedFieldLookup, context.assignedFieldNames, context.assignedFieldKinds, name, 1) < 0
 }
 
+// A binding whose borrowed value outlives every copy of it: a match payload
+// or walked element its arm/body never reassigns (the match input and the
+// walked List keep it), or a binding of a stable field path.
+function markStableCopy(context: CompilerContext, state: List<Integer>, id: Integer) {
+    if id < 0 { return }
+    context.stableBorrowCopies.add(state[9] * 100000 + id)
+}
+
+function stableCopyLocal(context: CompilerContext, state: List<Integer>, id: Integer): Boolean {
+    let key = state[9] * 100000 + id
+    let index = context.stableBorrowCopies.length - 1
+    while index >= 0 {
+        let entry = context.stableBorrowCopies[index]
+        if entry / 100000 != state[9] { return false }
+        if entry == key { return true }
+        index = index - 1
+    }
+    return false
+}
+
+// A copy of one stable local names the same object that local already keeps
+// alive: a readonly parameter or capture, which its caller keeps for the whole
+// call, or a binding whose borrowed value outlives the copy. The copy ends no
+// later than that binding's scope, so it owns no count of its own.
+function stableLocalCopy(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, start: Integer, end: Integer, resultType: List<Integer>): Boolean {
+    if end - start != 1 || context.tokenKinds[start] != 1 { return false }
+    if !isReferenceType(resultType[0]) { return false }
+    if resultType.length > 1 && resultType[1] >= 0 { return false }
+    let name = context.tokenTexts[start]
+    let source = findLocal(localNames, localLengths, state, name)
+    if source < 0 || localTypes[source] != resultType[0] { return false }
+    if localIds[source] < 0 { return true }
+    return stableCopyLocal(context, state, localIds[source])
+}
+
 // A binding initialized by a stable field path can borrow its value, like a
 // parameter: nothing can replace a field on that path while its root lives.
 // Later consumers of the binding create their own count first, as they do for
@@ -1055,6 +1090,7 @@ function stableRecordField(context: CompilerContext, type: Integer, name: Text):
 function stableFieldBorrow(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, start: Integer, end: Integer, resultType: List<Integer>): Boolean {
     if !isReferenceType(resultType[0]) { return false }
     if resultType.length > 1 && resultType[1] >= 0 { return false }
+    if stableLocalCopy(context, localNames, localTypes, localIds, localLengths, state, start, end, resultType) { return true }
     if end - start < 3 || (end - start) % 2 == 0 { return false }
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
@@ -1099,6 +1135,33 @@ function assignReference(output: List<Text>, state: List<Integer>, id: Integer, 
         rootLocal(output, state, id, value, resultType[0])
         if piece < output.length { noteCycleFixup(output, returnTypes, counts, fields, piece, resultType[0], 0) }
     }
+}
+
+// `target = source` where source is one stable local the target's scope cannot
+// outlive: the target names the same object and takes no count. A parameter or
+// a capture is older than every local; a local must be declared before it.
+function borrowedCopyAssignment(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, start: Integer, end: Integer, resultType: List<Integer>, targetId: Integer): Boolean {
+    if !stableLocalCopy(context, localNames, localTypes, localIds, localLengths, state, start, end, resultType) { return false }
+    let source = findLocal(localNames, localLengths, state, context.tokenTexts[start])
+    if source < 0 { return false }
+    return localIds[source] < targetId
+}
+
+// A binding that borrows still takes part in its function's ownership frame:
+// the exit stays a cleanup and cycle service point even when no cell is left.
+function markBorrowFrame(state: List<Integer>) {
+    state[6] = 1
+}
+
+// The binding now names a borrow: drop the count it owned and keep none for the
+// borrowed value. A binding that never took a count has nothing to release.
+function releaseOwnedBinding(output: List<Text>, state: List<Integer>, id: Integer, type: Integer) {
+    if !isReferenceType(type) { return }
+    // The binding still takes part in the function's ownership frame: its exit
+    // stays a cleanup and cycle service point even when no cell is left.
+    state[6] = 1
+    if !ownershipSlotAllocated(state, id) { return }
+    output.add("  call void @minyar_rc_local_take(i64 " + Text(ownershipSlot(state, id)) + ", ptr null)\n")
 }
 
 function borrowReference(output: List<Text>, state: List<Integer>, value: Text, type: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>) {

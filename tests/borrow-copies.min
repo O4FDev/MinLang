@@ -1,0 +1,146 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.moduleFunction(line, name)) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let found = 0
+    let rest = source
+    let position = rest.find(needle)
+    while position >= 0 {
+        found += 1
+        rest = rest.slice(position + needle.length, rest.length)
+        position = rest.find(needle)
+    }
+    return found
+}
+
+// Every ownership operation a binding can take: a copy that borrows takes none.
+function ownershipCount(emitted: Text): Integer {
+    return count(emitted, "call void @minyar_rc_retain(") + count(emitted, "call void @minyar_rc_local(") + count(emitted, "call void @minyar_rc_borrow(") + count(emitted, "call void @minyar_rc_local_take(")
+}
+
+function counts(ir: Text, name: Text): Integer {
+    return ownershipCount(body(ir, name))
+}
+
+// A function found by a symbol fragment, such as a closure body.
+function symbolBody(ir: Text, marker: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && test.contains(line, marker) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing function " + marker)
+    return joinText(parts)
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+// A copy of one stable local names the object that local already keeps alive:
+// a readonly parameter or capture, or a binding its block never reassigns. The
+// copy takes no count, so a match payload copied into a binding, a binding
+// reassigned from a payload, and a copy of a borrowed parameter stay borrowed.
+// A copy from a local declared in an inner block is not stable (the target's
+// scope may outlive the source), so it keeps its count.
+let source = #"""
+    record Item { name: Text; size: Integer }
+    choice Shape {
+        Dot(size: Integer)
+        Box(item: Item)
+    }
+
+    function payloadCopy(shape: Shape): Integer {
+        let total = 0
+        match shape {
+            Dot(size) { total = size }
+            Box(item) {
+                let held = item
+                total = held.size
+            }
+        }
+        return total
+    }
+
+    function payloadBranch(shape: Shape): Integer {
+        let total = 0
+        match shape {
+            Dot(size) { total = size }
+            Box(item) {
+                let held = item
+                if item.size > 1 { held = item }
+                total = held.size
+            }
+        }
+        return total
+    }
+
+    function parameterCopy(item: Item): Integer {
+        let held = item
+        if item.size > 2 { held = item }
+        return held.size
+    }
+
+    function runRead(read: () -> Integer): Integer { return read() }
+    function captureCopy(item: Item): Integer {
+        let read: () -> Integer = function(): Integer {
+            let held = item
+            return held.size
+        }
+        return runRead(read)
+    }
+
+    function innerSource(item: Item, other: Item): Integer {
+        let kept = item
+        let sum = 0
+        while sum < 2 {
+            let inner = other
+            kept = inner
+            sum += kept.size
+        }
+        return kept.size
+    }
+
+    let item = Item { name: "ab" + "c"; size: 2 }
+    let shapes = [Shape.Dot(3), Shape.Box(item)]
+    let total = 0
+    for shape in shapes { total += payloadCopy(shape) + payloadBranch(shape) }
+    print(total)
+    print(parameterCopy(item))
+    print(captureCopy(item))
+    print(innerSource(item, Item { name: "x" + "y"; size: 9 }))
+    """#
+let expected = "10\n2\n2\n9\n"
+
+test.require(fixtures.compile(frontend, source), "compile borrow copy IR")
+let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+// A payload binding the arm never reassigns is a stable root, and a binding
+// copied from it owns nothing.
+test.check(counts(ir, "payloadCopy") == 0, "payloadCopy: a payload binding and a copy of it borrow")
+test.check(counts(ir, "payloadBranch") == 0, "payloadBranch: a reassigned binding copies a payload borrow")
+test.check(counts(ir, "parameterCopy") == 0, "parameterCopy: a copy of a readonly parameter owns nothing")
+test.check(ownershipCount(symbolBody(ir, "@.minyar.closure.captureCopy.1(")) == 0, "captureCopy: a closure copies its capture without a count")
+// The source is declared in the loop body, so the target could outlive it.
+test.check(counts(ir, "innerSource") > 0, "innerSource: a copy from an inner block keeps its count")
+fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+test.removeTree(compiler.directory)
+print("Borrow copies: passed")
