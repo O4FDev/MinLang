@@ -25,6 +25,12 @@ static MINYAR_THREAD_LOCAL RcBoundedObjects rc_objects;
  * own nothing and visits the next owner field (or finalizes the record).
  * Fields that own nothing share the unit with the next owner. */
 #define RC_RECORD_UNIT_FIELDS 8
+/* A record with at most this many slots is retired by one unit: that unit
+ * visits its remaining owner slots and finalizes the record. Constant work,
+ * so K units still bound a service point. */
+#ifndef RC_SMALL_RECORD_SLOTS
+#define RC_SMALL_RECORD_SLOTS 4
+#endif
 #define MINYAR_RC_RECENT_OBJECTS 1
 #define rc_bounded_recent_head (rc_objects.recent_head)
 #define rc_bounded_recent_tail (rc_objects.recent_tail)
@@ -287,6 +293,15 @@ RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t
         size_t end = (size_t)record->length;
         if (q->cursor < end) {
             unsigned char *map = (unsigned char *)(record->values + end);
+            if (end <= RC_SMALL_RECORD_SLOTS) {
+                for (size_t index = q->cursor; index < end; index++)
+                    if (map[index] & 1)
+                        rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
+                rc_bounded_finish_object(object, RC_RECORD);
+                --*pending;
+                q->active = NULL;
+                return;
+            }
             size_t index = q->cursor;
             size_t limit = end - index > RC_RECORD_UNIT_FIELDS ? index + RC_RECORD_UNIT_FIELDS : end;
             while (index < limit && !(map[index] & 1)) index++;
@@ -322,6 +337,18 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit_in(RcBoundedObjects *q, siz
         size_t end = (size_t)record->length;
         if (cursor < end) {
             unsigned char *map = (unsigned char *)(record->values + end);
+            if (end <= RC_SMALL_RECORD_SLOTS) {
+                /* Detach the record first: children this unit kills take the
+                 * recent head, and the record retires in this same unit. */
+                q->recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
+                if (!q->recent_head) q->recent_tail = NULL;
+                for (size_t index = cursor; index < end; index++)
+                    if (map[index] & 1)
+                        rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
+                rc_bounded_finish_object(object, RC_RECORD);
+                --*pending;
+                return;
+            }
             size_t limit = end - cursor > RC_RECORD_UNIT_FIELDS ? cursor + RC_RECORD_UNIT_FIELDS : end;
             while (cursor < limit && !(map[cursor] & 1)) cursor++;
             if (cursor < end && (map[cursor] & 1)) {
