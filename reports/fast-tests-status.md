@@ -13,8 +13,17 @@ checks) in ≤ 300 s wall with the same pass/fail as a single-box gate. Command:
 | int13 (box M), c8 uncapped | 9c5e3b10d | 340 = 340 | + statement-nesting ("ran out of memory"), peer-regressions(-python-swift-ruby-lua) | 915 s |
 | one-c1 (box N) | 724d3b883 | 340 = 340 | + memory-regressions | 910 s |
 | c7 (box L, cake-base set) | 8631b46f5 | 337 = 337 | + last-use-sinks, quic-official-adapter, quic-rfc, record-reconstruction-reuse, structured-tasks | 877 s |
-4 of 4 agree check for check. Running now: batch 9 (2c2dd076b, text record 10/339 incl. last-use-sinks), int12,
-one-c4, one-c2 and the branch tip, on the fgcc image with `--cc-cache verify` (every hit recompiled and compared).
+4 of 4 agree check for check. Batch 2 (image 252406632, real clang, cache off):
+| batch 9 (box H, text record) | 2c2dd076b | 339 = 339 | + last-use-sinks, choice, choice-set-niche, ownership-name-proofs, quic-*, record-reconstruction-reuse, structured-tasks | 820 s |
+| int12 (box K), c8 uncapped | 4b03b4fab | 340 = 340 | + statement-nesting, memory-regressions, peer-regressions(-python…) | — |
+| one-c4 (box O) | 526b2f18f | 340 = 340 | + empty-map-traversal, scalar-record-reuse, public-release | — |
+7 of 7 recorded commits agree check for check. Still to come in batch 2: one-c2 (green) and the integrated tip.
+
+### Plan to the proof (capacity: 3 droplets until the run-2 boxes go, Sun 1 Nov 21:45 UTC)
+1. Freeze the code; snapshot the tip.
+2. As soon as 8 shards fit (limit raised, or Sun 21:45): `tools/fast-gate.sh TIP` with shard-cache → ≤ 300 s.
+3. Then, same command and code, the recorded trees on 8 shards (~5 min each) + `agree.py` → ≥ 6 agree.
+4. Merge into goal/2026-10-30 with that green gate; docs/dev-check.md, the playbook, REQUESTS.md rows.
 
 ### Since 20:45
 - Rebased on goal/2026-10-30 518e2b500 (determinism fix). Integrated the Wafer splits: frame-initialization (6 pieces,
