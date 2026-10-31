@@ -311,10 +311,20 @@ function parseMapMethod(context: CompilerContext, localNames: List<Text>, localT
     let key = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, keyType)
     requireType(tokenLines, state, keyType[0], mapKeyType(receiverType), "Map key has the wrong type")
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
+    let value = ""
+    let custom = false
+    let fusedHas = ""
+    if member == "has" && keyType[0] == 2 && keyType.length > 1 {
+        fusedHas = splitPieceMapHas(context, output, textState, state, globals, receiver, receiverType, key, keyType[1])
+    }
+    if fusedHas != "" {
+        value = fusedHas
+    } else {
     let slot = valueAsListSlot(output, textState, state, key, keyType[0])
-    let custom = noteHashableCalls(context, keyType[0], state, textState, output)
-    let value = valueName(textState, newTemporary(state))
+    custom = noteHashableCalls(context, keyType[0], state, textState, output)
+    value = valueName(textState, newTemporary(state))
     output.add("  " + value + " = call zeroext i1 @minyar_map_" + member + "(ptr " + receiver + ", i64 " + slot + ")\n")
+    }
     settleMapBorrow(context, output, state, receiverPiece, receiver, receiverType, receiverCalls, tokensMakeCall(tokenKinds, tokenTexts, keyStart, state[0]))
     if custom { recoveryCheckpoint(output, textState, state) }
     setType(resultType, 4)
@@ -469,9 +479,10 @@ function deferSplitBinding(context: CompilerContext, localNames: List<Text>, loc
     if tokenKinds[start] != 1 || tokenTexts[start + 1] != "." || tokenTexts[start + 2] != "split" || tokenTexts[start + 3] != "(" { return 0 }
     if tokenTexts[end - 1] != ")" { return 0 }
     if splitBracketEnd(tokenKinds, tokenTexts, start + 3) != end { return 0 }
-    // One byte is found by a word test. A longer separator would rescan the
-    // receiver with a search loop on every read, so it keeps the List.
-    if end != start + 6 || tokenKinds[start + 4] != 3 || tokenTexts[start + 4].byteLength != 1 { return 0 }
+    // The separator must be a literal. A one-byte separator is found by a word
+    // test on every read; a longer one is only worth the range index, where one
+    // search loop builds it, so a longer one needs three reads (see below).
+    if end != start + 6 || tokenKinds[start + 4] != 3 { return 0 }
     let receiverName = tokenTexts[start]
     let local = findLocal(localNames, localLengths, state, receiverName)
     // A parameter's local is an SSA value, and a captured binding cannot be
@@ -480,6 +491,7 @@ function deferSplitBinding(context: CompilerContext, localNames: List<Text>, loc
     if blockAssignsName(tokenKinds, tokenTexts, end, receiverName) { return 0 }
     let reads = splitUsesArePieces(tokenKinds, tokenTexts, name, end)
     if reads < 0 { return 0 }
+    if tokenTexts[start + 4].byteLength != 1 && reads < 3 { return 0 }
     let call = splitCallStart(output, value)
     if call < 0 { return 0 }
     context.splits.ids.add(id)
@@ -625,6 +637,39 @@ function splitPieceInteger(context: CompilerContext, output: List<Text>, textSta
         fused = emitCall(output, textState, state, 1, "minyar_text_split_integer", arguments, types)
         clearPieces(output, call, call + 14)
     }
+    return fused
+}
+
+// Map.has(fields[index]) with a range index: the key is hashed and compared
+// where it lies, so the read makes no piece.
+function splitPieceMapHas(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, map: Text, mapType: Integer, key: Text, owner: Integer): Text {
+    let index = splitPieceIndex(context, key)
+    if index < 0 { return "" }
+    let splits = context.splits
+    if splits.pieceModes[index] == 0 { return "" }
+    if splitPieceTake(context, output, state, key, owner) < 0 { return "" }
+    let call = splits.pieceCalls[index]
+    appendTextRuntimeDeclaration(globals, "minyar_map_text_split_index_has", 4, [mapType, 2, 1])
+    let arguments: List<Text> = [map, splits.pieceTexts[index], splits.piecePositions[index]]
+    let types: List<Integer> = [mapType, 2, 1]
+    let fused = emitCall(output, textState, state, 4, "minyar_map_text_split_index_has", arguments, types)
+    clearPieces(output, call, call + 11)
+    return fused
+}
+
+// map[fields[index]] with a range index: the same probe, no piece.
+function splitPieceMapGet(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, map: Text, mapType: Integer, key: Text, owner: Integer): Text {
+    let index = splitPieceIndex(context, key)
+    if index < 0 { return "" }
+    let splits = context.splits
+    if splits.pieceModes[index] == 0 { return "" }
+    if splitPieceTake(context, output, state, key, owner) < 0 { return "" }
+    let call = splits.pieceCalls[index]
+    appendTextRuntimeDeclaration(globals, "minyar_map_text_split_index_get", 1, [mapType, 2, 1])
+    let arguments: List<Text> = [map, splits.pieceTexts[index], splits.piecePositions[index]]
+    let types: List<Integer> = [mapType, 2, 1]
+    let fused = emitCall(output, textState, state, 1, "minyar_map_text_split_index_get", arguments, types)
+    clearPieces(output, call, call + 11)
     return fused
 }
 
@@ -1107,8 +1152,16 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
             if isMapType(collectionType) {
                 declareMapRuntime(globals)
                 requireTypeAt(tokenLines, positionLocation, positionType[0], mapKeyType(collectionType), "Map key has the wrong type")
+                let fusedGet = ""
+                if mapKeyType(collectionType) == 2 && positionType[0] == 2 && positionType.length > 1 {
+                    fusedGet = splitPieceMapGet(context, output, textState, state, globals, collection, collectionType, position, positionType[1])
+                }
+                if fusedGet != "" {
+                    value = slotAsValue(output, textState, state, fusedGet, mapValueType(collectionType))
+                } else {
                 let slot = valueAsListSlot(output, textState, state, position, positionType[0])
                 value = readMapElement(context, output, textState, state, collection, slot, mapValueType(collectionType), mapKeyType(collectionType))
+                }
                 settleMapBorrow(context, output, state, mapPiece, collection, collectionType, mapCalls, tokensMakeCall(tokenKinds, tokenTexts, positionLocation, state[0]))
                 setType(resultType, mapValueType(collectionType))
             } else {

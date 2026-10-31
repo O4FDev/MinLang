@@ -91,12 +91,10 @@ MINYAR_HOT uint64_t map_scalar_hash(uint64_t value) {
 }
 /* Text hashing loops over the bytes; it stays one out-of-line function so the
  * inlined Map paths keep the same shape for every key kind. */
-static MAP_GENERAL uint64_t map_text_hash(const MinyarText *text) {
+MINYAR_HOT uint64_t map_bytes_hash(const unsigned char *p, size_t n) {
     /* Read immutable UTF-8 bytes, never the lazy character-offset cache.
      * Word mixing makes path/index keys cheap without decoding Unicode. */
-    uint64_t hash = UINT64_C(0x9e3779b97f4a7c15) ^ (uint64_t)text->byte_length;
-    const unsigned char *p = text->bytes;
-    size_t n = (size_t)text->byte_length;
+    uint64_t hash = UINT64_C(0x9e3779b97f4a7c15) ^ (uint64_t)n;
     while (n >= 8) {
         /* One little-endian load per whole word: the same value eight byte
          * shifts used to assemble, and the same hash for every key. */
@@ -124,6 +122,9 @@ static MAP_GENERAL uint64_t map_text_hash(const MinyarText *text) {
     }
     hash = map_text_mix(hash ^ tail);
     return map_nonzero_hash(hash);
+}
+static MAP_GENERAL uint64_t map_text_hash(const MinyarText *text) {
+    return map_bytes_hash(text->bytes, (size_t)text->byte_length);
 }
 static uint64_t minyar_map_hash(long long kind, long long key) {
     if (kind == 2) return map_text_hash((const MinyarText *)(uintptr_t)key);
@@ -613,6 +614,47 @@ MINYAR_INLINE_ENTRY long long minyar_map_get_or(const MinyarRecord *map, long lo
     size_t bucket = map_builtin_find(map, kind, key);
     return bucket == SIZE_MAX ? fallback : MAP_VALUE(map_entries(map), bucket);
 }
+/* A Text key a split index holds, probed without making the piece: the hash
+ * and the comparison read the piece's bytes where they lie. */
+static size_t map_range_probe(const MinyarRecord *entries, size_t mask, const unsigned char *bytes,
+                              size_t length, uint64_t hash) {
+    size_t bucket = (size_t)hash & mask;
+    for (;;) {
+        uint64_t stored = (uint64_t)MAP_HASH(entries, bucket);
+        if (stored == hash) {
+            const MinyarText *key = (const MinyarText *)(uintptr_t)MAP_KEY(entries, bucket);
+            if ((size_t)key->byte_length == length && map_bytes_equal(key->bytes, bytes, length))
+                return bucket;
+        } else if (!stored) {
+            return bucket;
+        }
+        bucket = (bucket + 1) & mask;
+    }
+}
+static size_t map_split_index_find(const MinyarRecord *map, MinyarText *index, long long position) {
+    long long start, end;
+    text_index_range(index, position, &start, &end);
+    size_t capacity = map_capacity(map);
+    if (!capacity) return SIZE_MAX;
+    const MinyarRecord *entries = map_entries(map);
+    const unsigned char *bytes = index->bytes + start;
+    size_t length = (size_t)(end - start);
+    size_t bucket = map_range_probe(entries, capacity - 1, bytes, length, map_bytes_hash(bytes, length));
+    return MAP_HASH(entries, bucket) ? bucket : SIZE_MAX;
+}
+MINYAR_INLINE_ENTRY _Bool minyar_map_text_split_index_has(const MinyarRecord *map, MinyarText *index,
+                                                          long long position) {
+    if (map->values[MAP_KEY_KIND] != 2 || minyar_recovery_pending()) return 0;
+    return map_split_index_find(map, index, position) != SIZE_MAX;
+}
+MINYAR_INLINE_ENTRY long long minyar_map_text_split_index_get(const MinyarRecord *map, MinyarText *index,
+                                                              long long position) {
+    if (map->values[MAP_KEY_KIND] != 2 || minyar_recovery_pending()) return 0;
+    size_t bucket = map_split_index_find(map, index, position);
+    if (bucket == SIZE_MAX) map_key_absent();
+    return MAP_VALUE(map_entries(map), bucket);
+}
+
 MINYAR_INLINE_ENTRY void minyar_map_set(MinyarRecord *map, long long key, long long value) {
     long long kind = map->values[MAP_KEY_KIND];
     if (!map_builtin_kind(kind)) { map_set_general(map, key, value); return; }
