@@ -1245,6 +1245,17 @@ detection over all budgets.
 Native checks belong to `check-portable` (their `-budgets` complements to
 `check-ownership`); sanitizer checks belong to `check-ownership` and `check-sanitize`. All logs and failed artifacts are retained.
 
+Each differential above is also a recipe-less aggregate of independent pieces shaped by the harness's own selectors, so
+the gate shards run them concurrently: `check-frame-initialization-part-<runtime>-<profile>` and
+`check-temporary-owner-cache-part-<runtime>-<profile>` (six each, by `--runtimes` and `--profiles`),
+`check-empty-map-traversal-part-<profile>` and `check-owner-queue-batching-part-<profile>` (five and three, by
+`--profiles`), and `check-errors-language-bounded-part{1,32,1024}` / `check-errors-review-bounded-part{1,32,1024}`
+(one bounded poll budget each). The `-budgets` and `-sanitize` variants split the same way. The pieces together run
+exactly the cells the single check ran: the frozen-control negative in `tests/frame-initialization.py`
+(`--skip-negative`) and the mutants in `tests/temporary-owner-cache.py` (`--skip-mutants`) and
+`tests/empty-map-traversal.py` (`--skip-mutants`) stay in the matching `system` piece. Running a piece directly, for
+example `make check-frame-initialization-part-cycle-lazy`, checks only that slice.
+
 ## Running the suites
 
 `build/tooling/scripts/check-linux` (Linux) and `build/tooling/scripts/check-macos` (macOS, the
