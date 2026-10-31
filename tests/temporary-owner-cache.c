@@ -149,8 +149,10 @@ static void keep_service(void) {
     minyar_rc_step();
     drain();
     RcTemporaryChunk *cached = rc_bounded_cached_chunk;
-    /* Scalar fields keep the same object ready through all three batches. */
-    MinyarRecord *debt = minyar_record_new(4 * MINYAR_RC_POLL_BUDGET + 5);
+    /* Scalar fields keep the same object ready through all three batches. A
+     * record unit examines eight fields, so a debt worth four K units holds
+     * four K unit-batches of fields. */
+    MinyarRecord *debt = minyar_record_new(4 * MINYAR_RC_POLL_BUDGET * 8 + 5);
     rc_drop(debt);
     observed_calls = observed_work = 0;
     size_t allocations = allocation_counter();
