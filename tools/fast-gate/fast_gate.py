@@ -123,10 +123,15 @@ def wait_ssh(ip):
         time.sleep(1)
 
 
+def base_copy(ip, dest):
+    """A hard-linked copy of the box's base tree (the image's /home/agent/base, or --base) without any build outputs."""
+    ssh(ip, f"rm -rf {dest} && mkdir -p {os.path.dirname(dest)} && cp -al {BASE} {dest} && rm -rf {dest}/build")
+
+
 def sync_tree(ip, tree, files, dest):
-    """Make dest on ip an exact copy of the tree's files: a hard-linked copy of the image's base tree is the rsync
-    basis (rsync replaces changed files and never writes into the basis), then files the tree lacks are removed."""
-    ssh(ip, f"rm -rf {dest} && mkdir -p {os.path.dirname(dest)} && cp -al {BASE} {dest}")
+    """Make dest on ip an exact copy of the tree's files: a hard-linked copy of the base tree is the rsync basis
+    (rsync replaces changed files and never writes into the basis), then files the tree lacks are removed."""
+    base_copy(ip, dest)
     run(["rsync", "-a", "-c", "--from0", "--files-from=-", "-e", " ".join(SSH), tree + "/", f"agent@{ip}:{dest}/"],
         input="\0".join(files))
     # The single-box gates are seeded by the loop's `bb`, which leaves its file list as .bb-files in the tree root.
@@ -160,7 +165,7 @@ def prepare_shard(ip, tree, files, index, args, timeline):
     wait_ssh(ip)
     timeline["ssh"] = time.monotonic() - started
     if args.cache:
-        ssh(ip, f"rm -rf {TREE} && mkdir -p /home/agent/swarm && cp -al {BASE} {TREE}")
+        base_copy(ip, TREE)
     else:
         sync_tree(ip, tree, files, TREE)
     upload_tools(ip, FG, args)
@@ -315,6 +320,7 @@ def gate_tree(index, tree, checks, args, ips_ready):
 
 
 def main():
+    global BASE
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("trees", nargs="+", help="TREE, or TREE::CHECKS to gate that tree with its own check list; "
                         "several trees are gated one after another on the same shards")
@@ -332,8 +338,10 @@ def main():
     parser.add_argument("--hosts", default="", help="comma-separated existing boxes to use as shards instead of creating droplets (debugging only; never deleted)")
     parser.add_argument("--cc-cache", default="off", choices=["off", "log", "cache", "verify"],
                         help="mode of the image's compile cache (fgcc): verify recompiles every hit and compares bytes")
+    parser.add_argument("--base", default=BASE, help="base tree on the boxes used as the rsync basis (build/ is never copied)")
     parser.add_argument("--ignore-budget", action="store_true", help="skip the daily shard budget check")
     args = parser.parse_args()
+    BASE = args.base
     specs = []
     for spec in args.trees:
         path, _, checks = spec.partition("::")
