@@ -235,29 +235,30 @@ MinyarList *minyar_list_sorted(MinyarList *list, long long kind, long long refer
 }
 
 /* A compiler-emitted merge for one sortBy call site: the same top-down merge as
- * list_sort_merge over snapshot indices, with the comparator called directly
+ * list_sort_merge, over a working copy of the snapshot's slots instead of
+ * snapshot indices (no indirection per comparison), with the comparator called directly
  * (and inlinable) instead of through list_sort_compare. It checks recovery
  * after every comparison and returns early when it is pending. */
 void minyar_callback_check(const MinyarRecord *callback);
 /* The emitted merges' recovery test (its own symbol: the compiler declares it
  * whether or not the program's call-depth declarations are present). */
 int minyar_sort_pending(void) { return minyar_recovery_pending(); }
-typedef void (*MinyarSortMerge)(long long *indices, long long count, long long *scratch,
-                                const long long *snapshot, void *context);
+typedef void (*MinyarSortMerge)(long long *values, long long count, long long *scratch, void *context);
 static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortComparator comparator,
                                 long long references, int copying, MinyarSortMerge merge) {
     if (minyar_recovery_pending()) return copying ? NULL : list;
     SORT_RETAIN(list);
     SORT_RETAIN(context);
     size_t count = list_sort_count(list), half = count / 2 + count % 2;
-    /* Snapshot n, permutation n, merge scratch ceil(n/2): about 2.5n slots. */
+    /* Snapshot n, permutation (or, for an emitted merge, working slots) n, merge
+     * scratch ceil(n/2): about 2.5n slots. */
     if (count > (SIZE_MAX / sizeof(long long) - half) / 2) out_of_memory();
     long long *storage = list_sort_allocate(count * 2 + half);
     long long *snapshot = storage, *indices = count ? storage + count : NULL;
     long long *scratch = count ? indices + count : NULL;
     if (count) memcpy(snapshot, list->values, count * sizeof(*snapshot));
     for (size_t i = 0; i < count; i++) {
-        indices[i] = (long long)i;
+        indices[i] = merge ? snapshot[i] : (long long)i;
         if (references) SORT_RETAIN((void *)(uintptr_t)snapshot[i]);
     }
     MinyarList *result = copying ? NULL : list;
@@ -266,7 +267,7 @@ static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortCompa
          * checked once, before the first comparison, instead of per call. */
         if (count > 1) minyar_callback_check(context);
         minyar_runtime_callers++; /* a stop here must not leave a merge half done */
-        merge(indices, (long long)count, scratch, snapshot, context);
+        merge(indices, (long long)count, scratch, context);
         minyar_runtime_callers--;
     } else {
         MinyarSortOrder order = {0, snapshot, context, comparator};
@@ -281,14 +282,14 @@ static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortCompa
     if (copying) {
         result = list_sort_new(list, references);
         list_reserve(result, (long long)count);
-        for (size_t i = 0; i < count; i++) SORT_ADD(result, snapshot[indices[i]]);
+        for (size_t i = 0; i < count; i++) SORT_ADD(result, merge ? indices[i] : snapshot[indices[i]]);
     } else {
 #ifndef MINYAR_SORT_GRAPH
         /* The slots still equal the snapshot, so the permutation moves each
          * existing owner once, like the natural sort: no count changes. */
-        for (size_t i = 0; i < count; i++) list->values[i] = snapshot[indices[i]];
+        for (size_t i = 0; i < count; i++) list->values[i] = merge ? indices[i] : snapshot[indices[i]];
 #else
-        for (size_t i = 0; i < count; i++) SORT_SET(list, (long long)i, snapshot[indices[i]]);
+        for (size_t i = 0; i < count; i++) SORT_SET(list, (long long)i, merge ? indices[i] : snapshot[indices[i]]);
 #endif
     }
 done:
