@@ -1,9 +1,10 @@
 #!/bin/bash
 # shard-run.sh TREE INDEX SHARDS JOBS: one shard's part of a fast gate, run as `agent` from /home/agent/fg.
-# Builds the compiler and the check runner exactly as the single-box gate does, plans the full gate in this tree
-# (plan.py), packs it onto SHARDS shards (pack.py, the same answer on every shard), then runs the tree's own
-# `make check-in-parallel` over the full check list with the make shim finishing other shards' checks at once.
-# Progress lines go to out/status; results to out/.
+# With FAST_GATE_CACHE (the shard-cache box's VPC address) and FAST_GATE_RUN set, it first waits for that box's
+# cache-run.sh and copies its built tree and assignment; otherwise it builds the compiler and the check runner
+# exactly as the single-box gate does, plans the full gate in this tree (plan.py) and packs it onto SHARDS shards
+# (pack.py, the same answer on every shard). Then it runs the tree's own `make check-in-parallel` over the full
+# check list with the make shim finishing other shards' checks at once. Progress lines go to out/status.
 set -u
 fg=/home/agent/fg
 tree=$1 index=$2 shards=$3 jobs=$4
@@ -16,11 +17,22 @@ export MINYAR_CLANG=/opt/llvm-23.1.3/bin/clang LLVM_CC=/opt/llvm-23.1.3/bin/clan
 checks=$(cat "$fg/checks.txt")
 cd "$tree" || finish 9
 stamp START
+if [[ -n ${FAST_GATE_CACHE:-} ]]; then
+  source=rsync://$FAST_GATE_CACHE/fgc/$FAST_GATE_RUN
+  until rsync -q "$source/out/done" "$out/cache-done" 2>/dev/null; do sleep 0.5; done
+  stamp CACHE-READY
+  rsync -a -c --delete "$source/tree/" "$tree/" > "$out/pull.log" 2>&1 || { stamp PULL-FAILED; finish 5; }
+  rsync -a "$source/out/plan.json" "$source/out/assignment.json" "$out/" >> "$out/pull.log" 2>&1
+  rsync -a "$source/out/status" "$out/cache-status" >> "$out/pull.log" 2>&1
+  stamp PULLED
+fi
 make build/minyarc > "$out/build.log" 2>&1 || { stamp BUILD-FAILED; finish 3; }
 make build/tooling/tools/check-in-parallel >> "$out/build.log" 2>&1 || { stamp RUNNER-BUILD-FAILED; finish 3; }
 stamp BUILT
-python3 "$fg/plan.py" . $checks > "$out/plan.json" 2> "$out/plan.err" || { stamp PLAN-FAILED; finish 4; }
-python3 "$fg/pack.py" "$out/plan.json" "$fg/times.tsv" "$fg/goal-times.tsv" "$shards" "$jobs" > "$out/assignment.json" || { stamp PACK-FAILED; finish 4; }
+if [[ ! -s $out/assignment.json ]]; then
+  python3 "$fg/plan.py" . $checks > "$out/plan.json" 2> "$out/plan.err" || { stamp PLAN-FAILED; finish 4; }
+  python3 "$fg/pack.py" "$out/plan.json" "$fg/times.tsv" "$fg/goal-times.tsv" "$shards" "$jobs" > "$out/assignment.json" || { stamp PACK-FAILED; finish 4; }
+fi
 python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["assignment"][int(sys.argv[2])]; open(sys.argv[3],"w").write("".join(x+"\n" for x in a["skip"]))' \
   "$out/assignment.json" "$index" "$out/skip.txt" || finish 4
 stamp "PLANNED $(sha256sum < "$out/plan.json" | cut -c1-16) $(sha256sum < "$out/assignment.json" | cut -c1-16)"

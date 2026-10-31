@@ -26,7 +26,8 @@ SSH = ["ssh", "-i", KEY, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"
 BASE = "/home/agent/base"
 FG = "/home/agent/fg"
 TREE = "/home/agent/swarm/gate"
-FG_FILES = ["plan.py", "pack.py", "shard-run.sh", "checks.txt", "times.tsv", "goal-times.tsv", "shim/make"]
+CACHE_ROOT = "/home/agent/fgc"
+FG_FILES = ["plan.py", "pack.py", "prebuild.py", "shard-run.sh", "cache-run.sh", "checks.txt", "times.tsv", "goal-times.tsv", "shim/make"]
 
 started = time.monotonic()
 log_lock = threading.Lock()
@@ -95,6 +96,19 @@ class Shards:
         say(f"WARNING: could not confirm deletion of shard-{self.run_id}-*; the test-shard-guard reaps them after 2 h")
 
 
+def find_cache(choice):
+    if choice == "none":
+        return None
+    name = "shard-cache" if choice == "auto" else choice
+    for droplet in json.loads(doctl("compute", "droplet", "list") or "[]"):
+        if droplet["name"] == name and droplet["status"] == "active":
+            addresses = {n["type"]: n["ip_address"] for n in droplet["networks"]["v4"]}
+            return {"name": name, "public": addresses["public"], "private": addresses["private"]}
+    if choice != "auto":
+        raise RuntimeError(f"no active droplet named {name}")
+    return None
+
+
 def ssh(ip, command, check=True, timeout=None):
     return run(SSH + [f"agent@{ip}", command], check=check, timeout=timeout)
 
@@ -104,30 +118,58 @@ def tree_files(tree):
     return sorted(path for path in listing.split("\0") if path and os.path.lexists(os.path.join(tree, path)))
 
 
-def prepare_shard(ip, tree, files, index, args, timeline):
-    while True:
-        if ssh(ip, "true", check=False, timeout=15).returncode == 0:
-            break
+def wait_ssh(ip):
+    while ssh(ip, "true", check=False, timeout=15).returncode != 0:
         time.sleep(1)
-    timeline["ssh"] = time.monotonic() - started
-    listing = "".join(path + "\n" for path in files)
-    # A hard-linked copy of the image's base tree is the rsync basis; rsync replaces changed files, never the basis.
-    ssh(ip, f"rm -rf {TREE} {FG} && mkdir -p {FG}/shim /home/agent/swarm && cp -al {BASE} {TREE}")
-    run(["rsync", "-a", "-c", "--from0", "--files-from=-", "-e", " ".join(SSH), tree + "/", f"agent@{ip}:{TREE}/"],
+
+
+def sync_tree(ip, tree, files, dest):
+    """Make dest on ip an exact copy of the tree's files: a hard-linked copy of the image's base tree is the rsync
+    basis (rsync replaces changed files and never writes into the basis), then files the tree lacks are removed."""
+    ssh(ip, f"rm -rf {dest} && mkdir -p {os.path.dirname(dest)} && cp -al {BASE} {dest}")
+    run(["rsync", "-a", "-c", "--from0", "--files-from=-", "-e", " ".join(SSH), tree + "/", f"agent@{ip}:{dest}/"],
         input="\0".join(files))
     # The single-box gates are seeded by the loop's `bb`, which leaves its file list as .bb-files in the tree root.
-    run(SSH + [f"agent@{ip}", f"cat > {TREE}/.bb-files && cd {TREE} && find . -path ./build -prune -o \\( -type f -o -type l \\) -print | "
-               f"sed 's|^\\./||' | sort > /tmp/have && sort .bb-files > /tmp/want && echo .bb-files >> /tmp/want && "
-               f"sort -o /tmp/want /tmp/want && comm -23 /tmp/have /tmp/want | tr '\\n' '\\0' | xargs -0 -r rm -f && "
-               f"find . -mindepth 1 -type d -empty -delete"], input=listing)
+    listing = "".join(path + "\n" for path in files)
+    run(SSH + [f"agent@{ip}", f"cat > {dest}/.bb-files && cd {dest} && find . -path ./build -prune -o \\( -type f -o -type l \\) -print | "
+               f"sed 's|^\\./||' | sort > /tmp/have-$$ && sort .bb-files > /tmp/want-$$ && echo .bb-files >> /tmp/want-$$ && "
+               f"sort -o /tmp/want-$$ /tmp/want-$$ && comm -23 /tmp/have-$$ /tmp/want-$$ | tr '\\n' '\\0' | xargs -0 -r rm -f && "
+               f"find . -mindepth 1 -type d -empty -delete; rm -f /tmp/have-$$ /tmp/want-$$"], input=listing)
+
+
+def upload_tools(ip, dest, args):
+    ssh(ip, f"rm -rf {dest} && mkdir -p {dest}/shim {dest}/out")
     sources = [os.path.join(HERE, name) for name in FG_FILES if name not in ("shim/make", "checks.txt")]
-    run(["rsync", "-a", "-e", " ".join(SSH)] + sources + [os.path.join(args.out, "checks.txt"), f"agent@{ip}:{FG}/"])
-    run(["rsync", "-a", "-e", " ".join(SSH), os.path.join(HERE, "shim", "make"), f"agent@{ip}:{FG}/shim/make"])
+    run(["rsync", "-a", "-e", " ".join(SSH)] + sources + [os.path.join(args.out, "checks.txt"), f"agent@{ip}:{dest}/"])
+    run(["rsync", "-a", "-e", " ".join(SSH), os.path.join(HERE, "shim", "make"), f"agent@{ip}:{dest}/shim/make"])
+
+
+def prepare_cache(cache, tree, files, args, run_id, timeline):
+    """Start the cache box's part at once: it builds and plans while the shards boot."""
+    root = f"{CACHE_ROOT}/{run_id}"
+    # Keep the two latest earlier runs for debugging; older ones go.
+    ssh(cache["public"], f"mkdir -p {CACHE_ROOT} && cd {CACHE_ROOT} && ls -1t | tail -n +3 | xargs -r rm -rf")
+    sync_tree(cache["public"], tree, files, f"{root}/tree")
+    timeline["synced"] = time.monotonic() - started
+    upload_tools(cache["public"], f"{root}/fg", args)
+    ssh(cache["public"], f"setsid nohup bash {root}/fg/cache-run.sh {run_id} {args.shards} {args.jobs} > {root}/run.log 2>&1 < /dev/null &")
+    timeline["launched"] = time.monotonic() - started
+
+
+def prepare_shard(ip, tree, files, index, args, timeline):
+    wait_ssh(ip)
+    timeline["ssh"] = time.monotonic() - started
+    if args.cache:
+        ssh(ip, f"rm -rf {TREE} && mkdir -p /home/agent/swarm && cp -al {BASE} {TREE}")
+    else:
+        sync_tree(ip, tree, files, TREE)
+    upload_tools(ip, FG, args)
     timeline["synced"] = time.monotonic() - started
 
 
 def run_shard(ip, index, args, timeline):
-    command = (f"setsid nohup bash {FG}/shard-run.sh {TREE} {index} {args.shards} {args.jobs} > {FG}/run.log 2>&1 < /dev/null & "
+    cache = f"FAST_GATE_CACHE={args.cache['private']} FAST_GATE_RUN={args.run_id} " if args.cache else ""
+    command = (f"{cache}setsid nohup bash {FG}/shard-run.sh {TREE} {index} {args.shards} {args.jobs} > {FG}/run.log 2>&1 < /dev/null & "
                f"until grep -q SHARD-DONE {FG}/out/status 2>/dev/null; do sleep 1; done")
     while True:
         result = ssh(ip, command if "launched" not in timeline else command.split(" & ", 1)[1], check=False)
@@ -208,14 +250,24 @@ def main():
     parser.add_argument("--out", default=None)
     parser.add_argument("--checks", default=open(os.path.join(HERE, "checks.txt")).read().strip(),
                         help="the gate's CHECKS (default: tools/fast-gate/checks.txt, the single-box gate's list)")
+    parser.add_argument("--cache", default="auto", help="the shard-cache box: auto (the droplet named shard-cache, if any), none, or NAME")
     parser.add_argument("--keep", action="store_true", help="leave the shards running (debugging only)")
+    parser.add_argument("--hosts", default="", help="comma-separated existing boxes to use as shards instead of creating droplets (debugging only; never deleted)")
     args = parser.parse_args()
     tree = os.path.abspath(args.tree)
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%H%M%S") + f"{os.getpid() % 100:02d}"
     args.out = args.out or os.path.expanduser(f"~/Projects/minyar-fast-tests/runs/{run_id}")
     os.makedirs(args.out, exist_ok=True)
     open(os.path.join(args.out, "checks.txt"), "w").write(args.checks + "\n")
+    args.run_id = run_id
+    args.cache = find_cache(args.cache)
     shards = Shards(run_id, args.shards, args.image, args.size, args.region, args.key_id)
+    if args.hosts:
+        hosts = args.hosts.split(",")
+        args.shards, args.keep = len(hosts), True
+        shards = Shards(run_id, len(hosts), args.image, args.size, args.region, args.key_id)
+        shards.create = lambda: None
+        shards.addresses = lambda: {f"shard-{run_id}-{index}": ip for index, ip in enumerate(hosts)}
 
     def cleanup(*_):
         if not args.keep:
@@ -232,6 +284,11 @@ def main():
         creator.start()
         files = tree_files(tree)
         say(f"tree: {len(files)} files")
+        cache_timeline = {}
+        if args.cache:
+            say(f"cache box {args.cache['name']} {args.cache['public']} (VPC {args.cache['private']}) builds and plans")
+            cache_thread = threading.Thread(target=prepare_cache, args=(args.cache, tree, files, args, run_id, cache_timeline))
+            cache_thread.start()
         creator.join()
         say("droplets requested")
         timelines = [dict() for _ in range(args.shards)]
@@ -255,6 +312,8 @@ def main():
             if time.monotonic() - started > 600:
                 raise RuntimeError("shards did not become active within 600 s")
             time.sleep(2)
+        if args.cache:
+            cache_thread.join()
         shard_dirs = [None] * args.shards
         for index, future in futures.items():
             shard_dirs[index] = future.result()
