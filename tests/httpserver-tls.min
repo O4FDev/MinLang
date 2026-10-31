@@ -1,0 +1,42 @@
+use "httpserver" as http
+use "errors" as errors
+use "io" as io
+use "process" as processInfo
+
+// TLS listener fixture: same endpoints and bounds as tests/httpserver.min.
+function main(): Integer {
+    let limits = http.defaults()
+    limits.maxConnections = 4
+    limits.maxHeaderBytes = 1024
+    limits.maxBodyBytes = 65537
+    limits.maxResponseBytes = 4194304
+    limits.idleMilliseconds = 1000
+    limits.headerMilliseconds = 5000
+    limits.bodyMilliseconds = 5000
+    limits.applicationMilliseconds = 5000
+    limits.writeMilliseconds = 5000
+    let identity: List<Bytes> = [io.readBytesFile(processInfo.argument(0))]
+    let key = io.readBytesFile(processInfo.argument(1))
+    let server = http.listenTLS("127.0.0.1", 0, limits, identity, key)
+    if !http.ok(server) { fail(errors.message(http.serverError(server))) }
+    let largeBody = Bytes(1048576)
+    print("READY " + Text(http.port(server)))
+    let running = true
+    while running {
+        let batch = http.poll(server, 1000)
+        if errors.isError(http.batchError(batch)) { fail(errors.message(http.batchError(batch))) }
+        for request in http.requests(batch) {
+            let response = http.response(200, "application/octet-stream", request.body)
+            if request.target == "/quit" { running = false; response.body = Bytes("bye") }
+            else if request.target == "/head" { response.body = Bytes("hello") }
+            else if request.target == "/large" { response.body = largeBody }
+            else if request.target == "/stats" {
+                response.body = Bytes(Text(http.connectionCount(server)) + ":" + Text(http.slotCount(server)))
+            }
+            if !http.respond(server, request, response) { fail("response rejected") }
+        }
+    }
+    http.close(server)
+    if http.connectionCount(server) != 0 { fail("close leaked connections") }
+    return 0
+}

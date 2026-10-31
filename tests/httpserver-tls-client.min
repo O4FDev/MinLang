@@ -1,0 +1,202 @@
+use "io" as io
+use "net" as net
+use "process" as processInfo
+use "random" as secureRandom
+use "tls" as tls
+use "text" as utf8
+
+// TLS HTTP client fixture for tests/httpserver-tls-test.min.
+// Modes: roundtrip (GET/POST/keep-alive), large, limits, stats, garbage, abort.
+record Peer { socket: Integer; session: tls.Session; plain: Bytes; error: Text }
+record Answer { status: Integer; body: Bytes }
+
+function number(source: Text): Integer {
+    let value = 0
+    for digit in Bytes(source) { if digit >= 48 && digit <= 57 { value = value * 10 + digit - 48 } }
+    return value
+}
+function openPeer(port: Integer, root: Bytes): Peer {
+    let session = tls.clientWithProtocol("localhost", secureRandom.bytes(64), "http/1.1", [root], [], Bytes())
+    let socket = net.connect("127.0.0.1", port)
+    let peer = Peer { socket: socket; session: session; plain: Bytes(); error: "" }
+    if socket < 0 { peer.error = "connect: " + net.lastError(); return peer }
+    net.send(socket, tls.takeOutgoing(session))
+    while !tls.established(session) && session.state != tls.FAILED && session.state != tls.CLOSED {
+        if !net.ready(socket, 10000) { peer.error = "handshake timeout"; break }
+        let data = net.receive(socket, 65536)
+        if data.length == 0 { peer.error = "closed during handshake"; break }
+        tls.receive(session, data)
+        let reply = tls.takeOutgoing(session)
+        if reply.length > 0 { net.send(socket, reply) }
+    }
+    if !tls.established(session) {
+        if peer.error == "" { peer.error = "TLS: " + session.error }
+        net.close(socket)
+        peer.socket = -1
+    }
+    return peer
+}
+function fill(peer: Peer, milliseconds: Integer): Boolean {
+    if peer.socket < 0 { return false }
+    if !net.ready(peer.socket, milliseconds) { return false }
+    let data = net.receive(peer.socket, 65536)
+    if data.length == 0 { tls.endInput(peer.session); return false }
+    tls.receive(peer.session, data)
+    peer.plain.addBytes(tls.takeIncoming(peer.session))
+    return true
+}
+function headerEnd(data: Bytes): Integer {
+    for at in 3..data.length {
+        if data[at] == 10 && data[at - 1] == 13 && data[at - 2] == 10 && data[at - 3] == 13 { return at + 1 }
+    }
+    return -1
+}
+function statusOf(data: Bytes, end: Integer): Integer {
+    let at = 0
+    while at < end && data[at] != 32 { at += 1 }
+    at += 1
+    let value = 0
+    while at < end && data[at] >= 48 && data[at] <= 57 { value = value * 10 + data[at] - 48; at += 1 }
+    return value
+}
+function startsAt(data: Bytes, from: Integer, to: Integer, name: Text): Boolean {
+    let expected = Bytes(name)
+    if to - from < expected.length { return false }
+    for index in 0..expected.length { if data[from + index] != expected[index] { return false } }
+    return true
+}
+function contentLength(data: Bytes, end: Integer): Integer {
+    let at = 0
+    while at < end && data[at] != 10 { at += 1 }
+    at += 1
+    while at < end {
+        let stop = at
+        while stop < end && data[stop] != 10 { stop += 1 }
+        if startsAt(data, at, stop, "content-length:") {
+            let value = 0
+            for index in at + 15..stop { if data[index] >= 48 && data[index] <= 57 { value = value * 10 + data[index] - 48 } }
+            return value
+        }
+        at = stop + 1
+    }
+    return -1
+}
+function takeResponse(peer: Peer, head: Boolean): Answer {
+    while true {
+        let end = headerEnd(peer.plain)
+        if end > 0 {
+            let status = statusOf(peer.plain, end)
+            let length = contentLength(peer.plain, end)
+            if head { length = 0 }
+            if length >= 0 && peer.plain.length >= end + length {
+                let body = peer.plain.slice(end, end + length)
+                peer.plain = peer.plain.slice(end + length, peer.plain.length)
+                return Answer { status: status; body: body }
+            }
+        }
+        if !fill(peer, 10000) { return Answer { status: 0; body: Bytes() } }
+    }
+}
+function writeRequest(peer: Peer, request: Bytes) {
+    tls.send(peer.session, request)
+    net.send(peer.socket, tls.takeOutgoing(peer.session))
+}
+function get(peer: Peer, target: Text) {
+    writeRequest(peer, Bytes("GET " + target + " HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+}
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for at in 0..left.length { if left[at] != right[at] { return false } }
+    return true
+}
+function roundtrip(peer: Peer): Text {
+    if peer.socket < 0 { return "peer failed: " + peer.error }
+    get(peer, "/head")
+    let first = takeResponse(peer, false)
+    if first.status != 200 || utf8.decodeOrStop(first.body) != "hello" { return "first request: " + Text(first.status) }
+    let payload = Bytes()
+    for index in 0..777 { payload.add(index % 251) }
+    let post = Bytes("POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 777\r\n\r\n")
+    post.addBytes(payload)
+    writeRequest(peer, post)
+    let second = takeResponse(peer, false)
+    if second.status != 200 || !same(second.body, payload) { return "post echo: " + Text(second.status) }
+    get(peer, "/head")
+    let third = takeResponse(peer, false)
+    if third.status != 200 || utf8.decodeOrStop(third.body) != "hello" { return "keep-alive request: " + Text(third.status) }
+    return "roundtrip ok"
+}
+function large(peer: Peer): Text {
+    if peer.socket < 0 { return "peer failed: " + peer.error }
+    get(peer, "/large")
+    let answer = takeResponse(peer, false)
+    if answer.status != 200 || answer.body.length != 1048576 { return "large body: " + Text(answer.body.length) }
+    return "large ok"
+}
+function limits(peer: Peer): Text {
+    if peer.socket < 0 { return "peer failed: " + peer.error }
+    let request = Bytes("GET /oversized HTTP/1.1\r\nHost: localhost\r\nX-Large: ")
+    for index in 0..2000 { request.add(97) }
+    request.addBytes(Bytes("\r\n\r\n"))
+    writeRequest(peer, request)
+    let answer = takeResponse(peer, false)
+    if answer.status != 431 { return "oversized header status: " + Text(answer.status) }
+    return "limits ok"
+}
+function stats(peer: Peer): Text {
+    if peer.socket < 0 { return "peer failed: " + peer.error }
+    get(peer, "/stats")
+    let answer = takeResponse(peer, false)
+    if answer.status != 200 { return "stats status: " + Text(answer.status) }
+    return "stats " + utf8.decodeOrStop(answer.body)
+}
+function quit(peer: Peer): Text {
+    if peer.socket < 0 { return "peer failed: " + peer.error }
+    get(peer, "/quit")
+    let answer = takeResponse(peer, false)
+    if answer.status != 200 { return "quit status: " + Text(answer.status) }
+    return "quit ok"
+}
+function garbage(port: Integer): Text {
+    let socket = net.connect("127.0.0.1", port)
+    if socket < 0 { return "connect failed" }
+    net.send(socket, Bytes("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+    let closed = false
+    if net.ready(socket, 10000) { closed = net.receive(socket, 4096).length == 0 }
+    net.close(socket)
+    if !closed { return "bad handshake was not closed" }
+    return "garbage ok"
+}
+function abort(port: Integer, root: Bytes): Text {
+    // A real ClientHello, then the socket disappears before the server flight.
+    let session = tls.clientWithProtocol("localhost", secureRandom.bytes(64), "http/1.1", [root], [], Bytes())
+    let socket = net.connect("127.0.0.1", port)
+    if socket < 0 { return "connect failed" }
+    net.send(socket, tls.takeOutgoing(session))
+    net.close(socket)
+    return "abort ok"
+}
+
+function main(): Integer {
+    let mode = processInfo.argument(0)
+    let port = number(processInfo.argument(1))
+    let rootPath = processInfo.argument(2)
+    let root = Bytes()
+    if rootPath != "" { root = io.readBytesFile(rootPath) }
+    if mode == "garbage" {
+        print(garbage(port)); return 0
+    }
+    if mode == "abort" {
+        print(abort(port, root)); return 0
+    }
+    let peer = openPeer(port, root)
+    let result = "unknown mode: " + mode
+    if mode == "roundtrip" { result = roundtrip(peer) }
+    else if mode == "large" { result = large(peer) }
+    else if mode == "limits" { result = limits(peer) }
+    else if mode == "stats" { result = stats(peer) }
+    else if mode == "quit" { result = quit(peer) }
+    if peer.socket >= 0 { net.close(peer.socket) }
+    print(result)
+    return 0
+}

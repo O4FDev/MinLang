@@ -6,12 +6,24 @@ check-httpserver: build/minyarc build/minyar-default-runtime.o build/tooling/tes
 	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/httpserver-test --mode debug
 	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/httpserver-test --mode release
 
+# TLS termination behind listenTLS: library/tls client, O0 and O2 fixture builds.
+check-httpserver-tls: build/minyarc build/minyar-default-runtime.o build/tooling/tests/httpserver-tls-test
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/httpserver-tls-test --mode debug
+	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) ./build/tooling/tests/httpserver-tls-test --mode release
+
+check-httpserver: check-httpserver-tls
+
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check check-portable: check-httpserver
 endif
 
 check-httpserver-sanitize: build/minyarc build/tooling/tests/httpserver-test
 	MINYAR_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/httpserver-test --sanitize
+
+check-httpserver-tls-sanitize: build/minyarc build/tooling/tests/httpserver-tls-test
+	$(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/httpserver-tls-test --sanitize
+
+check-httpserver-sanitize: check-httpserver-tls-sanitize
 
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check-sanitize: check-httpserver-sanitize

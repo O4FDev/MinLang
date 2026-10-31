@@ -1,0 +1,59 @@
+use "./net-fixtures.min" as fixtures
+use "../tools/testing.min" as test
+
+// HTTPS listener: a TLS client from library/tls talks to http.listenTLS.
+// Covers GET/POST round trip, keep-alive, bad handshakes, mid-handshake
+// disconnects and a request that exceeds the header limit, without a peer
+// process: the server fixture is tests/httpserver-tls.min and the client is
+// tests/httpserver-tls-client.min.
+// The listener and the client are built at the same optimization level the
+// caller asked for, so this check runs at O0 and O2.
+function build(context: fixtures.Context, source: Text, output: Text, mode: Text) {
+    let result = test.run([context.root + "/minyar", "--" + mode, "--library", context.root + "/library",
+        context.root + "/" + source, "-o", output], context.environment, context.root, fixtures.logPath(context, "build"), 600)
+    test.require(result, "build " + source + " (" + mode + "): " + result.output + result.errorOutput)
+}
+function client(context: fixtures.Context, binary: Text, mode: Text, port: Integer, root: Text): test.Result {
+    return fixtures.run(context, [binary, mode, Text(port), root], 30)
+}
+function expect(context: fixtures.Context, binary: Text, mode: Text, port: Integer, root: Text, expected: Text) {
+    let result = client(context, binary, mode, port, root)
+    test.check(result.status == 0, mode + " client exit " + Text(result.status) + "\n" + result.output + result.errorOutput)
+    test.check(test.contains(result.output, expected), mode + " output: " + result.output + result.errorOutput)
+    test.check(result.errorOutput == "", mode + " stderr: " + result.errorOutput)
+    print("TLS HTTP " + mode + ": " + expected)
+}
+
+fixtures.arguments(["--sanitize"], ["--mode"])
+let mode = fixtures.option("--mode", "debug")
+test.check(mode == "debug" || mode == "release", "invalid mode: " + mode)
+let context = fixtures.context(fixtures.flag("--sanitize"))
+let ca = fixtures.authority(context, context.work + "/ca")
+fixtures.root(ca, "root")
+fixtures.leaf(ca, "server", "root", fixtures.options())
+let serverBinary = context.work + "/tls-http-server-" + mode
+let clientBinary = context.work + "/tls-http-client-" + mode
+build(context, "tests/httpserver-tls.min", serverBinary, mode)
+build(context, "tests/httpserver-tls-client.min", clientBinary, mode)
+let identity = fixtures.path(ca, "server", "der")
+let key = fixtures.path(ca, "server", "pk8")
+let root = fixtures.path(ca, "root", "der")
+let server = fixtures.launch(context, [serverBinary, identity, key], 120)
+let port = fixtures.ready(context, server)
+expect(context, clientBinary, "roundtrip", port, root, "roundtrip ok")
+expect(context, clientBinary, "large", port, root, "large ok")
+expect(context, clientBinary, "limits", port, root, "limits ok")
+// A bad handshake and a peer that leaves mid-handshake close only their own
+// connection: the same listener answers a full round trip afterwards.
+expect(context, clientBinary, "garbage", port, root, "garbage ok")
+expect(context, clientBinary, "abort", port, root, "abort ok")
+expect(context, clientBinary, "roundtrip", port, root, "roundtrip ok")
+let stats = client(context, clientBinary, "stats", port, root)
+test.check(stats.status == 0 && test.contains(stats.output, "stats 1:"),
+    "connection accounting after handshake failures: " + stats.output + stats.errorOutput)
+expect(context, clientBinary, "quit", port, root, "quit ok")
+let served = fixtures.collect(server)
+test.check(served.status == 0, "TLS HTTP server exit " + Text(served.status) + "\n" + served.output + served.errorOutput)
+test.check(served.errorOutput == "", served.errorOutput)
+print("HTTPS listener: TLS round trip, keep-alive, framing limits and handshake failures verified")
+fixtures.finish(context)

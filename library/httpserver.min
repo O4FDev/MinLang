@@ -1,10 +1,14 @@
 // Bounded, single-owner HTTP/1.1 server over the portable event loop.
 // No callbacks: poll/advance returns requests; respond consumes a private ticket.
-// Request transfer codings are deliberately rejected (501 + close). See docs/http-server.md.
+// Request transfer codings are deliberately rejected (501 + close).
+// listenTLS terminates TLS 1.3 per connection with the same Server API and limits.
+// See docs/http-server.md.
 use "net" as net
 use "eventloop" as loop
 use "errors" as errors
 use "text" as utf8
+use "tlsserver" as tlsserver
+use "random" as secureRandom
 
 public record Limits {
     maxConnections: Integer
@@ -63,6 +67,9 @@ record Connection {
     active: Boolean
     socket: Integer
     registration: Integer
+    secure: Boolean
+    tls: tlsserver.Session
+    wire: Bytes
     // 0 reading, 1 application (unwatched), 2 writing.
     phase: Integer
     input: Bytes
@@ -81,6 +88,7 @@ record Connection {
     sent: Integer
     bodySent: Integer
     closing: Boolean
+    closeSent: Boolean
     writeHup: Boolean
     writeProbeAt: Integer
 }
@@ -89,6 +97,12 @@ public record Server {
     private listener: Integer
     private listenerRegistration: Integer
     private limits: Limits
+    private secure: Boolean
+    private identity: List<Bytes>
+    private privateKey: Bytes
+    // Plain connections share one closed session, so listening without TLS
+    // does not allocate a TLS state record per connection.
+    private noneSession: tlsserver.Session
     private connections: List<Connection>
     private freeSlots: List<Integer>
     private freeCount: Integer
@@ -127,6 +141,15 @@ function validLimits(limits: Limits): Boolean {
         durationValid(limits.writeMilliseconds)
 }
 public function listen(host: Text, port: Integer, limits: Limits): Server {
+    return start(host, port, limits, false, [], Bytes())
+}
+// TLS 1.3 termination for the same Server API. Each accepted connection runs
+// its own tlsserver session (protocol "http/1.1", no client authentication):
+// socket bytes are TLS records and requests/responses stay plaintext in memory.
+public function listenTLS(host: Text, port: Integer, limits: Limits, identity: List<Bytes>, privateKey: Bytes): Server {
+    return start(host, port, limits, true, identity, privateKey)
+}
+function start(host: Text, port: Integer, limits: Limits, secure: Boolean, identity: List<Bytes>, privateKey: Bytes): Server {
     // Snapshot mutable Limits so callers cannot raise bounds mid-connection.
     let copied = Limits { maxConnections: limits.maxConnections; maxHeaderBytes: limits.maxHeaderBytes;
         maxHeaders: limits.maxHeaders; maxBodyBytes: limits.maxBodyBytes; maxResponseBytes: limits.maxResponseBytes;
@@ -135,11 +158,24 @@ public function listen(host: Text, port: Integer, limits: Limits): Server {
         headerMilliseconds: limits.headerMilliseconds; bodyMilliseconds: limits.bodyMilliseconds;
         applicationMilliseconds: limits.applicationMilliseconds; writeMilliseconds: limits.writeMilliseconds }
     let server = Server { handle: -1; listener: -1; listenerRegistration: -1; limits: copied;
+        secure: secure; identity: []; privateKey: Bytes(); noneSession: tlsserver.none();
         connections: []; freeSlots: []; freeCount: 0; active: 0; nextTicket: 1; closed: false; draining: false; error: errors.none() }
     if !validLimits(copied) {
         server.error = errors.make(errors.invalidDataCode(), 0, "invalid HTTP server limits")
         server.closed = true
         return server
+    }
+    if secure {
+        // Validate the identity and key once, before accepting: a configuration
+        // error must never turn into per-connection handshake failures.
+        let probe = tlsserver.server(secureRandom.bytes(64), "http/1.1", identity, privateKey, [], false)
+        if probe.state == tlsserver.FAILED {
+            server.error = errors.make(errors.invalidDataCode(), 0, "invalid TLS server identity or private key")
+            server.closed = true
+            return server
+        }
+        for certificate in identity { server.identity.add(certificate) }
+        server.privateKey = privateKey
     }
     let created = loop.create()
     if !errors.integerOk(created) {
@@ -162,11 +198,12 @@ public function listen(host: Text, port: Integer, limits: Limits): Server {
 function badHead(status: Integer): Head {
     return Head { status: status; method: ""; target: ""; headers: []; length: 0; keepAlive: false }
 }
-function newConnection(socket: Integer, deadline: Integer): Connection {
-    return Connection { active: true; socket: socket; registration: -1; phase: 0; input: Bytes();
+function newConnection(socket: Integer, deadline: Integer, secure: Boolean, session: tlsserver.Session): Connection {
+    return Connection { active: true; socket: socket; registration: -1; secure: secure; tls: session;
+        wire: Bytes(); phase: 0; input: Bytes();
         inputStart: 0; scan: 0; headerBytes: 0; parsed: badHead(0); deadline: deadline; started: false;
         needsParse: false; eof: false; ticket: 0; count: 0; output: Bytes(); body: Bytes();
-        sent: 0; bodySent: 0; closing: false; writeHup: false; writeProbeAt: -1 }
+        sent: 0; bodySent: 0; closing: false; closeSent: false; writeHup: false; writeProbeAt: -1 }
 }
 function removeWatch(server: Server, connection: Connection) {
     if connection.registration >= 0 {
@@ -183,6 +220,11 @@ function drop(server: Server, slot: Integer) {
     connection.ticket = 0
     connection.input = Bytes(); connection.output = Bytes(); connection.body = Bytes()
     connection.parsed = badHead(0)
+    if connection.secure {
+        // Release keys, handshake and plaintext buffers with the connection.
+        connection.tls = server.noneSession
+        connection.wire = Bytes()
+    }
     server.active -= 1
     if server.freeCount < server.freeSlots.length { server.freeSlots[server.freeCount] = slot }
     else { server.freeSlots.add(slot) }
@@ -203,6 +245,7 @@ public function close(server: Server) {
     }
     if server.listener >= 0 { net.close(server.listener); server.listener = -1 }
     if server.handle >= 0 { loop.close(server.handle) }
+    server.identity = []; server.privateKey = Bytes()
 }
 // Stop accepting and reading new requests. Already dispatched requests retain
 // their tickets; their responses finish before closing. Keep advancing the
@@ -239,7 +282,17 @@ function acceptReady(server: Server, now: Integer) {
         let socket = net.accept(server.listener)
         if socket < 0 { break }
         net.setNoDelay(socket, true)
-        let connection = newConnection(socket, now + server.limits.idleMilliseconds)
+        let session = server.noneSession
+        if server.secure {
+            session = tlsserver.server(secureRandom.bytes(64), "http/1.1", server.identity, server.privateKey, [], false)
+            if session.state == tlsserver.FAILED {
+                // The listener configuration was validated; refuse this socket
+                // instead of consuming a bounded connection slot.
+                net.close(socket)
+                continue
+            }
+        }
+        let connection = newConnection(socket, now + server.limits.idleMilliseconds, server.secure, session)
         let slot = server.connections.length
         if server.freeCount > 0 {
             server.freeCount -= 1; slot = server.freeSlots[server.freeCount]; server.connections[slot] = connection
@@ -427,10 +480,30 @@ function flush(server: Server, slot: Integer, now: Integer) {
     connection.writeProbeAt = -1
     let budget = server.limits.ioBudget
     while budget > 0 {
+        if connection.secure {
+            // The socket only ever carries TLS records: encrypt the plaintext
+            // body in bounded records once the queued ciphertext is drained.
+            if connection.sent == connection.output.length && connection.bodySent < connection.body.length {
+                let take = min(16384, connection.body.length - connection.bodySent)
+                tlsserver.send(connection.tls, connection.body.slice(connection.bodySent, connection.bodySent + take))
+                connection.bodySent += take
+                connection.output = tlsserver.takeOutgoing(connection.tls)
+                connection.sent = 0
+                if connection.tls.state != tlsserver.ESTABLISHED { drop(server, slot); return }
+            }
+            // A closing TLS connection ends with an authenticated close_notify.
+            if connection.closing && !connection.closeSent && connection.sent == connection.output.length &&
+               connection.bodySent == connection.body.length && connection.tls.state == tlsserver.ESTABLISHED {
+                connection.closeSent = true
+                tlsserver.close(connection.tls)
+                connection.output = tlsserver.takeOutgoing(connection.tls)
+                connection.sent = 0
+            }
+        }
         let data = connection.output
         let offset = connection.sent
         let writingHead = true
-        if offset == data.length { data = connection.body; offset = connection.bodySent; writingHead = false }
+        if offset == data.length && !connection.secure { data = connection.body; offset = connection.bodySent; writingHead = false }
         if offset == data.length { break }
         let count = net.writeRange(connection.socket, data, offset, min(budget, data.length - offset))
         if count == -1 {
@@ -447,7 +520,8 @@ function flush(server: Server, slot: Integer, now: Integer) {
         if writingHead { connection.sent += count } else { connection.bodySent += count }
         budget -= count
     }
-    if connection.sent != connection.output.length || connection.bodySent != connection.body.length {
+    if connection.sent != connection.output.length || connection.bodySent != connection.body.length ||
+       connection.secure && connection.closing && !connection.closeSent {
         // A paused writer that used its I/O budget made real progress. Give it
         // one more bounded turn without reinstalling a permanently ready HUP.
         if connection.registration < 0 { connection.writeProbeAt = now }
@@ -479,7 +553,6 @@ function startResponse(server: Server, slot: Integer, response: Response, head: 
     if response.status != 204 { output.addBytes(Bytes("content-length: " + Text(length) + "\r\n")) }
     if closing { output.addBytes(Bytes("connection: close\r\n\r\n")) }
     else { output.addBytes(Bytes("connection: keep-alive\r\n\r\n")) }
-    connection.output = output
     connection.body = response.body
     if head || response.status == 204 || response.status == 205 || response.status == 304 { connection.body = Bytes() }
     else {
@@ -491,8 +564,14 @@ function startResponse(server: Server, slot: Integer, response: Response, head: 
             connection.body = Bytes()
         }
     }
+    if connection.secure {
+        // Keep any queued TLS control records first, then the sealed response.
+        tlsserver.send(connection.tls, output)
+        connection.output.addBytes(tlsserver.takeOutgoing(connection.tls))
+        if connection.tls.state != tlsserver.ESTABLISHED { drop(server, slot); return false }
+    } else { connection.output = output }
     connection.sent = 0; connection.bodySent = 0; connection.phase = 2; connection.ticket = 0
-    connection.writeHup = false; connection.writeProbeAt = -1
+    connection.writeHup = false; connection.writeProbeAt = -1; connection.closeSent = false
     connection.closing = closing
     let now = net.monotonicMilliseconds()
     connection.deadline = now + server.limits.writeMilliseconds
@@ -565,8 +644,57 @@ function parseReady(server: Server, slot: Integer, now: Integer, ready: List<Req
     ready.add(Request { method: parsed.method; target: parsed.target; headers: parsed.headers;
         body: body; keepAlive: parsed.keepAlive; owner: server.handle; slot: slot; ticket: connection.ticket })
 }
+// TLS connections feed socket bytes through their session; only authenticated
+// plaintext reaches the HTTP parser. Handshake output is written before more
+// input is read, and a failed handshake or record closes this connection only.
+function readSecure(server: Server, slot: Integer, now: Integer, ready: List<Request>) {
+    let connection = server.connections[slot]
+    let capacity = server.limits.maxHeaderBytes + server.limits.maxBodyBytes
+    let pending = tlsserver.takeIncoming(connection.tls)
+    if pending.length > 0 { connection.input.addBytes(pending) }
+    let buffered = connection.input.length - connection.inputStart
+    if buffered < capacity {
+        connection.wire.clear()
+        let count = net.readInto(connection.socket, connection.wire, min(server.limits.ioBudget, capacity - buffered))
+        if count == -2 { drop(server, slot); return }
+        if count == 0 {
+            // The transport is gone. Without an authenticated close no request
+            // in progress can complete, so the session ends with the socket.
+            tlsserver.endInput(connection.tls)
+            if connection.tls.state != tlsserver.ESTABLISHED { drop(server, slot); return }
+            connection.eof = true
+        }
+        if connection.wire.length > 0 {
+            tlsserver.receive(connection.tls, connection.wire)
+            connection.wire = Bytes()
+        }
+        if connection.tls.state == tlsserver.FAILED || connection.tls.state == tlsserver.CLOSED {
+            drop(server, slot); return
+        }
+        pending = tlsserver.takeIncoming(connection.tls)
+        if pending.length > 0 { connection.input.addBytes(pending) }
+    }
+    if !connection.started {
+        connection.started = true; connection.deadline = now + server.limits.headerMilliseconds
+    }
+    let reply = tlsserver.takeOutgoing(connection.tls)
+    if reply.length > 0 {
+        connection.output.addBytes(reply)
+        // Handshake bytes must reach the peer before it can send its next flight.
+        if connection.phase == 0 {
+            connection.phase = 2; connection.closing = false; connection.closeSent = false
+            connection.writeHup = false; connection.writeProbeAt = -1
+            connection.deadline = now + server.limits.headerMilliseconds
+            if !watch(server, slot, loop.writableInterest()) { return }
+            flush(server, slot, now)
+        }
+        if connection.phase == 2 { return }
+    }
+    parseReady(server, slot, now, ready)
+}
 function readReady(server: Server, slot: Integer, now: Integer, ready: List<Request>) {
     let connection = server.connections[slot]
+    if connection.secure { readSecure(server, slot, now, ready); return }
     let capacity = server.limits.maxHeaderBytes + server.limits.maxBodyBytes
     let buffered = connection.input.length - connection.inputStart
     // A single bounded native read per readiness turn; cached headers avoid rescans.
@@ -651,9 +779,12 @@ public function advance(server: Server, batch: loop.Batch): Batch {
         let connection = server.connections[slot]
         if connection.active {
             if now >= connection.deadline {
-                // Application/write deadlines close directly; a parser timeout sends one finite reply.
-                if connection.phase == 0 && connection.started { reject(server, slot, 408) }
-                else { drop(server, slot) }
+                // Application/write deadlines close directly; a parser timeout sends
+                // one finite reply. A TLS handshake that cannot finish in time closes.
+                if connection.phase == 0 && connection.started &&
+                   (!connection.secure || connection.tls.state == tlsserver.ESTABLISHED) {
+                    reject(server, slot, 408)
+                } else { drop(server, slot) }
             } else {
                 if connection.phase == 0 && connection.needsParse { parseReady(server, slot, now, ready) }
                 if connection.phase == 2 && connection.writeProbeAt >= 0 && now >= connection.writeProbeAt {

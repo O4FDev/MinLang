@@ -60,11 +60,45 @@ at listen time. Set application-specific values before listening: Tideboard
 uses 32 connections and 512-byte bodies. This bounds server buffers; an
 application must also bound its own collections and response construction.
 
+## HTTPS on the same listener
+
+`listenTLS(host, port, limits, identity, privateKey)` returns the same Server
+with the same poll/respond API and limits; only the bytes on the socket differ.
+`identity` is a List of DER certificates (leaf first) and `privateKey` is a
+PKCS#8 DER key. Each accepted connection runs a TLS 1.3 session
+(`tlsserver`, ALPN "http/1.1", no client authentication), so request and
+response buffers stay plaintext and bounded by the same Limits. A failed
+handshake, a truncated record or a peer that disappears mid-handshake closes
+that connection only; polling continues. TLS connections end with an
+authenticated close_notify when the response closes them.
+
+```minyar
+use "httpserver" as http
+use "errors" as errors
+use "io" as io
+
+let identity: List<Bytes> = [io.readBytesFile("leaf.der")]
+let server = http.listenTLS("127.0.0.1", 8443, http.defaults(), identity, io.readBytesFile("leaf.pk8"))
+if !http.ok(server) { fail(errors.message(http.serverError(server))) }
+while true {
+    let batch = http.poll(server, -1)
+    for request in http.requests(batch) {
+        let response = http.response(200, "text/plain; charset=utf-8", Bytes("Hello over TLS.\n"))
+        if !http.respond(server, request, response) { http.abandon(server, request) }
+    }
+}
+```
+
+An invalid identity or key is reported by `listenTLS` before any connection is
+accepted: check `ok(server)` as for plain HTTP. Server name selection (SNI),
+client certificates and HTTP/2 remain application or separate-module concerns.
+
 For a shared event loop, `loopHandle(server)`, `waitMilliseconds(server, timeout)`
 and `advance(server, eventBatch)` expose the same state machine. Keep one owner
 and include the server's earliest deadline when choosing a wait.
 
-`make check-httpserver` and `make check-httpserver-front` qualify the transport.
+`make check-httpserver` (including `check-httpserver-tls`) and
+`make check-httpserver-front` qualify the transport.
 `make check-showcase-tideboard` compiles the real example at O0/O2 and exercises
-its API through loopback HTTP requests. HTTPS termination, authentication,
-durable application storage and deployment policy are separate concerns.
+its API through loopback HTTP requests. Client authentication, durable
+application storage and deployment policy are separate concerns.

@@ -1,7 +1,7 @@
 # Portable networking foundations have their own gates so protocol tests can
 # grow without mixing native desktop prerequisites into the portable suite.
 .PHONY: check-errors-values check-net check-net-loop check-net-connect check-net-connect-sanitize check-net-paths check-net-paths-sanitize check-os-net-stack check-os-net-stack-sanitize
-NET_FIXTURE_TOOLS = http-package-test http-bounded-test httpserver-test httpserver-front-test net-native-test net-loop-test \
+NET_FIXTURE_TOOLS = http-package-test http-bounded-test httpserver-test httpserver-tls-test httpserver-front-test net-native-test net-loop-test \
     net-udp-offload-test os-tlsverify-test peer-auth-mutants-test peer-auth-device-test peer-auth-test peer-wire-flow-test \
     peer-live-redis-test peer-live-test peer-wire-test redis-pipeline-test redis-protocol-test securecrypto-test \
     tls-handshake-validity-test tls-keyshare-test tls-signing-usage-test tls-local-test tls-resumption-expiry-test \
