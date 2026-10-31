@@ -97,6 +97,83 @@ function resultFindInBlock(lines: List<Text>, prefix: Text, from: Integer, to: I
 // takes the field as an argument.
 function resultTagRead(line: Text, value: Text): Boolean {
     return line.find("@.minyar.record.get.0(ptr " + value + ")") >= 0 || line.find("@.minyar.record.get(ptr " + value + ", i64 0)") >= 0
+
+// The boxing helper for a marker's flags: two-case choices other than Result
+// carry five (storage count, payload fields and reference flags by tag).
+function resultBoxFunction(flags: Text): Text {
+    if flags.split(", ").length == 5 { return "@minyar_choice_box" }
+    return "@minyar_result_box"
+}
+
+// The field of a `@.minyar.record.get` or `@minyar_record_take_field` of value
+// on line (as `X = call i64 @...(ptr VALUE, i64 FIELD)`), or "".
+function resultReadField(line: Text, value: Text): Text {
+    // A tagged field position has its own accessor (`@.minyar.record.get.K(ptr VALUE)`).
+    let tagged = 0
+    while tagged < 3 {
+        let accessor = " = call i64 @.minyar.record.get." + Text(tagged) + "(ptr " + value + ")"
+        if line.startsWith("  %") && line.endsWith(accessor) && resultNameUses(line, value) == 1 { return Text(tagged) }
+        tagged = tagged + 1
+    }
+    let prefixes: List<Text> = [" = call i64 @.minyar.record.get(ptr " + value + ", i64 ", " = call i64 @minyar_record_take_field(ptr " + value + ", i64 "]
+    let which = 0
+    while which < prefixes.length {
+        let prefix = prefixes[which]
+        let at = line.find(prefix)
+        if at > 2 && line.startsWith("  %") && line.endsWith(")") && resultNameUses(line, value) == 1 {
+            let field = line.slice(at + prefix.length, line.length - 1)
+            if field == "0" || field == "1" || field == "2" { return field }
+        }
+        which = which + 1
+    }
+    return ""
+}
+
+// Calls of marked functions whose value a consumed match or `is` test reads
+// only through tag reads, payload reads and takes: they become pairs.
+function resultLowerConsumed(lines: List<Text>, functions: ResultRegisterFunctions) {
+    let pattern = "  call void @.minyar.record.result.consume(ptr %"
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        if line.startsWith(pattern) {
+            let value = "%" + line.slice(pattern.length, line.length - 1)
+            let define = resultFind(lines, "  " + value + " = call ptr @")
+            let entry = -1
+            let open = -1
+            let start = value.length + 15
+            if define >= 0 {
+                open = lines[define].find("(")
+                if open > start { entry = genericIndexGet(functions.index, lines[define].slice(start, open)) }
+            }
+            if entry >= 0 && functions.flags[entry] != "" {
+                let reads: List<Integer> = []
+                let others = 0
+                let scan = 0
+                while scan < lines.length {
+                    if scan != define && scan != index && lines[scan].find(value) >= 0 && resultNameUses(lines[scan], value) > 0 {
+                        if resultReadField(lines[scan], value) != "" { reads.add(scan) } else { others = others + 1 }
+                    }
+                    scan = scan + 1
+                }
+                if others == 0 {
+                    let call = lines[define]
+                    let pair = value + ".pair"
+                    lines[define] = "  " + pair + " = call [2 x i64] @" + call.slice(start, open) + ".r" + call.slice(open, call.length)
+                    let read = 0
+                    while read < reads.length {
+                        let readLine = lines[reads[read]]
+                        let element = "1"
+                        if resultReadField(readLine, value) == "0" { element = "0" }
+                        lines[reads[read]] = readLine.slice(0, readLine.find(" = ") + 3) + "extractvalue [2 x i64] " + pair + ", " + element
+                        read = read + 1
+                    }
+                    lines[index] = ""
+                }
+            }
+        }
+        index = index + 1
+    }
 }
 
 // Calls of marked functions whose Result a consumed `try` reads only through
@@ -138,7 +215,7 @@ function resultLowerCalls(lines: List<Text>, functions: ResultRegisterFunctions)
                     let element = "1"
                     if takeLine.endsWith(", i64 0)") { element = "0" }
                     lines[take] = takeLine.slice(0, takeLine.find(" = ") + 3) + "extractvalue [2 x i64] " + pair + ", " + element
-                    lines[index] = "  " + failed + ".tag = extractvalue [2 x i64] " + pair + ", 0\n  " + failed + ".slot = extractvalue [2 x i64] " + pair + ", 1\n  " + failed + " = call ptr @minyar_result_box(i64 " + failed + ".tag, i64 " + failed + ".slot, " + flags + ")"
+                    lines[index] = "  " + failed + ".tag = extractvalue [2 x i64] " + pair + ", 0\n  " + failed + ".slot = extractvalue [2 x i64] " + pair + ", 1\n  " + failed + " = call ptr " + resultBoxFunction(flags) + "(i64 " + failed + ".tag, i64 " + failed + ".slot, " + flags + ")"
                 }
             }
         }
@@ -179,7 +256,7 @@ function resultLowerReturns(lines: List<Text>, functions: ResultRegisterFunction
             if !made { define = resultFind(lines, "  " + value + " = call ptr @minyar_record_new") }
             if define >= 0 && define < index {
                 let call = lines[define]
-                let fresh = call.endsWith(" = call ptr @minyar_record_new(i64 3)") || call.endsWith(" = call ptr @minyar_record_new_scalar(i64 3)")
+                let fresh = call.endsWith(" = call ptr @minyar_record_new(i64 3)") || call.endsWith(" = call ptr @minyar_record_new_scalar(i64 3)") || call.endsWith(" = call ptr @minyar_record_new(i64 2)") || call.endsWith(" = call ptr @minyar_record_new_scalar(i64 2)")
                 let tagSet = resultFindInBlock(lines, "  call void @minyar_record_set(ptr " + value + ", i64 0, i64 ", define, index)
                 let uses = 3
                 let slot = "0"
@@ -242,19 +319,21 @@ function resultLowerFunction(lines: List<Text>, functions: ResultRegisterFunctio
             let parameters = define.slice(open + 1, close)
             lines[0] = "define internal [2 x i64] @" + name + ".r(" + parameters + define.slice(close, define.length)
             if resultLowerReturns(lines, functions) { failCompiler("Result register lowering: an unboxed return in " + name) }
-            functions.wrappers.add(define.slice(0, at) + " ptr @" + name + "(" + parameters + ") uwtable {\nentry:\n  %result.pair = call [2 x i64] @" + name + ".r(" + parameters + ")\n  %result.tag = extractvalue [2 x i64] %result.pair, 0\n  %result.slot = extractvalue [2 x i64] %result.pair, 1\n  %result.record = call ptr @minyar_result_box(i64 %result.tag, i64 %result.slot, " + flags + ")\n  ret ptr %result.record\n}\n\n")
+            functions.wrappers.add(define.slice(0, at) + " ptr @" + name + "(" + parameters + ") uwtable {\nentry:\n  %result.pair = call [2 x i64] @" + name + ".r(" + parameters + ")\n  %result.tag = extractvalue [2 x i64] %result.pair, 0\n  %result.slot = extractvalue [2 x i64] %result.pair, 1\n  %result.record = call ptr " + resultBoxFunction(flags) + "(i64 %result.tag, i64 %result.slot, " + flags + ")\n  ret ptr %result.record\n}\n\n")
             changed = true
         }
     }
     let index = 1
+    let consumed = false
+    let reboxed = false
     while index < lines.length {
-        if lines[index].find("@.minyar.record.result.rebox(") >= 0 {
-            resultLowerCalls(lines, functions)
-            return true
-        }
+        if lines[index].find("@.minyar.record.result.rebox(") >= 0 { reboxed = true }
+        if lines[index].startsWith("  call void @.minyar.record.result.consume(") { consumed = true }
         index = index + 1
     }
-    return changed
+    if reboxed { resultLowerCalls(lines, functions) }
+    if consumed { resultLowerConsumed(lines, functions) }
+    return changed || reboxed || consumed
 }
 
 // The position of pattern at or after start, or -1 (Text characters). Native:
@@ -321,15 +400,18 @@ function lowerResultRegisters(pieces: List<Text>): List<Text> {
     let copied = 0
     let reboxText = "@.minyar.record.result.rebox("
     let rebox = module.find(reboxText)
+    let consumeText = "call void @.minyar.record.result.consume("
+    let consume = module.find(consumeText)
     let candidate = 0
     let start = resultFindFrom(module, "\ndefine ", 0)
     while start >= 0 {
         let end = resultFindFrom(module, "\n}\n", start)
         if end < 0 { start = -1 } else {
             while rebox >= 0 && rebox < start { rebox = resultFindFrom(module, reboxText, rebox + 1) }
+            while consume >= 0 && consume < start { consume = resultFindFrom(module, consumeText, consume + 1) }
             while candidate < functions.starts.length && functions.starts[candidate] < start + 1 { candidate = candidate + 1 }
             let marked = candidate < functions.starts.length && functions.starts[candidate] == start + 1
-            if marked || (rebox >= 0 && rebox < end) {
+            if marked || (rebox >= 0 && rebox < end) || (consume >= 0 && consume < end) {
                 let lines: List<Text> = []
                 let flags = ""
                 if marked {

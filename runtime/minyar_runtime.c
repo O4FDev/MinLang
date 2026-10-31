@@ -567,6 +567,24 @@ MinyarRecord *minyar_result_box(long long tag, long long slot, long long ok_refe
     return record;
 }
 
+/* A two-case choice returned in registers, boxed for a caller that needs the
+ * record: `slots` storage fields, the payload field and reference flag of each
+ * tag (field 0: the case has no payload). */
+MinyarRecord *minyar_choice_box(long long tag, long long slot, long long slots, long long field0,
+                                long long field1, long long reference0, long long reference1) {
+    long long field = tag ? field1 : field0;
+    if (field && (tag ? reference1 : reference0)) {
+        MinyarRecord *record = minyar_record_new(slots);
+        minyar_record_set(record, 0, tag);
+        minyar_record_set_take(record, field, slot);
+        return record;
+    }
+    MinyarRecord *record = minyar_record_new_scalar(slots);
+    minyar_record_set(record, 0, tag);
+    if (field) minyar_record_set(record, field, slot);
+    return record;
+}
+
 static _Bool validate_text_bytes(const unsigned char *bytes, long long length);
 
 static MinyarText *copy_c_text(const char *source) {

@@ -54,10 +54,20 @@ function parsePatternCondition(context: CompilerContext, localNames: List<Text>,
         addLocal(localNames, localTypes, localIds, localLengths, state, " loop", -1, loop)
     }
     scopes[0] = state[3]
+    // A fresh pair choice tested against a plain case is consumed on both
+    // paths: the binding owns the payload and no record outlives the test.
+    let pairFields = pairChoiceFields(context, inputType[0])
+    let cases: List<Text> = []
+    if pairFields.length == 2 { cases = choiceMatchCases(context, inputType[0]) }
+    let consumed = pairFields.length == 2 && !recoveryEnabled(state) && inputType.length > 1 && inputType[1] >= 0 && pairCasePattern(context, state[0], cases) > 0 && takeResult(output, state, input, inputType)
     let owner = nextLocal(state)
-    addLocal(localNames, localTypes, localIds, localLengths, state, " pattern input", inputType[0], owner)
-    assignReference(output, state, owner, input, inputType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
-    storeLocal(output, owner, inputType[0], input)
+    if consumed { output.add("  call void @.minyar.record.result.consume(ptr " + input + ")\n") } else {
+        addLocal(localNames, localTypes, localIds, localLengths, state, " pattern input", inputType[0], owner)
+        assignReference(output, state, owner, input, inputType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+        storeLocal(output, owner, inputType[0], input)
+    }
+    let tag = 0
+    if consumed { tag = findText(cases, context.tokenTexts[state[0]]) - 1 }
     let nodes: List<MatchPattern> = []
     let names: List<Text> = []
     let node = parseMatchPattern(context, state, inputType[0], nodes, names, 0)
@@ -66,11 +76,26 @@ function parsePatternCondition(context: CompilerContext, localNames: List<Text>,
     let bindingNodes: List<Integer> = []
     let values: List<Text> = []
     emitMatchPattern(context, nodes, node, input, localNames, localTypes, localIds, localLengths, state, textState, output, globals, failure, bindingNodes, values)
-    installPatternBindings(context, nodes, bindingNodes, values, localNames, localTypes, localIds, localLengths, state, output)
-    rootLocal(output, state, owner, "null", inputType[0])
+    if consumed {
+        let taken = consumePairCase(context, output, textState, state, input, inputType[0], pairFields, tag, bindingNodes.length > 0)
+        if bindingNodes.length > 0 {
+            let pattern = nodes[bindingNodes[0]]
+            let id = nextLocal(state)
+            addLocal(localNames, localTypes, localIds, localLengths, state, pattern.name, pattern.type, id)
+            let type: List<Integer> = [pattern.type]
+            ownResult(output, state, taken, type)
+            assignReference(output, state, id, taken, type, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+            storeLocal(output, id, pattern.type, taken)
+        }
+    } else {
+        installPatternBindings(context, nodes, bindingNodes, values, localNames, localTypes, localIds, localLengths, state, output)
+        rootLocal(output, state, owner, "null", inputType[0])
+    }
     let success = textState[0]
     output.add("  br label %" + end + "\n\n" + failure + ":\n")
-    rootLocal(output, state, owner, "null", inputType[0])
+    if consumed {
+        let other = consumePairCase(context, output, textState, state, input, inputType[0], pairFields, 1 - tag, false)
+    } else { rootLocal(output, state, owner, "null", inputType[0]) }
     let total = matchPatternIrrefutable(context, nodes, node)
     if total { output.add("  unreachable\n") } else { output.add("  br label %" + end + "\n") }
     output.add("\n" + end + ":\n")

@@ -359,6 +359,94 @@ function patternBorrowsPayloads(nodes: List<MatchPattern>, node: Integer): Boole
     return true
 }
 
+// A two-case Result or tagged choice whose cases carry at most one untraced
+// payload each: a fresh value of it fits two registers, [tag, payload slot].
+// The storage field of each case's payload by tag (0 for none), or [].
+function pairChoiceFields(context: CompilerContext, type: Integer): List<Integer> {
+    let fields: List<Integer> = []
+    if !isRecordType(type) || isScalarChoiceType(type) || !untracedValueType(context, type) { return fields }
+    let result = resultTypeName(type, context.functionNames)
+    if !result && choiceLayoutKind(context, type) != 2 { return fields }
+    let cases = choiceMatchCases(context, type)
+    if cases.length != 3 { return fields }
+    let first = functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type))
+    let variant = 1
+    while variant < 3 {
+        let logical = choiceMatchFields(context, type, cases[variant])
+        if logical.length > 1 { fields.clear(); return fields }
+        if logical.length == 0 { fields.add(0) } else {
+            let payload = context.functionParameterTypes[first + logical[0]]
+            if payload != 5 && isReferenceType(payload) && !untracedValueType(context, payload) { fields.clear(); return fields }
+            if result { fields.add(logical[0]) } else { fields.add(choiceStorageField(context, type, logical[0])) }
+        }
+        variant = variant + 1
+    }
+    return fields
+}
+
+// The payload type of the case with this tag in a pair choice (5 for none).
+function pairChoicePayload(context: CompilerContext, type: Integer, tag: Integer): Integer {
+    let logical = choiceMatchFields(context, type, choiceMatchCases(context, type)[tag + 1])
+    if logical.length == 0 { return 5 }
+    return context.functionParameterTypes[functionParameterOffset(context.functionParameterCounts, recordTypeIndex(type)) + logical[0]]
+}
+
+// The Result register marker flags of a pair choice that is not a Result:
+// storage count, payload field by tag, payload reference flag by tag.
+function pairChoiceAbi(context: CompilerContext, type: Integer, fields: List<Integer>): Text {
+    return "i64 " + Text(choiceStorageCount(context, type)) + ", i64 " + Text(fields[0]) + ", i64 " + Text(fields[1]) + ", i64 " + resultReferenceFlag(pairChoicePayload(context, type, 0)) + ", i64 " + resultReferenceFlag(pairChoicePayload(context, type, 1))
+}
+
+// Whether the pattern at position is `Case`, `Case(name)` or `Case(_)`, and
+// returns the token after it, or -1.
+function pairCasePattern(context: CompilerContext, position: Integer, cases: List<Text>): Integer {
+    let kinds = context.tokenKinds
+    let texts = context.tokenTexts
+    if kinds[position] != 1 || findText(cases, texts[position]) < 1 { return -1 }
+    if !returnMatchPunctuation(context, position + 1, "(") { return position + 1 }
+    if kinds[position + 2] != 1 || !returnMatchPunctuation(context, position + 3, ")") { return -1 }
+    return position + 4
+}
+
+// Whether every arm of the match block at position is a plain case pattern
+// with no guard, so each arm can consume the input when it starts.
+function pairCaseArms(context: CompilerContext, position: Integer, cases: List<Text>): Boolean {
+    let kinds = context.tokenKinds
+    if !returnMatchPunctuation(context, position, "{") { return false }
+    let at = position + 1
+    while kinds[at] == 6 { at = at + 1 }
+    while !returnMatchPunctuation(context, at, "}") {
+        at = pairCasePattern(context, at, cases)
+        if at < 0 || !returnMatchPunctuation(context, at, "{") { return false }
+        let braces = 0
+        let closed = false
+        while !closed {
+            if kinds[at] == 0 { return false }
+            if returnMatchPunctuation(context, at, "{") { braces = braces + 1 }
+            if returnMatchPunctuation(context, at, "}") {
+                braces = braces - 1
+                closed = braces == 0
+            }
+            at = at + 1
+        }
+        while kinds[at] == 6 { at = at + 1 }
+    }
+    return true
+}
+
+// Consumes a pair choice in the case with this tag: takes the payload's count
+// out of the record (disposing of it) and releases a reference payload that
+// no binding owns. Returns the taken payload, or "".
+function consumePairCase(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, input: Text, type: Integer, fields: List<Integer>, tag: Integer, bound: Boolean): Text {
+    let raw = valueName(textState, newTemporary(state))
+    output.add("  " + raw + " = call i64 @minyar_record_take_field(ptr " + input + ", i64 " + Text(fields[tag]) + ")\n")
+    let payload = pairChoicePayload(context, type, tag)
+    if fields[tag] == 0 || payload == 5 { return "" }
+    let value = slotAsValue(output, textState, state, raw, payload)
+    if !bound && isReferenceType(payload) { output.add("  call void @minyar_rc_release(ptr " + value + ")\n") }
+    return value
+}
+
 function parseMatchExpression(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let location = state[0]
     state[0] = state[0] + 1
@@ -434,10 +522,17 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
     // traced or not: the input is that root's own value, not a new edge.
     let borrowedInput = state[0] == location + 2 && kinds[location + 1] == 1 && isReferenceType(inputType[0]) && stableBorrowRoot(context, localNames, localIds, localLengths, state, texts[location + 1])
     let borrowPayloads = !recoveryEnabled(state)
+    // A fresh pair choice whose arms are plain cases is consumed by the arm
+    // that runs: its bindings own the payload and no record outlives the
+    // dispatch, so the final Result lowering can keep it in registers.
+    let pairFields = pairChoiceFields(context, inputType[0])
+    let consumed = !borrowedInput && pairFields.length == 2 && !recoveryEnabled(state) && inputType.length > 1 && inputType[1] >= 0 && pairCaseArms(context, state[0], cases) && takeResult(output, state, input, inputType)
     let owner = nextLocal(state)
-    addLocal(localNames, localTypes, localIds, localLengths, state, " choice match", inputType[0], owner)
-    if !borrowedInput { assignReference(output, state, owner, input, inputType, counts, types, returns) }
-    storeLocal(output, owner, inputType[0], input)
+    if consumed { output.add("  call void @.minyar.record.result.consume(ptr " + input + ")\n") } else {
+        addLocal(localNames, localTypes, localIds, localLengths, state, " choice match", inputType[0], owner)
+        if !borrowedInput { assignReference(output, state, owner, input, inputType, counts, types, returns) }
+        storeLocal(output, owner, inputType[0], input)
+    }
     let dispatch = newPatternDispatch(context, cases, inputType[0], input, output, textState, state)
     let nodes: List<MatchPattern> = []
     let rows: List<PatternRow> = []
@@ -475,6 +570,10 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
         emitDebugOrigin(output, lines, armLocation, "line")
         output.add("; minyar-debug-scope: begin\n")
         emitPatternDispatchArm(dispatch, context, nodes, node, input, localNames, localTypes, localIds, localLengths, state, textState, output, globals, nextLabel, bindingNodes, bindingValues)
+        if consumed {
+            let taken = consumePairCase(context, output, textState, state, input, inputType[0], pairFields, variant - 1, bindingNodes.length > 0)
+            if taken != "" && bindingNodes.length > 0 { bindingValues[0] = taken }
+        }
         let index = 0
         while index < bindingNodes.length {
             let pattern = nodes[bindingNodes[index]]
@@ -482,7 +581,10 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
             addLocal(localNames, localTypes, localIds, localLengths, state, pattern.name, pattern.type, id)
             let payloadType: List<Integer> = [pattern.type]
             let borrowable = borrowPayloads && patternBorrowsPayloads(nodes, node)
-            if borrowable && !untracedValueType(context, pattern.type) && context.provisionalBorrows.enabled && isReferenceType(pattern.type) {
+            if consumed {
+                ownResult(output, state, bindingValues[index], payloadType)
+                assignReference(output, state, id, bindingValues[index], payloadType, counts, types, returns)
+            } else if borrowable && !untracedValueType(context, pattern.type) && context.provisionalBorrows.enabled && isReferenceType(pattern.type) {
                 provisionalBorrow(context, output, state, id, bindingValues[index], pattern.type)
             } else if !(borrowable && untracedValueType(context, pattern.type)) {
                 assignReference(output, state, id, bindingValues[index], payloadType, counts, types, returns)
@@ -596,7 +698,7 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
             rootLocal(output, state, valueId, "null", expressionType[0])
             expressionValue.add(value)
         }
-        rootLocal(output, state, owner, "null", inputType[0])
+        if !consumed { rootLocal(output, state, owner, "null", inputType[0]) }
         if !expression { output.add("  call void @minyar_rc_step()\n") }
     }
     state[3] = outerScope

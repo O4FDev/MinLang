@@ -181,5 +181,91 @@ test.check(!test.contains(quietIR, "; minyar-cycle-runtime: 1\n") && !test.conta
 test.check(count(body(quietIR, "make"), "call i64 @minyar_record_take_field(") == 2, "quiet: both tries take their payloads")
 test.check(count(body(quietIR, "measure.r"), "call i64 @minyar_record_take_field(") == 1, "quiet: measure (returning an Integer Result in registers) takes its tree")
 fixtures.executes(frontend, quiet, "ok 75\nerr negative -1\nok 5\n", ["-O0", "-O2"], 0, "", true)
+
+// A fresh two-case Result or choice whose cases carry at most one untraced
+// payload is consumed by a match of plain case arms or an `is` test: the arm
+// or test takes the payload and disposes of the record when it starts, so a
+// call of a function returning such a value in registers builds no record.
+let pairs = #"""
+    choice Two {
+        Small(value: Integer)
+        Named(name: Text)
+    }
+    choice Opt {
+        Have(value: Integer)
+        Gone
+    }
+    function two(n: Integer): Two {
+        if n % 3 == 0 { return Two.Named("n" + Text(n)) }
+        return Two.Small(n * 2)
+    }
+    function opt(n: Integer): Opt {
+        if n % 2 == 0 { return Opt.Have(n) }
+        return Opt.Gone
+    }
+    function check(n: Integer): Result<Integer, Text> {
+        if n % 5 == 0 { return Err("five " + Text(n)) }
+        return Ok(n + 1)
+    }
+    function describe(n: Integer): Text {
+        return match two(n) {
+            Small(value) { "small " + Text(value) }
+            Named(name) { name + "!" }
+        }
+    }
+    function firstNamed(limit: Integer): Text {
+        let i = 0
+        while i < limit {
+            match two(i) {
+                Small(_) { i += 1 }
+                Named(name) {
+                    if i > 4 { return name }
+                    i += 1
+                }
+            }
+        }
+        return "none"
+    }
+    function score(n: Integer, texts: List<Text>): Integer {
+        let total = 0
+        match check(n) {
+            Ok(v) { total += v }
+            Err(message) { texts.add(message) }
+        }
+        match check(n) {
+            Ok(_) { total += 1 }
+            Err(_) { total += 2 }
+        }
+        if opt(n) is Have(v) { total += v }
+        if opt(n) is Gone { total += 100 }
+        if two(n) is Named(name) { texts.add(name) }
+        if two(n) is Small(s) { total += s }
+        return total
+    }
+    function kept(n: Integer): Integer {
+        let value = two(n)
+        return match value {
+            Small(s) { s }
+            Named(name) { name.length }
+        }
+    }
+
+    let texts: List<Text> = []
+    let total = 0
+    for n in 0..12 { total += score(n, texts) + kept(n) }
+    print(Text(total))
+    print(firstNamed(20))
+    for n in 0..4 { print(describe(n)) }
+    for text in texts { print(text) }
+    """#
+test.require(fixtures.compile(frontend, pairs), "compile consumed pair choice IR")
+let pairsIR = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+test.check(count(body(pairsIR, "two.r"), "@minyar_record_new") == 0 && count(body(pairsIR, "opt.r"), "@minyar_record_new") == 0, "pairs: two-case choices return in registers")
+test.check(count(body(pairsIR, "two"), "call ptr @minyar_choice_box(") == 1, "pairs: other callers get the choice boxed")
+let scoreBody = body(pairsIR, "score")
+test.check(count(scoreBody, "call [2 x i64] @") == 6 && count(scoreBody, "@minyar_record_take_field(") == 0 && count(scoreBody, "@.minyar.record.result.consume(") == 0, "pairs: consumed matches and is tests read the callee's registers")
+test.check(count(body(pairsIR, "describe"), "call [2 x i64] @") == 1 && count(body(pairsIR, "firstNamed"), "call [2 x i64] @") == 1, "pairs: a returned or looping match consumes its input")
+test.check(count(body(pairsIR, "kept"), "two.r(") == 0, "pairs: a match on a local keeps the record")
+fixtures.executes(frontend, pairs, "905\nn6\nn0!\nsmall 2\nsmall 4\nn3!\nfive 0\nn0\nn3\nfive 5\nn6\nn9\nfive 10\n", ["-O0", "-O2"], 0, "", true)
 test.removeTree(compiler.directory)
 print("Result try consumption: passed")
