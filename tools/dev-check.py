@@ -191,6 +191,16 @@ def parse_trace(trace, root, checks):
     checks = set(checks)
     parent, check_of_pid, exe_of_pid, root_make = {}, {}, {}, set()
     cloned_at, parsed_until = {}, {}
+    builders, goals_of_pid = set(), {}  # Make processes whose parse is covered by the rule comparison
+    def inside_check(pid):
+        seen = 0
+        while pid is not None and seen < 10000:
+            if pid in check_of_pid:
+                return True
+            pid = parent.get(pid)
+            seen += 1
+        return False
+
     # Pass 1: process tree and check roots. A check's own `make -j1 check-x` process parses the
     # Makefile first ($(wildcard), $(shell find ...), -include of .d files); those effects reach the
     # check only through Make's rules and variables, which `run` compares directly, so the parse
@@ -210,7 +220,7 @@ def parse_trace(trace, root, checks):
                 if result and int(result.group(1)) > 0:
                     parent.setdefault(int(result.group(1)), pid)
                     cloned_at.setdefault(int(result.group(1)), number)
-            elif pid in root_make and name in ("open", "openat"):
+            elif pid in builders and name in ("open", "openat"):
                 strings = STRING.findall(rest)
                 if strings:
                     path = unescape(strings[0])
@@ -221,18 +231,24 @@ def parse_trace(trace, root, checks):
                 if strings:
                     exe_of_pid.setdefault(pid, []).append(os.path.basename(unescape(strings[0])))
                     argv = [unescape(item) for item in strings[1:]]
-                    if (os.path.basename(unescape(strings[0])) == "make" and "-j1" in argv and argv
-                            and argv[-1] in checks):
-                        check_of_pid[pid] = argv[-1]
-                        root_make.add(pid)
+                    if os.path.basename(unescape(strings[0])) == "make":
+                        if "-j1" in argv and argv[-1] in checks and not inside_check(pid):
+                            check_of_pid[pid] = argv[-1]
+                            root_make.add(pid)
+                            builders.add(pid)
+                        else:
+                            goals = make_goals(argv, root)
+                            if goals is not None:
+                                builders.add(pid)
+                                goals_of_pid[pid] = goals
 
     def owner(pid):
         seen = 0
-        if pid in root_make:
-            return None  # the check's Make itself: parse and prerequisite stats
+        if pid in builders:
+            return None  # a building Make itself: parse and prerequisite stats
         while pid is not None and seen < 10000:
             up = parent.get(pid)
-            if up in root_make and cloned_at.get(pid, -1) < parsed_until.get(up, -1):
+            if up in builders and cloned_at.get(pid, -1) < parsed_until.get(up, -1):
                 return None  # spawned by $(shell ...) while Make parsed
             if pid in check_of_pid:
                 return check_of_pid[pid]
@@ -240,6 +256,11 @@ def parse_trace(trace, root, checks):
             seen += 1
         return None
 
+    goals = {name: set() for name in checks}
+    for pid, targets in goals_of_pid.items():
+        check = owner(parent.get(pid)) if parent.get(pid) is not None else None
+        if check is not None:
+            goals[check].update(targets)
     cache = {}
     reads = {name: set() for name in checks}
     listed = {name: set() for name in checks}
@@ -322,7 +343,43 @@ def parse_trace(trace, root, checks):
                 reads[check].add(relative)
             else:
                 reads[check].add(relative)
-    return reads, listed, executed
+    return reads, listed, executed, goals
+
+
+def make_goals(argv, root):
+    """Goals of a nested Make that builds in this tree, or None when its output depends on the whole
+    database (-p, -n, -q, -d, other directories or makefiles): such a Make's reads are kept."""
+    goals, skip = [], False
+    for index, item in enumerate(argv[1:]):
+        if skip:
+            skip = False
+            continue
+        if item in ("-C", "--directory"):
+            if index + 2 > len(argv) - 1 or os.path.normpath(os.path.join(root, argv[index + 2])) != root:
+                return None
+            skip = True
+            continue
+        if item.startswith(("--directory=",)) or item in ("-f", "--file", "--makefile") or item.startswith(("--file=", "--makefile=")):
+            return None
+        if item in ("-j", "-l", "-o", "-W", "-I", "--jobs", "--load-average"):
+            skip = True
+            continue
+        if item.startswith("--"):
+            if item.split("=")[0] in ("--print-data-base", "--just-print", "--dry-run", "--recon", "--question",
+                                      "--debug", "--touch", "--what-if", "--new-file", "--assume-new"):
+                return None
+            continue
+        if item.startswith("-"):
+            letters = item[1:]
+            if letters[:1] in ("j", "l") or letters[:1].isdigit():
+                continue
+            if any(letter in letters for letter in "pnqdtWo"):
+                return None
+            continue
+        if "=" in item:
+            continue
+        goals.append(item)
+    return goals or None
 
 
 # ---------------------------------------------------------------------------- helpers
@@ -441,10 +498,10 @@ def command_index(arguments):
                     untraced_pass[name] = timing["passed"]
     elif arguments.reuse_trace and trace.with_name(trace.stem + "-retry.log").exists():
         traces.append(trace.with_name(trace.stem + "-retry.log"))
-    reads, listed, executed = {name: set() for name in checks}, {name: set() for name in checks}, {name: set() for name in checks}
+    reads, listed, executed, goals = ({name: set() for name in checks} for _ in range(4))
     for item in traces:
         more = parse_trace(item, root, checks)
-        for target, extra in zip((reads, listed, executed), more):
+        for target, extra in zip((reads, listed, executed, goals), more):
             for name in checks:
                 target[name] |= extra[name]
     table, numbers = [], {}
@@ -467,6 +524,7 @@ def command_index(arguments):
             "reads": sorted(number(path) for path in reads[check]),
             "listed": sorted(number(path) for path in listed[check]),
             "executed": sorted(number(path) for path in executed[check]),
+            "goals": sorted(goals[check]),
         }
     index = {"schema": INDEX_SCHEMA, "aggregate": aggregate, "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
              "gate_wall_s": round(time.time() - started), "manifest": base, "paths": table,
@@ -649,8 +707,13 @@ def select(index, database, checks, changed, added, removed, stale):
             lists = sorted(entry["listed"] & parents)
             if lists:
                 why.append("lists " + ", ".join(lists[:3]) + " (a file was added or removed)")
+        names = closure(check)
+        for goal in (entry or {}).get("goals", []):
+            names |= closure(goal)
+        built = sorted(name for name in names & changed_set if name.startswith("build/"))
+        if built and not any(item.startswith("uses ") for item in why):
+            why.append("builds " + ", ".join(built[:3]))
         if changed_rules or changed_variables:
-            names = closure(check)
             rule_hits = sorted(names & changed_rules)
             if rule_hits:
                 why.append("make rule changed: " + ", ".join(rule_hits[:3]))
@@ -706,7 +769,10 @@ def command_run(arguments):
     database = make_database(root, aggregate)
     checks = checks_of(database, aggregate)
     prerequisites = file_prerequisites(database, checks)
-    stale, _ = stale_outputs(root, prerequisites, database)
+    phony = set(database["phony"])
+    nested = {goal for entry in index["checks"].values() for goal in entry.get("goals", [])
+              if goal not in phony and goal in database["rules"]}
+    stale, _ = stale_outputs(root, sorted(set(prerequisites) | nested), database)
     stale_build = sorted(path for path in stale if path.startswith("build/"))
     compiler = sorted(path for path in changed if path.startswith(("compiler/", "bootstrap/")))
     rebuilt = 0

@@ -42,14 +42,27 @@ def trace_attribution(tree):
         f'202 openat(AT_FDCWD, "json.min", O_RDONLY) = 7',
         f'202 openat(AT_FDCWD, "/tmp/scratch/x.min", O_RDONLY) = 8',
         f'202 openat(AT_FDCWD, "{root}/library/missing.min", O_RDONLY) = -1 ENOENT (No such file or directory)',
+        # A nested Make that builds a goal: its parse and stats are covered by the goal's rules.
+        f'202 clone(child_stack=NULL) = 203',
+        f'203 execve("/usr/bin/make", ["make", "-s", "build/minyarc"], 0x1 /* 3 vars */) = 0',
+        f'203 openat(AT_FDCWD, "Makefile", O_RDONLY) = 3',
+        f'203 openat(AT_FDCWD, "{root}/build-support/a.mk", O_RDONLY) = 3',
+        f'203 newfstatat(AT_FDCWD, "{root}/compiler/compiler.min", {{st_mode=S_IFREG}}, 0) = 0',
+        # A Make that prints its database depends on every makefile: its reads count.
+        f'202 clone(child_stack=NULL) = 204',
+        f'204 execve("/usr/bin/make", ["make", "-pnq", "FORCE"], 0x1 /* 3 vars */) = 0',
+        f'204 openat(AT_FDCWD, "{root}/build-support/b.mk", O_RDONLY) = 3',
         # A shared build outside every check is not attributed.
         f'100 clone(child_stack=NULL) = 300',
         f'300 openat(AT_FDCWD, "{root}/compiler/compiler.min", O_RDONLY) = 3',
     ]
     trace = tree / "trace.log"
     trace.write_text("\n".join(lines) + "\n")
-    reads, listed, executed = dev.parse_trace(trace, tree, ["check-a"])
+    reads, listed, executed, goals = dev.parse_trace(trace, tree, ["check-a"])
     reads, listed = reads["check-a"], listed["check-a"]
+    expect(goals["check-a"] == {"build/minyarc"}, f"nested Make goals: {goals['check-a']}")
+    expect("build-support/a.mk" not in reads and "compiler/compiler.min" not in reads, "a building Make's parse leaked")
+    expect("build-support/b.mk" in reads, "a database-printing Make must keep its makefile reads")
     expect("tests/a.min" in reads, f"fixture read missing: {sorted(reads)}")
     expect("docs/guide.md" in reads, "directory-descriptor relative open not resolved")
     expect("library/json.min" in reads, "open after chdir not resolved")
