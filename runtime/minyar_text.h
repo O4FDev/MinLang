@@ -42,6 +42,12 @@ static long long *text_search_table(const MinyarText *needle, long long availabl
                                     long long small[TEXT_SEARCH_SMALL]) {
     long long length = needle->byte_length;
     if (length <= TEXT_SEARCH_SHORT || length > available) return NULL;
+#if defined(__linux__)
+    /* text_search_next searches these with the C library's memmem, which
+     * needs no table; building one for every search of an IR line was the
+     * larger half of a self-compile's Text search time. */
+    return NULL;
+#endif
     if ((unsigned long long)length > SIZE_MAX / sizeof(long long))
         minyar_stop("the Text search pattern is too large.");
     long long *table = small;
@@ -65,7 +71,7 @@ static long long *text_search_table(const MinyarText *needle, long long availabl
     return table;
 }
 static void text_search_free(long long *table, const long long *small) {
-    if (table == small)
+    if (!table || table == small)
         return;
 #ifndef MINYAR_COMPILER_ARENA
     rc_free_data(table);
@@ -92,6 +98,19 @@ static long long text_search_next(const MinyarText *text, const MinyarText *need
         }
         return -1;
     }
+#if defined(__linux__)
+    /* The C library's memmem is vectorised and needs no table. The compiler
+     * searches a few hundred thousand short IR lines for fixed patterns, and
+     * building a table for each of those searches was a visible share of a
+     * compile; its module-wide searches over tens of megabytes gain more than
+     * the table search does. Every other target keeps the table search. */
+    {
+        const unsigned char *found =
+            memmem(text->bytes + start, (size_t)(text->byte_length - start),
+                   needle->bytes, (size_t)needle->byte_length);
+        return found ? found - text->bytes : -1;
+    }
+#endif
     for (long long i = start, matched = 0; i < text->byte_length; i++) {
         while (matched && text->bytes[i] != needle->bytes[matched]) matched = table[matched - 1];
         if (text->bytes[i] == needle->bytes[matched]) {

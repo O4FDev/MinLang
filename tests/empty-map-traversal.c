@@ -239,10 +239,9 @@ int main(int argc, char **argv) {
     free(rc_pending);
 #endif
 #else
-    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena};
-    for (size_t i = 0; i < sizeof(arenas) / sizeof(*arenas); i++) while (arenas[i]->block) {
-        MinyarArenaBlock *block = arenas[i]->block; arenas[i]->block = block->next; free(block);
-    }
+    /* The compiler arena keeps its memory in regions, so it returns them as
+     * one unit. */
+    minyar_arena_release();
 #endif
     puts("empty Map traversal: exact results, callbacks, guards, cleanup and full recovery");
 }

@@ -55,16 +55,9 @@ static void release_list(MinyarList *list) {
 
 static void cleanup(void) {
 #ifdef MINYAR_COMPILER_ARENA
-    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena};
-    for (size_t i = 0; i < sizeof(arenas) / sizeof(*arenas); ++i) {
-        MinyarArenaBlock *block = arenas[i]->block;
-        while (block) {
-            MinyarArenaBlock *next = block->next;
-            free(block);
-            block = next;
-        }
-        arenas[i]->block = NULL;
-    }
+    /* The compiler arena keeps its memory in regions, so it returns them as
+     * one unit; every program in this fixture runs in the same process. */
+    minyar_arena_release();
 #else
 #ifdef MINYAR_BOUNDED_RC
     while (rc_pending_count) assert(minyar_rc_poll(32) > 0);

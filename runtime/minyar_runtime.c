@@ -36,6 +36,7 @@
 #elif defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
 #if defined(__linux__)
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -344,17 +345,158 @@ static MinyarArena object_arena = {NULL, 1024 * 1024};
 static MinyarArena data_arena = {NULL, 1024 * 1024};
 static MinyarArena list_arena = {NULL, 1024 * 1024};
 
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+enum { ARENA_HUGE = 2 * 1024 * 1024 };
+#endif
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define MINYAR_ADDRESS_SANITIZER 1
+#endif
+#elif defined(__SANITIZE_ADDRESS__)
+#define MINYAR_ADDRESS_SANITIZER 1
+#endif
+
+#if defined(__linux__) && defined(MADV_HUGEPAGE) && !defined(MINYAR_ARENA_TRACKED_MALLOC)
+/* Linux faults every 4 KiB page of a fresh mapping separately, and a compile
+ * of a large program touches hundreds of megabytes; that fault handling is a
+ * visible share of the wall time. Blocks are cut from 2 MiB-aligned regions
+ * that ask the kernel for transparent huge pages, so one fault maps a whole
+ * huge page and consecutive blocks share those pages. A region is one
+ * mapping, returned whole by minyar_arena_release. */
+enum { ARENA_REGION_BYTES = 64 * 1024 * 1024 };
+
+#if defined(MINYAR_ADDRESS_SANITIZER)
+extern void __lsan_register_root_region(const void *begin, size_t size);
+extern void __lsan_unregister_root_region(const void *begin, size_t size);
+#endif
+
+typedef struct MinyarArenaRegion {
+    struct MinyarArenaRegion *next;
+    unsigned char *base;
+    size_t bytes;
+} MinyarArenaRegion;
+
+static MinyarArenaRegion *arena_regions;
+static unsigned char *arena_region_next;
+static size_t arena_region_left;
+
+static MINYAR_COLD int arena_region_reserve(size_t bytes) {
+    size_t chunk = bytes > ARENA_REGION_BYTES
+                       ? (bytes + ARENA_HUGE - 1) & ~(size_t)(ARENA_HUGE - 1)
+                       : (size_t)ARENA_REGION_BYTES;
+    unsigned char *raw = mmap(NULL, chunk + ARENA_HUGE, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned char *aligned;
+    MinyarArenaRegion *region;
+    size_t head, tail;
+    if (raw == MAP_FAILED)
+        return 0;
+    aligned = (unsigned char *)(((uintptr_t)raw + ARENA_HUGE - 1) & ~(uintptr_t)(ARENA_HUGE - 1));
+    head = (size_t)(aligned - raw);
+    tail = chunk + ARENA_HUGE - head - chunk;
+    if (head)
+        munmap(raw, head);
+    if (tail)
+        munmap(aligned + chunk, tail);
+    (void)madvise(aligned, chunk, MADV_HUGEPAGE);
+#if defined(MINYAR_ADDRESS_SANITIZER)
+    /* LeakSanitizer scans malloc'd memory, globals and stacks for pointers,
+     * not mapped regions. Arena blocks carry the only pointers to the large
+     * Lists' ordinary storage, so the region has to count as a root. */
+    __lsan_register_root_region(aligned, chunk);
+#endif
+    region = malloc(sizeof(*region));
+    if (!region)
+        out_of_memory();
+    region->next = arena_regions;
+    region->base = aligned;
+    region->bytes = chunk;
+    arena_regions = region;
+    arena_region_next = aligned;
+    arena_region_left = chunk;
+    return 1;
+}
+
+/* Returns the usable bytes after the block header; *allocated receives the
+ * rounded allocation size. */
+static MINYAR_COLD void *arena_block_memory(size_t bytes, size_t *allocated) {
+    if (arena_region_left < bytes && !arena_region_reserve(bytes)) {
+        void *fallback = malloc(bytes);
+        if (!fallback)
+            out_of_memory();
+        *allocated = bytes;
+        return fallback;
+    }
+    {
+        void *memory = arena_region_next;
+        arena_region_next += bytes;
+        arena_region_left -= bytes;
+        *allocated = bytes;
+        return memory;
+    }
+}
+
+/* Returns every arena's memory to the system and empties the arenas. The
+ * compiler itself never needs this: it exits. It exists for the memory
+ * fixtures, which run several compiled programs in one process and then
+ * assert that no arena memory is left. */
+void minyar_arena_release(void) {
+    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena};
+    size_t index;
+    for (index = 0; index < sizeof(arenas) / sizeof(*arenas); index++)
+        arenas[index]->block = NULL;
+    while (arena_regions) {
+        MinyarArenaRegion *next = arena_regions->next;
+#if defined(MINYAR_ADDRESS_SANITIZER)
+        __lsan_unregister_root_region(arena_regions->base, arena_regions->bytes);
+#endif
+        munmap(arena_regions->base, arena_regions->bytes);
+        free(arena_regions);
+        arena_regions = next;
+    }
+    arena_region_next = NULL;
+    arena_region_left = 0;
+}
+#else
+/* A memory harness that instruments malloc sets MINYAR_ARENA_TRACKED_MALLOC:
+ * it has to see every block, so each one is a plain allocation. */
+static MINYAR_COLD void *arena_block_memory(size_t bytes, size_t *allocated) {
+    void *memory = malloc(bytes);
+    if (!memory)
+        out_of_memory();
+    *allocated = bytes;
+    return memory;
+}
+
+void minyar_arena_release(void) {
+    MinyarArena *arenas[] = {&object_arena, &data_arena, &list_arena};
+    size_t index;
+    for (index = 0; index < sizeof(arenas) / sizeof(*arenas); index++) {
+        MinyarArenaBlock *block = arenas[index]->block;
+        while (block) {
+            MinyarArenaBlock *next = block->next;
+            free(block);
+            block = next;
+        }
+        arenas[index]->block = NULL;
+    }
+}
+#endif
+
 static MINYAR_COLD void *arena_grow(MinyarArena *arena, size_t size, size_t alignment) {
     size_t capacity = size > arena->block_size ? size : arena->block_size;
+    size_t bytes;
+    size_t allocated = 0;
     MinyarArenaBlock *block;
     if (capacity > SIZE_MAX - sizeof(*block) - alignment)
         out_of_memory();
-    block = malloc(sizeof(*block) + capacity);
-    if (!block)
-        out_of_memory();
+    bytes = (sizeof(*block) + capacity + _Alignof(max_align_t) - 1) &
+            ~(size_t)(_Alignof(max_align_t) - 1);
+    block = arena_block_memory(bytes, &allocated);
     block->next = arena->block;
     block->used = size;
-    block->capacity = capacity;
+    block->capacity = allocated - sizeof(*block);
     arena->block = block;
     return block->data;
 }
@@ -413,6 +555,40 @@ static void large_list_storage_setup(void) {
 #endif
 }
 
+#if defined(__linux__) && defined(MADV_HUGEPAGE) && !defined(MINYAR_ARENA_TRACKED_MALLOC)
+/* The token streams and the output list are the largest blocks the compiler
+ * owns: a self-compile puts about 75 MiB in them, in tens of thousands of
+ * 4 KiB pages that each fault separately. From HUGE_LIST_CAPACITY entries on,
+ * their storage is a 2 MiB-aligned mapping that asks for transparent huge
+ * pages. Growth copies and unmaps the superseded block, as the working set of
+ * a growing List is small compared with the fault saving. */
+enum { HUGE_LIST_CAPACITY = 256 * 1024 };
+#define MINYAR_HUGE_LISTS 1
+
+static MINYAR_COLD size_t huge_map_bytes(size_t bytes) {
+    return (bytes + ARENA_HUGE - 1) & ~(size_t)(ARENA_HUGE - 1);
+}
+
+static MINYAR_COLD long long *huge_list_map(size_t bytes) {
+    size_t size = huge_map_bytes(bytes);
+    unsigned char *raw = mmap(NULL, size + ARENA_HUGE, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned char *aligned;
+    size_t head, tail;
+    if (raw == MAP_FAILED)
+        out_of_memory();
+    aligned = (unsigned char *)(((uintptr_t)raw + ARENA_HUGE - 1) & ~(uintptr_t)(ARENA_HUGE - 1));
+    head = (size_t)(aligned - raw);
+    tail = size + ARENA_HUGE - head - size;
+    if (head)
+        munmap(raw, head);
+    if (tail)
+        munmap(aligned + size, tail);
+    (void)madvise(aligned, size, MADV_HUGEPAGE);
+    return (long long *)aligned;
+}
+#endif
+
 /* Moves a List's storage to room for capacity entries. Small Lists live in
  * the list arena and grow in place while they are its newest allocation. A
  * large List owns a malloc block instead: realloc grows it in place or remaps
@@ -422,6 +598,21 @@ static void large_list_storage_setup(void) {
 MINYAR_HOT long long *list_arena_resize(long long *values, long long length,
                                         long long current, long long capacity) {
     size_t size = (size_t)capacity * sizeof(*values);
+#ifdef MINYAR_HUGE_LISTS
+    if (capacity >= HUGE_LIST_CAPACITY) {
+        long long *grown = huge_list_map(size);
+        if (values) {
+            memcpy(grown, values, (size_t)length * sizeof(*values));
+            /* Small storage belongs to the list arena, which never frees;
+             * larger storage is this function's own block. */
+            if (current >= HUGE_LIST_CAPACITY)
+                munmap(values, huge_map_bytes((size_t)current * sizeof(*values)));
+            else if (current >= LARGE_LIST_CAPACITY)
+                free(values);
+        }
+        return grown;
+    }
+#endif
     if (capacity >= LARGE_LIST_CAPACITY) {
         large_list_storage_setup();
         long long *grown = realloc(current >= LARGE_LIST_CAPACITY ? values : NULL, size);
@@ -445,6 +636,14 @@ MINYAR_HOT long long *list_arena_resize(long long *values, long long length,
 void list_arena_release(MinyarList *list) {
     if (list->capacity < LARGE_LIST_CAPACITY)
         return;
+#ifdef MINYAR_HUGE_LISTS
+    if (list->capacity >= HUGE_LIST_CAPACITY) {
+        munmap(list->values, huge_map_bytes((size_t)list->capacity * sizeof(*list->values)));
+        list->values = NULL;
+        list->capacity = 0;
+        return;
+    }
+#endif
     free(list->values);
     list->values = NULL;
     list->capacity = 0;

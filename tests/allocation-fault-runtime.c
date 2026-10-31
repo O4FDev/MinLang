@@ -184,6 +184,10 @@ static void *fault_calloc(size_t count, size_t size) {
 #define realloc fault_realloc
 #define free fault_free
 #define exit fault_exit
+/* The fault allocator carries its own header in front of every payload and so
+ * cannot keep a 2 MiB alignment; take the compiler arena's blocks through it
+ * anyway, so the budget, the fault ordinals and the suffix checks see them. */
+#define MINYAR_ARENA_TRACKED_MALLOC 1
 #define MINYAR_SYSTEM_HEAP 1
 #define MINYAR_RC_TESTING 1
 #ifndef MINYAR_COMPILER_ARENA
