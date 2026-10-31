@@ -9,8 +9,9 @@ checks) in ≤ 300 s wall with the same pass/fail as a single-box gate. Command:
 - **Shard image** `252387913` (`shard-image-20261031a`): the gate boxes' provisioning (LLVM 23.1.3 + FileCheck,
   Rust, the apt set), user `agent`, no apt timers, base tree 160ab1d42 for delta syncs. Boot to SSH: 65 s.
 - **Parity of the image:** a single-box gate of int14 (160ab1d42) on a shard from the image agrees with box M's
-  recorded int14 gate on all 340 checks (both red only on the box-environment `check-determinism-runtime` and its
-  aggregate `check-portable`), 24.6 min.
+  recorded int14 gate on all 340 checks (both red only on `check-determinism-runtime` and its aggregate
+  `check-portable`), 24.6 min. That red was real, not the box: three runtime helpers were missing from the determinism
+  audit (fixed on the goal branch in 01a0bfe46, which goal/fast-tests is rebased on).
 - **`tools/fast-gate.sh`** (`tools/fast-gate/`): creates `shard-*` droplets tagged `test-shard`, sends the tree as a
   delta against the image's base, runs the tree's own `make check-in-parallel` over the full check list on every
   shard with a PATH `make` shim that finishes the checks and shared builds packed onto other shards at once
