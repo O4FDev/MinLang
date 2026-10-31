@@ -606,7 +606,11 @@ MINYAR_INLINE_ENTRY void minyar_map_set(MinyarRecord *map, long long key, long l
     size_t capacity = map_capacity(map), bucket = 0;
     if (capacity && map_recent.map == map && map_recent.key == key && !map_recent.present &&
         map_recent.epoch == map_epoch && map_recent.capacity == capacity &&
-        map_recent.bucket < capacity && !MAP_HASH(map_entries(map), map_recent.bucket)) {
+        map_recent.bucket < capacity && !MAP_HASH(map_entries(map), map_recent.bucket) &&
+        /* A Text key is a pointer: a freed key's address can hold another Text
+         * by the time the store runs, so its stored hash must still match. Equal
+         * keys always hash alike, so a match keeps this the same probe run. */
+        (kind != 2 || map_recent.hash == map_builtin_hash(2, key))) {
         /* `has` or `getOr` just found this key absent and left the empty bucket
          * its probe ended at; nothing changed the bucket array since, so this is
          * one find-or-insert: no second hash and no second probe. */

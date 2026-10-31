@@ -108,6 +108,58 @@ print(entries.has(Key { identity: 1 }))
 print(calls[1] >= 3)
 """#, "true\ntrue\n")
 
+// A `has` or `getOr` miss leaves the empty bucket its probe ended at, and the
+// store that follows inserts there instead of probing again. Fresh temporary
+// Text keys (so freed addresses get reused), a mutation between the two calls
+// and a growth between them must all leave exactly the plain path's contents.
+test.executes(compiler, #"""
+function transient(n: Integer): Map<Text, Integer> {
+    let counts: Map<Text, Integer> = Map()
+    for i in 0..n {
+        // Two one-off keys of the same size: the first is released before the
+        // second is built, so the second can land on the first one's address.
+        // The remembered bucket belongs to "a<i>", never to "b<i>".
+        if !counts.has("a\(i % 300)") { counts["b\(i % 300)"] = i }
+    }
+    return counts
+}
+function mutateBetween(m: Map<Integer, Integer>): Integer {
+    if !m.has(1) {
+        m.remove(2)
+        m[1] = 7
+    }
+    return m[1]
+}
+function growBetween(m: Map<Integer, Integer>, n: Integer): Integer {
+    if !m.has(1000) {
+        for i in 0..n { m[i] = i }
+        m[1000] = 5
+    }
+    return m[1000]
+}
+function viaGetOr(m: Map<Text, Integer>, key: Text): Integer {
+    let value = m.getOr(key, 0)
+    if value == 0 { m[key] = 11 } else { m[key] = value + 1 }
+    return m[key]
+}
+let counts = transient(2000)
+print(counts.length)
+print(counts["b0"])
+print(counts.has("a0"))
+let m = {2: 1}
+print(mutateBetween(m))
+print(m.length)
+print(m.has(2))
+let big = Map<Integer, Integer>()
+print(growBetween(big, 500))
+print(big.length)
+print(big[17])
+let texts: Map<Text, Integer> = Map()
+print(viaGetOr(texts, "a"))
+print(viaGetOr(texts, "a"))
+print(texts.length)
+"""#, "300\n1800\nfalse\n7\n1\nfalse\n5\n501\n17\n11\n12\n1\n")
+
 // Absent keys fail exactly as a read does, before the right side runs.
 stops(compiler, "function side(): Integer { print(\"side\"); return 1 }\nlet m = {1: 2}\nm[3] += side()\n", "Minyar stopped: Map key is absent.\n")
 stops(compiler, "let m = {\"a\": 2}\nm[\"b\"] += 1\n", "Minyar stopped: Map key is absent.\n")
