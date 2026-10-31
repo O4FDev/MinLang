@@ -21,6 +21,10 @@ static MINYAR_THREAD_LOCAL RcBoundedObjects rc_objects;
 #define rc_bounded_tail (rc_objects.tail)
 #define rc_bounded_active (rc_objects.active)
 #define rc_bounded_cursor (rc_objects.cursor)
+/* A record unit examines at most this many fields: it passes over fields that
+ * own nothing and visits the next owner field (or finalizes the record).
+ * Fields that own nothing share the unit with the next owner. */
+#define RC_RECORD_UNIT_FIELDS 8
 #define MINYAR_RC_RECENT_OBJECTS 1
 #define rc_bounded_recent_head (rc_objects.recent_head)
 #define rc_bounded_recent_tail (rc_objects.recent_tail)
@@ -280,11 +284,19 @@ RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t
     unsigned kind = object->ownership & 7;
     if (kind == RC_RECORD) {
         MinyarRecord *record = (MinyarRecord *)(object + 1);
-        if (q->cursor < (size_t)record->length) {
-            unsigned char *map = (unsigned char *)(record->values + record->length);
-            size_t index = q->cursor++;
-            if (map[index] & 1) rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
-            return;
+        size_t end = (size_t)record->length;
+        if (q->cursor < end) {
+            unsigned char *map = (unsigned char *)(record->values + end);
+            size_t index = q->cursor;
+            size_t limit = end - index > RC_RECORD_UNIT_FIELDS ? index + RC_RECORD_UNIT_FIELDS : end;
+            while (index < limit && !(map[index] & 1)) index++;
+            q->cursor = index;
+            if (index < end && (map[index] & 1)) {
+                q->cursor = index + 1;
+                rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
+                return;
+            }
+            if (index < end) return;
         }
     } else if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
@@ -307,11 +319,18 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit_in(RcBoundedObjects *q, siz
     if (kind == RC_RECORD) {
         MinyarRecord *record = (MinyarRecord *)(object + 1);
         size_t cursor = rc_record_saved_cursor(object);
-        if (cursor < (size_t)record->length) {
-            unsigned char *map = (unsigned char *)(record->values + record->length);
-            void *child = (map[cursor] & 1) ? (void *)(uintptr_t)record->values[cursor] : NULL;
-            rc_record_save_cursor(object, cursor + 1);
-            rc_drop_in(q, pending, child);
+        size_t end = (size_t)record->length;
+        if (cursor < end) {
+            unsigned char *map = (unsigned char *)(record->values + end);
+            size_t limit = end - cursor > RC_RECORD_UNIT_FIELDS ? cursor + RC_RECORD_UNIT_FIELDS : end;
+            while (cursor < limit && !(map[cursor] & 1)) cursor++;
+            if (cursor < end && (map[cursor] & 1)) {
+                void *child = (void *)(uintptr_t)record->values[cursor];
+                rc_record_save_cursor(object, cursor + 1);
+                rc_drop_in(q, pending, child);
+                return;
+            }
+            rc_record_save_cursor(object, cursor);
             return;
         }
         q->recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
@@ -501,9 +520,15 @@ static size_t rc_bounded_schedule(size_t budget) {
                 size_t end = q->cursor + count;
                 while (q->cursor < end) {
                     q->recent_turn ^= 1;
-                    size_t index = q->cursor++;
+                    size_t index = q->cursor;
+                    size_t limit = end - index > RC_RECORD_UNIT_FIELDS ? index + RC_RECORD_UNIT_FIELDS : end;
+                    while (index < limit && !(map[index] & 1)) index++;
+                    q->cursor = index;
+                    if (index < end && (map[index] & 1)) {
+                        q->cursor = index + 1;
+                        rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
+                    }
                     work++;
-                    if (map[index] & 1) rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
                     if (q->recent_head) break;
                 }
                 if (count) {

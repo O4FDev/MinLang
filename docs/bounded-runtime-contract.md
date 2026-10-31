@@ -124,8 +124,13 @@ batch late. Native code can do the same through `minyar_rc_poll_idle(budget)`.
 
 Let **K** be `MINYAR_RC_POLL_BUDGET`.
 `minyar_rc_poll(budget)` performs at most `min(budget, K)` queued work units
-and returns the number performed. One unit visits an object field or a
-frame/temporary owner, or finalizes a task. Releasing a visited owner may also
+and returns the number performed. One unit visits a record field or a
+frame/temporary owner, or finalizes a task: a record unit examines at most
+eight fields, passing over the ones that own nothing and visiting the next
+owner, so a record whose compared fields own nothing costs fewer units than it
+has fields. Non-owning fields still cost constant work (at most eight field
+examinations per unit); they share the unit with the next owner or with the
+record's finalization. Releasing a visited owner may also
 free one leaf, requiring at most three backing frees. Cleanup never recursively
 walks the object graph. Queue selection examines at most three queues.
 
@@ -215,7 +220,9 @@ uses at most ten bytes on the tested 64-bit ABI.
 Batching reduces scheduler overhead under specific conditions:
 
 - Contiguous List visits share the remaining budget and stop when they create
-  new recent work. A whole List never counts as one unit.
+  new recent work. A whole List never counts as one unit. Record fields share
+  one unit up to the eight-field examination limit above; the first field that
+  owns a reference, or the record's finalization, ends that unit.
 - If the last captured object is an already-visited unary record, it can be
   finalized before its recent child. This frees chains in reverse allocation
   order and delays recent service by at most one object unit. It cannot bypass

@@ -224,6 +224,11 @@ static inline int rc_bounded_traced_visit(RcObject *object, size_t cursor, int r
     return 1;
 }
 
+/* A record unit examines at most this many fields (see minyar_bounded_rc.h). */
+#ifndef RC_RECORD_UNIT_FIELDS
+#define RC_RECORD_UNIT_FIELDS 8
+#endif
+
 static MINYAR_THREAD_LOCAL RcFrame *rc_bounded_frame_head, *rc_bounded_frame_tail;
 static MINYAR_THREAD_LOCAL RcTemporaryChunk *rc_bounded_chunk_head, *rc_bounded_chunk_tail;
 static MINYAR_THREAD_LOCAL unsigned rc_bounded_next_queue;
@@ -257,11 +262,19 @@ static void rc_bounded_old_object_unit(void) {
         }
     } else if (kind == RC_RECORD) {
         MinyarRecord *record = (MinyarRecord *)(object + 1);
-        if (rc_bounded_cursor < (size_t)record->length) {
-            unsigned char *map = (unsigned char *)(record->values + record->length);
-            size_t index = rc_bounded_cursor++;
-            if (map[index] & 1) rc_drop((void *)(uintptr_t)record->values[index]);
-            return;
+        size_t end = (size_t)record->length;
+        if (rc_bounded_cursor < end) {
+            unsigned char *map = (unsigned char *)(record->values + end);
+            size_t index = rc_bounded_cursor;
+            size_t limit = end - index > RC_RECORD_UNIT_FIELDS ? index + RC_RECORD_UNIT_FIELDS : end;
+            while (index < limit && !(map[index] & 1)) index++;
+            rc_bounded_cursor = index;
+            if (index < end && (map[index] & 1)) {
+                rc_bounded_cursor = index + 1;
+                rc_drop((void *)(uintptr_t)record->values[index]);
+                return;
+            }
+            if (index < end) return;
         }
     } else if (kind == RC_TRACED && rc_bounded_traced_visit(object, rc_bounded_cursor, 0)) {
         return;
@@ -288,11 +301,18 @@ static void rc_bounded_recent_object_unit(void) {
         }
     } else if (kind == RC_RECORD) {
         MinyarRecord *record = (MinyarRecord *)(object + 1);
-        if (cursor < (size_t)record->length) {
-            unsigned char *map = (unsigned char *)(record->values + record->length);
-            void *child = (map[cursor] & 1) ? (void *)(uintptr_t)record->values[cursor] : NULL;
-            rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop(child);
+        size_t end = (size_t)record->length;
+        if (cursor < end) {
+            unsigned char *map = (unsigned char *)(record->values + end);
+            size_t limit = end - cursor > RC_RECORD_UNIT_FIELDS ? cursor + RC_RECORD_UNIT_FIELDS : end;
+            while (cursor < limit && !(map[cursor] & 1)) cursor++;
+            if (cursor < end && (map[cursor] & 1)) {
+                void *child = (void *)(uintptr_t)record->values[cursor];
+                rc_bounded_save_cursor(object, cursor + 1);
+                rc_drop(child);
+                return;
+            }
+            rc_bounded_save_cursor(object, cursor);
             return;
         }
     } else if (kind == RC_TRACED && rc_bounded_traced_visit(object, cursor, 1)) {
