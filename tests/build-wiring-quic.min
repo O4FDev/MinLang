@@ -109,6 +109,10 @@ function rfcProbe(w: wire.Wiring, fragment: Text, frontends: List<Text>, inputs:
     let native = "check-quic-rfc"
     let sanitize = "check-quic-rfc-sanitize"
     let c = wire.checks()
+    let pieces = ["check-quic-rfc-o0-migration", "check-quic-rfc-o0-cipher", "check-quic-rfc-o0-network",
+        "check-quic-rfc-o2-migration", "check-quic-rfc-o2-cipher", "check-quic-rfc-o2-network",
+        "check-quic-rfc-sanitize-o0-migration", "check-quic-rfc-sanitize-o0-cipher", "check-quic-rfc-sanitize-o0-network",
+        "check-quic-rfc-sanitize-o2-migration", "check-quic-rfc-sanitize-o2-cipher", "check-quic-rfc-sanitize-o2-network"]
     let fixtures = wire.sorted(wire.union(wire.union(frontends, inputs), ["build", "build/tooling/tests/quic-protocol-artifacts"]))
     let makefile = stubbed(w, "QUIC RFC Make rules ", fragment, fixtures, "\t@echo INPUT $@")
     let result = wire.make(w, ["-rRnp", "-f", makefile, native, sanitize], wire.environment("", []), "")
@@ -117,15 +121,33 @@ function rfcProbe(w: wire.Wiring, fragment: Text, frontends: List<Text>, inputs:
     for gate in ["check", "check-portable", "check-quic"] { wire.ensure(c, wire.has(wire.deps(database, gate), native), gate) }
     for gate in ["check-sanitize", "check-quic-sanitize"] { wire.ensure(c, wire.has(wire.deps(database, gate), sanitize), gate) }
     for target in [native, sanitize] { wire.ensure(c, wire.subset(wire.union(frontends, inputs), wire.deps(database, target)), target + " inputs") }
+    for index in 0..6 {
+        wire.ensure(c, wire.has(wire.deps(database, native), pieces[index]), native + " piece " + pieces[index])
+        wire.ensure(c, wire.has(wire.deps(database, sanitize), pieces[index + 6]), sanitize + " piece " + pieces[index + 6])
+    }
     let commands = wire.dryRunCommands(result.output)
-    wire.ensure(c, wire.count(commands, "./build/tooling/tests/quic-rfc --optimization") == 2, "RFC commands")
-    wire.ensure(c, wire.count(commands, "--optimization both") == 2, "both optimizations")
-    wire.ensure(c, wire.count(commands, "--sanitize") == 1, "RFC sanitizer")
-    wire.ensure(c, wire.count(commands, "mktemp -d \"") == 3, "artifact directories")
-    wire.ensure(c, wire.count(commands, "--artifacts \"$artifacts/run\"") == 3, "artifact leaves")
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/quic-rfc --optimization") == 12, "RFC commands")
+    for level in ["0", "2"] { wire.ensure(c, wire.count(commands, "--optimization " + level) == 6, "optimization " + level) }
+    wire.ensure(c, !wire.contains(commands, "--optimization both"), "aggregate optimization")
+    for driver in ["migration", "cipher", "local,vn"] { wire.ensure(c, wire.count(commands, "--drivers " + driver) == 4, driver + " drivers") }
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/quic-rfc-harness") == 12, "RFC harnesses")
+    wire.ensure(c, wire.count(commands, "--sanitize") == 6, "RFC sanitizer")
+    wire.ensure(c, wire.count(commands, "mktemp -d \"") == 13, "artifact directories")
+    wire.ensure(c, wire.count(commands, "--artifacts \"$artifacts/run\"") == 13, "artifact leaves")
+    let gateLines = wire.linesContaining(commands, "./build/tooling/tests/quic-rfc --optimization")
+    wire.ensure(c, gateLines.length == 12, "one command per piece")
+    let networkPorts: List<Text> = []
+    for line in gateLines {
+        if wire.contains(line, "--drivers local,vn") {
+            for port in ["44320", "44330", "44340", "44350"] { if wire.contains(line, "MINYAR_QUIC_RFC_PORT=" + port) { networkPorts.add(port) } }
+        }
+    }
+    wire.ensure(c, networkPorts.length == 4 && wire.union(networkPorts, []).length == 4, "network pieces reserve distinct ports")
     wire.ensure(c, !wire.contains(commands, "--case "), "case filter")
     wire.ensure(c, !wire.contains(commands, "--expect-old-code"), "old code oracle")
-    for suffix in ["native", "sanitize"] { wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/quic-rfc-" + suffix), "absolute " + suffix) }
+    let absolute = wire.replaceAll(commands, "\\", "/")
+    for suffix in ["native", "sanitize"] { wire.ensure(c, wire.contains(absolute, w.root + "/build/quic-rfc-" + suffix), "absolute " + suffix) }
+    wire.ensure(c, wire.count(absolute, w.root + "/build/quic-rfc-") == 12, "absolute piece artifacts")
     return wire.failure(c)
 }
 public function test_quic_rfc_gates_keep_all_drivers_and_public_frontends(w: wire.Wiring) {
@@ -152,8 +174,8 @@ public function test_quic_rfc_gates_keep_all_drivers_and_public_frontends(w: wir
         wire.check(mutant != source, "RFC dependency listed " + dependency)
         wire.refuse(w, rfcProbe(w, mutant, frontends, inputs), "missing dependency " + dependency)
     }
-    let olds = ["--optimization both", "--sanitize --artifacts", "--optimization both", "--optimization both", "$(abspath build)/quic-rfc-"]
-    let news = ["--optimization 0", "--artifacts", "--optimization both --case migration-cid", "--optimization both --expect-old-code", "build/quic-rfc-"]
+    let olds = ["--optimization 0 --drivers migration", "--sanitize --artifacts", "--drivers local,vn --sanitize", "--drivers local,vn", "$(abspath build)/quic-rfc-"]
+    let news = ["--optimization both --drivers migration", "--artifacts", "--drivers local,vn --case migration-cid --sanitize", "--drivers vn", "build/quic-rfc-"]
     for index in 0..olds.length {
         let mutant = wire.replaceFirst(source, olds[index], news[index])
         wire.check(mutant != source, "RFC mutation applies " + news[index])

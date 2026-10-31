@@ -35,6 +35,21 @@ public function driverSymbol(kind: Text): Text {
     if kind == "local" { return "CASES" }
     return ""
 }
+// Only the binaries the selected drivers execute themselves are built: the
+// evidence checks bind every driver to the binary it actually ran.
+public function requiredBinaries(drivers: List<Text>): List<Text> {
+    let result: List<Text> = []
+    for name in binaryNames() {
+        let needed = false
+        for kind in drivers {
+            if kind == name { needed = true }
+            if kind == "local" && (name == "client" || name == "server") { needed = true }
+            if kind == "vn" && name == "server" { needed = true }
+        }
+        if needed { result.add(name) }
+    }
+    return result
+}
 public function nativeSupport(): List<Text> { return ["tests/quic-protocol-support.min", "tests/quic-test-support.min", "tools/testing.min", "tests/quic-json.min"] }
 public function endpointSource(): Text { return "tests/interop/qns/endpoint.min" }
 public function binary(binaries: Binaries, name: Text): Text {
@@ -998,7 +1013,7 @@ function failGate(gate: Gate, message: Text): Text {
     set(gate.report, "error", data.object(["type", "message"], [data.string("ValueError"), data.string(message)]))
     return message
 }
-function body(gate: Gate, sanitize: Boolean, before: Snapshot, tools: List<Tool>): Text {
+function body(gate: Gate, sanitize: Boolean, before: Snapshot, tools: List<Tool>, optimizations: List<Text>, drivers: List<Text>): Text {
     let context = gate.context
     if fault("snapshot") { return "original snapshot" }
     if before.error != "" { return before.error }
@@ -1071,12 +1086,13 @@ function body(gate: Gate, sanitize: Boolean, before: Snapshot, tools: List<Tool>
         tools.add(Tool { name: kind + "-driver"; source: copied.rows[0].source; before: copied.rows[0].before })
     }
     set(gate.report, "external_tools", data.object(toolKeys, toolRows))
-    for optimization in ["0", "2"] {
+    let binariesNeeded = requiredBinaries(drivers)
+    for optimization in optimizations {
         let flags = quic.joined(requestedFlags(optimization, sanitize), " ")
         let mode = environment
         for name in ["MINYAR_CLANG_FLAGS", "MINYAR_NATIVE_FLAGS", "MINYAR_RUNTIME_FLAGS"] { mode = quic.setting(mode, name, flags) }
         let paths: List<Text> = []
-        for name in binaryNames() {
+        for name in binariesNeeded {
             let output = gate.directory + "/" + name + "-O" + optimization
             let link = gate.directory + "/link-" + name + "-O" + optimization
             let built = run(gate, "build-" + name + "-O" + optimization, [context.root + "/minyar", "--library", context.root + "/library", context.root + "/" + binarySource(name), "-o", output],
@@ -1087,8 +1103,8 @@ function body(gate: Gate, sanitize: Boolean, before: Snapshot, tools: List<Tool>
             if checked != "" { return checked }
             append(gate.report, "links", data.object(["name", "optimization", "manifest"], [data.string(name), data.string(optimization), data.decode(io.readBytesFile(link + "/manifest.json"))]))
         }
-        let binaries = Binaries { names: binaryNames(); paths: paths }
-        for kind in driverKinds() {
+        let binaries = Binaries { names: binariesNeeded; paths: paths }
+        for kind in drivers {
             let child = gate.directory + "/driver-" + kind + "-O" + optimization
             let command = [driverTool(context, kind)]
             if kind == "migration" || kind == "cipher" { command.add("--binary"); command.add(binary(binaries, kind)) }
@@ -1120,19 +1136,19 @@ function body(gate: Gate, sanitize: Boolean, before: Snapshot, tools: List<Tool>
     }
     return ""
 }
-public function runGate(context: Context, directory: Text, sanitize: Boolean, sourceCommit: Text): Integer {
+public function runGate(context: Context, directory: Text, sanitize: Boolean, sourceCommit: Text, optimizations: List<Text>, drivers: List<Text>): Integer {
     let commit = data.none()
     if sourceCommit != "" { commit = data.string(sourceCommit) }
     let platform = shell(context, "uname -srm", [])
     let report = Report { value: data.object(["schema_version", "passed", "sanitize", "optimization", "platform", "source_commit", "source_before", "source_copies", "frontends", "external_tools", "commands", "links", "drivers", "retention_errors", "runtime_scope"],
-        [data.number(1), data.boolean(false), data.boolean(sanitize), data.strings(["0", "2"]), data.string(quic.joined(test.lines(platform.output), " ")), commit, data.object([], []), data.object([], []),
+        [data.number(1), data.boolean(false), data.boolean(sanitize), data.strings(optimizations), data.string(quic.joined(test.lines(platform.output), " ")), commit, data.object([], []), data.object([], []),
         data.object([], []), data.object([], []), data.array([]), data.array([]), data.array([]), data.array([]), data.string("Observed native link object; compile count is not independently measured.")]) }
     let state = Gate { context: context; directory: directory; report: report; environment: system.environment(); serial: 0 }
     writeReport(directory, report, false)
     let tools: List<Tool> = []
     let before = Snapshot { names: []; hashes: []; error: "" }
     if !fault("snapshot") { before = snapshotInputs(context) }
-    let error = body(state, sanitize, before, tools)
+    let error = body(state, sanitize, before, tools, optimizations, drivers)
     if error != "" { failGate(state, error) }
     let after = snapshotInputs(context)
     if after.error != "" { retentionError(report, "source-after", after.error) }
@@ -1181,12 +1197,26 @@ public function runGate(context: Context, directory: Text, sanitize: Boolean, so
 public function main(): Integer {
     let sanitize = false
     let directory = ""
+    let optimizations = ["0", "2"]
+    let drivers = driverKinds()
     let index = 0
     while index < processInfo.argumentCount() {
         let name = processInfo.argument(index)
         if name == "--sanitize" { sanitize = true; index += 1; continue }
         test.check(index + 1 < processInfo.argumentCount(), "missing option value: " + name)
-        if name == "--optimization" { test.check(processInfo.argument(index + 1) == "both", "invalid optimization: " + processInfo.argument(index + 1)) }
+        if name == "--optimization" {
+            let level = processInfo.argument(index + 1)
+            test.check(level == "both" || level == "0" || level == "2", "invalid optimization: " + level)
+            if level == "both" { optimizations = ["0", "2"] } else { optimizations = [level] }
+        }
+        else if name == "--drivers" {
+            let wanted = quic.split(processInfo.argument(index + 1), 44)
+            let selected: List<Text> = []
+            for kind in driverKinds() { if hasText(wanted, kind) { selected.add(kind) } }
+            for kind in wanted { test.check(hasText(driverKinds(), kind), "invalid driver: " + kind) }
+            test.check(selected.length > 0, "no drivers selected")
+            drivers = selected
+        }
         else if name == "--artifacts" { directory = processInfo.argument(index + 1) }
         else { fail("unknown option: " + name) }
         index += 2
@@ -1199,7 +1229,7 @@ public function main(): Integer {
     let configured = system.getenv("MINYAR_QUIC_RFC_PORT")
     if configured != "" { port = Integer(configured) }
     let context = Context { root: quic.root(); scratch: scratch; port: port; windows: false }
-    let status = runGate(context, resolved(context, directory), sanitize, system.getenv("MINYAR_SOURCE_COMMIT"))
+    let status = runGate(context, resolved(context, directory), sanitize, system.getenv("MINYAR_SOURCE_COMMIT"), optimizations, drivers)
     test.removeTree(scratch)
     return status
 }
