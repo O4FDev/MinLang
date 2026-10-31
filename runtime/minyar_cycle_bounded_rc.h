@@ -256,9 +256,13 @@ static void rc_bounded_old_object_unit(void) {
     } else if (kind == RC_TRACED && rc_bounded_traced_visit(object, rc_bounded_cursor, 0)) {
         return;
     }
-    rc_bounded_finish_object(object, kind);
+    /* A Text task can hold a shared backing (a Text view of frozen storage).
+     * finish returns that backing instead of freeing it; release it here, so a
+     * queued view task cannot drop an owning root on the floor. */
+    void *backing = rc_bounded_finish_object(object, kind);
     rc_pending_count--;
     rc_bounded_active = NULL;
+    if (backing) rc_drop(backing);
 }
 
 /* A recent task remains linked while visiting its next owner. Saving the
@@ -290,8 +294,9 @@ static void rc_bounded_recent_object_unit(void) {
     }
     rc_bounded_recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
     if (!rc_bounded_recent_head) rc_bounded_recent_tail = NULL;
-    rc_bounded_finish_object(object, kind);
+    void *backing = rc_bounded_finish_object(object, kind);
     rc_pending_count--;
+    if (backing) rc_drop(backing);
 }
 
 /* Reserve alternating object units for the oldest finite batch. Whenever that

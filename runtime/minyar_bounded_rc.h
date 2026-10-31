@@ -283,9 +283,13 @@ RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t
             return;
         }
     }
-    rc_bounded_finish_object(object, kind);
+    /* A Text task can hold a shared backing (a Text view of frozen storage).
+     * finish returns that backing instead of freeing it; release it here, so a
+     * queued view task cannot drop an owning root on the floor. */
+    void *backing = rc_bounded_finish_object(object, kind);
     --*pending;
     q->active = NULL;
+    if (backing) rc_drop_in(q, pending, backing);
 }
 
 /* A recent task remains linked while visiting its next owner. Saving the
@@ -322,8 +326,9 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit_in(RcBoundedObjects *q, siz
     }
     q->recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
     if (!q->recent_head) q->recent_tail = NULL;
-    rc_bounded_finish_object(object, kind);
+    void *backing = rc_bounded_finish_object(object, kind);
     --*pending;
+    if (backing) rc_drop_in(q, pending, backing);
 }
 
 /* Reserve alternating object units for the oldest finite batch. Whenever that

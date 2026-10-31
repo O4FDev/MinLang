@@ -2062,7 +2062,12 @@ before they return.
   `getUInt32`, `getInt64`, `getFloat32`, `getFloat64`; reads are inline and
   checked, like Bytes reads); `freezeBytesTake` moves
   the buffer instead, leaving the original empty, and `copyFrozenBytes` makes an
-  ordinary Bytes copy.
+  ordinary Bytes copy. `use "frozen" as frozen` turns a byte range of that
+  shared buffer into `Result<Text, errors.Error>` with `frozen.decode(source,
+  start, end)` without copying it: one validating pass, exactly like
+  `text.decode`, and the Text view keeps the frozen buffer alive. A range that
+  splits a character is not UTF-8 on its own and is an invalid-data error;
+  positions outside the buffer stop.
 - `bytesChannel(maxBytes, maxMessages)` is a bounded queue that any number of
   threads may send to and receive from. `sendBytes(channel, bytes)` moves the
   buffer into the queue (the sender's Bytes become empty) and waits for room;
