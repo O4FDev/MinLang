@@ -1,3 +1,28 @@
+# DECISION FOR LUKE — opt-in `region { … }` block (c5 measured a 29–76% Ir ceiling on parse-then-drop programs)
+```minyar
+// before (today): every node of `tree` is freed object by object through the bounded cleanup scheduler
+for line in lines {
+    let tree = parse(line)
+    total = total + eval(tree)
+}
+
+// after (proposed): everything allocated inside the block is freed in one step when the block exits
+for line in lines {
+    region {
+        let tree = parse(line)
+        total = total + eval(tree)   // `total` is an Integer, so nothing escapes
+    }
+}
+// letting a region value escape is a compile error, e.g. `results.add(tree)` inside the block:
+//   error: `tree` was allocated in a region and cannot outlive it
+```
+What it costs the user: one new keyword; code that wants the speed must say `region`; values cannot leave the block.
+What it buys: no per-object teardown for the region's allocations (measured ceiling −29% to −76% instructions).
+Bounded pauses: the region exit is allocator work (page frees), outside the cleanup unit budget — the contract would need a
+sentence saying so. Status: mechanism prototyped on `goal/cake-c5` (opt-in env flag); not merged; awaiting your call.
+
+---
+
 # Minyar goal status (2026-10-31 20:25 UTC — end of the cake swarm window; boxes D/F/G/H–O deleted at 21:30)
 
 ## NEXT SESSION — first merge batch (unmerged wins, with branches)
