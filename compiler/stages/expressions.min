@@ -424,18 +424,41 @@ function splitBracketEnd(tokenKinds: List<Integer>, tokenTexts: List<Text>, open
 // position (`name[index]` or `name.length`). A shadow, a whole-List use and an
 // element store keep the ordinary split. A read may sit in a nested block: it
 // re-derives its own piece from the receiver, so it needs nothing else alive.
+//
+// A read that scans the receiver from its start is linear in the pieces, so a
+// binding with one or two reads whose read sits in a loop would cost O(n) per
+// iteration while the List costs that once: those keep the List (a loop watch
+// is exact, `for`/`while` braces nest normally). Three reads build a range
+// index, whose reads are constant time, so they may sit in loops.
 function splitUsesArePieces(tokenKinds: List<Integer>, tokenTexts: List<Text>, name: Text, start: Integer): Integer {
     let depth = 0
     let reads = 0
     let index = start
+    // Open loop-brace depths as a manual stack: stage0 has no List.removeAt.
+    let loops: List<Integer> = []
+    let loopTop = 0
+    let loopAfter = -1
+    let loopReads = 0
     while index < tokenKinds.length {
         if tokenKinds[index] == 0 { return -1 }
+        if tokenKinds[index] == 1 && (tokenTexts[index] == "for" || tokenTexts[index] == "while") { loopAfter = depth }
         if tokenKinds[index] == 4 {
             let token = tokenTexts[index]
             if token == "{" {
+                if loopAfter == depth {
+                    if loopTop < loops.length { loops[loopTop] = depth + 1 } else { loops.add(depth + 1) }
+                    loopTop = loopTop + 1
+                    loopAfter = -1
+                }
                 depth = depth + 1
             } else if token == "}" {
-                if depth == 0 { return reads }
+                if depth == 0 {
+                    // One or two reads that sit in a loop: a scan per read
+                    // would repeat every iteration, so keep the List there.
+                    if reads < 3 && loopReads > 0 { return -1 }
+                    return reads
+                }
+                if loopTop > 0 && loops[loopTop - 1] == depth { loopTop = loopTop - 1 }
                 depth = depth - 1
             }
         }
@@ -448,9 +471,11 @@ function splitUsesArePieces(tokenKinds: List<Integer>, tokenTexts: List<Text>, n
                 if after < tokenKinds.length && tokenKinds[after] == 4 && isAssignmentOperator(tokenTexts[after]) { return -1 }
                 index = after - 1
                 reads = reads + 1
+                if loopTop > 0 { loopReads = loopReads + 1 }
             } else if tokenKinds[next] == 4 && tokenTexts[next] == "." && tokenKinds[next + 1] == 1 && tokenTexts[next + 1] == "length" && !(tokenKinds[next + 2] == 4 && (tokenTexts[next + 2] == "(" || isAssignmentOperator(tokenTexts[next + 2]))) {
                 index = next + 1
                 reads = reads + 1
+                if loopTop > 0 { loopReads = loopReads + 1 }
             } else {
                 return -1
             }

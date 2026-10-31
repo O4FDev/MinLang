@@ -733,5 +733,63 @@ test.check(test.contains(keptByReturn, "@minyar_text_split_at(") && !test.contai
 let sortedBody = functionBody(pieceLLVM, "sorted")
 test.check(test.contains(sortedBody, "@minyar_text_split("), "a whole-List use keeps the split's List")
 
+// A position read that sits in a loop scans the receiver from its start, so a
+// line read by a loop of positions would cost one scan per iteration. Those
+// bindings keep the ordinary List, which is built once; the same reads outside
+// a loop (one execution) may compute their piece.
+fixtures.executes(frontend, #"""
+    function forward(line: Text): Integer {
+        let fields = line.split(",")
+        let total = 0
+        let index = 0
+        while index < fields.length {
+            total += Integer(fields[index])
+            index += 1
+        }
+        return total
+    }
+    function reverse(line: Text): Integer {
+        let fields = line.split(",")
+        let total = 0
+        let index = fields.length
+        while index > 0 {
+            index -= 1
+            total += Integer(fields[index])
+        }
+        return total
+    }
+    function scattered(line: Text, positions: List<Integer>): Integer {
+        let fields = line.split(",")
+        let total = 0
+        for position in positions { total += Integer(fields[position]) }
+        return total
+    }
+    function once(line: Text, position: Integer): Integer {
+        let fields = line.split(",")
+        return Integer(fields[position])
+    }
+    function build(count: Integer): Text {
+        let parts: List<Text> = []
+        for index in 0..count { parts.add(Text(index)) }
+        return joinText(parts, ",")
+    }
+    let long = build(5000)
+    print(forward(long))
+    print(reverse(long))
+    print(scattered(long, [0, 4999, 2500, 3]))
+    print(once(long, 4999))
+    print(once("a,7,z", 1))
+    """#, "12497500\n12497500\n7502\n4999\n7\n", levels, 0, "", true)
+let loopPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let loopLLVM = io.readTextFile(loopPath + ".ll")
+let forwardBody = functionBody(loopLLVM, "forward")
+test.check(test.contains(forwardBody, "@minyar_text_split(") && test.contains(forwardBody, "@.minyar.list.get.checked("), "a position read inside a loop keeps the List built once")
+let reverseBody = functionBody(loopLLVM, "reverse")
+test.check(test.contains(reverseBody, "@minyar_text_split("), "a reverse position loop keeps the List built once")
+let scatteredBody = functionBody(loopLLVM, "scattered")
+test.check(test.contains(scatteredBody, "@minyar_text_split("), "scattered positions in a loop keep the List built once")
+let onceBody = functionBody(loopLLVM, "once")
+test.check(!test.contains(onceBody, "@minyar_text_split(") && test.contains(onceBody, "@minyar_text_split_integer("), "one position read outside a loop parses its piece in place")
+
 test.removeTree(frontend.compiler.directory)
 print("Text scanning: passed")
