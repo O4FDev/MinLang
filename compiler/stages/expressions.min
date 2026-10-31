@@ -355,6 +355,7 @@ function resetSplitBindings(context: CompilerContext) {
     splits.ids.clear()
     splits.texts.clear()
     splits.separators.clear()
+    splits.modes.clear()
     splits.pending = -1
     splits.pieces.clear()
     splits.pieceCalls.clear()
@@ -362,6 +363,7 @@ function resetSplitBindings(context: CompilerContext) {
     splits.pieceTexts.clear()
     splits.pieceSeparators.clear()
     splits.piecePositions.clear()
+    splits.pieceModes.clear()
 }
 
 // The binding for a local id, or -1. Forgetting a binding sets its id to -1.
@@ -401,40 +403,43 @@ function splitBracketEnd(tokenKinds: List<Integer>, tokenTexts: List<Text>, open
 // position (`name[index]` or `name.length`). A shadow, a whole-List use and an
 // element store keep the ordinary split. A read may sit in a nested block: it
 // re-derives its own piece from the receiver, so it needs nothing else alive.
-function splitUsesArePieces(tokenKinds: List<Integer>, tokenTexts: List<Text>, name: Text, start: Integer): Boolean {
+function splitUsesArePieces(tokenKinds: List<Integer>, tokenTexts: List<Text>, name: Text, start: Integer): Integer {
     let depth = 0
+    let reads = 0
     let index = start
     while index < tokenKinds.length {
-        if tokenKinds[index] == 0 { return false }
+        if tokenKinds[index] == 0 { return -1 }
         if tokenKinds[index] == 4 {
             let token = tokenTexts[index]
             if token == "{" {
                 depth = depth + 1
             } else if token == "}" {
-                if depth == 0 { return true }
+                if depth == 0 { return reads }
                 depth = depth - 1
             }
         }
         if tokenKinds[index] == 1 && tokenTexts[index] == name && !(index > 0 && tokenKinds[index - 1] == 4 && tokenTexts[index - 1] == ".") {
-            if index > 0 && (tokenTexts[index - 1] == "let" || tokenTexts[index - 1] == "for") { return false }
+            if index > 0 && (tokenTexts[index - 1] == "let" || tokenTexts[index - 1] == "for") { return -1 }
             let next = index + 1
             if tokenKinds[next] == 4 && tokenTexts[next] == "[" {
                 let after = splitBracketEnd(tokenKinds, tokenTexts, next)
-                if after < 0 { return false }
-                if after < tokenKinds.length && tokenKinds[after] == 4 && isAssignmentOperator(tokenTexts[after]) { return false }
+                if after < 0 { return -1 }
+                if after < tokenKinds.length && tokenKinds[after] == 4 && isAssignmentOperator(tokenTexts[after]) { return -1 }
                 index = after - 1
+                reads = reads + 1
             } else if tokenKinds[next] == 4 && tokenTexts[next] == "." && tokenKinds[next + 1] == 1 && tokenTexts[next + 1] == "length" && !(tokenKinds[next + 2] == 4 && (tokenTexts[next + 2] == "(" || isAssignmentOperator(tokenTexts[next + 2]))) {
                 index = next + 1
+                reads = reads + 1
             } else {
-                return false
+                return -1
             }
         }
         // A parallel body moves to a worker function: a value from here is not
         // in its scope, so the receiver could not outlive the read.
-        if tokenKinds[index] == 1 && tokenTexts[index] == "parallel" { return false }
+        if tokenKinds[index] == 1 && tokenTexts[index] == "parallel" { return -1 }
         index = index + 1
     }
-    return false
+    return -1
 }
 
 // Where the `minyar_text_split` call that produced `value` sits, or -1.
@@ -454,25 +459,42 @@ function splitCallStart(output: List<Text>, value: Text): Integer {
 // `let name = receiver.split(separator)`, where the pieces are read only by
 // position: drop the call and remember the receiver and separator instead.
 // `start` is the first token of the initializer, `end` the first after it.
-function deferSplitBinding(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>, name: Text, id: Integer, value: Text, start: Integer, end: Integer): Boolean {
-    if recoveryEnabled(state) { return false }
+// 0 when the binding keeps its List, 1 when it becomes a range index (the
+// value exists and is stored), 2 when each read scans for its piece (the call
+// is gone, so the binding stores nothing).
+function deferSplitBinding(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>, globals: List<Text>, name: Text, id: Integer, value: Text, start: Integer, end: Integer): Integer {
+    if recoveryEnabled(state) { return 0 }
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
-    if tokenKinds[start] != 1 || tokenTexts[start + 1] != "." || tokenTexts[start + 2] != "split" || tokenTexts[start + 3] != "(" { return false }
-    if tokenTexts[end - 1] != ")" { return false }
-    if splitBracketEnd(tokenKinds, tokenTexts, start + 3) != end { return false }
+    if tokenKinds[start] != 1 || tokenTexts[start + 1] != "." || tokenTexts[start + 2] != "split" || tokenTexts[start + 3] != "(" { return 0 }
+    if tokenTexts[end - 1] != ")" { return 0 }
+    if splitBracketEnd(tokenKinds, tokenTexts, start + 3) != end { return 0 }
     // One byte is found by a word test. A longer separator would rescan the
     // receiver with a search loop on every read, so it keeps the List.
-    if end != start + 6 || tokenKinds[start + 4] != 3 || tokenTexts[start + 4].byteLength != 1 { return false }
+    if end != start + 6 || tokenKinds[start + 4] != 3 || tokenTexts[start + 4].byteLength != 1 { return 0 }
     let receiverName = tokenTexts[start]
     let local = findLocal(localNames, localLengths, state, receiverName)
     // A parameter's local is an SSA value, and a captured binding cannot be
     // reassigned either: both outlive every read in this block.
-    if local < 0 || localTypes[local] != 2 { return false }
-    if blockAssignsName(tokenKinds, tokenTexts, end, receiverName) { return false }
-    if !splitUsesArePieces(tokenKinds, tokenTexts, name, end) { return false }
+    if local < 0 || localTypes[local] != 2 { return 0 }
+    if blockAssignsName(tokenKinds, tokenTexts, end, receiverName) { return 0 }
+    let reads = splitUsesArePieces(tokenKinds, tokenTexts, name, end)
+    if reads < 0 { return 0 }
     let call = splitCallStart(output, value)
-    if call < 0 { return false }
+    if call < 0 { return 0 }
+    context.splits.ids.add(id)
+    if reads >= 3 {
+        // Three or more reads: one scan builds the piece-range index, and each
+        // read is a lookup.
+        output[call + 3] = "minyar_text_split_index"
+        appendTextRuntimeDeclaration(globals, "minyar_text_split_index", 2, [2, 2])
+        context.splits.texts.add(value)
+        context.splits.separators.add("")
+        context.splits.modes.add(1)
+        return 1
+    }
+    // One or two reads: no object at all. Drop the call and the count it held,
+    // and let each read find its piece from the receiver's start.
     let receiver = output[call + 6]
     let separator = output[call + 9]
     let pieces = 11
@@ -481,10 +503,10 @@ function deferSplitBinding(context: CompilerContext, localNames: List<Text>, loc
         if state[7] > 0 { state[7] = state[7] - 1 }
     }
     clearPieces(output, call, call + pieces)
-    context.splits.ids.add(id)
     context.splits.texts.add(receiver)
     context.splits.separators.add(separator)
-    return true
+    context.splits.modes.add(0)
+    return 2
 }
 
 // `name[index]`: one piece, computed in place, without the List.
@@ -500,11 +522,19 @@ function splitPieceRead(context: CompilerContext, localNames: List<Text>, localT
     let position = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
     expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
     if positionType[0] != 1 { requireContextType(context, positionLocation, positionType[0], 1, "a position must be an Integer") }
-    appendTextRuntimeDeclaration(globals, "minyar_text_split_at", 2, [2, 2, 1])
     let call = output.length
-    let arguments: List<Text> = [context.splits.texts[binding], context.splits.separators[binding], position]
-    let types: List<Integer> = [2, 2, 1]
-    let piece = emitCall(output, textState, state, 2, "minyar_text_split_at", arguments, types)
+    let piece = ""
+    if context.splits.modes[binding] != 0 {
+        appendTextRuntimeDeclaration(globals, "minyar_text_split_index_at", 2, [2, 1])
+        let arguments: List<Text> = [context.splits.texts[binding], position]
+        let types: List<Integer> = [2, 1]
+        piece = emitCall(output, textState, state, 2, "minyar_text_split_index_at", arguments, types)
+    } else {
+        appendTextRuntimeDeclaration(globals, "minyar_text_split_at", 2, [2, 2, 1])
+        let arguments: List<Text> = [context.splits.texts[binding], context.splits.separators[binding], position]
+        let types: List<Integer> = [2, 2, 1]
+        piece = emitCall(output, textState, state, 2, "minyar_text_split_at", arguments, types)
+    }
     setType(resultType, 2)
     ownResult(output, state, piece, resultType)
     let owner = -1
@@ -515,6 +545,7 @@ function splitPieceRead(context: CompilerContext, localNames: List<Text>, localT
     context.splits.pieceTexts.add(context.splits.texts[binding])
     context.splits.pieceSeparators.add(context.splits.separators[binding])
     context.splits.piecePositions.add(position)
+    context.splits.pieceModes.add(context.splits.modes[binding])
     return piece
 }
 
@@ -528,16 +559,20 @@ function splitMaterialise(context: CompilerContext, localNames: List<Text>, loca
     let local = 0
     while local < state[3] && localIds[local] != id { local = local + 1 }
     let type = localTypes[local]
-    let text = context.splits.texts[binding]
-    let separator = context.splits.separators[binding]
-    appendTextRuntimeDeclaration(globals, "minyar_text_split", 2, [2, 2])
-    let arguments: List<Text> = [text, separator]
-    let types: List<Integer> = [2, 2]
-    let list = emitCall(output, textState, state, type, "minyar_text_split", arguments, types)
-    let valueType: List<Integer> = [type, keepReference(output, state, list, type)]
-    assignReference(output, state, id, list, valueType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
-    storeLocal(output, id, type, list)
-    context.splits.ids[binding] = -1
+    let list = ""
+    if context.splits.modes[binding] != 0 {
+        appendTextRuntimeDeclaration(globals, "minyar_text_split_index_list", 2, [2])
+        let arguments: List<Text> = [context.splits.texts[binding]]
+        let types: List<Integer> = [2]
+        list = emitCall(output, textState, state, type, "minyar_text_split_index_list", arguments, types)
+    } else {
+        appendTextRuntimeDeclaration(globals, "minyar_text_split", 2, [2, 2])
+        let arguments: List<Text> = [context.splits.texts[binding], context.splits.separators[binding]]
+        let types: List<Integer> = [2, 2]
+        list = emitCall(output, textState, state, type, "minyar_text_split", arguments, types)
+    }
+    let valueType: List<Integer> = [type]
+    ownResult(output, state, list, valueType)
     setType(resultType, type)
     return list
 }
@@ -560,7 +595,7 @@ function splitPieceTake(context: CompilerContext, output: List<Text>, state: Lis
     let index = 0
     while index < splits.pieces.length {
         if splits.pieces[index] == value && splits.pieceOwners[index] == owner {
-            if output[splits.pieceCalls[index] + 3] != "minyar_text_split_at" { return -1 }
+            if output[splits.pieceCalls[index] + 3] != "minyar_text_split_index_at" && output[splits.pieceCalls[index] + 3] != "minyar_text_split_at" { return -1 }
             if !takeOwner(output, state, value, owner) { return -1 }
             splits.pieces[index] = ""
             return index
@@ -574,13 +609,22 @@ function splitPieceTake(context: CompilerContext, output: List<Text>, state: Lis
 function splitPieceInteger(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, value: Text, owner: Integer): Text {
     let index = splitPieceTake(context, output, state, value, owner)
     if index < 0 { return "" }
-    appendTextRuntimeDeclaration(globals, "minyar_text_split_integer", 1, [2, 2, 1])
     let splits = context.splits
-    let arguments: List<Text> = [splits.pieceTexts[index], splits.pieceSeparators[index], splits.piecePositions[index]]
-    let types: List<Integer> = [2, 2, 1]
     let call = splits.pieceCalls[index]
-    let fused = emitCall(output, textState, state, 1, "minyar_text_split_integer", arguments, types)
-    clearPieces(output, call, call + 14)
+    let fused = ""
+    if splits.pieceModes[index] != 0 {
+        appendTextRuntimeDeclaration(globals, "minyar_text_split_index_integer", 1, [2, 1])
+        let arguments: List<Text> = [splits.pieceTexts[index], splits.piecePositions[index]]
+        let types: List<Integer> = [2, 1]
+        fused = emitCall(output, textState, state, 1, "minyar_text_split_index_integer", arguments, types)
+        clearPieces(output, call, call + 11)
+    } else {
+        appendTextRuntimeDeclaration(globals, "minyar_text_split_integer", 1, [2, 2, 1])
+        let arguments: List<Text> = [splits.pieceTexts[index], splits.pieceSeparators[index], splits.piecePositions[index]]
+        let types: List<Integer> = [2, 2, 1]
+        fused = emitCall(output, textState, state, 1, "minyar_text_split_integer", arguments, types)
+        clearPieces(output, call, call + 14)
+    }
     return fused
 }
 
@@ -588,13 +632,22 @@ function splitPieceInteger(context: CompilerContext, output: List<Text>, textSta
 function splitPieceEquals(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, value: Text, owner: Integer, other: Text): Text {
     let index = splitPieceTake(context, output, state, value, owner)
     if index < 0 { return "" }
-    appendTextRuntimeDeclaration(globals, "minyar_text_split_equals", 4, [2, 2, 1, 2])
     let splits = context.splits
-    let arguments: List<Text> = [splits.pieceTexts[index], splits.pieceSeparators[index], splits.piecePositions[index], other]
-    let types: List<Integer> = [2, 2, 1, 2]
     let call = splits.pieceCalls[index]
-    let fused = emitCall(output, textState, state, 4, "minyar_text_split_equals", arguments, types)
-    clearPieces(output, call, call + 14)
+    let fused = ""
+    if splits.pieceModes[index] != 0 {
+        appendTextRuntimeDeclaration(globals, "minyar_text_split_index_equals", 4, [2, 1, 2])
+        let arguments: List<Text> = [splits.pieceTexts[index], splits.piecePositions[index], other]
+        let types: List<Integer> = [2, 1, 2]
+        fused = emitCall(output, textState, state, 4, "minyar_text_split_index_equals", arguments, types)
+        clearPieces(output, call, call + 11)
+    } else {
+        appendTextRuntimeDeclaration(globals, "minyar_text_split_equals", 4, [2, 2, 1, 2])
+        let arguments: List<Text> = [splits.pieceTexts[index], splits.pieceSeparators[index], splits.piecePositions[index], other]
+        let types: List<Integer> = [2, 2, 1, 2]
+        fused = emitCall(output, textState, state, 4, "minyar_text_split_equals", arguments, types)
+        clearPieces(output, call, call + 14)
+    }
     return fused
 }
 
@@ -633,10 +686,17 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
         } else if tokenKinds[state[0]] == 4 && tokenTexts[state[0]] == "." && tokenKinds[state[0] + 1] == 1 && tokenTexts[state[0] + 1] == "length" && !(tokenKinds[state[0] + 2] == 4 && tokenTexts[state[0] + 2] == "(") {
             context.splits.pending = -1
             state[0] = state[0] + 2
-            appendTextRuntimeDeclaration(globals, "minyar_text_split_count", 1, [2, 2])
-            let arguments: List<Text> = [context.splits.texts[binding], context.splits.separators[binding]]
-            let types: List<Integer> = [2, 2]
-            value = emitCall(output, textState, state, 1, "minyar_text_split_count", arguments, types)
+            if context.splits.modes[binding] != 0 {
+                appendTextRuntimeDeclaration(globals, "minyar_text_split_index_count", 1, [2])
+                let arguments: List<Text> = [context.splits.texts[binding]]
+                let types: List<Integer> = [2]
+                value = emitCall(output, textState, state, 1, "minyar_text_split_index_count", arguments, types)
+            } else {
+                appendTextRuntimeDeclaration(globals, "minyar_text_split_count", 1, [2, 2])
+                let arguments: List<Text> = [context.splits.texts[binding], context.splits.separators[binding]]
+                let types: List<Integer> = [2, 2]
+                value = emitCall(output, textState, state, 1, "minyar_text_split_count", arguments, types)
+            }
             setType(resultType, 1)
         } else {
             value = splitMaterialise(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)

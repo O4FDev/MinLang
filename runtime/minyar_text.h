@@ -418,22 +418,19 @@ _Bool minyar_text_range_equals(MinyarText *text, long long start, long long end,
            bytes_are_equal(text->bytes + first, other->bytes, (size_t)(last - first));
 }
 
-/*
- * On-demand pieces of text.split(separator): the same pieces, in the same
- * order, computed for one position instead of one Text each. A reader that
- * only parses, compares or measures a field never builds the piece.
- *
- * text_split_range stops exactly as `fields[index]` does when the position is
- * outside the split's length, with the List's own stop message.
- */
+/* One piece of text.split(separator) without the List: the same pieces, in
+ * the same order, found from the receiver's start. A reader that takes one or
+ * two pieces this way is cheaper than building the range index (below), which
+ * is why both exist: the compiler picks by how many reads it sees. */
 static void text_split_range(MinyarText *text, MinyarText *separator, long long index,
                              long long *start, long long *end) {
     ensure_text_index(text);
     ensure_text_index(separator);
     if (index < 0) list_position_stop(index, 0);
+    const unsigned char *bytes = text->bytes;
+    long long length = text->byte_length, from = 0, piece = 0;
     if (!separator->byte_length) {
-        const unsigned char *bytes = text->bytes;
-        long long length = text->byte_length, at = 0, piece = 0;
+        long long at = 0;
         while (at < length) {
             unsigned char lead = bytes[at];
             long long width = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
@@ -444,8 +441,6 @@ static void text_split_range(MinyarText *text, MinyarText *separator, long long 
         list_position_stop(index, piece);
     }
     if (separator->byte_length == 1) {
-        const unsigned char *bytes = text->bytes;
-        long long length = text->byte_length, from = 0, piece = 0;
         for (;;) {
             long long at = text_byte_find(bytes, from, length, separator->bytes[0]);
             if (piece == index) { *start = from; *end = at; return; }
@@ -456,13 +451,12 @@ static void text_split_range(MinyarText *text, MinyarText *separator, long long 
         list_position_stop(index, piece + 1);
     }
     long long small[TEXT_SEARCH_SMALL];
-    long long *table = text_search_table(separator, text->byte_length, small);
-    long long from = 0, piece = 0;
+    long long *table = text_search_table(separator, length, small);
     for (;;) {
         long long match = text_search_next(text, separator, from, table);
         if (piece == index) {
             *start = from;
-            *end = match < 0 ? text->byte_length : match;
+            *end = match < 0 ? length : match;
             text_search_free(table, small);
             return;
         }
@@ -473,19 +467,19 @@ static void text_split_range(MinyarText *text, MinyarText *separator, long long 
     text_search_free(table, small);
     list_position_stop(index, piece + 1);
 }
-static long long text_split_characters(MinyarText *text, long long start, long long end) {
+static long long text_piece_characters(MinyarText *text, long long start, long long end) {
     return text->character_offsets ? text_scalar_count(text->bytes + start, end - start) : end - start;
 }
 long long minyar_text_split_count(MinyarText *text, MinyarText *separator) {
     ensure_text_index(text);
     ensure_text_index(separator);
     if (!separator->byte_length) return text->character_length;
-    const unsigned char *bytes = text->bytes;
-    long long length = text->byte_length, from = 0, pieces = 1;
+    long long pieces = 1, from = 0;
     if (separator->byte_length == 1) {
-        unsigned char wanted = separator->bytes[0];
+        const unsigned char *bytes = text->bytes;
+        long long length = text->byte_length;
         for (;;) {
-            long long at = text_byte_find(bytes, from, length, wanted);
+            long long at = text_byte_find(bytes, from, length, separator->bytes[0]);
             if (at >= length) return pieces;
             pieces++;
             from = at + 1;
@@ -505,21 +499,18 @@ long long minyar_text_split_count(MinyarText *text, MinyarText *separator) {
 MinyarText *minyar_text_split_at(MinyarText *text, MinyarText *separator, long long index) {
     long long start, end;
     text_split_range(text, separator, index, &start, &end);
-    return text_slice_bytes(text, start, end, text_split_characters(text, start, end));
+    return text_slice_bytes(text, start, end, text_piece_characters(text, start, end));
 }
-/* Integer(fields[index]) without the piece. */
 long long minyar_text_split_integer(MinyarText *text, MinyarText *separator, long long index) {
     long long start, end;
     text_split_range(text, separator, index, &start, &end);
     return text_integer_bytes(text->bytes, start, end);
 }
-/* fields[index].length without the piece. */
 long long minyar_text_split_length(MinyarText *text, MinyarText *separator, long long index) {
     long long start, end;
     text_split_range(text, separator, index, &start, &end);
-    return text_split_characters(text, start, end);
+    return text_piece_characters(text, start, end);
 }
-/* fields[index] == other without the piece. */
 _Bool minyar_text_split_equals(MinyarText *text, MinyarText *separator, long long index,
                                const MinyarText *other) {
     long long start, end;
@@ -527,23 +518,188 @@ _Bool minyar_text_split_equals(MinyarText *text, MinyarText *separator, long lon
     return other->byte_length == end - start &&
            bytes_are_equal(text->bytes + start, other->bytes, (size_t)(end - start));
 }
-/* fields[index].startsWith / endsWith(needle) without the piece. */
-_Bool minyar_text_split_starts_with(MinyarText *text, MinyarText *separator, long long index,
-                                    MinyarText *needle) {
-    long long start, end;
-    text_split_range(text, separator, index, &start, &end);
-    ensure_text_index(needle);
-    return needle->byte_length <= end - start &&
-           bytes_are_equal(text->bytes + start, needle->bytes, (size_t)needle->byte_length);
+
+/*
+ * text.split(separator) as an index of piece ranges, for readers that only
+ * need pieces by position: `let fields = text.split(",")` then `fields[i]`
+ * scans the receiver once instead of once per read, and a reader that parses,
+ * compares or measures a field never builds the piece at all.
+ *
+ * The index is shaped like a Text so its lifetime is an ordinary owning count
+ * (the runtime frees `character_offsets` and drops `backing` when the last
+ * owner goes): `bytes` is the receiver's first byte, `byte_length` the piece
+ * count, `character_length` 1 when the receiver is ASCII (its pieces then are),
+ * and `character_offsets` the pairs of byte offsets.
+ */
+static long long *split_index_ranges(const MinyarText *index) {
+    return (long long *)index->character_offsets;
 }
-_Bool minyar_text_split_ends_with(MinyarText *text, MinyarText *separator, long long index,
-                                  MinyarText *needle) {
+static void text_index_range(const MinyarText *index, long long position, long long *start, long long *end) {
+    long long count = index->byte_length;
+    if ((unsigned long long)position >= (unsigned long long)count)
+        list_position_stop(position, count);
+    const long long *ranges = split_index_ranges(index);
+    *start = ranges[2 * position];
+    *end = ranges[2 * position + 1];
+}
+static long long text_index_characters(const MinyarText *index, long long start, long long end) {
+    return index->character_length ? end - start : text_scalar_count(index->bytes + start, end - start);
+}
+/* One piece of the index, with the slice rules: a tiny piece of a large root
+ * gets its own bytes, and a view keeps the flattened root alive. */
+static MinyarText *text_index_piece(MinyarText *index, long long start, long long end) {
+    long long length = end - start;
+    long long characters = text_index_characters(index, start, end);
+    long long known = length == characters ? characters : -1;
+    const unsigned char *bytes = index->bytes + start;
+#ifdef MINYAR_COMPILER_ARENA
+    /* The arena never frees, so a piece shares the receiver's bytes. */
+    return new_text(bytes, length, known);
+#else
+    MinyarText *root = index->backing;
+#if MINYAR_THREADED
+    _Bool shared = text_backing_shared(index);
+    long long root_length = shared ? index->byte_length : root->byte_length;
+#else
+    _Bool shared = 0;
+    long long root_length = root->byte_length;
+#endif
+    if (!shared && root_length > 4096 &&
+        (unsigned long long)length * 8 < (unsigned long long)root_length) {
+        MinyarText *copy = new_text_storage(length, known);
+        unsigned char *target = (unsigned char *)copy->bytes;
+        copy_bytes(target, bytes, (size_t)length);
+        target[length] = 0;
+        return copy;
+    }
+    MinyarText *view = new_text(bytes, length, known);
+    view->backing = root;
+    minyar_rc_retain(root);
+    return view;
+#endif
+}
+/* text.split(separator), as the piece ranges. One pass over the receiver. */
+MinyarText *minyar_text_split_index(MinyarText *text, MinyarText *separator) {
+    ensure_text_index(text);
+    ensure_text_index(separator);
+    long long small[2 * 32];
+    long long *ranges = small;
+    long long capacity = 32, count = 0;
+    const unsigned char *bytes = text->bytes;
+    long long length = text->byte_length, from = 0;
+    _Bool more = 1;
+    long long small_table[TEXT_SEARCH_SMALL];
+    long long *table = NULL;
+    if (separator->byte_length > 1) table = text_search_table(separator, length, small_table);
+    while (more) {
+        long long end;
+        if (!separator->byte_length) {
+            if (from >= length) break;
+            unsigned char lead = bytes[from];
+            end = from + (lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4);
+        } else if (separator->byte_length == 1) {
+            end = text_byte_find(bytes, from, length, separator->bytes[0]);
+        } else {
+            long long match = text_search_next(text, separator, from, table);
+            if (match < 0) end = length; else end = match;
+        }
+        if (count == capacity) {
+            long long grown_capacity = capacity * 2;
+            long long *grown = data_allocate((size_t)(2 * grown_capacity) * sizeof(long long),
+                                            sizeof(long long));
+            memcpy(grown, ranges, (size_t)(2 * count) * sizeof(long long));
+#ifndef MINYAR_COMPILER_ARENA
+            if (ranges != small) rc_free_data(ranges);
+#endif
+            ranges = grown;
+            capacity = grown_capacity;
+        }
+        ranges[2 * count] = from;
+        ranges[2 * count + 1] = end;
+        count++;
+        if (!separator->byte_length) {
+            from = end;
+        } else if (end >= length) {
+            more = 0;
+        } else {
+            from = end + separator->byte_length;
+        }
+    }
+    MinyarText *index = new_text(bytes, count, !text->character_offsets ? 1 : 0);
+    index->character_offsets = NULL;
+    if (count) {
+        index->character_offsets = data_allocate((size_t)(2 * count) * sizeof(long long),
+                                                 sizeof(long long));
+        memcpy(index->character_offsets, ranges, (size_t)(2 * count) * sizeof(long long));
+    }
+#ifndef MINYAR_COMPILER_ARENA
+    index->backing = text->backing ? text->backing : text;
+    minyar_rc_retain(index->backing);
+#endif
+#ifndef MINYAR_COMPILER_ARENA
+    if (ranges != small) rc_free_data(ranges);
+#endif
+    if (table) text_search_free(table, small_table);
+    return index;
+}
+long long minyar_text_split_index_count(MinyarText *index) {
+    return index->byte_length;
+}
+MinyarText *minyar_text_split_index_at(MinyarText *index, long long position) {
     long long start, end;
-    text_split_range(text, separator, index, &start, &end);
+    text_index_range(index, position, &start, &end);
+    return text_index_piece(index, start, end);
+}
+/* Integer(fields[position]) without the piece. */
+long long minyar_text_split_index_integer(MinyarText *index, long long position) {
+    long long start, end;
+    text_index_range(index, position, &start, &end);
+    return text_integer_bytes(index->bytes, start, end);
+}
+/* fields[position].length without the piece. */
+long long minyar_text_split_index_length(MinyarText *index, long long position) {
+    long long start, end;
+    text_index_range(index, position, &start, &end);
+    return text_index_characters(index, start, end);
+}
+/* fields[position] == other without the piece. */
+_Bool minyar_text_split_index_equals(MinyarText *index, long long position, const MinyarText *other) {
+    long long start, end;
+    text_index_range(index, position, &start, &end);
+    return other->byte_length == end - start &&
+           bytes_are_equal(index->bytes + start, other->bytes, (size_t)(end - start));
+}
+/* fields[position].startsWith / endsWith(needle) without the piece. */
+_Bool minyar_text_split_index_starts_with(MinyarText *index, long long position, MinyarText *needle) {
+    long long start, end;
+    text_index_range(index, position, &start, &end);
     ensure_text_index(needle);
     return needle->byte_length <= end - start &&
-           bytes_are_equal(text->bytes + end - needle->byte_length, needle->bytes,
+           bytes_are_equal(index->bytes + start, needle->bytes, (size_t)needle->byte_length);
+}
+_Bool minyar_text_split_index_ends_with(MinyarText *index, long long position, MinyarText *needle) {
+    long long start, end;
+    text_index_range(index, position, &start, &end);
+    ensure_text_index(needle);
+    return needle->byte_length <= end - start &&
+           bytes_are_equal(index->bytes + end - needle->byte_length, needle->bytes,
                            (size_t)needle->byte_length);
+}
+/* The pieces as the List text.split makes, for a use that needs the whole
+ * split (a mutation, a whole-List call, an escape). */
+MinyarList *minyar_text_split_index_list(MinyarText *index) {
+    MinyarList *parts = minyar_list_new();
+    minyar_list_references(parts);
+    long long count = index->byte_length;
+    list_reserve(parts, count);
+    long long piece = 0;
+    while (piece < count) {
+        long long start, end;
+        text_index_range(index, piece, &start, &end);
+        minyar_list_add_take(parts, (long long)(uintptr_t)text_index_piece(index, start, end));
+        piece = piece + 1;
+    }
+    return parts;
 }
 
 /* JSON scanning helpers for library/json.min. Positions are scalar offsets.
