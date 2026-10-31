@@ -42,7 +42,7 @@ static long long *text_search_table(const MinyarText *needle, long long availabl
                                     long long small[TEXT_SEARCH_SMALL]) {
     long long length = needle->byte_length;
     if (length <= TEXT_SEARCH_SHORT || length > available) return NULL;
-#if defined(__linux__)
+#if defined(__linux__) && defined(MINYAR_COMPILER_ARENA)
     /* text_search_next searches these with the C library's memmem, which
      * needs no table; building one for every search of an IR line was the
      * larger half of a self-compile's Text search time. */
@@ -98,12 +98,14 @@ static long long text_search_next(const MinyarText *text, const MinyarText *need
         }
         return -1;
     }
-#if defined(__linux__)
+#if defined(__linux__) && defined(MINYAR_COMPILER_ARENA)
     /* The C library's memmem is vectorised and needs no table. The compiler
      * searches a few hundred thousand short IR lines for fixed patterns, and
      * building a table for each of those searches was a visible share of a
      * compile; its module-wide searches over tens of megabytes gain more than
-     * the table search does. Every other target keeps the table search. */
+     * the table search does. Programs keep the table search: their runtime
+     * must stay the same code, and a long search over a long text is where
+     * the table wins. */
     {
         const unsigned char *found =
             memmem(text->bytes + start, (size_t)(text->byte_length - start),
