@@ -46,6 +46,10 @@ record LoopCopy {
     windowCode: List<Text>
     windowNames: List<Text>
     windowHoisted: List<Text>
+    fields: Boolean
+    texts: List<Text>
+    textLengths: List<Text>
+    textBytes: List<Text>
 }
 
 function loopNameCharacter(character: Character): Boolean {
@@ -522,7 +526,7 @@ function loopRename(copy: LoopCopy, line: Text): Text {
 // the condition. Returns false, changing nothing, when no access qualifies.
 function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Text, loopLabel: Integer, counter: Integer, variable: Integer, position: Text, bound: Text): Boolean {
     let loop = Text(loopLabel)
-    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".fast" + loop, loop: loop, blocks: 0, position: position, variable: "", lists: [], values: [], lengths: [], valueLoads: [], positionLists: [], windowLengths: [], windowLists: [], windowOffsets: [], windowCode: [], windowNames: [], windowHoisted: [] }
+    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".fast" + loop, loop: loop, blocks: 0, position: position, variable: "", lists: [], values: [], lengths: [], valueLoads: [], positionLists: [], windowLengths: [], windowLists: [], windowOffsets: [], windowCode: [], windowNames: [], windowHoisted: [], fields: false, texts: [], textLengths: [], textBytes: [] }
     loopClassify(copy)
     // The loop variable is an alias of the position only if the region stores
     // nothing else into it.
@@ -617,5 +621,293 @@ function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Tex
         index = index + 1
     }
     output[entryPiece + 1] = "  br i1 %loop.idle." + loop + ", label %for.guard." + loop + ", label %for.checked." + loop + "\n\nfor.guard." + loop + ":\n" + joinText(copy.guard) + joinText(test) + "  br i1 " + all + ", label %for.condition." + loop + copy.suffix + ", label %for.checked." + loop + "\n\n" + joinText(body) + "\nfor.checked." + loop + ":\n" + output[entryPiece + 1]
+    return true
+}
+
+// --- Text loops ---------------------------------------------------------
+//
+// A Text counts its characters lazily: a negative character length means the
+// runtime has not counted it, and a counted Text without character offsets is
+// ASCII. For such a Text a character position is its byte position, so a loop
+// that reads `text[i]` or `text.length` of one Text can read the header once
+// before the loop and then load bytes directly. A loop over any other Text
+// still needs the counted or indexed path, so the loop is versioned: one test
+// of every Text it reads picks a copy whose reads are plain byte loads, and
+// every other Text runs the loop unchanged with the same traps.
+
+// Whether a region line names `name` as a name of its own, not as a prefix.
+function loopMentions(line: Text, name: Text): Boolean {
+    let parts = line.split(name)
+    let index = 1
+    while index < parts.length {
+        let part = parts[index]
+        if part.length == 0 || !loopNameCharacter(part[0]) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+// Whether the region takes the address of a local other than to load its
+// value. A callee given such an address may store through it, so the local is
+// not the same value on the next iteration.
+function loopLocalEscapes(copy: LoopCopy, local: Text): Boolean {
+    let load = " = load i64, ptr " + local
+    let pointer = " = load ptr, ptr " + local
+    let index = 0
+    while index < copy.lines.length {
+        let line = copy.lines[index]
+        if !line.startsWith(";") && loopMentions(line, local) && line.find(load) < 0 && line.find(pointer) < 0 { return true }
+        index = index + 1
+    }
+    return false
+}
+
+// The field index text of `@.minyar.record.get.N`, or "".
+function loopGetField(callee: Text): Text {
+    let prefix = "@.minyar.record.get."
+    if !callee.startsWith(prefix) { return "" }
+    let field = callee.slice(prefix.length, callee.length)
+    if field.length == 0 || field.startsWith(".") || field.find("(") >= 0 { return "" }
+    return field
+}
+
+// Whether the region stores a scalar into field N of any record. A scalar
+// store to another field cannot change this one, but a store of a reference
+// (which a call-free loop never has) could.
+function loopFieldStored(copy: LoopCopy, field: Text): Boolean {
+    let prefix = "@.minyar.record.set.scalar("
+    let index = 0
+    while index < copy.lines.length {
+        let line = copy.lines[index]
+        let at = line.find(prefix)
+        if at >= 0 {
+            let rest = line.slice(at + prefix.length, line.length)
+            let first = rest.find(", i64 ")
+            if first >= 0 {
+                let after = rest.slice(first + 6, rest.length)
+                let second = after.find(",")
+                if second >= 0 && after.slice(0, second) == field { return true }
+            }
+        }
+        index = index + 1
+    }
+    return false
+}
+
+// The hoisted slot value of a Text the loop reads, or "" when the loop cannot
+// prove it is the same header on every iteration. A value defined before the
+// loop is one name throughout it; a local or parameter the region never stores
+// to or takes the address of keeps its value; a reference record field keeps
+// its slot in a call-free loop that never stores that field.
+function loopTextSlot(copy: LoopCopy, value: Text): Text {
+    if !value.startsWith("%") { return value }
+    let known = loopNamed(copy.invariant, value)
+    if known >= 0 { return copy.hoisted[known] }
+    let defined = loopDefinitionLine(copy, value)
+    if defined == -1 { return value }
+    if defined < 0 { return "" }
+    let line = copy.lines[defined]
+    let local = copy.loaded[defined]
+    let name = loopGuardName(copy, value, ".slot")
+    if local != "" {
+        if loopNamed(copy.touched, local) >= 0 || value.startsWith("%local.") || loopLocalEscapes(copy, local) { return "" }
+        copy.guard.add("  " + name + line.slice(line.find(" = "), line.length) + "\n")
+    } else if line.find(" = call i64 @.minyar.record.get") >= 0 {
+        let at = line.find("@.minyar.record.get")
+        let opening = line.find("(")
+        if at < 0 || opening < at { return "" }
+        let field = loopGetField(line.slice(at, opening))
+        if field == "" || !copy.fields || loopFieldStored(copy, field) { return "" }
+        let arguments = loopCallArguments(line, "@.minyar.record.get." + field)
+        if arguments.length != 1 { return "" }
+        let record = loopInvariant(copy, arguments[0], false)
+        if record == "" { return "" }
+        copy.guard.add("  " + name + ".values = getelementptr inbounds i8, ptr " + record + ", i64 8\n  " + name + ".pointer = getelementptr inbounds i64, ptr " + name + ".values, i64 " + field + "\n  " + name + " = load i64, ptr " + name + ".pointer\n")
+    } else {
+        return ""
+    }
+    copy.invariant.add(value)
+    copy.hoisted.add(name)
+    return name
+}
+
+// The hoisted pointer of a Text the loop reads, or "" when it cannot be
+// hoisted. Text values reach a read as a pointer converted from a slot value.
+function loopTextPointer(copy: LoopCopy, value: Text): Text {
+    if !value.startsWith("%") { return value }
+    let known = loopNamed(copy.invariant, value)
+    if known >= 0 { return copy.hoisted[known] }
+    let defined = loopDefinitionLine(copy, value)
+    if defined == -1 {
+        if value.startsWith("%local.") { return "" }
+        return value
+    }
+    if defined < 0 { return "" }
+    let line = copy.lines[defined]
+    let name = loopGuardName(copy, value, ".text")
+    let start = line.find(" = inttoptr i64 ")
+    if start >= 0 && line.endsWith(" to ptr") {
+        let slot = loopTextSlot(copy, line.slice(start + 16, line.length - 7))
+        if slot == "" { return "" }
+        copy.guard.add("  " + name + " = inttoptr i64 " + slot + " to ptr\n")
+    } else if line.find(" = load ptr, ptr ") >= 0 {
+        // A Text held in a local as its header pointer.
+        let local = copy.loaded[defined]
+        if local == "" || loopNamed(copy.touched, local) >= 0 || loopLocalEscapes(copy, local) { return "" }
+        copy.guard.add("  " + name + line.slice(line.find(" = "), line.length) + "\n")
+    } else {
+        return ""
+    }
+    copy.invariant.add(value)
+    copy.hoisted.add(name)
+    return name
+}
+
+// The index of a Text's hoisted header reads, adding them on first use: the
+// character length, whether it is counted and ASCII, and the bytes buffer.
+function loopTextHeader(copy: LoopCopy, pointer: Text): Integer {
+    let known = loopNamed(copy.texts, pointer)
+    if known >= 0 { return known }
+    let base = "%text." + copy.loop + "." + Text(copy.texts.length)
+    let length = base + ".length"
+    copy.guard.add("  " + length + ".pointer = getelementptr inbounds { ptr, i64, i64, ptr }, ptr " + pointer + ", i32 0, i32 2\n  " + length + " = load i64, ptr " + length + ".pointer\n  " + base + ".counted = icmp sgt i64 " + length + ", -1\n  " + length + ".offsets = getelementptr inbounds { ptr, i64, i64, ptr }, ptr " + pointer + ", i32 0, i32 3\n  " + length + ".offsets.value = load ptr, ptr " + length + ".offsets\n  " + length + ".ascii = icmp eq ptr " + length + ".offsets.value, null\n  " + length + ".known = and i1 " + base + ".counted, " + length + ".ascii\n  " + base + ".bytes = load ptr, ptr " + pointer + "\n")
+    copy.texts.add(pointer)
+    copy.textLengths.add(length)
+    copy.textBytes.add(base + ".bytes")
+    return copy.texts.length - 1
+}
+
+// The accesses a Text versioned loop found, by region line: 1 a character
+// length, 2 a character, 0 neither.
+function loopTextKinds(copy: LoopCopy): List<Integer> {
+    let kinds: List<Integer> = []
+    let index = 0
+    while index < copy.lines.length {
+        let line = copy.lines[index]
+        let kind = 0
+        if copy.defined[index] != "" {
+            if line.find(" = call i64 @.minyar.text.length(") >= 0 { kind = 1 }
+            if line.find(" = call i32 @.minyar.text.character(") >= 0 { kind = 2 }
+        }
+        kinds.add(kind)
+        index = index + 1
+    }
+    return kinds
+}
+
+function loopDropTextTest(copy: LoopCopy, guard: Integer, invariantCount: Integer) {
+    copy.guard = loopTruncated(copy.guard, guard)
+    copy.invariant = loopTruncated(copy.invariant, invariantCount)
+    copy.hoisted = loopTruncated(copy.hoisted, invariantCount)
+    let texts: List<Text> = []
+    let lengths: List<Text> = []
+    let bytes: List<Text> = []
+    copy.texts = texts
+    copy.textLengths = lengths
+    copy.textBytes = bytes
+}
+
+// The versioned test and fast copy of a Text loop: one test of every Text the
+// region reads, then a copy whose reads are direct byte loads on a hoisted
+// header, and a checked label for the unversioned loop. `label` is the
+// condition label the copy branches back to; `loop` keeps names apart.
+function textLoopVersion(region: Text, loop: Text, label: Text, fields: Boolean): Text {
+    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".fast" + loop, loop: loop, blocks: 0, position: "", variable: "", lists: [], values: [], fields: fields, texts: [], textLengths: [], textBytes: [] }
+    loopClassify(copy)
+    // The loop's condition label is defined before the region, but the copy
+    // ends by branching back to it.
+    copy.otherNames.add("%" + label)
+    copy.otherLines.add(-2)
+    let kinds = loopTextKinds(copy)
+    let guard = copy.guard.length
+    let invariantCount = copy.invariant.length
+    let index = 0
+    while index < copy.lines.length {
+        let kind = kinds[index]
+        if kind != 0 {
+            let callee = "@.minyar.text.length"
+            let count = 1
+            if kind == 2 {
+                callee = "@.minyar.text.character"
+                count = 2
+            }
+            let arguments = loopCallArguments(copy.lines[index], callee)
+            if arguments.length != count {
+                loopDropTextTest(copy, guard, invariantCount)
+                return ""
+            }
+            let pointer = loopTextPointer(copy, arguments[0])
+            if pointer == "" {
+                loopDropTextTest(copy, guard, invariantCount)
+                return ""
+            }
+            if kind == 1 {
+                let header = loopTextHeader(copy, pointer)
+                copy.invariant.add(copy.defined[index])
+                copy.hoisted.add(copy.textLengths[header])
+            } else {
+                let ignored = loopTextHeader(copy, pointer)
+            }
+        }
+        index = index + 1
+    }
+    if copy.texts.length == 0 { return "" }
+    let body: List<Text> = []
+    let replaced = 0
+    index = 0
+    while index < copy.lines.length {
+        let line = copy.lines[index]
+        let kind = kinds[index]
+        let name = copy.defined[index]
+        if name != "" && loopNamed(copy.invariant, name) >= 0 {
+            // Computed once before the loop; uses name the hoisted value.
+            if kind != 0 { replaced = replaced + 1 }
+        } else if kind == 2 {
+            let arguments = loopCallArguments(line, "@.minyar.text.character")
+            let pointer = loopTextPointer(copy, arguments[0])
+            let header = loopTextHeader(copy, pointer)
+            body.add("  " + name + copy.suffix + " = call i32 @.minyar.text.character.known(ptr " + pointer + ", i64 " + loopRename(copy, arguments[1]) + ", i64 " + copy.textLengths[header] + ", ptr " + copy.textBytes[header] + ")\n")
+            replaced = replaced + 1
+        } else {
+            body.add(loopRename(copy, line) + "\n")
+        }
+        index = index + 1
+    }
+    if replaced == 0 { return "" }
+    // One test of every Text before the copy, so the copy is entered only when
+    // each of them is counted ASCII.
+    let all = ""
+    index = 0
+    while index < copy.texts.length {
+        let known = copy.textLengths[index] + ".known"
+        if index > 0 {
+            let merged = "%text.all." + loop + "." + Text(index)
+            copy.guard.add("  " + merged + " = and i1 " + all + ", " + known + "\n")
+            all = merged
+        } else {
+            all = known
+        }
+        index = index + 1
+    }
+    let fast = label + copy.suffix
+    return joinText(copy.guard) + "  br i1 " + all + ", label %" + fast + ", label %text.checked." + loop + "\n\n" + fast + ":\n" + joinText(body) + "\ntext.checked." + loop + ":\n"
+}
+
+// Version a while loop: `entryPiece + 2` is the branch to its condition label,
+// which the pieces after it complete.
+function versionTextLoop(output: List<Text>, entryPiece: Integer, region: Text, loopLabel: Integer, conditionLabel: Integer, fields: Boolean): Boolean {
+    let test = textLoopVersion(region, Text(loopLabel), "while.condition." + Text(conditionLabel), fields)
+    if test == "" { return false }
+    output[entryPiece + 2] = test + "  br label %while.condition."
+    return true
+}
+
+// Version a for loop: `entryPiece + 2` is the branch to its condition label,
+// which the pieces after it complete.
+function versionTextFor(output: List<Text>, entryPiece: Integer, region: Text, loopLabel: Integer, fields: Boolean): Boolean {
+    let test = textLoopVersion(region, Text(loopLabel), "for.condition." + Text(loopLabel), fields)
+    if test == "" { return false }
+    // The strip setup comes first, so both copies share it.
+    output[entryPiece + 2] = test + output[entryPiece + 2]
     return true
 }
