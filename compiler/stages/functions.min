@@ -184,49 +184,24 @@ function compileAtomicStatementBody(context: CompilerContext, localNames: List<T
             let returnValueLocation = state[0]
             let valueType: List<Integer> = [returnType]
             let value = ""
+            let armsReturned = false
             if returnType == 5 && contractOutcomeAt(tokenKinds, tokenTexts, state[0]) {
                 state[0] = state[0] + 1
                 returnValueLocation = returnLocation
                 setType(valueType, 5)
+            } else if returnType != 5 && tailReturnMatch(context, state[0]) {
+                compileReturnMatch(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
+                armsReturned = true
             } else if tokenKinds[state[0]] != 6 && !tokenIs(tokenKinds, tokenTexts, state, "}") {
                 value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, valueType)
             } else {
                 returnValueLocation = returnLocation
                 setType(valueType, 5)
             }
-            if valueType[0] != returnType {
+            if !armsReturned && valueType[0] != returnType {
                 requireContextType(context, returnValueLocation, valueType[0], returnType, "a returned value has the wrong type")
             }
-            if isReferenceType(valueType[0]) { takeTerminalReuse(context, localNames, localIds, localLengths, state, output, -1) }
-            if isReferenceType(valueType[0]) && !takeReturnedResult(output, state, value, valueType, context.valueBorrows.returnHandOff) && !takeReturnedLocal(context, localNames, localIds, localLengths, state, output, value) {
-                noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, valueType[0], 0)
-                output.add("  call void @minyar_rc_retain(ptr ")
-                output.add(value)
-                output.add(")\n")
-            }
-            if textState[1] == "main" {
-                if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
-            }
-            if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }
-            output.add("  call void @minyar_rc_leave()\n")
-            output.add(stackLeave(state))
-            if textState[1] == "main" {
-                let temporary = newTemporary(state)
-                output.add("  %value.")
-                output.add(Text(temporary))
-                output.add(" = trunc i64 ")
-                output.add(value)
-                output.add(" to i32\n")
-                output.add("  ret i32 %value.")
-                output.add(Text(temporary))
-                output.add("\n")
-            } else {
-                output.add("  ret ")
-                output.add(llvmType(valueType[0]))
-                output.add(" ")
-                output.add(value)
-                output.add("\n")
-            }
+            if !armsReturned { emitReturnValue(context, localNames, localIds, localLengths, state, textState, output, globals, value, valueType) }
             returns = true
         } else {
 
@@ -298,6 +273,45 @@ function compileAtomicStatementBody(context: CompilerContext, localNames: List<T
         output.add("  call void @minyar_rc_step()\n")
     }
     return returns
+}
+
+// The rest of a `return` once its value is computed: hand the value's count
+// to the caller, join threads, leave the frame and return.
+function emitReturnValue(context: CompilerContext, localNames: List<Text>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, value: Text, valueType: List<Integer>) {
+    let symbolKinds = context.symbolKinds
+    let functionReturnTypes = context.functionReturnTypes
+    let functionParameterCounts = context.functionParameterCounts
+    let functionParameterTypes = context.functionParameterTypes
+    if isReferenceType(valueType[0]) { takeTerminalReuse(context, localNames, localIds, localLengths, state, output, -1) }
+    if isReferenceType(valueType[0]) && !takeReturnedResult(output, state, value, valueType, context.valueBorrows.returnHandOff) && !takeReturnedLocal(context, localNames, localIds, localLengths, state, output, value) {
+        noteCycleFixup(output, functionReturnTypes, functionParameterCounts, functionParameterTypes, output.length, valueType[0], 0)
+        output.add("  call void @minyar_rc_retain(ptr ")
+        output.add(value)
+        output.add(")\n")
+    }
+    if textState[1] == "main" {
+        if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }; emitModuleConstantCleanup(output, symbolKinds, functionParameterCounts)
+    }
+    if (state[15] / 4 % 2) != 0 { threadJoinOnReturn(output, globals, textState[1]) }
+    output.add("  call void @minyar_rc_leave()\n")
+    output.add(stackLeave(state))
+    if textState[1] == "main" {
+        let temporary = newTemporary(state)
+        output.add("  %value.")
+        output.add(Text(temporary))
+        output.add(" = trunc i64 ")
+        output.add(value)
+        output.add(" to i32\n")
+        output.add("  ret i32 %value.")
+        output.add(Text(temporary))
+        output.add("\n")
+    } else {
+        output.add("  ret ")
+        output.add(llvmType(valueType[0]))
+        output.add(" ")
+        output.add(value)
+        output.add("\n")
+    }
 }
 
 function markAssignedParameters(tokenKinds: List<Integer>, tokenTexts: List<Text>, start: Integer, names: List<Text>, types: List<Integer>) {

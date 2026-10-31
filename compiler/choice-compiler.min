@@ -366,11 +366,55 @@ function parseMatchExpression(context: CompilerContext, localNames: List<Text>, 
     let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
     if !matchInputType(context, inputType[0]) { failAtToken(context.tokenLines, location, "match needs a choice, Result or scalar value") }
     let values: List<Text> = []
-    let terminal = compileChoiceMatchInput(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, context.activeReturnType, input, inputType, location, resultType, values)
+    let terminal = compileChoiceMatchInput(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, context.activeReturnType, input, inputType, location, resultType, values, false)
     return values[0]
 }
 
-function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer, input: Text, inputType: List<Integer>, location: Integer, expressionType: List<Integer>, expressionValue: List<Text>): Boolean {
+function returnMatchPunctuation(context: CompilerContext, position: Integer, expected: Text): Boolean {
+    let kind = context.tokenKinds[position]
+    return kind != 2 && kind != 3 && kind != 5 && kind != 7 && context.tokenTexts[position] == expected
+}
+
+// Whether the `match` at position is the whole returned expression: its arm
+// block (the first `{` outside brackets) closes right before the statement end.
+function tailReturnMatch(context: CompilerContext, position: Integer): Boolean {
+    if !returnMatchPunctuation(context, position, "match") || context.tokenKinds[position] != 1 { return false }
+    let count = context.tokenKinds.length
+    let at = position + 1
+    let depth = 0
+    while at < count && !(depth == 0 && returnMatchPunctuation(context, at, "{")) {
+        if context.tokenKinds[at] == 6 && depth == 0 { return false }
+        if returnMatchPunctuation(context, at, "(") || returnMatchPunctuation(context, at, "[") { depth = depth + 1 }
+        if returnMatchPunctuation(context, at, ")") || returnMatchPunctuation(context, at, "]") { depth = depth - 1 }
+        if returnMatchPunctuation(context, at, "}") { return false }
+        at = at + 1
+    }
+    let braces = 0
+    while at < count {
+        if returnMatchPunctuation(context, at, "{") { braces = braces + 1 }
+        if returnMatchPunctuation(context, at, "}") {
+            braces = braces - 1
+            if braces == 0 { return at + 1 < count && (context.tokenKinds[at + 1] == 6 || returnMatchPunctuation(context, at + 1, "}")) }
+        }
+        at = at + 1
+    }
+    return false
+}
+
+// `return match input { arms }`: every arm returns its value directly, so a
+// Result built in an arm reaches the return like `return Ok(..)` does.
+function compileReturnMatch(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer) {
+    let location = state[0]
+    state[0] = state[0] + 1
+    let inputType: List<Integer> = [0]
+    let input = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, inputType)
+    if !matchInputType(context, inputType[0]) { failAtToken(context.tokenLines, location, "match needs a choice, Result or scalar value") }
+    let resultType: List<Integer> = [returnType]
+    let values: List<Text> = []
+    let terminal = compileChoiceMatchInput(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType, input, inputType, location, resultType, values, true)
+}
+
+function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer, input: Text, inputType: List<Integer>, location: Integer, expressionType: List<Integer>, expressionValue: List<Text>, returnArms: Boolean): Boolean {
     let kinds = context.tokenKinds
     let texts = context.tokenTexts
     let lines = context.tokenLines
@@ -381,7 +425,7 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
     let seen: List<Integer> = []
     let seenIndex = 0
     while seenIndex < cases.length { seen.add(0); seenIndex = seenIndex + 1 }
-    let expression = expressionType.length > 0
+    let expression = expressionType.length > 0 && !returnArms
     let valueId = -1
     if expression { valueId = nextLocal(state) }
     let outerScope = state[3]
@@ -475,6 +519,17 @@ function compileChoiceMatchInput(context: CompilerContext, localNames: List<Text
             storeLocal(output, valueId, armType[0], value)
             skipTerminators(kinds, state)
             expectToken(kinds, texts, lines, state, "}")
+        } else if returnArms {
+            expectToken(kinds, texts, lines, state, "{")
+            skipTerminators(kinds, state)
+            let armType: List<Integer> = [expressionType[0]]
+            let value = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, armType)
+            if armType[0] == 5 || armType[0] == 6 { failCompiler(describeLocation(tokenLocation(lines, armLocation)) + ": a match expression arm must produce a value") }
+            if armType[0] != expressionType[0] { failCompiler(describeLocation(tokenLocation(lines, armLocation)) + ": match expression arms must have the same type") }
+            emitReturnValue(context, localNames, localIds, localLengths, state, textState, output, globals, value, armType)
+            skipTerminators(kinds, state)
+            expectToken(kinds, texts, lines, state, "}")
+            terminal = true
         } else {
             terminal = compileBlock(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, returnType)
         }
