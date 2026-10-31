@@ -11,16 +11,26 @@
 # its own test.scratch(), so pieces never share a directory, an output file or a port.
 PERFCS_GATE_BUDGETS = 1,32,1024
 PERFCS_OTHER_BUDGETS = 2,7
+PERFCS_MAP_GATE_BUDGETS = 1,32
 
 PERFCS_RUNTIME_PROFILES = ordinary-system ordinary-fixed ordinary-lazy cycle-system cycle-fixed cycle-lazy
-PERFCS_TEMPORARY_CACHE_INPUTS = tests/temporary-owner-cache.py tests/temporary-owner-cache.c $(RUNTIME_HEADERS)
+PERFCS_PROFILES = system fixed lazy
+PERFCS_MAP_PROFILES = system fixed lazy eager arena
 PERFCS_FRAME_INITIALIZATION_INPUTS = tests/frame-initialization.py tests/frame-initialization.c $(RUNTIME_HEADERS)
+PERFCS_EMPTY_MAP_INPUTS = tests/empty-map-traversal.py tests/empty-map-traversal.c $(RUNTIME_HEADERS)
 
 # $(1) target base, $(2) harness, $(3) inputs, $(4) command prefix, $(5) harness arguments, $(6) runtime-profile pair,
 # $(7) argument that drops a shared block (used only when the pair is not a system profile).
 define PERFCS_RUNTIME_PROFILE_PIECE
 check-$(1)-part-$(6): $(3) | build
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(4) python3 "$(2)" $(5) --runtimes $(firstword $(subst -, ,$(6))) --profiles $(lastword $(subst -, ,$(6))) $(if $(filter system,$(lastword $(subst -, ,$(6)))),,$(7))
+endef
+
+# $(1) target base, $(2) harness, $(3) inputs, $(4) command prefix, $(5) harness arguments, $(6) profile, $(7) argument
+# that drops a shared block (used only when profile is not system).
+define PERFCS_PROFILE_PIECE
+check-$(1)-part-$(6): $(3) | build
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(4) python3 "$(2)" $(5) --profiles $(6) $(if $(filter system,$(6)),,$(7))
 endef
 
 .PHONY: check-owner-queue-batching check-owner-queue-batching-budgets check-owner-queue-batching-sanitize
@@ -61,16 +71,24 @@ $(foreach pair,$(PERFCS_RUNTIME_PROFILES),$(eval $(call PERFCS_RUNTIME_PROFILE_P
 $(foreach pair,$(PERFCS_RUNTIME_PROFILES),$(eval $(call PERFCS_RUNTIME_PROFILE_PIECE,frame-initialization-budgets,tests/frame-initialization.py,$(PERFCS_FRAME_INITIALIZATION_INPUTS),$(LIMITED),--modes native --budgets $(PERFCS_OTHER_BUDGETS),$(pair),--skip-negative)))
 $(foreach pair,$(PERFCS_RUNTIME_PROFILES),$(eval $(call PERFCS_RUNTIME_PROFILE_PIECE,frame-initialization-sanitize,tests/frame-initialization.py,$(PERFCS_FRAME_INITIALIZATION_INPUTS),$(SANITIZER_LIMITED),--modes sanitize --activated-matrix full,$(pair),--skip-negative)))
 
-.PHONY: check-empty-map-traversal check-empty-map-traversal-budgets check-empty-map-traversal-sanitize
-check-empty-map-traversal: tests/empty-map-traversal.py tests/empty-map-traversal.c $(RUNTIME_HEADERS) | build
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) python3 "tests/empty-map-traversal.py" --modes native --budgets 1,32
+.PHONY: check-empty-map-traversal check-empty-map-traversal-budgets check-empty-map-traversal-sanitize \
+	$(addprefix check-empty-map-traversal-part-,$(PERFCS_MAP_PROFILES)) \
+	$(addprefix check-empty-map-traversal-budgets-part-,$(PERFCS_PROFILES)) \
+	$(addprefix check-empty-map-traversal-sanitize-part-,$(PERFCS_MAP_PROFILES))
+check-empty-map-traversal: $(addprefix check-empty-map-traversal-part-,$(PERFCS_MAP_PROFILES))
 
 # Eager and arena profiles take no budget and the mutants run at K1: both are already covered by check-empty-map-traversal.
-check-empty-map-traversal-budgets: tests/empty-map-traversal.py tests/empty-map-traversal.c $(RUNTIME_HEADERS) | build
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) python3 "tests/empty-map-traversal.py" --modes native --budgets $(PERFCS_OTHER_BUDGETS) --profiles system,fixed,lazy --skip-mutants
+check-empty-map-traversal-budgets: $(addprefix check-empty-map-traversal-budgets-part-,$(PERFCS_PROFILES))
 
-check-empty-map-traversal-sanitize: tests/empty-map-traversal.py tests/empty-map-traversal.c $(RUNTIME_HEADERS) | build
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) python3 "tests/empty-map-traversal.py" --modes sanitize
+check-empty-map-traversal-sanitize: $(addprefix check-empty-map-traversal-sanitize-part-,$(PERFCS_MAP_PROFILES))
+
+# The two mutant pairs stay in the system piece; the other four profiles skip them.
+$(foreach profile,$(PERFCS_MAP_PROFILES),$(eval $(call PERFCS_PROFILE_PIECE,empty-map-traversal,tests/empty-map-traversal.py,$(PERFCS_EMPTY_MAP_INPUTS),$(LIMITED),--modes native --budgets $(PERFCS_MAP_GATE_BUDGETS),$(profile),--skip-mutants)))
+$(foreach profile,$(PERFCS_MAP_PROFILES),$(eval $(call PERFCS_PROFILE_PIECE,empty-map-traversal-sanitize,tests/empty-map-traversal.py,$(PERFCS_EMPTY_MAP_INPUTS),$(SANITIZER_LIMITED),--modes sanitize,$(profile),--skip-mutants)))
+
+# check-empty-map-traversal-budgets already skips the mutants (K1 covers them), so every piece skips them.
+check-empty-map-traversal-budgets-part-system check-empty-map-traversal-budgets-part-fixed check-empty-map-traversal-budgets-part-lazy: $(PERFCS_EMPTY_MAP_INPUTS) | build
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) python3 "tests/empty-map-traversal.py" --modes native --budgets $(PERFCS_OTHER_BUDGETS) --profiles $(patsubst check-empty-map-traversal-budgets-part-%,%,$@) --skip-mutants
 
 check check-portable: check-owner-queue-batching check-temporary-owner-cache check-frame-initialization check-empty-map-traversal
 check check-ownership: check-owner-queue-batching-budgets check-temporary-owner-cache-budgets check-frame-initialization-budgets check-empty-map-traversal-budgets
