@@ -21,6 +21,28 @@ function functionBody(llvm: Text, name: Text): Text {
     fail("Text scanning LLVM function is missing: " + name)
 }
 
+// Whether one function body defines a local name twice. LLVM names are
+// function-scoped, so two definitions of `%value.N.suffix` are invalid IR even
+// in different blocks.
+function duplicateLocals(body: Text): Boolean {
+    let seen: List<Text> = []
+    for line in test.lines(body) {
+        if line.startsWith("  %") {
+            let equals = line.find(" = ")
+            if equals > 2 {
+                let name = line.slice(2, equals)
+                let index = 0
+                while index < seen.length {
+                    if seen[index] == name { return true }
+                    index = index + 1
+                }
+                seen.add(name)
+            }
+        }
+    }
+    return false
+}
+
 let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
 let levels = ["-O0", "-O2"]
 
@@ -335,6 +357,189 @@ let directSlice = functionBody(sliceLLVM, "direct")
 test.check(test.contains(directSlice, "call i64 @minyar_text_integer_range(") && !test.contains(directSlice, "@minyar_text_slice(") && !test.contains(directSlice, "@minyar_rc_"), "Integer of a slice must parse the range without a slice")
 let keptSlice = functionBody(sliceLLVM, "kept")
 test.check(test.contains(keptSlice, "@minyar_text_slice(") && test.contains(keptSlice, "@minyar_text_integer(") && !test.contains(keptSlice, "@minyar_text_integer_range("), "a stored slice is still a Text")
+
+// A loop that reads one Text's characters or length tests it once: a counted
+// ASCII Text reads its bytes directly in a copy of the loop, and every other
+// Text runs the counted loop unchanged with the same results and traps.
+fixtures.executes(frontend, #"""
+    record Cursor { text: Text; position: Integer }
+    function Cursor.spaces() {
+        while self.position < self.text.length && self.text[self.position] == ' ' { self.position += 1 }
+    }
+    function count(text: Text): Integer {
+        let found = 0
+        let index = 0
+        while index < text.length {
+            if text[index] == 'a' { found += 1 }
+            index += 1
+        }
+        return found
+    }
+    function letters(text: Text): Integer {
+        let total = 0
+        for character in text { if character != ' ' { total += 1 } }
+        return total
+    }
+    let cursor = Cursor { text: "   drei", position: 0 }
+    cursor.spaces()
+    print(cursor.position)
+    print(count("aña🙂a"))
+    print(count(""))
+    print(letters("a b c"))
+    let unicode = "añ🙂b"
+    let shown: List<Text> = []
+    for index in 0..unicode.length { shown.add(Text(unicode[index])) }
+    print(joinText(shown, "|") + " " + Text(unicode.length))
+    """#, "3\n3\n0\n3\na|ñ|🙂|b 4\n", levels, 0, "", true)
+let countPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let countLLVM = io.readTextFile(countPath + ".ll")
+let counted = functionBody(countLLVM, "count")
+test.check(test.contains(counted, "@.minyar.text.character.known(") && test.contains(counted, "icmp sgt i64"), "a loop over one Text tests counted ASCII once and reads bytes directly")
+test.check(test.contains(counted, "call i32 @.minyar.text.character("), "the counted loop stays for a Text that is not counted ASCII")
+let letterBody = functionBody(countLLVM, "letters")
+test.check(test.contains(letterBody, "@.minyar.text.character.known("), "a for loop over a Text reads bytes directly")
+
+// The fast copy traps exactly where the counted loop does.
+fixtures.executes(frontend, #"""
+    let text = "abc"
+    let index = 0
+    while index <= text.length {
+        print(Text(text[index]))
+        index += 1
+    }
+    """#, "a\nb\nc\n", levels, 1, "Minyar stopped: a Text position was outside the Text.\n", false)
+
+// Text and List versioning copy the same loop region independently, and an
+// enclosing copy renames a nested copy again. Every pass keeps its own name
+// suffix, so nesting any depth leaves one definition per local name.
+fixtures.executes(frontend, #"""
+    record Entry { text: Text; weight: Integer }
+    function countLetters(text: Text): Integer {
+        let total = 0
+        for character in text { if character != ' ' { total += 1 } }
+        return total
+    }
+    function windowScan(values: List<Integer>, text: Text): Integer {
+        let total = 0
+        for j in 0..3 {
+            total += values[j] + text.length
+        }
+        return total
+    }
+    function scanInsideList(values: List<Integer>, text: Text): Integer {
+        let total = 0
+        for j in 0..3 {
+            let index = 0
+            while index < text.length {
+                if text[index] == 'a' { total += values[j] }
+                index += 1
+            }
+        }
+        return total
+    }
+    function textInsideText(outer: Text, inner: Text): Integer {
+        let total = 0
+        for left in outer {
+            let index = 0
+            while index < inner.length {
+                if inner[index] == 'b' { total += 1 }
+                index += 1
+            }
+            total += 1
+        }
+        return total
+    }
+    function threeLevels(rows: List<Text>): Integer {
+        let total = 0
+        for row in rows {
+            let outer = 0
+            while outer < row.length {
+                let inner = 0
+                while inner < row.length {
+                    if row[inner] != ' ' { total += 1 }
+                    inner += 1
+                }
+                outer += 1
+            }
+        }
+        return total
+    }
+    function recordScans(entries: List<Entry>): Integer {
+        let total = 0
+        for entry in entries {
+            let index = 0
+            while index < entry.text.length {
+                if entry.text[index] == 'x' { total += entry.weight }
+                index += 1
+            }
+        }
+        return total
+    }
+    function scanWithCalls(rows: List<Text>, text: Text): Integer {
+        let total = 0
+        for row in rows {
+            let index = 0
+            while index < text.length {
+                if text[index] == 'z' { total += countLetters(row) }
+                index += 1
+            }
+        }
+        return total
+    }
+    function whileOuter(words: List<Text>): Integer {
+        let total = 0
+        let start = 0
+        while start < words.length {
+            let word = words[start]
+            let index = 0
+            while index < word.length {
+                if word[index] == 'c' { total += 1 }
+                index += 1
+            }
+            start += 1
+        }
+        return total
+    }
+    function whileOverWindow(values: List<Integer>, text: Text): Integer {
+        let total = 0
+        let outer = 0
+        while outer < 2 {
+            for j in 0..3 {
+                total += values[j] + text.length
+            }
+            outer += 1
+        }
+        return total
+    }
+    function textOverWindow(values: List<Integer>, text: Text): Integer {
+        let total = 0
+        for left in text {
+            for j in 0..3 {
+                total += values[j] + text.length
+            }
+        }
+        return total
+    }
+    print(windowScan([1, 2, 3], "abcdef"))
+    print(scanInsideList([1, 2, 3], "aa"))
+    print(textInsideText("xy", "bbb"))
+    print(threeLevels(["ab", "c"]))
+    print(recordScans([Entry { text: "xoxo", weight: 3 }, Entry { text: "zz", weight: 9 }]))
+    print(scanWithCalls(["ab c", "de"], "zzz"))
+    print(whileOuter(["ac", "cc"]))
+    print(whileOverWindow([1, 2, 3], "abc"))
+    print(textOverWindow([1, 2, 3], "ab"))
+    """#, "24\n12\n8\n5\n6\n15\n3\n30\n24\n", levels, 0, "", true)
+let nestedPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let nestedLLVM = io.readTextFile(nestedPath + ".ll")
+for name in ["windowScan", "scanInsideList", "textInsideText", "threeLevels", "recordScans", "scanWithCalls", "whileOuter", "whileOverWindow", "textOverWindow"] {
+    test.check(!duplicateLocals(functionBody(nestedLLVM, name)), "nested loop copies define one LLVM local twice: " + name)
+}
+let windowBody = functionBody(nestedLLVM, "windowScan")
+test.check(test.contains(windowBody, "for.guard.") && test.contains(windowBody, "@.minyar.text.length("), "a List window loop keeps its List copy and its Text length read")
+test.check(test.contains(functionBody(nestedLLVM, "scanInsideList"), "@.minyar.text.character.known("), "a nested Text scan still reads bytes directly")
+let overWindowBody = functionBody(nestedLLVM, "whileOverWindow")
+test.check(test.contains(overWindowBody, "for.guard.") && test.contains(overWindowBody, "@.minyar.text.length("), "an enclosing Text copy and a nested List window copy coexist")
 
 test.removeTree(frontend.compiler.directory)
 print("Text scanning: passed")
