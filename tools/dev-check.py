@@ -400,7 +400,8 @@ def command_index(arguments):
     passed.update({name: entry["passed"] for name, entry in times.items()})
     traces = [trace]
     untraced_pass = {}
-    failed = [name for name in checks if not passed.get(name, False)]
+    # The aggregate's own recipe cannot run without all of its prerequisites; it is selected statically.
+    failed = [name for name in checks if not passed.get(name, False) and name not in aggregate]
     if failed and (not arguments.reuse_trace or arguments.retry):
         # Retry failures alone under the tracer (load or ordering), then untraced to tell a base failure
         # from a check that cannot run under strace. Either way they are selected on every run.
@@ -449,7 +450,8 @@ def command_index(arguments):
         timing = times.get(check, {})
         status = passed.get(check, False)
         entries[check] = {
-            "passed": bool(status) or untraced_pass.get(check, False),
+            "static": check in aggregate,
+            "passed": bool(status) or untraced_pass.get(check, False) or check in aggregate,
             "traced": bool(status) and bool(reads[check] or listed[check]),
             "wall_ms": timing.get("wall_ms", 0), "cpu_ms": timing.get("cpu_ms", 0),
             "reads": sorted(number(path) for path in reads[check]),
@@ -589,6 +591,13 @@ def select(index, database, checks, changed, added, removed, stale):
         entry = index["checks"].get(check)
         if entry is None:
             why.append("new check (no base trace)")
+        elif entry.get("static"):
+            # An aggregate goal's own recipe: its file prerequisites and the paths its recipe names.
+            rule = database["rules"].get(check, {"prerequisites": [], "recipe": []})
+            named = set(rule["prerequisites"]) | {token.strip('"\'') for line in rule["recipe"] for token in line.split()}
+            hits = sorted(named & changed_set)
+            if hits:
+                why.append("its own recipe uses " + ", ".join(hits[:4]) + " (runs the whole aggregate)")
         else:
             if not entry["passed"]:
                 why.append("not passing at base")
