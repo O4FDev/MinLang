@@ -106,6 +106,9 @@ def find_cache(choice):
             return {"name": name, "public": addresses["public"], "private": addresses["private"]}
     if choice != "auto":
         raise RuntimeError(f"no active droplet named {name}")
+    # The guard deletes it after 2 h like any shard; creating one inside a gate would not finish before the shards
+    # boot, so a gate without one builds on its shards. tools/fast-gate/create-cache.sh makes one ahead of a session.
+    say("no shard-cache box: the shards build the compiler themselves (tools/fast-gate/create-cache.sh makes one)")
     return None
 
 
