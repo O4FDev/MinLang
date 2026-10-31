@@ -36,6 +36,11 @@ static MINYAR_THREAD_LOCAL RcBoundedObjects rc_objects;
 #ifndef RC_SMALL_RECORD_UNIT_OBJECTS
 #define RC_SMALL_RECORD_UNIT_OBJECTS 4
 #endif
+/* A reference List with at most this many slots is a small aggregate too: one
+ * unit visits its elements and finalizes it. */
+#ifndef RC_SMALL_LIST_SLOTS
+#define RC_SMALL_LIST_SLOTS 8
+#endif
 #define MINYAR_RC_RECENT_OBJECTS 1
 #define rc_bounded_recent_head (rc_objects.recent_head)
 #define rc_bounded_recent_tail (rc_objects.recent_tail)
@@ -282,6 +287,23 @@ static void rc_bounded_retire_temporaries(RcFrame *frame) {
 #define RC_BOUNDED_INLINE static inline
 #endif
 
+/* A uniquely owned small aggregate among the current unit's owners is marked
+ * dead and taken onto the unit's stack instead of joining the queue. */
+RC_BOUNDED_INLINE int rc_take_small_child(void *child, RcObject **stack, size_t *top, size_t taken) {
+    if (!child) return 0;
+    RcObject *object = (RcObject *)child - 1;
+    size_t ownership = object->ownership;
+    if (ownership == (8 | RC_RECORD)) {
+        if ((size_t)((MinyarRecord *)(object + 1))->length > RC_SMALL_RECORD_SLOTS) return 0;
+    } else if (ownership == (8 | RC_REFERENCES)) {
+        if ((size_t)((MinyarList *)(object + 1))->length > RC_SMALL_LIST_SLOTS) return 0;
+    } else return 0;
+    if (*top + taken >= RC_SMALL_RECORD_UNIT_OBJECTS) return 0;
+    object->ownership = (size_t)(ownership & 7);
+    stack[(*top)++] = object;
+    return 1;
+}
+
 /* Retire one small record and, while the unit's object allowance lasts, the
  * children that are small records themselves, so one unit frees a whole small
  * subtree instead of one record. A child not taken here follows the ordinary
@@ -292,28 +314,38 @@ static void rc_bounded_retire_temporaries(RcFrame *frame) {
 __attribute__((noinline))
 #endif
 static void rc_bounded_retire_small_in(RcBoundedObjects *q, size_t *pending, RcObject *object) {
-    RcObject *stack[RC_SMALL_RECORD_UNIT_OBJECTS];
-    size_t top = 0;
+    RcObject *stack[RC_SMALL_RECORD_UNIT_OBJECTS], *finish[RC_SMALL_RECORD_UNIT_OBJECTS];
+    size_t top = 0, finished = 0;
     stack[top++] = object;
     while (top) {
         RcObject *current = stack[--top];
+        unsigned kind = current->ownership & 7;
+        finish[finished++] = current;
+        if (kind == RC_REFERENCES) {
+            MinyarList *list = (MinyarList *)(current + 1);
+            size_t end = (size_t)list->length;
+            for (size_t index = 0; index < end; index++) {
+                void *child = (void *)(uintptr_t)list->values[index];
+                if (rc_take_small_child(child, stack, &top, finished)) continue;
+                rc_drop_in(q, pending, child);
+            }
+            continue;
+        }
         MinyarRecord *record = (MinyarRecord *)(current + 1);
         size_t end = (size_t)record->length;
         unsigned char *map = (unsigned char *)(record->values + end);
         for (size_t index = 0; index < end; index++) {
             if (!(map[index] & 1)) continue;
             void *child = (void *)(uintptr_t)record->values[index];
-            RcObject *child_object = (RcObject *)child - 1;
-            if (child_object->ownership == (8 | RC_RECORD) &&
-                (size_t)((MinyarRecord *)(child_object + 1))->length <= RC_SMALL_RECORD_SLOTS &&
-                top < RC_SMALL_RECORD_UNIT_OBJECTS) {
-                child_object->ownership = RC_RECORD;
-                stack[top++] = child_object;
-                continue;
-            }
+            if (rc_take_small_child(child, stack, &top, finished)) continue;
             rc_drop_in(q, pending, child);
         }
-        rc_bounded_finish_object(current, RC_RECORD);
+    }
+    /* Newest first: a unit retires a small subtree in reverse allocation order,
+     * like the unary chains the recent queue already follows. */
+    while (finished) {
+        RcObject *current = finish[--finished];
+        rc_bounded_finish_object(current, current->ownership & 7);
     }
 }
 
@@ -352,7 +384,14 @@ RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t
         }
     } else if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
-        if (q->cursor < (size_t)list->length) {
+        size_t end = (size_t)list->length;
+        if (q->cursor < end) {
+            if (end <= RC_SMALL_LIST_SLOTS && !q->cursor) {
+                rc_bounded_retire_small_in(q, pending, object);
+                --*pending;
+                q->active = NULL;
+                return;
+            }
             rc_drop_in(q, pending, (void *)(uintptr_t)list->values[q->cursor++]);
             return;
         }
@@ -403,7 +442,15 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit_in(RcBoundedObjects *q, siz
     size_t cursor = rc_bounded_saved_cursor(object);
     if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
-        if (cursor < (size_t)list->length) {
+        size_t end = (size_t)list->length;
+        if (cursor < end) {
+            if (end <= RC_SMALL_LIST_SLOTS && !cursor) {
+                q->recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
+                if (!q->recent_head) q->recent_tail = NULL;
+                rc_bounded_retire_small_in(q, pending, object);
+                --*pending;
+                return;
+            }
             void *child = (void *)(uintptr_t)list->values[cursor];
             rc_bounded_save_cursor(object, cursor + 1);
             rc_drop_in(q, pending, child);
