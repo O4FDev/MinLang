@@ -260,13 +260,12 @@ double minyar_frozen_bytes_get_float64(const RcThreadLeaf *frozen, long long pos
     return value;
 }
 
-/* text.decodeFrozen: a Text view of a byte range of a FrozenBytes. The range
- * is validated as UTF-8 in one pass and never copied, so every thread and
- * every branch of a join can read shared input without a Bytes copy. Returns
- * NULL (Maybe None) when the range is not UTF-8. The view owns the shared
- * buffer through an owner Text whose bytes are that buffer: the owner keeps
- * the handle alive and its release drops the handle instead of freeing bytes.
- * Views point at the owner, never at another view, exactly like slices. */
+/* frozen.decode: a Text view of a byte range of a FrozenBytes. The range is
+ * validated as UTF-8 in one pass and never copied, so every thread and every
+ * branch of a join can read shared input without a Bytes copy. Returns NULL
+ * (Maybe None) when the range is not UTF-8. The view keeps the shared handle
+ * alive through its backing: release drops the handle instead of freeing
+ * bytes, and slices of it keep sharing the same buffer. */
 MinyarText *minyar_runtime_frozenText(const RcThreadLeaf *frozen, long long start, long long end) {
     RcThreadBuffer b = rc_frozen(frozen)->buffer;
     if (start < 0 || end < start || end > b.length)
@@ -275,12 +274,9 @@ MinyarText *minyar_runtime_frozenText(const RcThreadLeaf *frozen, long long star
     const unsigned char *bytes = (const unsigned char *)(b.data + 1) + start;
     int status = utf8_scan(bytes, length);
     if (status < 0) return NULL;
-    MinyarText *owner = new_text((const unsigned char *)(b.data + 1), b.length, -1);
-    owner->backing = (MinyarText *)(void *)frozen;
-    minyar_rc_retain((void *)frozen);
-    /* The view takes the owner's reference; nothing else owns the owner. */
     MinyarText *view = new_text(bytes, length, status ? length : -1);
-    view->backing = owner;
+    view->backing = (MinyarText *)(void *)frozen;
+    minyar_rc_retain((void *)frozen);
     return view;
 }
 

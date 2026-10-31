@@ -478,6 +478,16 @@ MINYAR_HOT MinyarText *new_text(const unsigned char *bytes, long long byte_lengt
     return text;
 }
 
+#if !defined(MINYAR_COMPILER_ARENA) && MINYAR_THREADED
+/* A view can keep shared storage alive through the handle itself (a
+ * FrozenBytes leaf) instead of through an owning Text. Such a backing has a
+ * kind other than RC_TEXT and no byte_length of its own, so size heuristics
+ * read the view instead. Only the thread runtime can make one. */
+static _Bool text_backing_shared(const MinyarText *text) {
+    return text->backing && ((((RcObject *)text->backing) - 1)->ownership & 7) != RC_TEXT;
+}
+#endif
+
 /* Text pieces are mostly a few bytes long; copying them with overlapping
    fixed-width loads avoids a library call and never reads past the source. */
 MINYAR_HOT void copy_bytes(unsigned char *target, const unsigned char *source, size_t length) {
@@ -1207,14 +1217,20 @@ static MinyarText *text_slice_bytes(MinyarText *text, long long first_byte, long
     {
         long long length = last_byte - first_byte;
         MinyarText *root = text->backing ? text->backing : text;
+#if MINYAR_THREADED
+        _Bool shared = text_backing_shared(text);
+#else
+        _Bool shared = 0;
+#endif
         /* A full slice is the same immutable value. For a tiny portion of a
          * large allocation, copy so a short-lived token cannot retain the
-         * whole source; otherwise use a zero-copy view. */
+         * whole source; otherwise use a zero-copy view. A view of shared
+         * frozen storage has no owning Text to measure, so it keeps sharing. */
         if (first_byte == 0 && length == text->byte_length) {
             minyar_rc_retain(text);
             return text;
         }
-        if (root->byte_length > 4096 &&
+        if (!shared && root->byte_length > 4096 &&
             (unsigned long long)length * 8 < (unsigned long long)root->byte_length) {
             MinyarText *copy = new_text_storage(length, length == characters ? characters : -1);
             unsigned char *bytes = (unsigned char *)copy->bytes;

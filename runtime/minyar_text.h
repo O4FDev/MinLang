@@ -197,9 +197,17 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
  * slice. Text is immutable, so every owner sees the same contents. */
 static void text_compact_kept_piece(MinyarText *piece) {
     MinyarText *root = piece->backing;
+#if MINYAR_THREADED
+    /* A piece of shared frozen storage keeps the shared buffer, never an
+     * owning Text it could copy out of. */
+    if (!root || text_backing_shared(piece) || root->byte_length <= 4096 ||
+        (unsigned long long)piece->byte_length * 8 >= (unsigned long long)root->byte_length)
+        return;
+#else
     if (!root || root->byte_length <= 4096 ||
         (unsigned long long)piece->byte_length * 8 >= (unsigned long long)root->byte_length)
         return;
+#endif
     long long length = piece->byte_length;
     unsigned char *bytes = new_bytes(length);
     memcpy(bytes, piece->bytes, (size_t)length);
@@ -331,8 +339,14 @@ MinyarText *minyar_text_trim_take(MinyarText *text) {
 #ifndef MINYAR_COMPILER_ARENA
     MinyarText *root = text->backing;
     long long length = last - first;
+#if MINYAR_THREADED
+    _Bool shared = text_backing_shared(text);
+    long long root_length = shared ? text->byte_length : (root ? root->byte_length : 0);
+#else
+    long long root_length = root ? root->byte_length : 0;
+#endif
     if (((RcObject *)text - 1)->ownership == (8 | RC_TEXT) && root &&
-        (root->byte_length <= 4096 || (unsigned long long)length * 8 >= (unsigned long long)root->byte_length)) {
+        (root_length <= 4096 || (unsigned long long)length * 8 >= (unsigned long long)root_length)) {
         rc_free_data(text->character_offsets);
         text->bytes += first;
         text->byte_length = length;

@@ -205,7 +205,17 @@ RC_QUEUE_INLINE unsigned rc_drop_in(RcBoundedObjects *q, size_t *pending, void *
             RcObject *root = (RcObject *)backing - 1;
             if (root->ownership >> 3) {
                 root->ownership -= 8;
-                if (!(root->ownership >> 3)) rc_bounded_enqueue_in(q, pending, root);
+                if (!(root->ownership >> 3)) {
+#if MINYAR_THREADED
+                    /* A view may keep shared storage alive through the handle
+                     * itself; a handle has no fields for the queue to visit,
+                     * so finish it here and in one unit. */
+                    if ((root->ownership & 7) == 0) rc_bounded_finish_object(root, 0);
+                    else rc_bounded_enqueue_in(q, pending, root);
+#else
+                    rc_bounded_enqueue_in(q, pending, root);
+#endif
+                }
             }
         }
         return 1;
@@ -283,13 +293,9 @@ RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t
             return;
         }
     }
-    /* A Text task can hold a shared backing (a Text view of frozen storage).
-     * finish returns that backing instead of freeing it; release it here, so a
-     * queued view task cannot drop an owning root on the floor. */
-    void *backing = rc_bounded_finish_object(object, kind);
+    rc_bounded_finish_object(object, kind);
     --*pending;
     q->active = NULL;
-    if (backing) rc_drop_in(q, pending, backing);
 }
 
 /* A recent task remains linked while visiting its next owner. Saving the
@@ -326,9 +332,8 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit_in(RcBoundedObjects *q, siz
     }
     q->recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
     if (!q->recent_head) q->recent_tail = NULL;
-    void *backing = rc_bounded_finish_object(object, kind);
+    rc_bounded_finish_object(object, kind);
     --*pending;
-    if (backing) rc_drop_in(q, pending, backing);
 }
 
 /* Reserve alternating object units for the oldest finite batch. Whenever that
