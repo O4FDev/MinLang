@@ -1,3 +1,46 @@
+# Minyar goal status (2026-10-31 20:25 UTC — end of the cake swarm window; boxes D/F/G/H–O deleted at 21:30)
+
+## NEXT SESSION — first merge batch (unmerged wins, with branches)
+1. **c8 Text loop versioning** — `goal/cake-c8` 821bca9bb (exprparse −4%, tokenizer −5%). Merged then reverted
+   (84e2e01a3): nested versioning emits `multiple definition of local value 'value.N.fastA.fastB'` on a hidden program's
+   nested loops. Fix the copy naming for loops inside an already-versioned region, add that shape to
+   tests/text-scanning.min, re-gate, re-score hidden.
+2. **c10 per-unit scheduler savings re-based on c4** — `goal/cake-c10-on-c4` if the agent finished it, else
+   `goal/cake-c10` 257edb3b4 (built on c3's d0f9d338a, exprparse/logstats −1.3%, json −1.1%); must show no program slower
+   on top of c4. Its recent-first-with-minimum-share variant is decision D1 below (needs the sustained-load test).
+3. **c5 region mechanism** — `goal/cake-c5` 663771786, a7e041b0d, only if Luke approves D2 (`region { … }`).
+4. **c1 header recycling** (treewalk −9.3%) — blocked by a latent double-release in borrow bookkeeping (reports/cake/c1.md);
+   fix that bug first (it is a memory-safety bug regardless of recycling).
+5. **Gate flow:** switch merges to the fast-tests loop's sharded `fast-gate` once it announces itself in
+   ~/Projects/goal-loops/REQUESTS.md (branch goal/fast-tests). Until then use ~/Projects/minyar-goal-20261030/shard/
+   (3-way sharded gate = 10.5 min vs ~25 min single box).
+6. **Harness v2** is merged (function-level selection; docs/dev-check.md). It is the default pre-gate check for every lane
+   and Wafer agent. What's left (reports/harness.md): compiler/runtime edits still select 78–90 checks (12–17 min) because
+   many checks hash the compiler binary as data; 26 checks lack coverage; SIGKILLed processes lose counts. The coverage
+   index must be re-recorded on the next session's boxes (`make dev-check-index`, ~57 min once).
+
+## Current numbers
+| | baseline 3832f4373 | now (goal tip) |
+|---|---|---|
+| hidden h01–h20 vs fastest of C/C++/Rust | 7.453 (max 19.47) | **4.826** (max 12.94); vs Rust **3.236** (max 9.51) |
+| hidden b01–b07 (serial / 4-thread) | 6.38 / 2.97 | **3.46 / 2.13** (vs Rust 2.60 / 2.13) |
+| visible compare suite (22 programs) | 5.32 | **2.52** (vs Rust 2.03); worst json 6.38 |
+Phase 1 bars (≤ 1.25×, no program > 2×; Luke's ≤ 1.0×, none > 1.2×) are **not met**. Phase 2 register rows built but
+not yet adopted by the projects that asked; async I/O and SIMD not started.
+
+## Decisions for Luke (from the cake swarm, reports/cake.md has the code examples)
+- D1 recent-first cleanup with a guaranteed old-batch share (doc wording change only; gain −2.8% exprparse, −1.2% json for
+  the unbounded form; bounded form not finished).
+- D2 opt-in `region { … }` block (new syntax; ceiling −29% to −76% Ir on parse-then-drop programs).
+- D3 json member index needs a private `Value` field (breaks `json.Value { … }` literals; wins only from ~32 members).
+- Already decided by Luke today: T4b coarser scheduler unit APPROVED (landed via c4's subunit drain); json API break and
+  new arena syntax NOT approved; everything else keeps its guarantee.
+
+## Spend (2026-10-31)
+Wafer Code: $6.46 for the swarm (14:20 UTC on), $6.99 for the whole day (01:10 UTC on). Boxes: H, I–L, M–O inside
+Luke's $10; nothing else created.
+
+---
 # Minyar goal status (2026-10-31, before the 09:40 UTC box shutdown)
 
 Goal: find exactly why Minyar is slower than heavily optimised C/C++/Rust and fix it in the compiler, runtime and

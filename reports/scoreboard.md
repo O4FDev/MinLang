@@ -114,3 +114,15 @@ ownership5 lane as a numbers-only signal; fix due 19:30 UTC. Note goal/2026-10-3
 check-determinism-runtime (box-H env), check-harness-dependencies (artifact of my tree seeding: copied build outputs older
 than the checked-out sources and compare-and-move rules never refresh their mtime — passes once the chain is touched).
 Merged into goal/2026-10-30.
+
+## Swarm finding to fix (c1, 18:05 UTC): latent double-release in borrow bookkeeping
+Recycling whole List headers (c1's best attempt, treewalk −9.3%) segfaults treewalk; memcheck shows a write into a List
+header that was already released and handed out again — a release the compiler's borrow bookkeeping makes on a header it
+no longer owns. Hidden today only because freed slots are rarely reused that fast. Treat as a memory-safety bug to fix
+before any reuse-style allocation lands (repro + details: reports/cake/c1.md).
+
+## FINAL (2026-10-31 20:22 UTC), goal/2026-10-30 after the swarm merges and the c8 revert
+Hidden (box B): h geomean=4.826 max=12.940 over2=18 failed=0 | vs Rust 3.236 / 9.512 | b serial 3.460, parallel 2.133, failed 0
+  (with c8: h 4.671 but b07 failed to compile — reverted).  Baseline 3832f4373: h 7.453 / max 19.47.
+Visible compare (box M, 22 programs): 2.52 vs fastest, 2.03 vs Rust; worst json 6.38 (baseline 5.32 on 21 programs).
+Gates: sharded 3-way full gate (M/K/J) green except box-env check-determinism-runtime; b07 verified at 1 and 4 threads.

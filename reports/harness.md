@@ -1,7 +1,58 @@
-INDEX READY (14:33 UTC): /home/agent/swarm/harness/build/dev-check/index.json (337 checks of check-portable, base =
-goal/2026-10-30-harness 253b28805 = cake-base + dev-check). Copy it to <tree>/build/dev-check/index.json. 7 base reds and
-check-debugger-values (ptrace, untraceable) run on every invocation (~1 min); a seed whose build is partial gets one
-wider first run while Make builds the missing outputs.
+HARNESS V2 READY (19:35 UTC): compiler and runtime changes are selected by the functions they change.
+Index: /home/agent/swarm/harness/build/dev-check/index.json (= index-v4.json: file trace + per-check function coverage,
+337 checks; base = goal/2026-10-30-harness at ae948c628..1d936135f, i.e. cake-base + dev-check). Needs the tool at branch tip
+1d936135f or later (older tools read the same index but ignore the function data). Command unchanged: `./minyar dev check`.
+Proof: mutation full gate (runtime minyar_map_remove + compiler constantOverflow message; 10 mutation-caused failures):
+dev-check selected all 10, missed none. Compiler-stage function edit alone: 78/337 checks, RED in 700 s on exactly the
+failing check (check-compile-time-constants). Runtime-header function edit (minyar_map_get_or, run by 1 check): 90/337.
+Batch B4 (recorded red check-last-use-sinks) is fully function-attributable: its 13 changed compiler functions are executed
+by 215 checks including check-last-use-sinks.
+
+HARNESS READY: `./minyar dev check` (= `make dev-check` = `python3 tools/dev-check.py run`; `--plan`, `--only PATH`,
+`--bench --bench-base FILE`, `--include-base-red`). Branch goal/2026-10-30-harness, tip de678b88b.
+Index (box H): /home/agent/swarm/harness/build/dev-check/index.json, replaced 16:23 UTC by the re-parsed v2 (nested-Make goals,
+fixed retry statuses; same base). The 253b28805 copy is at /home/agent/swarm/harness-val/index-253b28805.json.
+Agents on 253b28805 should cherry-pick up to de678b88b: the content cutoff (496cac274) and file-rule-by-recipe (e210ead6d)
+are what keep a .mk / new-file change from selecting everything.
+
+## Agreement: harness vs recorded full gate
+| batch (tip) | change | gate | dev-check | agree |
+| --- | --- | --- | --- | --- |
+| B2 153ad7ee5 | compiler (text lowering) + tests | red: check-language-contracts | compiler sources → build/minyarc stale → all 337 selected, i.e. it runs the gate's check set; not rerun (Luke: no gate reruns) | yes by construction |
+| B4 978516b86 | compiler (codegen) + docs | red: check-last-use-sinks | same: all 337 | yes by construction |
+| B5 2d2a3804b | benchmarks.mk rule, new tests/ablation/*, minyar, run.py, reports | red: suite-catalogue → build-wiring, peer-manifest, peer-regressions* | RAN (replayed on the indexed tree): 115 selected, RED: suite-catalogue, build-wiring, peer-manifest, peer-regressions-rust-go-zig | yes |
+| B3 bb87f78f4 | compiler + runtime | green 335/335 | all 337 (plan) | consistent |
+| B6 908aec3ab | runtime + compiler | green 338/338 | all 337 (plan) | consistent |
+| B7 1ddea7b87 / runtime-only fd83e1930+1ddea7b87 | runtime | green 339/339 | all 337 (plan; runtime headers feed runtime.o and the compiler runtime) | consistent |
+| base cake-base 9aa49c5f1 | — | (no record) | index run: 6 checks red at base (see FINDING) | confirmed by orchestrator's batch-9 gate (same 6 + 3 new) |
+| docs edit (synthetic) | docs/language.md | — | 4 selected, GREEN 166 s | — |
+| test edit (synthetic) | tests/http.min | — | no Linux gate check reads it; GREEN 24 s | — |
+Not done in the time box: replays of glib (c26af6a9d), gnative (e1fc31110), gtest (bd48818de), gmk (8810e3f0b), gdocs, and a
+narrow library edit (tar) — gnative was running when the box got saturated; first attempt selected 271 checks because
+file rules were compared by prerequisite list (fixed in e210ead6d, not yet re-measured).
+
+## Turnaround (box H, 8 vCPU shared with ~10 agents, --jobs 4)
+| change | rebuild | checks | wall |
+| --- | --- | --- | --- |
+| docs edit | cutoff build 10 s, 0 changed | 4 | 166 s |
+| test edit not in the Linux gate | 6 s | 0 (+1 untraceable) | 24 s |
+| .mk rule + new test files (B5) | cutoff 206 s (338 outputs rebuilt, 0 bytes changed) | 115 | 1,310 s (RED) |
+| library module used by the runner (json) | 151 s, 220 changed | 337 | = gate (aborted) |
+| compiler pass edit | build/minyarc 52 s (stage1+stage2, thin-LTO cache; stage0 only for bootstrap/) | 337 | = gate |
+| runtime header edit | runtime.o + compiler runtime | 337 | = gate |
+| full gate | — | 336-339 | 22-24 min at CHECK_JOBS=8 (orchestrator); traced index gate 57 min at 4 jobs on the shared box |
+
+## What remains
+- Precision: new files are seen by every check that lists their directory (`tests`, `.`, `tools`); 30+ checks list
+  tests/. Next: record which listed entries a process then opens and match by name pattern, or find the shared lister.
+- Compiler/runtime-core changes are honest (= gate). Real narrowing needs per-check coverage of compiler functions
+  (IR-level PGO instrumentation of minyarc) — not started.
+- `rebase` after reverting core sources rebuilds everything (282-449 s); fine for validation, irrelevant for agents.
+- macOS-only checks are not covered (Linux index).
+
+INDEX READY (14:33 UTC; base = goal/2026-10-30-harness 253b28805 = cake-base + dev-check). Copy it to
+<tree>/build/dev-check/index.json. check-debugger-values (ptrace) cannot be traced and runs every time; since 8beeca6e0
+base reds are listed, not rerun. A seed whose build is partial gets one wider first run while Make builds the missing outputs.
 
 # Lane harness: `minyar dev check`
 
@@ -13,9 +64,6 @@ the orchestrator.
 Second real catch (orchestrator, 14:30): the full batch-9 gate on box H (goal/integrate-9 = cake-base + ownership5) failed
 10/339 = the six base reds above + check-choice, check-choice-set-niche, check-ownership-name-proofs (new in batch 9).
 
-STATUS 14:22 UTC: not ready yet. Traced base index on box H is at 300/336 checks (box shared with the int9 gate);
-validation (B5 red run, greens, compiler/runtime plans) follows immediately; expected ~14:15 UTC.
-Branch goal/2026-10-30-harness has the tool (tools/dev-check.py, `./minyar dev check`, docs/dev-check.md).
 
 ## Design (12:40-13:00 UTC)
 - Existing `check-changed`/`tools/check-selection.min` treats every compiler/runtime path as "bounded" (core checks only)
@@ -82,3 +130,56 @@ on goal/integrate-9.
   are observed by every check that lists those directories; minyar launcher readers); RED in 1310 s on the loaded box:
   check-suite-catalogue, check-build-wiring, check-peer-manifest, check-peer-regressions-rust-go-zig (+ 2 base reds whose
   partial traces were hit). Gate (box G): 9 failures from the same uncatalogued script. AGREES.
+
+## Harness v2: compiler and runtime changes by executed function (16:50 UTC onwards)
+- Instrumented gate (box H, /home/agent/swarm/harness-cov): clang wrapper (`build/dev-check/cov/bin/clang`) compiles runtime
+  C and compiler IR to objects with `-fprofile-generate -mllvm -pgo-function-entry-coverage -mllvm -runtime-counter-relocation
+  -mllvm -disable-preinline`; every link gets the profile runtime and a weak `__llvm_profile_counter_bias`; continuous mode
+  (`%c`) keeps counts of aborting programs (verified: an `abort()`ing program's functions are recorded); a `make` shim on PATH
+  sets LLVM_PROFILE_FILE=<data>/<check>/%c%p.profraw for each `make -j1 check-x`. minyarc: 1,752 instrumented functions,
+  140 KB per profile. Compiler IR names `.minyar.fn.minyar_module_<hash>_<name>` map 1:1 to compiler source functions
+  (the compiler is one concatenated module).
+- Pitfalls met: llvm-nm shows no `__profc_` in the LTO'd minyarc although it is instrumented (check with llvm-readelf/a run);
+  `%4m` online merging + continuous mode gave counter-mismatch/truncated files (use per-pid files); continuous mode prints
+  "Neither __llvm_profile_counter_bias ..." on stderr in programs without instrumented code (fixed by the weak symbol);
+  deleting build outputs to force rebuilds broke checks that use undeclared artefacts (rebuilt via the runner, restart).
+- Function snapshots: compiler 1,259 functions, runtime 2,084 functions; comments/whitespace ignored; anything outside
+  function bodies, a signature change, or an added/removed file widens to file-level selection.
+- Recorded batches by function (git parent→tip): B4 (978516b86, red check-last-use-sinks) is fully attributable: 13 compiler
+  function bodies, nothing else in compiler/ or runtime/. B2, B3, B6, B7, runtime-only and batch 8 all widen (signature or
+  struct/macro changes, a new runtime header) — real batches mostly change declarations too.
+- 18:05 LLVM 23 findings: `-pgo-function-entry-coverage` makes every runtime-linked program's profile unreadable
+  ("number of counters 1 is greater than the maximum number of counters 0"), and continuous mode (`%c`) truncates them; only
+  minyarc's profiles were readable (293 checks would have had incomplete coverage). Switched to full IR counters with
+  `-pgo-instrument-entry` (executed ⇔ entry counter > 0), plain per-pid files, and `tools/dev-check-coverage/covexit.c`
+  (linked into every program: writes the profile on `_exit`/`_Exit`/`abort` via `--wrap` and on fatal signals; verified an
+  aborting program keeps its counts). Third instrumented gate started 18:10.
+- Mutation full gate (the one allowed rerun; tree = base + M1 + M2, box H, 4 jobs, 4,321 s): M1 = runtime/minyar_maps.h
+  `minyar_map_remove` returns 0 for keyed maps; M2 = compiler/constant-evaluation.min `constantOverflow` diagnostic text.
+  Failed (beyond the 6 base reds and the aggregate): check-choice-enums, check-choice-layout, check-choice-runtime-profiles,
+  check-choice-scalar-niche, check-choice-set-niche, check-compile-time-constants, check-empty-map-traversal, check-maps,
+  check-record-capabilities, check-record-collections. dev-check v2 must select all ten.
+- 19:00-19:45 v2 validation on the warm harness tree (each mutation measured after `dev-check rebase` to a clean base build;
+  a first attempt without rebase measured against the previous mutation's build and selected everything — fixed by procedure):
+  | change | rebuilt / bytes changed | selected | verdict | wall |
+  | --- | --- | --- | --- | --- |
+  | M2 compiler: constantOverflow message (compiler/constant-evaluation.min) | 674 / 22 (121 s) | 78 | RED: check-compile-time-constants (+ base reds hit) | 700 s |
+  | N1 runtime header: minyar_map_get_or returns the fallback (runtime/minyar_maps.h) | 684 / 350 (217 s) | 90 | RED: check-stdlib-everyday (the only check that runs it) | 1,022 s |
+  | M1 runtime: minyar_map_remove (used by the compiler itself, so compiler output changes) | 684 / 337 | 306 | (stopped; ≈ gate) | — |
+  | mutation full gate M1+M2 (4 jobs, shared box) | — | 336 | 10 mutation-caused failures, all selected by dev-check | 4,321 s |
+  Most of the 78/90 come from "inspects": checks whose processes read build/minyarc, minyarc-modules, runtime.o or the
+  changed source as data (mostly sha256sum for cache keys, cp, the launcher). Kept conservative: hashes can be asserted
+  (fixed-point checks compare stage outputs). 26 checks lack complete coverage and are always selected for core changes
+  (6 base reds, 5 that fail when instrumented, 4 with an unreadable profile, 11 that emit runtime IR as text).
+- Green replays finished on the v2 index (replayed on the warm tree, rebase first; box H toolchain environment required —
+  a first attempt without it saw Makefile variables CC/LLVM_CC differ and selected everything):
+  | batch | recorded gate | dev-check | wall |
+  | --- | --- | --- | --- |
+  | gdocs 8968863a6^..aa151eb22 (reports + livepatch bench script) | green (box B 336/336 at 81044253f) | 24 selected (new reports/ files are seen by checks that list `.`), BASE-RED only: check-quic-official-adapter (box H base red) | 277 s |
+
+## Sharded full gate (orchestrator, 2026-10-31 19:43–19:54 UTC)
+Final swarm batch (goal + c7 + c8 + c4 + c6 + o5fix), check-portable leaf checks bin-packed longest-first from int14's
+times.tsv (9,187 s CPU sum, slowest check-quic-rfc 262 s) into 3 shards on boxes M/K/J, each a clean synced tree built
+from scratch: **10.5 min wall end-to-end** (build ~3 min + checks ~7 min), green except the box-environment
+check-determinism-runtime. Single-box gate of the same tree on L: ~25 min. Tools: ~/Projects/minyar-goal-20261030/shard/
+(plan.py, run-shard.sh, shard-gate.sh, shard-collect.sh).
