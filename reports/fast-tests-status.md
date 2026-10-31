@@ -3,6 +3,35 @@
 Goal: the full gate (`check-portable` + the benchmark checks: the 8 targets of the single-box gate queue, 340
 checks) in ≤ 300 s wall with the same pass/fail as a single-box gate. Command: `tools/fast-gate.sh TREE`.
 
+## 2026-10-31 22:35 UTC
+
+### Agreement so far (2 shards, image 252387913, compile cache off)
+`tools/fast-gate.sh --shards 2 TREES…` then `tools/fast-gate/agree.py RUN` (records in `tools/fast-gate/recorded/`):
+| recorded gate | commit | checks | red (fast = recorded) | wall on 2 shards |
+| --- | --- | --- | --- | --- |
+| int14 (box M) | 160ab1d42 | 340 = 340 | determinism-runtime, portable | 951 s |
+| int13 (box M), c8 uncapped | 9c5e3b10d | 340 = 340 | + statement-nesting ("ran out of memory"), peer-regressions(-python-swift-ruby-lua) | 915 s |
+| one-c1 (box N) | 724d3b883 | 340 = 340 | + memory-regressions | 910 s |
+| c7 (box L, cake-base set) | 8631b46f5 | 337 = 337 | + last-use-sinks, quic-official-adapter, quic-rfc, record-reconstruction-reuse, structured-tasks | 877 s |
+4 of 4 agree check for check. Running now: batch 9 (2c2dd076b, text record 10/339 incl. last-use-sinks), int12,
+one-c4, one-c2 and the branch tip, on the fgcc image with `--cc-cache verify` (every hit recompiled and compared).
+
+### Since 20:45
+- Rebased on goal/2026-10-30 518e2b500 (determinism fix). Integrated the Wafer splits: frame-initialization (6 pieces,
+  longest 46 s), temporary-owner-cache, empty-map-traversal, owner-queue-batching, errors-*-bounded, quic-rfc(-sanitize)
+  (6 each, longest 68 s; harness self-test kept once per variant), library-documentation (4, 76 s), last-use-sinks,
+  record-reconstruction-reuse, scope-ownership, sequences, simulation-cli (6, 81 s), managed-graphs(-launcher),
+  cycle-registration-exposure-sanitize, parallel-signatures, cycle-private-retirement-sanitize. Not taken:
+  osdev-seeds-host (5 pieces cost +52 s CPU; 97 s unsplit fits). unicode-installed, installed-cli, cold-bootstrap stay
+  whole (one dependent chain each).
+- Shard timeline (shim start stamps): 6–8 cores busy in the main phase, but a 4–5 min tail because a fresh tree's
+  runner starts its long checks last. Each shard now seeds `build/tooling/check-durations` (ordering only) so the
+  longest checks start first.
+- Image 252406055: same toolchain + fgcc (C) as the clang driver, off unless a run sets it.
+- fgcc test (5 checks, 3 passes): within one run 32 of 312 compiles were repeats, saving 74 of 306 compile-seconds
+  (24%); every verified hit byte-identical. Across runs almost no hits: harnesses compile copies in random scratch
+  directories, whose paths reach the outputs (so a cross-run hit would not be byte-identical, and the key rightly misses).
+
 ## 2026-10-31 20:45 UTC
 
 ### Done
