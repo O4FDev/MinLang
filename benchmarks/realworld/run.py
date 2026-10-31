@@ -68,6 +68,33 @@ def default_clang(tree):
     return found or "clang-23"
 
 
+def tree_stamp(tree):
+    """Identity of everything in the tree that decides generated code.
+
+    Covers the compiler binary (its own hash, so a rebuild is visible), every
+    runtime source, and the selected Clang. `minyar --version` alone is not
+    enough: a runtime-only change keeps the same source hash.
+    """
+    digest = hashlib.sha256()
+    digest.update(tool_version([os.path.join(tree, "minyar"), "--version"]).encode() + b"\0")
+    digest.update(default_clang(tree).encode() + b"\0")
+    for built in (os.path.join(tree, "build", "minyarc"),
+                  os.path.join(tree, "build", "tooling", "tools", "clang-driver")):
+        if os.path.exists(built):
+            with open(built, "rb") as f:
+                digest.update(hashlib.sha256(f.read()).digest())
+    for area in ("runtime", "library"):
+        for root, directories, files in os.walk(os.path.join(tree, area)):
+            directories.sort()
+            for name in sorted(files):
+                if name.endswith((".c", ".h", ".min")):
+                    path = os.path.join(root, name)
+                    digest.update(os.path.relpath(path, tree).encode() + b"\0")
+                    with open(path, "rb") as f:
+                        digest.update(hashlib.sha256(f.read()).digest())
+    return digest.hexdigest()[:24]
+
+
 def tool_version(cmd):
     try:
         return subprocess.run(cmd, capture_output=True, text=True).stdout.splitlines()[0]
@@ -146,6 +173,7 @@ def tree_identity(tree, clang):
         commit = ""
     return {"path": os.path.abspath(tree), "commit": commit,
             "compiler": tool_version([os.path.join(tree, "minyar"), "--version"]),
+            "tree_stamp": tree_stamp(tree) if os.path.isdir(tree) else "",
             "valgrind": tool_version(["valgrind", "--version"]),
             "clang": tool_version([clang, "--version"]),
             "platform": platform.platform(), "machine": platform.machine()}
@@ -372,7 +400,7 @@ def neo_db_compile(project, tree, clang, source, output, stamp_key):
     suite rebuilds only when the compiler identity or the sources change.
     """
     stamp_path = output + ".stamp"
-    stamp = tool_version([os.path.join(tree, "minyar"), "--version"]) + "|" + neo_db_source_hash(project) + "|" + stamp_key
+    stamp = tree_stamp(tree) + "|" + neo_db_source_hash(project) + "|" + stamp_key
     if os.path.exists(output) and os.path.exists(stamp_path) and open(stamp_path).read() == stamp:
         return output
     env = dict(os.environ)
