@@ -36,7 +36,28 @@ function closureSortComparatorThunk(names: List<Text>, type: Integer, element: I
 // literal's body is called by name, so LLVM can inline it; other callbacks are
 // called through their code slot. The runtime checks the callback's domain once and brackets the merge
 // as a runtime caller; the merge returns as soon as recovery is pending.
-function closureSortMerge(names: List<Text>, type: Integer, element: Integer, globals: List<Text>, direct: Text): Text {
+// The first `{` of a function literal: its body, after the parameter list.
+function comparatorBodyStart(kinds: List<Integer>, texts: List<Text>, start: Integer, end: Integer): Integer {
+    let cursor = start
+    while cursor < end {
+        if kinds[cursor] == 4 && texts[cursor] == "{" { return cursor + 1 }
+        cursor = cursor + 1
+    }
+    return -1
+}
+
+// A comparator that indexes a List or Map runs runtime code that could make the
+// recovery pending even without a call token, so it keeps the per-comparison poll.
+function comparatorIndexes(kinds: List<Integer>, texts: List<Text>, start: Integer, end: Integer): Boolean {
+    let cursor = start
+    while cursor < end {
+        if kinds[cursor] == 4 && (texts[cursor] == "[" || texts[cursor] == "]" || texts[cursor] == "for") { return true }
+        cursor = cursor + 1
+    }
+    return false
+}
+
+function closureSortMerge(names: List<Text>, type: Integer, element: Integer, globals: List<Text>, direct: Text, checked: Boolean): Text {
     closureSortComparatorThunk(names, type, element, globals)
     let pendingDeclaration = "declare i32 @minyar_sort_pending()\n"
     if findText(globals, pendingDeclaration) < 0 { globals.add(pendingDeclaration) }
@@ -62,12 +83,12 @@ function closureSortMerge(names: List<Text>, type: Integer, element: Integer, gl
     }
     code = code + "  %result = call i64 " + target + "(ptr %env, " + llvmType(element) + " " + left + ", " + llvmType(element) + " " + right + ")\n  ret i64 %result\n}\n"
     globals.add(code)
-    return closureSortMergeBody(compare, globals)
+    return closureSortMergeBody(compare, globals, checked)
 }
 
 // The merge function for one call site: the same top-down stable merge over a
 // working copy of the snapshot's slots, calling `compare` directly.
-function closureSortMergeBody(compare: Text, globals: List<Text>): Text {
+function closureSortMergeBody(compare: Text, globals: List<Text>, checked: Boolean): Text {
     let merge = "@.minyar.sort.merge." + Text(globals.length)
     let code = "define internal void " + merge + "(ptr %values, i64 %count, ptr %scratch, ptr %callback) {\nentry:\n"
     code = code + "  %few = icmp slt i64 %count, 2\n  br i1 %few, label %done, label %start\nstart:\n"
@@ -88,7 +109,13 @@ function closureSortMergeBody(compare: Text, globals: List<Text>): Text {
     code = code + "  %left.in = icmp slt i64 %left, %left.count\n  %right.in = icmp slt i64 %right, %count\n  %both = and i1 %left.in, %right.in\n  br i1 %both, label %body, label %rest\nbody:\n"
     code = code + "  %held.at = getelementptr i64, ptr %scratch, i64 %left\n  %held = load i64, ptr %held.at\n  %candidate.at = getelementptr i64, ptr %values, i64 %right\n  %candidate = load i64, ptr %candidate.at\n"
     code = code + "  %order = call i64 " + compare + "(ptr %callback, i64 %held, i64 %candidate)\n"
-    code = code + "  %pending.3 = call i32 @minyar_sort_pending()\n  %failed.3 = icmp ne i32 %pending.3, 0\n  br i1 %failed.3, label %done, label %step\nstep:\n"
+    if checked {
+        code = code + "  %pending.3 = call i32 @minyar_sort_pending()\n  %failed.3 = icmp ne i32 %pending.3, 0\n  br i1 %failed.3, label %done, label %step\nstep:\n"
+    } else {
+        // A comparator that makes no call cannot make the recovery pending:
+        // the merge polls it after each half and each cross comparison instead.
+        code = code + "  br label %step\nstep:\n"
+    }
     code = code + "  %take.left = icmp sle i64 %order, 0\n  %taken = select i1 %take.left, i64 %held, i64 %candidate\n  %out.at = getelementptr i64, ptr %values, i64 %out\n  store i64 %taken, ptr %out.at\n"
     code = code + "  %left.step = zext i1 %take.left to i64\n  %left.next = add i64 %left, %left.step\n  %right.step = sub i64 1, %left.step\n  %right.next = add i64 %right, %right.step\n  %out.next = add i64 %out, 1\n  br label %loop\n"
     code = code + "rest:\n  %rest.more = icmp slt i64 %left, %left.count\n  br i1 %rest.more, label %tail, label %done\ntail:\n"
@@ -112,7 +139,7 @@ function closureRecordSortMerge(compare: Text, globals: List<Text>): Text {
     code = code + "  %left = inttoptr i64 %left.slot to ptr\n  %right = inttoptr i64 %right.slot to ptr\n"
     code = code + "  %result = call i64 " + compare + "(ptr %left, ptr %right)\n  ret i64 %result\n}\n"
     globals.add(code)
-    return closureSortMergeBody(direct, globals)
+    return closureSortMergeBody(direct, globals, true)
 }
 
 function callbackTypePositions(kinds: List<Integer>, texts: List<Text>): List<Boolean> {
