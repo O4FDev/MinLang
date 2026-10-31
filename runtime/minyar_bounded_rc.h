@@ -3,7 +3,9 @@
  * Its payload is retained until a cursor has processed every field. Only
  * zero-count objects enter the object queue; detached frames and temporary
  * chunks have separate queues.
- * A work unit visits one owner/field or retires one task (up to three frees).
+ * A work unit visits one owner/field or retires one task; a small aggregate
+ * (a record or reference List of at most eight slots) and, while its allowance
+ * lasts, the small aggregates it owns are retired by one unit.
  * Pool frees have at most log2(heap/minimum-block) merge steps. System
  * allocator calls have no runtime-imposed execution-time bound.
  * Work bounds exclude startup, data copying and OS scheduling/page faults. */

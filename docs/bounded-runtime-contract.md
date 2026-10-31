@@ -130,15 +130,26 @@ eight fields, passing over the ones that own nothing and visiting the next
 owner, so a record whose compared fields own nothing costs fewer units than it
 has fields. Non-owning fields still cost constant work (at most eight field
 examinations per unit); they share the unit with the next owner or with the
-record's finalization. Releasing a visited owner may also
-free one leaf, requiring at most three backing frees. Cleanup never recursively
-walks the object graph. Queue selection examines at most three queues.
+record's finalization.
+
+A **small aggregate** — a record with at most eight slots, or a reference List
+with at most eight slots — is retired by one unit: that unit visits the
+aggregate's owner slots and finalizes it, so a small aggregate costs one unit
+however many owners it has. When a visited owner is itself a unique small
+aggregate, the unit takes it and retires it too, up to eight aggregates per
+unit. An aggregate beyond that allowance, a shared child, and any larger
+record or List follow the ordinary path: the drop frees a leaf, queues an
+aggregate, or leaves it for a later unit. A unit therefore performs a constant
+amount of work (at most eight aggregates of at most eight slots, plus the
+backing frees they need), and K units still bound a service point. Cleanup
+never recursively walks the object graph: the unit's own fixed stack holds its
+allowance. Queue selection examines at most three queues.
 
 The limits for individual runtime operations are:
 
 | Operation | Cleanup limit |
 | --- | --- |
-| Public release | K, including immediate leaf destruction |
+| Public release | K, including immediate leaf and small-aggregate destruction |
 | Managed object/data allocation or data resize | K queued units |
 | Frame entry, frame exit, or statement cleanup | K each |
 | Scope-cell statement cleanup or return | K each, including one unit per cell |
@@ -227,15 +238,6 @@ Batching reduces scheduler overhead under specific conditions:
   finalized before its recent child. This frees chains in reverse allocation
   order and delays recent service by at most one object unit. It cannot bypass
   another captured object.
-- With exactly one unvisited unary record, no active object or frame/temporary
-  tasks, and at least two units left, a field visit and finalization run as a
-  pair. They still cost two units. Budget-one and competing-work cases follow
-  the ordinary scheduler.
-- A uniquely owned unary child can continue directly into the next pair. This
-  requires at least four remaining units, leaving two for the child. Each
-  iteration costs two; the final ordinary pair publishes queue, cursor, count,
-  and parity state before returning. Shared children use the normal decrement
-  path.
 
 - Frame exit and statement cleanup usually find nothing pending (an
   old-object backlog does not count). When the exiting
