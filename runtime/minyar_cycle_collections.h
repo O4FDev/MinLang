@@ -68,7 +68,7 @@ MINYAR_HOT long long list_next_capacity(long long current) {
 #endif
     if (current > LLONG_MAX / factor)
         minyar_stop("this List became too large.");
-    long long capacity = current == 0 ? 2 : current * factor;
+    long long capacity = current == 0 ? 4 : current * factor;
 #endif
     return capacity;
 }
