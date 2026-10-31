@@ -459,6 +459,28 @@ MinyarRecord *minyar_record_new_scalar(long long field_count) {
     return record_allocate(field_count, 0);
 }
 
+/* Storage whose caller writes every field it will read before publishing it.
+ * Escaping records keep minyar_record_new's zeroing guarantee; Map bucket
+ * arrays use this because the hash column marks an empty bucket and key/value
+ * are read only when that hash is set. */
+MinyarRecord *minyar_record_new_unzeroed_scalar(long long field_count) {
+    if (field_count < 0 || (unsigned long long)field_count > SIZE_MAX / sizeof(long long))
+        minyar_stop("this record has too many fields.");
+#ifdef MINYAR_COMPILER_ARENA
+    if ((unsigned long long)field_count > (SIZE_MAX - sizeof(MinyarRecord)) / sizeof(long long))
+        out_of_memory();
+    MinyarRecord *record = object_allocate(sizeof(*record) + (size_t)field_count * sizeof(*record->values), 2);
+#else
+    if ((unsigned long long)field_count >
+        (SIZE_MAX - sizeof(RcObject) - sizeof(MinyarRecord)) / sizeof(long long))
+        out_of_memory();
+    MinyarRecord *record = rc_allocate_object(sizeof(*record) + (size_t)field_count * sizeof(long long),
+                                              RC_SCALAR_RECORD);
+#endif
+    record->length = field_count;
+    return record;
+}
+
 /* The caller owns record, has evaluated every scalar initializer, and will
  * write every field before publishing the result. Nominal type/layout checks
  * belong to that compiler proof; only ordinary scalar allocations may reuse. */

@@ -218,19 +218,22 @@ MINYAR_HOT void map_remember_absent(const MinyarRecord *map, long long kind, lon
 /* Zeroed buckets whose key and value fields are flagged as references when
  * the Map's keys or values are references. */
 static MinyarRecord *map_new_entries(long long capacity, int key_references, int value_references) {
-    MinyarRecord *entries = minyar_record_new(capacity * 3);
-#ifndef MINYAR_COMPILER_ARENA
+    MinyarRecord *entries;
     if (key_references || value_references) {
+        entries = minyar_record_new(capacity * 3);
+#ifndef MINYAR_COMPILER_ARENA
         unsigned char *references = (unsigned char *)(entries->values + entries->length);
         for (long long bucket = 0; bucket < capacity; bucket++) {
             references[3 * bucket + 1] = (unsigned char)key_references;
             references[3 * bucket + 2] = (unsigned char)value_references;
         }
-    }
-#else
-    (void)key_references;
-    (void)value_references;
 #endif
+        return entries;
+    }
+    /* Scalar keys and values: only the hash column has to start zero, because
+     * an empty bucket is "hash 0" and its key and value are never read. */
+    entries = minyar_record_new_unzeroed_scalar(capacity * 3);
+    for (long long bucket = 0; bucket < capacity; bucket++) entries->values[3 * bucket] = 0;
     return entries;
 }
 static MinyarRecord *map_create(long long key_kind, long long value_references, long long fields) {
@@ -296,7 +299,9 @@ static MINYAR_COLD void map_grow(MinyarRecord *map) {
      * per move. Emptied, the old record releases as one unit; deallocation
      * does not depend on its length, and its field bytes are accounted here. */
 #ifndef MINYAR_COMPILER_ARENA
-    RC_ACCOUNT(rc_bytes -= (size_t)old->length * (sizeof(long long) + 1));
+    RC_ACCOUNT(rc_bytes -= (size_t)old->length *
+               (sizeof(long long) + (map_key_references(map->values[MAP_KEY_KIND]) ||
+                                     map->values[MAP_VALUE_REFERENCES] ? 1 : 0)));
 #endif
     old->length = 0;
     map->values[MAP_ENTRIES] = (long long)(uintptr_t)fresh;
