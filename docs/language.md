@@ -2121,8 +2121,33 @@ pairs of outputs. Views starting at the same byte may share direct-index
 access; shifted overlapping views need separate storage or a copy. Disjoint
 views of one owner can still run together.
 Buffers keep their existing length, bounds checks and shared reference semantics.
-Managed values cannot be created, resized or returned by an iteration. Calls
-must be to pure `parallel function`s, including their callees; raw machine
+An iteration may create managed values of its own — `Text`, records and Lists —
+and use them until it ends:
+
+```minyar
+record Pair { key: Text; value: Integer }
+
+let values = [3, 4, 5, 6]
+let widths = [0, 0, 0, 0]
+parallel for index in 0..values.length {
+    let label = Text(values[index]) + "!"
+    let pair = Pair { key: label; value: values[index] }
+    let words: List<Text> = [pair.key]
+    widths[index] = pair.key.length + words.length
+}
+print(widths[0]) // 3
+```
+
+The iteration owns what it creates: the values live on the worker's own
+ownership domain, no count crosses a thread, and they are released before the
+iteration ends. They cannot leave it: not into a captured buffer, not through
+the loop's result and not into a call — pass `pair.key.length`, not `pair.key`,
+to a `parallel function`. Fields of such a record and elements of such a List
+may not be assigned yet; build them as a whole. A captured value stays
+read-only whatever the iteration builds. A program with such a loop links the
+thread runtime, whose ownership state is per thread; loops of scalars and
+borrowed buffers still pay nothing for it.
+Calls must be to pure `parallel function`s, including their callees; raw machine
 operations and native effects are rejected. An input buffer can be read with
 Bytes getters such as `getInt64` and passed whole to a parallel function, which
 borrows it read-only. Elements of a captured `List<Bytes>` are read-only views
@@ -2191,7 +2216,9 @@ items to the workers. Freestanding
 OS builds use the processor-entry scheduler after the processors are started.
 Other targets and recoverable execution use the sequential backend. Each loop can
 capture at most 64 values. Scalar captures are snapshots; the caller keeps buffer
-owners alive, and worker code performs no ownership operations.
+owners alive. A worker whose iterations create nothing performs no ownership
+operations; a worker whose iterations create managed values owns a frame per
+chunk on its own domain, drains it when the chunk ends, and hands nothing back.
 Parallel builds currently check the whole module graph,
 including when module caching is requested. The [parallel gallery](../examples/gallery/parallel.min)
 draws a Julia garden into separate slots, with a woven Unicode preview or a PNG.
