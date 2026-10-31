@@ -577,6 +577,10 @@ MinyarRecord *minyar_result_box(long long tag, long long slot, long long ok_refe
     return record;
 }
 
+/* minyar_rc_retain of a reference held in a record slot (a consumed match's
+ * take), so generated code needs no pointer conversion for it. */
+void minyar_rc_retain_slot(long long value) { minyar_rc_retain((void *)(uintptr_t)value); }
+
 /* A two-case choice returned in registers, boxed for a caller that needs the
  * record: `slots` storage fields, the payload field and reference flag of each
  * tag (field 0: the case has no payload). */
