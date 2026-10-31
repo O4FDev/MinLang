@@ -52,6 +52,23 @@ function invalidAccess(compiler: test.Compiler, declaration: Text, length: Integ
     }
 }
 
+// A loop that reads a window of a List (`terms[q * 4 + j]`) proves the window
+// inside the List before the loop and reads it unchecked inside; an index the
+// window does not cover still reports exactly what the checked access reports.
+function windowLoops(compiler: test.Compiler) {
+    invalidAccess(compiler, "let values = [7, 8]", 2, 2, "let total = 0\nfor j in 0..4 { total += values[j] }\nprint(total)")
+    test.executes(compiler, "parallel function windowed(terms: List<Integer>, q: Integer): Integer { let total = 0; for j in 0..4 { total += terms[q * 4 + j] }; return total }\nlet terms = [1, 2, 3, 4, 5, 6, 7, 8]\nprint(windowed(terms, 1))\n", "26\n")
+    let body = after(generated(compiler), "define i64 @.minyar.fn.windowed(")
+    body = body.slice(0, body.find("\n}\n"))
+    test.check(test.contains(body, "loop.window."), "a List window inside a loop lost its up-front test")
+    let guard = body.slice(body.find("for.guard."), body.length)
+    let fast = guard.slice(guard.find("for.condition."), guard.length)
+    let checked = fast.find("\nfor.checked.")
+    if checked >= 0 { fast = fast.slice(0, checked) }
+    test.check(!test.contains(fast, "@.minyar.list.get."), "the window's fast copy still checks every access")
+    test.check(test.contains(fast, "ptr %argument.0.values"), "the window's fast copy does not read the entry-loaded values")
+}
+
 function constructorReturns(compiler: test.Compiler, llvm: Text) {
     for name in ["bytes_new", "list_new", "record_new", "record_new_scalar"] {
         let parameters = "i64"
@@ -88,6 +105,7 @@ if processInfo.argumentCount() == 1 { test.check(processInfo.argument(0) == "Lis
 test.executes(compiler, "let values = [42]\nvalues[0] = 42\nprint(values[0])\nprint(values.length)\n", "42\n1\n")
 let llvm = generated(compiler)
 constructorReturns(compiler, llvm)
+windowLoops(compiler)
 for expected in ["define internal i64 @.minyar.list.get.checked", "define internal void @.minyar.list.set.scalar.checked", "define internal i64 @.minyar.list.length", "%get.valid = icmp ult i64 %position, %length", "%set.valid = icmp ult i64 %position, %length", "call i64 @minyar_list_get(ptr %list, i64 %position)\n  unreachable", "call void @minyar_list_set(ptr %list, i64 %position, i64 %value)\n  unreachable"] {
     test.check(test.contains(llvm, expected), "missing checked List helper IR: " + expected)
 }
