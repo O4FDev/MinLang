@@ -424,7 +424,7 @@ function parseBinary(context: CompilerContext, localNames: List<Text>, localType
             endSyntaxNode(context.syntax, syntaxNode, state[0], 2)
             if resultType.length > 1 { keepTransferredOwner(output, resultType[1]) }
             let firstStable = chainPartStable(context, localNames, localLengths, state, left, leftStart, operatorLocation, -1)
-            left = compileTextChain(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, left, firstStable, textPiece, leftCalls, right, operatorLocation + 1, level)
+            left = compileTextChain(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType, left, firstStable, textPiece, leftCalls, right, operatorLocation + 1, level, leftStart)
         } else {
             let range = ""
             if (operator == "==" || operator == "!=") && leftType == 2 && resultType[0] == 2 { range = rangeEquality(context, localNames, localLengths, state, textState, output, globals, operator, left, leftOwner, right, operatorLocation + 1) }
@@ -488,7 +488,19 @@ function chainPartStable(context: CompilerContext, localNames: List<Text>, local
 // that a later part could release gets a count if that part runs user code
 // that could replace its holder. Two parts keep the join, and so does a chain whose first part is
 // owned (a result, or a local's last use): its join can grow it in place.
-function compileTextChain(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, first: Text, firstStable: Boolean, firstPiece: Integer, firstCalls: Integer, second: Text, secondStart: Integer, level: Integer): Text {
+// A chain part that is one Text literal token: its bytes are compile-time constants.
+function chainPartIsLiteral(context: CompilerContext, value: Text, start: Integer, end: Integer): Integer {
+    if !value.startsWith("getelementptr (i8, ptr @") { return 0 }
+    if end != start + 1 || context.tokenKinds[start] != 3 { return 0 }
+    return 1
+}
+
+function chainPartLiteral(context: CompilerContext, value: Text, start: Integer, end: Integer): Text {
+    if chainPartIsLiteral(context, value, start, end) == 0 { return "" }
+    return context.tokenTexts[start]
+}
+
+function compileTextChain(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, first: Text, firstStable: Boolean, firstPiece: Integer, firstCalls: Integer, second: Text, secondStart: Integer, level: Integer, firstStart: Integer): Text {
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
     let secondOwner = -1
@@ -497,6 +509,8 @@ function compileTextChain(context: CompilerContext, localNames: List<Text>, loca
     let stable: List<Boolean> = [firstStable, chainPartStable(context, localNames, localLengths, state, second, secondStart, state[0], secondOwner)]
     let pieces: List<Integer> = [firstPiece, output.length]
     let calls: List<Integer> = [firstCalls, context.callTargets.length]
+    let literals: List<Text> = [chainPartLiteral(context, first, firstStart, secondStart - 1), chainPartLiteral(context, second, secondStart, state[0])]
+    let literalParts: List<Integer> = [chainPartIsLiteral(context, first, firstStart, secondStart - 1), chainPartIsLiteral(context, second, secondStart, state[0])]
     output.add("")
     while tokenKinds[state[0]] == 4 && tokenTexts[state[0]] == "+" {
         let location = state[0]
@@ -513,6 +527,8 @@ function compileTextChain(context: CompilerContext, localNames: List<Text>, loca
         if resultType[0] != 2 { let ignored = emitBinary(context, globals, output, textState, state, "+", first, 2, -1, part, resultType[0], resultType, context.tokenLines, location) }
         parts.add(part)
         stable.add(chainPartStable(context, localNames, localLengths, state, part, location + 1, state[0], owner))
+        literals.add(chainPartLiteral(context, part, location + 1, state[0]))
+        literalParts.add(chainPartIsLiteral(context, part, location + 1, state[0]))
         pieces.add(output.length)
         output.add("")
         calls.add(context.callTargets.length)
@@ -523,8 +539,9 @@ function compileTextChain(context: CompilerContext, localNames: List<Text>, loca
         if !stable[index] { settleBorrow(context, output, state, pieces[index], parts[index], 2, calls[index]) }
         index = index + 1
     }
-    let value = valueName(textState, newTemporary(state))
+    let value = ""
     if parts.length <= 4 {
+        value = valueName(textState, newTemporary(state))
         output.add("  " + value + " = call ptr @minyar_join_text" + Text(parts.length) + "(ptr " + parts[0])
         index = 1
         while index < parts.length {
@@ -533,13 +550,15 @@ function compileTextChain(context: CompilerContext, localNames: List<Text>, loca
         }
         output.add(")\n")
     } else {
-        let slots: List<Text> = []
+        // A longer chain is an interpolation with every part Text: one
+        // exactly sized builder result, not a runtime join of boxed slots.
+        let partTypes: List<Integer> = []
         index = 0
         while index < parts.length {
-            slots.add(", i64 2, i64 " + valueAsListSlot(output, textState, state, parts[index], 2))
+            partTypes.add(2)
             index = index + 1
         }
-        output.add("  " + value + " = call ptr (i64, ...) @minyar_interpolate(i64 " + Text(parts.length) + joinText(slots) + ")\n")
+        value = emitTextBuilder(output, textState, state, globals, partTypes, parts, literals, literalParts)
     }
     setType(resultType, 2)
     ownResult(output, state, value, resultType)
