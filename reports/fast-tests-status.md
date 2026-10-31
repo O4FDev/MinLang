@@ -28,6 +28,13 @@ one-c4, one-c2 and the branch tip, on the fgcc image with `--cc-cache verify` (e
   runner starts its long checks last. Each shard now seeds `build/tooling/check-durations` (ordering only) so the
   longest checks start first.
 - Image 252406055: same toolchain + fgcc (C) as the clang driver, off unless a run sets it.
+- **Caught by the agreement runs:** with fgcc installed as `/opt/llvm-23.1.3/bin/clang` (image 252406055), batch 9
+  disagreed on `check-native-cache` ("Clang fixture must exercise more than one retention chunk": the check retains the
+  compiler binary itself as link provenance and requires it to be > 64 KiB; the 40 KB wrapper is not). Any wrapper at
+  the toolchain's own path changes what checks observe, in every mode. Fixed: the image keeps the real driver there;
+  fgcc sits at `/opt/fgcc/bin/clang` and a run that asks for it (`--cc-cache`) uses it only as the fixture Clang
+  (`TEST_CLANG`, with `MINYAR_TEST_REAL_CLANG` real), the same route as the tree's own `MINYAR_TEST_CLANG_CACHE`. Batch
+  2 rerun on the corrected image, cache off.
 - fgcc test (5 checks, 3 passes): within one run 32 of 312 compiles were repeats, saving 74 of 306 compile-seconds
   (24%); every verified hit byte-identical. Across runs almost no hits: harnesses compile copies in random scratch
   directories, whose paths reach the outputs (so a cross-run hit would not be byte-identical, and the key rightly misses).
