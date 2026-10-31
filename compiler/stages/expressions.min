@@ -344,6 +344,260 @@ function transfersBorrow(tokenKinds: List<Integer>, tokenTexts: List<Text>, atom
     return whole && (tokenTexts[atom - 1] == "=" || tokenTexts[atom - 1] == "return")
 }
 
+// ---------------------------------------------------------------- split bindings
+// `let fields = text.split(separator)` whose pieces are only read by position
+// keeps no List: each read computes its piece from the receiver. The receiver
+// must be a local or parameter the block never reassigns, so its owning binding
+// outlives every read.
+
+function resetSplitBindings(context: CompilerContext) {
+    let splits = context.splits
+    splits.ids.clear()
+    splits.texts.clear()
+    splits.separators.clear()
+    splits.pending = -1
+    splits.pieces.clear()
+    splits.pieceCalls.clear()
+    splits.pieceOwners.clear()
+    splits.pieceTexts.clear()
+    splits.pieceSeparators.clear()
+    splits.piecePositions.clear()
+}
+
+// The binding for a local id, or -1. Forgetting a binding sets its id to -1.
+function splitBindingIndex(context: CompilerContext, id: Integer): Integer {
+    let splits = context.splits
+    let index = 0
+    while index < splits.ids.length {
+        if splits.ids[index] == id { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+// The index just after the bracket that closes the one at `open`, or -1.
+function splitBracketEnd(tokenKinds: List<Integer>, tokenTexts: List<Text>, open: Integer): Integer {
+    let opener = tokenTexts[open]
+    if opener != "[" && opener != "(" { return -1 }
+    let closer = "]"
+    if opener == "(" { closer = ")" }
+    let depth = 0
+    let index = open
+    while index < tokenKinds.length && tokenKinds[index] != 0 {
+        if tokenKinds[index] == 4 {
+            let token = tokenTexts[index]
+            if token == opener { depth = depth + 1 }
+            if token == closer {
+                depth = depth - 1
+                if depth == 0 { return index + 1 }
+            }
+        }
+        index = index + 1
+    }
+    return -1
+}
+
+// Every use of `name` from `start` to the end of its block reads one piece by
+// position (`name[index]` or `name.length`). A shadow, a whole-List use and an
+// element store keep the ordinary split. A read may sit in a nested block: it
+// re-derives its own piece from the receiver, so it needs nothing else alive.
+function splitUsesArePieces(tokenKinds: List<Integer>, tokenTexts: List<Text>, name: Text, start: Integer): Boolean {
+    let depth = 0
+    let index = start
+    while index < tokenKinds.length {
+        if tokenKinds[index] == 0 { return false }
+        if tokenKinds[index] == 4 {
+            let token = tokenTexts[index]
+            if token == "{" {
+                depth = depth + 1
+            } else if token == "}" {
+                if depth == 0 { return true }
+                depth = depth - 1
+            }
+        }
+        if tokenKinds[index] == 1 && tokenTexts[index] == name && !(index > 0 && tokenKinds[index - 1] == 4 && tokenTexts[index - 1] == ".") {
+            if index > 0 && (tokenTexts[index - 1] == "let" || tokenTexts[index - 1] == "for") { return false }
+            let next = index + 1
+            if tokenKinds[next] == 4 && tokenTexts[next] == "[" {
+                let after = splitBracketEnd(tokenKinds, tokenTexts, next)
+                if after < 0 { return false }
+                if after < tokenKinds.length && tokenKinds[after] == 4 && isAssignmentOperator(tokenTexts[after]) { return false }
+                index = after - 1
+            } else if tokenKinds[next] == 4 && tokenTexts[next] == "." && tokenKinds[next + 1] == 1 && tokenTexts[next + 1] == "length" && !(tokenKinds[next + 2] == 4 && (tokenTexts[next + 2] == "(" || isAssignmentOperator(tokenTexts[next + 2]))) {
+                index = next + 1
+            } else {
+                return false
+            }
+        }
+        // A parallel body moves to a worker function: a value from here is not
+        // in its scope, so the receiver could not outlive the read.
+        if tokenKinds[index] == 1 && tokenTexts[index] == "parallel" { return false }
+        index = index + 1
+    }
+    return false
+}
+
+// Where the `minyar_text_split` call that produced `value` sits, or -1.
+// emitCall writes one piece per part: "  ", name, " = call ptr @", callee,
+// "(", "ptr ", receiver, ", ", "ptr ", separator, ")\n".
+function splitCallStart(output: List<Text>, value: Text): Integer {
+    let piece = output.length - 11
+    while piece >= 0 {
+        if output[piece] == "  " && output[piece + 1] == value && output[piece + 2] == " = call ptr @" && output[piece + 3] == "minyar_text_split" && output[piece + 4] == "(" && output[piece + 5] == "ptr " && output[piece + 10] == ")\n" {
+            return piece
+        }
+        piece = piece - 1
+    }
+    return -1
+}
+
+// `let name = receiver.split(separator)`, where the pieces are read only by
+// position: drop the call and remember the receiver and separator instead.
+// `start` is the first token of the initializer, `end` the first after it.
+function deferSplitBinding(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, output: List<Text>, name: Text, id: Integer, value: Text, start: Integer, end: Integer): Boolean {
+    if recoveryEnabled(state) { return false }
+    let tokenKinds = context.tokenKinds
+    let tokenTexts = context.tokenTexts
+    if tokenKinds[start] != 1 || tokenTexts[start + 1] != "." || tokenTexts[start + 2] != "split" || tokenTexts[start + 3] != "(" { return false }
+    if tokenTexts[end - 1] != ")" { return false }
+    if splitBracketEnd(tokenKinds, tokenTexts, start + 3) != end { return false }
+    // One byte is found by a word test. A longer separator would rescan the
+    // receiver with a search loop on every read, so it keeps the List.
+    if end != start + 6 || tokenKinds[start + 4] != 3 || tokenTexts[start + 4].byteLength != 1 { return false }
+    let receiverName = tokenTexts[start]
+    let local = findLocal(localNames, localLengths, state, receiverName)
+    // A parameter's local is an SSA value, and a captured binding cannot be
+    // reassigned either: both outlive every read in this block.
+    if local < 0 || localTypes[local] != 2 { return false }
+    if blockAssignsName(tokenKinds, tokenTexts, end, receiverName) { return false }
+    if !splitUsesArePieces(tokenKinds, tokenTexts, name, end) { return false }
+    let call = splitCallStart(output, value)
+    if call < 0 { return false }
+    let receiver = output[call + 6]
+    let separator = output[call + 9]
+    let pieces = 11
+    if output[call + 11] == "  call void @minyar_rc_keep(ptr " && output[call + 12] == output[call + 1] {
+        pieces = 14
+        if state[7] > 0 { state[7] = state[7] - 1 }
+    }
+    clearPieces(output, call, call + pieces)
+    context.splits.ids.add(id)
+    context.splits.texts.add(receiver)
+    context.splits.separators.add(separator)
+    return true
+}
+
+// `name[index]`: one piece, computed in place, without the List.
+function splitPieceRead(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let tokenTexts = context.tokenTexts
+    let tokenKinds = context.tokenKinds
+    let tokenLines = context.tokenLines
+    let binding = context.splits.pending
+    context.splits.pending = -1
+    state[0] = state[0] + 1
+    let positionLocation = state[0]
+    let positionType: List<Integer> = [0]
+    let position = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, positionType)
+    expectToken(tokenKinds, tokenTexts, tokenLines, state, "]")
+    if positionType[0] != 1 { requireContextType(context, positionLocation, positionType[0], 1, "a position must be an Integer") }
+    appendTextRuntimeDeclaration(globals, "minyar_text_split_at", 2, [2, 2, 1])
+    let call = output.length
+    let arguments: List<Text> = [context.splits.texts[binding], context.splits.separators[binding], position]
+    let types: List<Integer> = [2, 2, 1]
+    let piece = emitCall(output, textState, state, 2, "minyar_text_split_at", arguments, types)
+    setType(resultType, 2)
+    ownResult(output, state, piece, resultType)
+    let owner = -1
+    if resultType.length > 1 { owner = resultType[1] }
+    context.splits.pieces.add(piece)
+    context.splits.pieceCalls.add(call)
+    context.splits.pieceOwners.add(owner)
+    context.splits.pieceTexts.add(context.splits.texts[binding])
+    context.splits.pieceSeparators.add(context.splits.separators[binding])
+    context.splits.piecePositions.add(position)
+    return piece
+}
+
+// A use the scan did not predict: build the List here and make the binding an
+// ordinary List local. Split has no side effects, so reads that already
+// happened are unaffected.
+function splitMaterialise(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
+    let binding = context.splits.pending
+    context.splits.pending = -1
+    let id = context.splits.ids[binding]
+    let local = 0
+    while local < state[3] && localIds[local] != id { local = local + 1 }
+    let type = localTypes[local]
+    let text = context.splits.texts[binding]
+    let separator = context.splits.separators[binding]
+    appendTextRuntimeDeclaration(globals, "minyar_text_split", 2, [2, 2])
+    let arguments: List<Text> = [text, separator]
+    let types: List<Integer> = [2, 2]
+    let list = emitCall(output, textState, state, type, "minyar_text_split", arguments, types)
+    let valueType: List<Integer> = [type, keepReference(output, state, list, type)]
+    assignReference(output, state, id, list, valueType, context.functionParameterCounts, context.functionParameterTypes, context.functionReturnTypes)
+    storeLocal(output, id, type, list)
+    context.splits.ids[binding] = -1
+    setType(resultType, type)
+    return list
+}
+
+// Where `value` is a piece this function read, or -1.
+function splitPieceIndex(context: CompilerContext, value: Text): Integer {
+    let splits = context.splits
+    let index = 0
+    while index < splits.pieces.length {
+        if splits.pieces[index] == value { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+// The piece value a fused read still owns, or -1. A read consumed this way
+// drops its call and its count; nothing else can name the piece.
+function splitPieceTake(context: CompilerContext, output: List<Text>, state: List<Integer>, value: Text, owner: Integer): Integer {
+    let splits = context.splits
+    let index = 0
+    while index < splits.pieces.length {
+        if splits.pieces[index] == value && splits.pieceOwners[index] == owner {
+            if output[splits.pieceCalls[index] + 3] != "minyar_text_split_at" { return -1 }
+            if !takeOwner(output, state, value, owner) { return -1 }
+            splits.pieces[index] = ""
+            return index
+        }
+        index = index + 1
+    }
+    return -1
+}
+
+// Integer(fields[index]) parses the piece where it lies.
+function splitPieceInteger(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, value: Text, owner: Integer): Text {
+    let index = splitPieceTake(context, output, state, value, owner)
+    if index < 0 { return "" }
+    appendTextRuntimeDeclaration(globals, "minyar_text_split_integer", 1, [2, 2, 1])
+    let splits = context.splits
+    let arguments: List<Text> = [splits.pieceTexts[index], splits.pieceSeparators[index], splits.piecePositions[index]]
+    let types: List<Integer> = [2, 2, 1]
+    let call = splits.pieceCalls[index]
+    let fused = emitCall(output, textState, state, 1, "minyar_text_split_integer", arguments, types)
+    clearPieces(output, call, call + 14)
+    return fused
+}
+
+// fields[index] == other compares the piece where it lies.
+function splitPieceEquals(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, globals: List<Text>, value: Text, owner: Integer, other: Text): Text {
+    let index = splitPieceTake(context, output, state, value, owner)
+    if index < 0 { return "" }
+    appendTextRuntimeDeclaration(globals, "minyar_text_split_equals", 4, [2, 2, 1, 2])
+    let splits = context.splits
+    let arguments: List<Text> = [splits.pieceTexts[index], splits.pieceSeparators[index], splits.piecePositions[index], other]
+    let types: List<Integer> = [2, 2, 1, 2]
+    let call = splits.pieceCalls[index]
+    let fused = emitCall(output, textState, state, 4, "minyar_text_split_equals", arguments, types)
+    clearPieces(output, call, call + 14)
+    return fused
+}
+
 function parsePrimary(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>): Text {
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
@@ -369,6 +623,26 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
         }
     }
 
+    // A deferred split binding reads one piece by position, or its count.
+    let splitPieceOwned = -1
+    if context.splits.pending >= 0 {
+        let binding = context.splits.pending
+        if tokenKinds[state[0]] == 4 && tokenTexts[state[0]] == "[" {
+            value = splitPieceRead(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+            if resultType.length > 1 { splitPieceOwned = resultType[1] }
+        } else if tokenKinds[state[0]] == 4 && tokenTexts[state[0]] == "." && tokenKinds[state[0] + 1] == 1 && tokenTexts[state[0] + 1] == "length" && !(tokenKinds[state[0] + 2] == 4 && tokenTexts[state[0] + 2] == "(") {
+            context.splits.pending = -1
+            state[0] = state[0] + 2
+            appendTextRuntimeDeclaration(globals, "minyar_text_split_count", 1, [2, 2])
+            let arguments: List<Text> = [context.splits.texts[binding], context.splits.separators[binding]]
+            let types: List<Integer> = [2, 2]
+            value = emitCall(output, textState, state, 1, "minyar_text_split_count", arguments, types)
+            setType(resultType, 1)
+        } else {
+            value = splitMaterialise(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, resultType)
+        }
+    }
+
     // A receiver whose method arguments look call-free reserves its temporary
     // count; settleBorrow fills it if compiling those arguments ran user code.
     let deferredPiece = -1
@@ -379,6 +653,8 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
     let stablePath = tokenKinds[atom] == 1 && state[0] == atom + 1 && tokenTexts[state[0]] == "." && stableBorrowRoot(context, localNames, localIds, localLengths, state, tokenTexts[atom])
     while tokenKinds[state[0]] == 4 && (tokenTexts[state[0]] == "." || tokenTexts[state[0]] == "[" || tokenTexts[state[0]] == "(") {
         endSyntaxNode(context.syntax, syntaxNode, state[0], resultType[0])
+        // Any further step consumes the piece this read produced.
+        splitPieceOwned = -1
         let stableStep = false
         let syntaxKind = 212
         if tokenTexts[state[0]] == "[" { syntaxKind = 213 }
@@ -824,6 +1100,8 @@ function parsePrimary(context: CompilerContext, localNames: List<Text>, localTyp
         }
         stablePath = stableStep && !ownsResult
         if viewResult {
+        } else if splitPieceOwned >= 0 {
+            // The piece read took its count when it was made.
         } else if ownsResult {
             ownResult(output, state, value, resultType)
         } else if stablePath && untracedBorrowType(context, resultType[0]) {

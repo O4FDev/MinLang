@@ -540,6 +540,124 @@ test.check(test.contains(windowBody, "for.guard.") && test.contains(windowBody, 
 test.check(test.contains(functionBody(nestedLLVM, "scanInsideList"), "@.minyar.text.character.known("), "a nested Text scan still reads bytes directly")
 let overWindowBody = functionBody(nestedLLVM, "whileOverWindow")
 test.check(test.contains(overWindowBody, "for.guard.") && test.contains(overWindowBody, "@.minyar.text.length("), "an enclosing Text copy and a nested List window copy coexist")
+// `let fields = text.split(sep)` read only by position keeps no List: the
+// pieces are computed where they are read, and Integer or a comparison with a
+// literal reads the bytes in place. Edge pieces, Unicode content, dynamic
+// positions and the List's own bound message must all match split.
+fixtures.executes(frontend, #"""
+    function field(line: Text, at: Integer): Text {
+        let fields = line.split(",")
+        return fields[at]
+    }
+    function integerAt(line: Text, at: Integer): Integer {
+        let fields = line.split(",")
+        return Integer(fields[at])
+    }
+    function named(line: Text): Integer {
+        let fields = line.split(",")
+        let count = fields.length
+        if fields[1] == "WARN" { count += 100 }
+        if fields[2] != "" { count += 1000 }
+        return count
+    }
+    print(field("a,b,c", 0) + "|" + field("a,b,c", 2))
+    print(integerAt("10,20,30", 1))
+    print(named("t,WARN,x"))
+    print(named("t,INFO,"))
+    print(named(",,"))
+    let unicode = "añb,é🙂,ü"
+    print(field(unicode, 1) + Text(field(unicode, 1).length))
+    print(integerAt(",,  7 ", 2))
+    let empty = ""
+    let none = empty.split(",")
+    print(none.length)
+    let trail = "a,"
+    let parts = trail.split(",")
+    print(parts.length + none.length)
+    for line in "1,2\n3,4\n5,6".split("\n") {
+        let cells = line.split(",")
+        if Integer(cells[0]) + 1 != Integer(cells[1]) { fail("wrong cells") }
+        print(cells[1] + "-" + cells[0])
+    }
+    """#, "a|c\n20\n1103\n3\n3\né🙂2\n7\n1\n3\n2-1\n4-3\n6-5\n", levels, 0, "", true)
+fixtures.executes(frontend, #"""
+    function outside(line: Text): Text {
+        let fields = line.split(",")
+        return fields[4]
+    }
+    print(outside("a,b,c"))
+    """#, "", levels, 1, "Minyar stopped: List position 4 is outside its length of 3.\n", false)
+// A split whose pieces leave the block, or a whole-List use, keeps its List.
+fixtures.executes(frontend, #"""
+    function first(line: Text): Text {
+        let fields = line.split(",")
+        return fields[1]
+    }
+    function sorted(line: Text): Text {
+        let fields = line.split(",")
+        fields.sort()
+        return joinText(fields, "|")
+    }
+    function stored(line: Text): Integer {
+        let fields = line.split(",")
+        let copy: List<Text> = []
+        for field in fields { copy.add(field) }
+        return copy.length
+    }
+    function replaced(line: Text): Text {
+        let fields = line.split(",")
+        fields[1] = "x"
+        return joinText(fields, "|")
+    }
+    print(first("p,q,r"))
+    print(sorted("c,a,b"))
+    print(stored("1,2,3"))
+    print(replaced("1,2,3"))
+    """#, "q\na|b|c\n3\n1|x|3\n", levels, 0, "", true)
+fixtures.executes(frontend, #"""
+    function field(line: Text, at: Integer): Text {
+        let fields = line.split(",")
+        return fields[at]
+    }
+    function named(line: Text): Integer {
+        let fields = line.split(",")
+        if fields[1] == "WARN" { return 100 }
+        if fields[2] != "" { return 1000 }
+        return fields.length
+    }
+    function window(line: Text): Integer {
+        let fields = line.split(",")
+        return Integer(fields[1]) + fields.length
+    }
+    function first(line: Text): Text {
+        let fields = line.split(",")
+        return fields[1]
+    }
+    function sorted(line: Text): Text {
+        let fields = line.split(",")
+        fields.sort()
+        return joinText(fields, "|")
+    }
+    print(field("a,b,c", 1))
+    print(named("t,WARN,x"))
+    print(window("1,20,3"))
+    print(first("p,q,r"))
+    print(sorted("c,a,b"))
+    """#, "b\n100\n23\nq\na|b|c\n", levels, 0, "", true)
+let piecePath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let pieceLLVM = io.readTextFile(piecePath + ".ll")
+let windowBody = functionBody(pieceLLVM, "window")
+test.check(test.contains(windowBody, "call i64 @minyar_text_split_count("), "a positioned split's count must not build the List")
+test.check(test.contains(windowBody, "call i64 @minyar_text_split_integer(") && !test.contains(windowBody, "@minyar_text_integer("), "Integer of a positioned piece must parse it where it lies")
+test.check(!test.contains(windowBody, "@minyar_text_split(") && !test.contains(windowBody, "@minyar_list_"), "a positioned split must not build a List")
+let pieceBody = functionBody(pieceLLVM, "field")
+test.check(test.contains(pieceBody, "call ptr @minyar_text_split_at(") && !test.contains(pieceBody, "@minyar_list_get("), "a piece read must compute one piece in place")
+let namedBody = functionBody(pieceLLVM, "named")
+test.check(test.contains(namedBody, "call zeroext i1 @minyar_text_split_equals(") && !test.contains(namedBody, "@minyar_texts_are_equal("), "a positioned piece compared with a literal must compare in place")
+let keptByReturn = functionBody(pieceLLVM, "first")
+test.check(test.contains(keptByReturn, "@minyar_text_split_at(") && !test.contains(keptByReturn, "@minyar_text_split("), "a returned piece is one piece, not a List")
+let sortedBody = functionBody(pieceLLVM, "sorted")
+test.check(test.contains(sortedBody, "@minyar_text_split("), "a whole-List use keeps the split's List")
 
 test.removeTree(frontend.compiler.directory)
 print("Text scanning: passed")

@@ -149,20 +149,28 @@ function compileAtomicStatementBody(context: CompilerContext, localNames: List<T
         }
         let id = reservedLocal
         if id < 0 { id = nextLocal(state) }
-        let borrowed = initializerStart >= 0 && stableFieldBorrow(context, localNames, localTypes, localIds, localLengths, state, initializerStart, state[0], valueType)
-        let guarded = !borrowed && initializerStart >= 0 && guardableElementBinding(context, localNames, localLengths, state, initializerStart, state[0], name, valueType)
+        // `let fields = text.split(separator)` read only by position keeps no
+        // List: the compiler remembers the receiver and separator instead.
+        let deferred = initializerStart >= 0 && !immutable && declaredType == 0 && isListType(type) && listElementType(type) == 2 && deferSplitBinding(context, localNames, localTypes, localIds, localLengths, state, output, name, id, value, initializerStart, state[0])
+        let borrowed = !deferred && initializerStart >= 0 && stableFieldBorrow(context, localNames, localTypes, localIds, localLengths, state, initializerStart, state[0], valueType)
+        // A split piece is a value of its own, not an element of the root the
+        // initializer's token shape names, so a binding guard would hold the
+        // wrong lifetime.
+        let piece = !deferred && splitPieceIndex(context, value) >= 0
+        let guarded = !deferred && !piece && !borrowed && initializerStart >= 0 && guardableElementBinding(context, localNames, localLengths, state, initializerStart, state[0], name, valueType)
         if guarded { borrowed = true }
         addLocal(localNames, localTypes, localIds, localLengths, state, name, type, id)
         // A guard is a hidden local after the binding; the binding stays at bound.
         let bound = state[3] - 1
         if guarded { reserveBindingGuard(context, localNames, localTypes, localIds, localLengths, state, output, value, type) }
         dmaBindLocal(context, context.syntax.active, bound, id)
-        noteMoveBinding(context, id, type)
+        if !deferred { noteMoveBinding(context, id, type) }
         if immutable { localLengths[bound] = -name.byteLength }
         // A record binding its block never reassigns is as stable a field-path
         // root as a constant: one value for the binding's whole scope. A guarded
         // binding is too: its guard keeps the value if the block could release it.
         if !immutable && plainRecordType(context, type) && !blockAssignsName(tokenKinds, tokenTexts, state[0], name) { localLengths[bound] = -name.byteLength }
+        if !deferred {
         if !borrowed { assignReference(output, state, id, value, valueType, functionParameterCounts, functionParameterTypes, functionReturnTypes) }
         output.add("  store ")
         output.add(llvmType(type))
@@ -171,6 +179,7 @@ function compileAtomicStatementBody(context: CompilerContext, localNames: List<T
         output.add(", ptr %local.")
         output.add(Text(id))
         output.add("\n")
+        }
         let scalarValues = scalarRecordValues(state, id)
         if scalarValues >= 0 { emitDebugScalarBinding(context, output, nameLocation, name, type, scalarValues) } else { emitDebugBinding(context, output, nameLocation, name, type, "ptr %local." + Text(id), 0, true) }
         }
@@ -444,6 +453,7 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
     let borrowsEnabled = context.valueBorrows.enabled
     if threadEntryFunction { context.valueBorrows.enabled = false }
     beginLocalMoves(context, state, threadEntryFunction)
+    resetSplitBindings(context)
     textState[0] = "entry"
     if recoveryEnabled(state) { textState[0] = "recovery.body" }
     let localNames: List<Text> = []
@@ -834,6 +844,7 @@ function compileTopLevel(context: CompilerContext, output: List<Text>, globals: 
     context.debugTypes = pendingDebugTypes
     dmaStartFunction(context)
     context.localMoves.enabled = false
+    resetSplitBindings(context)
     context.syntax.active = 0
     let tokenKinds = context.tokenKinds
     let tokenTexts = context.tokenTexts
