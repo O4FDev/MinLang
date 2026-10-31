@@ -73,6 +73,15 @@ static long long map_canonical_key(long long kind, long long key) {
 #define MAP_GENERAL
 #endif
 MINYAR_HOT uint64_t map_nonzero_hash(uint64_t hash) { return hash ? hash : UINT64_C(0x9e3779b97f4a7c15); }
+/* Scalar keys (Integer, Character, Boolean, Float) need no avalanche: one
+ * multiply by an odd constant is a bijection on the low bits, so runs of keys
+ * never share a bucket, and folding the high half back down spreads keys that
+ * are multiples of a power of two. Equal keys still hash alike, and Map
+ * iteration order stays deterministic for a given key sequence. */
+MINYAR_HOT uint64_t map_scalar_hash(uint64_t value) {
+    value *= UINT64_C(0xff51afd7ed558ccd);
+    return map_nonzero_hash(value ^ (value >> 29));
+}
 /* Text hashing loops over the bytes; it stays one out-of-line function so the
  * inlined Map paths keep the same shape for every key kind. */
 static MAP_GENERAL uint64_t map_text_hash(const MinyarText *text) {
@@ -82,9 +91,13 @@ static MAP_GENERAL uint64_t map_text_hash(const MinyarText *text) {
     const unsigned char *p = text->bytes;
     size_t n = (size_t)text->byte_length;
     while (n >= 8) {
-        uint64_t word = 0;
-        /* Byte order is explicit, also avoiding unaligned reads. */
-        for (unsigned i = 0; i < 8; i++) word |= (uint64_t)p[i] << (8 * i);
+        /* One little-endian load per whole word: the same value eight byte
+         * shifts used to assemble, and the same hash for every key. */
+        uint64_t word;
+        memcpy(&word, p, sizeof(word));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        word = __builtin_bswap64(word);
+#endif
         hash = map_mix(hash ^ word); p += 8; n -= 8;
     }
     /* The same little-endian tail value from at most two loads; the
@@ -107,7 +120,7 @@ static MAP_GENERAL uint64_t map_text_hash(const MinyarText *text) {
 }
 static uint64_t minyar_map_hash(long long kind, long long key) {
     if (kind == 2) return map_text_hash((const MinyarText *)(uintptr_t)key);
-    return map_nonzero_hash(map_mix((uint64_t)map_canonical_key(kind, key)));
+    return map_scalar_hash((uint64_t)map_canonical_key(kind, key));
 }
 uint64_t minyar_hash_slot(long long kind, long long key) {
     if (kind == 2 && !key) return 0; /* Inactive choice/Result payload. */
@@ -514,7 +527,7 @@ MINYAR_HOT uint64_t map_builtin_hash(long long kind, long long key) {
         if ((size_t)text->byte_length < 8) return map_text_hash_short(text);
         return map_text_hash(text);
     }
-    return map_nonzero_hash(map_mix((uint64_t)key));
+    return map_scalar_hash((uint64_t)key);
 }
 /* The bucket holding key, or the empty bucket that ends its probe run. Stored
  * hashes are compared first, so Text bytes are compared only on a full hash
