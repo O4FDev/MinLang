@@ -1081,8 +1081,13 @@ check-map-basics: build/minyarc build/minyar-runtime.o build/tooling/tests/map-b
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/map-basics
 check-map-basics-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/map-basics tests/memory-contracts-runtime.c $(RUNTIME_HEADERS)
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/map-basics
-check check-portable: check-list-basics check-map-basics
-check-sanitize: check-list-basics-sanitize check-map-basics-sanitize
+.PHONY: check-map-update check-map-update-sanitize
+check-map-update: build/minyarc build/minyar-runtime.o build/tooling/tests/map-update
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/map-update
+check-map-update-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/map-update
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/map-update
+check check-portable: check-list-basics check-map-basics check-map-update
+check-sanitize: check-list-basics-sanitize check-map-basics-sanitize check-map-update-sanitize
 
 .PHONY: check-mutation-coverage
 check-mutation-coverage: build/minyarc build/minyar-runtime.o build/tooling/tests/mutation-coverage

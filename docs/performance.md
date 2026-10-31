@@ -455,6 +455,17 @@ no length test. Reference fields keep their ownership-aware runtime setters.
 `make check-record-access` checks the helper IR, its inlining at O2, the absence
 of a failure path and the arena layout.
 
+A compound Map assignment `m[k] op= v` with an Integer, Text, Float, Boolean,
+Character or payload-free choice key and a non-reference value looks the key up
+once: `minyar_map_value_slot` reads like `m[k]` (an absent key stops before the
+right side runs) and `minyar_map_store_slot` writes through the found slot.
+When the right side can run user code, which could grow or clear the Map, the
+statement still reads through the slot but stores with `minyar_map_set`. Pending recovery and a
+Map read by an active hash or equality method take a scratch slot whose store
+runs `minyar_map_set`, so failures and diagnostics are unchanged; Float keys
+(NaN and signed-zero rules) also take the scratch slot.
+`make check-map-update` runs both paths at O0/O2 and checks the emitted calls.
+
 On the frozen safelibs fixtures (Linux x86_64, LLVM 23.1.2, separate O2 codec
 and runtime objects, median of three pinned samples), inline record access
 reduced decode time by 22–35%:

@@ -524,6 +524,31 @@ void minyar_map_set(MinyarRecord *map, long long key, long long value) {
     }
     map_builtin_insert(map, kind, key, value, hash, bucket);
 }
+/* `m[k] op= v` with a scalar value finds the bucket once: the slot call reads
+ * like minyar_map_get, failures included, and the compiler emits the store
+ * call in place of minyar_map_set only when nothing between the two can run
+ * user code, so the bucket cannot move. Where minyar_map_set would not simply
+ * store (pending recovery, Float or record keys, or a Map read by an active
+ * hash or equality method), the slot is a per-thread scratch copy and the
+ * store runs minyar_map_set. */
+static MINYAR_THREAD_LOCAL long long map_scratch_slot;
+long long *minyar_map_value_slot(const MinyarRecord *map, long long key) {
+    long long kind = map->values[MAP_KEY_KIND];
+    if (!map_builtin_kind(kind) || map_active_reads) {
+        long long value = minyar_map_get(map, key);
+        map_scratch_slot = value;
+        return &map_scratch_slot;
+    }
+    map_scratch_slot = 0;
+    if (minyar_recovery_pending()) return &map_scratch_slot;
+    size_t bucket = map_builtin_find(map, kind, key);
+    if (bucket == SIZE_MAX) map_key_absent();
+    return &MAP_VALUE(map_entries(map), bucket);
+}
+void minyar_map_store_slot(MinyarRecord *map, long long key, long long *slot, long long value) {
+    if (slot == &map_scratch_slot || minyar_recovery_pending()) minyar_map_set(map, key, value);
+    else *slot = value;
+}
 _Bool minyar_map_remove(MinyarRecord *map, long long key) {
     long long kind = map->values[MAP_KEY_KIND];
     if (!map_builtin_kind(kind)) return map_remove_general(map, key);

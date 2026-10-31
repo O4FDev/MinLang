@@ -178,10 +178,10 @@ function loopBodyCallee(callee: Text, containers: Boolean): Boolean {
     if callee.startsWith("@minyar_text_") || callee.startsWith("@minyar_texts_are_equal(") || callee.startsWith("@minyar_join_text") || callee.startsWith("@minyar_interpolate(") || callee.startsWith("@minyar_print_") || callee.startsWith("@minyar_bytes_") { return true }
     if callee.startsWith("@minyar_integer_text(") || callee.startsWith("@minyar_float_text(") || callee.startsWith("@minyar_character_text(") || callee.startsWith("@minyar_boolean_text(") || callee.startsWith("@minyar_integer_character(") || callee.startsWith("@minyar_float_integer(") { return true }
     if callee.startsWith("@minyar_compare_slots(") || callee.startsWith("@minyar_equal_slots(") || callee.startsWith("@minyar_hash_slot(") || callee.startsWith("@minyar_check_") || callee.startsWith("@minyar_fail") { return true }
-    if callee.startsWith("@minyar_list_new(") || callee.startsWith("@minyar_list_add(") || callee.startsWith("@.minyar.list.add.scalar(") || callee.startsWith("@minyar_list_add_take(") || callee.startsWith("@minyar_list_references(") || callee.startsWith("@minyar_list_length(") || callee.startsWith("@minyar_list_slice(") { return true }
-    if callee.startsWith("@minyar_record_new(") || callee.startsWith("@minyar_record_new_scalar(") || callee.startsWith("@minyar_record_set_scalar(") || callee.startsWith("@minyar_map_new(") || callee.startsWith("@minyar_map_has(") || callee.startsWith("@minyar_map_get(") || callee.startsWith("@minyar_map_length(") { return true }
+    if callee.startsWith("@minyar_list_new(") || callee.startsWith("@minyar_list_add(") || callee.startsWith("@minyar_list_add_take(") || callee.startsWith("@minyar_list_references(") || callee.startsWith("@minyar_list_length(") || callee.startsWith("@minyar_list_slice(") || callee.startsWith("@.minyar.list.add.scalar(") { return true }
+    if callee.startsWith("@minyar_record_new(") || callee.startsWith("@minyar_record_new_scalar(") || callee.startsWith("@minyar_record_set_scalar(") || callee.startsWith("@minyar_map_new(") || callee.startsWith("@minyar_map_has(") || callee.startsWith("@minyar_map_get(") || callee.startsWith("@minyar_map_value_slot(") || callee.startsWith("@minyar_map_length(") { return true }
     if containers { return false }
-    return callee.startsWith("@minyar_record_set(") || callee.startsWith("@minyar_record_set_take(") || callee.startsWith("@minyar_record_set_reference(") || callee.startsWith("@minyar_record_replace(") || callee.startsWith("@minyar_record_append_text(") || callee.startsWith("@minyar_map_set(") || callee.startsWith("@minyar_map_remove(")
+    return callee.startsWith("@minyar_record_set(") || callee.startsWith("@minyar_record_set_take(") || callee.startsWith("@minyar_record_set_reference(") || callee.startsWith("@minyar_record_replace(") || callee.startsWith("@minyar_record_append_text(") || callee.startsWith("@minyar_map_set(") || callee.startsWith("@minyar_map_store_slot(") || callee.startsWith("@minyar_map_remove(")
 }
 
 // An element, field or Map value read inside a statement stays alive while
@@ -737,15 +737,35 @@ function compileAssignment(context: CompilerContext, localNames: List<Text>, loc
                     functionReturnTypes.add(-5)
                     functionReturnTypes.add(receiverType)
                     checkMapMutation(receiverType, functionParameterCounts, functionParameterTypes)
+                    // `m[k] op= v` with a built-in key and a scalar value looks the
+                    // key up once and stores through the value slot, unless the
+                    // right side can run user code that might move the bucket.
+                    let keyType = mapKeyType(receiverType)
+                    let inPlace = binary != "" && !isReferenceType(elementType) && (keyType == 1 || keyType == 2 || keyType == 3 || keyType == 4 || keyType == 7 || isScalarChoiceType(keyType))
+                    let valueSlot = ""
                     if binary != "" {
-                        current = readMapElement(context, output, textState, state, receiver, position, elementType, mapKeyType(receiverType))
+                        if inPlace {
+                            valueSlot = valueName(textState, newTemporary(state))
+                            output.add("  " + valueSlot + " = call ptr @minyar_map_value_slot(ptr " + receiver + ", i64 " + position + ")\n")
+                            let raw = valueName(textState, newTemporary(state))
+                            output.add("  " + raw + " = load i64, ptr " + valueSlot + "\n")
+                            current = slotAsValue(output, textState, state, raw, elementType)
+                        } else {
+                            current = readMapElement(context, output, textState, state, receiver, position, elementType, keyType)
+                        }
                         borrowReference(output, state, current, elementType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
                     }
+                    let valueStart = output.length
+                    let valueCalls = context.callTargets.length
                     let value = assignedValue(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, binary, current, elementType, valueType, operatorLocation)
                     requireType(tokenLines, state, valueType[0], elementType, "Map value has the wrong type")
                     let slot = valueAsListSlot(output, textState, state, value, elementType)
-                    let custom = noteHashableCalls(context, mapKeyType(receiverType), state, textState, output)
-                    output.add("  call void @minyar_map_set(ptr " + receiver + ", i64 " + position + ", i64 " + slot + ")\n")
+                    let custom = noteHashableCalls(context, keyType, state, textState, output)
+                    if inPlace && !custom && !ranUserCode(context, output, valueStart, valueCalls) && !tokensMakeCall(tokenKinds, tokenTexts, operatorPosition + 1, state[0]) {
+                        output.add("  call void @minyar_map_store_slot(ptr " + receiver + ", i64 " + position + ", ptr " + valueSlot + ", i64 " + slot + ")\n")
+                    } else {
+                        output.add("  call void @minyar_map_set(ptr " + receiver + ", i64 " + position + ", i64 " + slot + ")\n")
+                    }
                     settleMapBorrow(context, output, state, keyPiece, keyValue, mapKeyType(receiverType), keyCalls, tokensMakeCall(tokenKinds, tokenTexts, operatorPosition + 1, state[0]))
                     if custom { recoveryCheckpoint(output, textState, state) }
                 } else {

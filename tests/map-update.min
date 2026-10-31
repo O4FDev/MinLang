@@ -1,0 +1,115 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "system" as system
+
+// `m[k] op= v` with a built-in key and a scalar value finds the key once and
+// stores through its value slot; anything that could move the bucket keeps
+// the separate read and minyar_map_set.
+function body(llvm: Text, name: Text): Text {
+    let active = false
+    let result = ""
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") && test.contains(line, " @.minyar.fn." + name + "(") { active = true }
+        if active {
+            result += line + "\n"
+            if line == "}" { return result }
+        }
+    }
+    fail("missing function: " + name)
+}
+function stops(compiler: test.Compiler, source: Text, message: Text) {
+    test.require(test.compile(compiler, source), "compile failing program")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link failing program")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 1, "expected failure status 1 at " + optimization + ", got " + Text(result.status))
+        test.check(result.errorOutput.startsWith(message), "unexpected failure at " + optimization + "\n" + result.errorOutput)
+        test.check(result.output == "", "the right side ran before the absent key stopped the update at " + optimization)
+    }
+}
+
+let compiler = test.compiler()
+test.executes(compiler, #"""
+function count(words: List<Text>): Map<Text, Integer> {
+    let counts: Map<Text, Integer> = Map()
+    for word in words { if counts.has(word) { counts[word] += 1 } else { counts[word] = 1 } }
+    return counts
+}
+function grow(m: Map<Integer, Integer>): Integer {
+    for n in 100..200 { m[n] = n }
+    return 5
+}
+function viaCall(m: Map<Integer, Integer>) { m[1] += grow(m) }
+function appendText(texts: Map<Integer, Text>) { texts[1] += "b" }
+let counts = count("a b a c a b".split(" "))
+print(counts["a"]); print(counts["b"]); print(counts["c"])
+let ints = {1: 10, 2: 20}
+ints[1] -= 3; ints[2] *= 2
+print(ints[1]); print(ints[2])
+let floats = {'x': 1.5}
+floats['x'] += 0.25
+print(floats['x'])
+let flags = {true: 1, false: 2}
+flags[false] += 40
+print(flags[false])
+let real = {0.5: 7}
+real[0.5] %= 4
+print(real[0.5])
+let g = {1: 1}
+viaCall(g)
+print(g[1]); print(g.length)
+let big = Map<Integer, Integer>()
+for i in 0..1000 { big[i % 37] = 0 }
+for i in 0..1000 { big[i % 37] += i }
+let total = 0
+for key in big { big[key] += 1; total += big[key] }
+print(big[0]); print(big[36]); print(total)
+let texts = {1: "a"}
+appendText(texts)
+print(texts[1])
+"""#, "3\n2\n1\n7\n40\n1.75\n42\n3\n6\n101\n13987\n13960\n499537\nab\n")
+
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+let counting = body(llvm, "count")
+test.check(test.contains(counting, " = call ptr @minyar_map_value_slot(ptr ") && test.contains(counting, "call void @minyar_map_store_slot(ptr "), "a scalar update must use one value slot")
+let sets = 0
+for line in test.lines(counting) { if test.contains(line, "call void @minyar_map_set(") { sets += 1 } }
+test.check(!test.contains(counting, "call i64 @minyar_map_get(") && sets == 1, "a scalar update must not read and set separately (only the insert sets)")
+// Negative controls. A right side that runs user code may grow the Map, so the
+// update reads through the slot first but stores with minyar_map_set; Text
+// values keep the separate read and set.
+let viaCall = body(llvm, "viaCall")
+test.check(test.contains(viaCall, "call void @minyar_map_set(ptr ") && !test.contains(viaCall, "@minyar_map_store_slot("), "an update whose right side calls user code must store with minyar_map_set")
+let appendText = body(llvm, "appendText")
+test.check(test.contains(appendText, "call i64 @minyar_map_get(ptr ") && test.contains(appendText, "call void @minyar_map_set(ptr "), "reference values keep the separate read and set")
+test.check(!test.contains(appendText, "@minyar_map_value_slot(") && !test.contains(appendText, "@minyar_map_store_slot("), "reference values must not hold a value slot")
+
+// Inside a record key's hash method the Map being read is guarded, so the
+// update takes the scratch slot and minyar_map_set; a different Map may still
+// be updated there.
+test.executes(compiler, #"""
+record Key { identity: Integer }
+global counters: List<Map<Integer, Integer>> = []
+function Key.equal(other: Key): Boolean { return self.identity == other.identity }
+function Key.hash(): Integer { let maps = counters; let calls = maps[0]; calls[1] += 1; return self.identity }
+conform Key to Hashable
+let calls: Map<Integer, Integer> = {1: 0}
+let maps = counters
+maps.add(calls)
+let entries: Map<Key, Integer> = Map()
+entries[Key { identity: 1 }] = 1
+entries[Key { identity: 2 }] = 2
+print(entries.has(Key { identity: 1 }))
+print(calls[1] >= 3)
+"""#, "true\ntrue\n")
+
+// Absent keys fail exactly as a read does, before the right side runs.
+stops(compiler, "function side(): Integer { print(\"side\"); return 1 }\nlet m = {1: 2}\nm[3] += side()\n", "Minyar stopped: Map key is absent.\n")
+stops(compiler, "let m = {\"a\": 2}\nm[\"b\"] += 1\n", "Minyar stopped: Map key is absent.\n")
+test.removeTree(compiler.directory)
+print("map update: passed")
