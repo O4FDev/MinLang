@@ -39,7 +39,7 @@ fi
 python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["assignment"][int(sys.argv[2])]; open(sys.argv[3],"w").write("".join(x+"\n" for x in a["skip"]))' \
   "$out/assignment.json" "$index" "$out/skip.txt" || finish 4
 stamp "PLANNED $(sha256sum < "$out/plan.json" | cut -c1-16) $(sha256sum < "$out/assignment.json" | cut -c1-16)"
-PATH=$fg/shim:$PATH FAST_GATE_SKIP=$out/skip.txt FAST_GATE_ROOT=$(pwd -P) \
+PATH=$fg/shim:$PATH FAST_GATE_SKIP=$out/skip.txt FAST_GATE_ROOT=$(pwd -P) FAST_GATE_TIMELINE=$out/timeline \
   make check-in-parallel CHECKS="$checks" CHECK_JOBS="$jobs" > "$out/gate.log" 2>&1
 status=$?
 stamp "GATE-EXIT $status"
