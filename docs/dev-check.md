@@ -21,6 +21,8 @@ programs under cachegrind and prints their Minyar Ir against
 `--bench-base` (a `compare.json` of the base), failing if an output differs.
 
 It is feedback, not a landing gate: always run the full gate before merging.
+dev-check is the default pre-gate step for all Minyar work: run it after every
+change, fix what it reports, and only then queue the full gate.
 
 ## How a check is selected
 
@@ -68,7 +70,40 @@ harnesses or fixtures use that module (directly or through imports), and a new
 test file runs the checks that enumerate its directory, such as
 `check-suite-catalogue`.
 
-Compiler and runtime-core changes are honest rather than fast: almost every
+## Compiler and runtime changes: selection by function
+
+A second index records which compiler and runtime functions each check
+executes. `tools/dev-check.py coverage` folds it in from one instrumented gate
+run: a clang wrapper compiles runtime C and the compiler's LLVM IR with
+function-entry coverage (`-fprofile-generate -mllvm -pgo-function-entry-coverage`,
+continuous mode so aborting programs keep their counts), every link gets the
+profile runtime, and a `make` shim on `PATH` sends the profiles of each
+`make -j1 check-x` to that check's directory. The index also keeps a function
+snapshot of `compiler/**/*.min` and `runtime/**/*.{c,h}`.
+
+For a change to those files, dev-check compares each file with the snapshot.
+When only function bodies changed (comments and whitespace are ignored), it
+selects the checks that executed one of those functions at base, plus:
+
+- checks without complete coverage (they failed in the instrumented run, wrote
+  an unreadable profile, or compiled runtime or compiler code to IR or assembly
+  that they read as text rather than run);
+- checks that open a changed compiler or runtime file, or a rebuilt compiler or
+  runtime artefact, as data (anything but a compiler or linker reading it);
+- checks selected the usual way by every other changed file or output. Build
+  outputs whose only change is compiler or runtime code (the compilers, runtime
+  objects, and programs linked from them) are explained by the coverage; a
+  Minyar-compiled `.ll` whose bytes changed is a codegen change and selects the
+  checks that use it.
+
+It falls back to file-level selection (close to the full gate) when code
+outside function bodies changed (types, structs, macros, constants, top-level
+declarations), a signature changed, a file was added or removed, a changed
+function has no coverage counter at base, or the check runner or a process
+whose check is unknown executed a changed function. Line numbers that shift
+inside unchanged functions are not treated as changes.
+
+Compiler and runtime-core changes without a coverage index are honest rather than fast: almost every
 check compiles or links Minyar code, so the selection is close to the full
 gate. dev-check says so, and Make rebuilds `build/minyarc` through its normal
 self-host stages (stage0 only when `bootstrap/` changed).
