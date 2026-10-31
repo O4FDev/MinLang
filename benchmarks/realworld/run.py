@@ -166,6 +166,29 @@ def file_hash_text(data):
 
 # --------------------------------------------------------------- cross-project
 
+def warm_tree(tree, clang, work):
+    """Build the tree's runtime and driver once, before any timed build.
+
+    A new compiler identity makes the launcher rebuild the configured runtime
+    and the link driver; charging that to whichever project happens to build
+    first would make the build column meaningless.
+    """
+    source = os.path.join(work, "warmup.min")
+    if not os.path.exists(source):
+        with open(source, "w") as f:
+            f.write("function main(): Integer { return 0 }\n")
+    env = dict(os.environ)
+    env["MINYAR_CLANG"] = clang
+    env["LLVM_CC"] = clang
+    started = time.perf_counter()
+    result = subprocess.run([os.path.join(tree, "minyar"), "--release", source,
+                             "-o", os.path.join(work, "warmup")],
+                            capture_output=True, env=env, text=True)
+    if result.returncode != 0:
+        raise Failure("warm-up build failed\n" + (result.stdout + result.stderr)[-2000:])
+    return time.perf_counter() - started
+
+
 def tree_identity(tree, clang):
     try:
         commit = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
@@ -642,8 +665,10 @@ def main():
             baseline = json.load(f)
     clang = default_clang(args.tree)
     identity = tree_identity(args.tree, clang)
+    warmed = warm_tree(args.tree, clang, work)
     print(f"tree {identity['path']} commit {identity['commit'][:12] or 'unknown'}"
-          f"  projects {args.projects}  baseline {identity_commit(baseline)}", flush=True)
+          f"  projects {args.projects}  baseline {identity_commit(baseline)}"
+          f"  warm-up {warmed:.1f}s", flush=True)
     results = []
     for spec in specs:
         try:
@@ -656,7 +681,7 @@ def main():
                 sys.exit(f"{spec['name']}: {error}")
     print_rows(results, baseline)
     totals = summarize(results, baseline)
-    doc = {"tree": identity, "threads": THREADS, "projects_root": os.path.abspath(args.projects),
+    doc = {"tree": identity, "threads": THREADS, "warmup_seconds": warmed, "projects_root": os.path.abspath(args.projects),
            "inputs": {"query_rows": QUERY_ROWS, "sales_sha256": file_hash(prepared["sales"]),
                       "js_sha256": file_hash(prepared["js"]), "sandbox_requests": SANDBOX_REQUESTS,
                       "sandbox_sha256": file_hash(prepared["requests"]),
