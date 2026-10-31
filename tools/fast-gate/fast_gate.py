@@ -305,19 +305,28 @@ def gate_tree(index, tree, checks, args, ips_ready):
         cache_thread = threading.Thread(target=prepare_cache, args=(ctx.cache, tree, files, ctx, ctx.run_id, cache_timeline))
         cache_thread.start()
     timelines = [dict() for _ in range(ctx.shards)]
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=ctx.shards)
-    futures = {}
-    for shard, ip in ips_ready():
-        timelines[shard]["active"] = time.monotonic() - t0
+    # Each box takes the next shard of the plan when it is free: with --boxes below --shards the same plan runs in
+    # waves (every shard's own timeline is still measured), otherwise every box runs one shard.
+    queue, queue_lock, shard_dirs = list(range(ctx.shards)), threading.Lock(), [None] * ctx.shards
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=ctx.boxes)
+    futures = []
+    for box, ip in ips_ready():
 
-        def work(ip=ip, shard=shard):
-            prepare_shard(ip, tree, files, shard, ctx, timelines[shard])
-            return run_shard(ip, shard, ctx, timelines[shard])
+        def work(ip=ip):
+            while True:
+                with queue_lock:
+                    if not queue:
+                        return
+                    shard = queue.pop(0)
+                timelines[shard]["active"] = time.monotonic() - t0
+                prepare_shard(ip, tree, files, shard, ctx, timelines[shard])
+                shard_dirs[shard] = run_shard(ip, shard, ctx, timelines[shard])
 
-        futures[shard] = pool.submit(work)
+        futures.append(pool.submit(work))
     if ctx.cache:
         cache_thread.join()
-    shard_dirs = [futures[shard].result() for shard in range(ctx.shards)]
+    for future in futures:
+        future.result()
     plan, final, results, problems = merge(ctx, shard_dirs)
     elapsed = time.monotonic() - t0
     with open(os.path.join(ctx.out, "merged.tsv"), "w") as out:
@@ -356,6 +365,7 @@ def main():
                         "several trees are gated one after another on the same shards")
     parser.add_argument("--shards", type=int, default=8)
     parser.add_argument("--jobs", type=int, default=8)
+    parser.add_argument("--boxes", type=int, default=0, help="droplets to create (default: one per shard); fewer runs the plan's shards in waves")
     parser.add_argument("--image", default=open(os.path.join(HERE, "image.txt")).read().split()[0])
     parser.add_argument("--size", default="s-8vcpu-16gb-amd")
     parser.add_argument("--region", default="lon1")
@@ -382,15 +392,18 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     args.run_id = run_id
     args.cache = find_cache(args.cache)
-    shards = Shards(run_id, args.shards, args.image, args.size, args.region, args.key_id)
+    args.boxes = args.boxes or args.shards
+    shards = Shards(run_id, args.boxes, args.image, args.size, args.region, args.key_id)
     if args.hosts:
         hosts = args.hosts.split(",")
-        args.shards, args.keep = len(hosts), True
+        args.keep = True
+        args.boxes = len(hosts)
+        args.shards = max(args.shards, len(hosts)) if "--shards" in sys.argv else len(hosts)
         shards = Shards(run_id, len(hosts), args.image, args.size, args.region, args.key_id)
         shards.create = lambda: None
         shards.addresses = lambda: {f"shard-{run_id}-{index}": ip for index, ip in enumerate(hosts)}
     elif not args.ignore_budget:
-        spend, cost = guard_spend(), args.shards * 0.16667
+        spend, cost = guard_spend(), args.boxes * 0.16667
         if spend + cost > SHARD_BUDGET_USD:
             sys.exit(f"fast gate: today's shard spend is ${spend:.2f}; {args.shards} more shards (${cost:.2f} as the guard counts "
                      f"them) would pass the ${SHARD_BUDGET_USD:.2f} shard budget. Wait for the next UTC day or use fewer shards.")
@@ -405,7 +418,7 @@ def main():
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGHUP, cleanup)
-    say(f"fast gate {run_id}: {len(specs)} tree(s) on {args.shards} x {args.size} (image {args.image}), results in {args.out}")
+    say(f"fast gate {run_id}: {len(specs)} tree(s), {args.shards} shards on {args.boxes} x {args.size} (image {args.image}), results in {args.out}")
     if args.cache:
         say(f"cache box {args.cache['name']} {args.cache['public']} (VPC {args.cache['private']}) builds and plans")
     known = {}
@@ -416,7 +429,7 @@ def main():
 
         def first_ready():
             creator.join()
-            while len(known) < args.shards:
+            while len(known) < args.boxes:
                 for name, ip in shards.addresses().items():
                     index = int(name.rsplit("-", 1)[1])
                     if index not in known:
