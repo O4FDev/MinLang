@@ -13,8 +13,30 @@ check-simulation-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.
 build/tooling/tests/simulation-cli: TOOL_NATIVE = tools/clang-driver-host.c
 build/tooling/tests/simulation-cli: tools/clang-driver-host.c runtime/minyar_native.h
 
-check-simulation-cli: build/tooling/tests/simulation-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
-	+MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/simulation-cli
+# One piece per independent invocation group of tests/simulation-cli.min. Every
+# piece is its own process, so its `test.scratch()` project (and its target/
+# cache) is private; replay groups stay with the run whose output they replay.
+SIMULATION_CLI_PARTS = check-simulation-cli-lanterns check-simulation-cli-vault check-simulation-cli-beacons check-simulation-cli-options check-simulation-cli-durable check-simulation-cli-early
+.PHONY: $(SIMULATION_CLI_PARTS)
+check-simulation-cli: $(SIMULATION_CLI_PARTS)
+
+check-simulation-cli-lanterns: build/tooling/tests/simulation-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
+	+MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/simulation-cli --cases lanterns
+
+check-simulation-cli-vault: build/tooling/tests/simulation-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
+	+MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/simulation-cli --cases vault
+
+check-simulation-cli-beacons: build/tooling/tests/simulation-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
+	+MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/simulation-cli --cases beacons
+
+check-simulation-cli-durable: build/tooling/tests/simulation-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
+	+MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/simulation-cli --cases durable
+
+check-simulation-cli-early: build/tooling/tests/simulation-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
+	+MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/simulation-cli --cases early
+
+check-simulation-cli-options: build/tooling/tests/simulation-cli build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
+	+MINYAR_TEST_CLANG="$(TEST_CLANG)" ./build/tooling/tests/simulation-cli --cases options
 
 check-determinism-runtime:
 	python3 tests/determinism-runtime.py

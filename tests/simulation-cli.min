@@ -2,6 +2,30 @@ use "../tools/testing.min" as test
 use "../tools/driver-support.min" as host
 use "io" as io
 use "system" as system
+use "process" as processInfo
+
+// Piece selector: `--cases name[,name...]` limits the run to the named groups.
+// With no --cases the harness runs every group, exactly as before.
+let caseGroups = ["lanterns", "vault", "beacons", "options", "durable", "early"]
+let requestedCases: List<Text> = []
+let caseIndex = 0
+while caseIndex < processInfo.argumentCount() {
+    let caseOption = processInfo.argument(caseIndex)
+    test.check(caseOption == "--cases" && caseIndex + 1 < processInfo.argumentCount(), "unknown simulation-cli option: " + caseOption)
+    for caseName in test.words(test.replace(processInfo.argument(caseIndex + 1), ",", " ")) {
+        let caseKnown = false
+        for caseGroup in caseGroups { if caseGroup == caseName { caseKnown = true } }
+        test.check(caseKnown, "unknown simulation-cli case group: " + caseName)
+        requestedCases.add(caseName)
+    }
+    caseIndex += 2
+}
+
+function runsCases(requested: List<Text>, name: Text): Boolean {
+    if requested.length == 0 { return true }
+    for group in requested { if group == name { return true } }
+    return false
+}
 
 // minyar sim: discovery, seed sharing across jobs, the first failing seed, its
 // replay, one-seed runs, filters, option checks and the determinism proof.
@@ -79,6 +103,7 @@ function lineAfter(text: Text, prefix: Text): Text {
 }
 
 let environment = system.environment()
+if runsCases(requestedCases, "lanterns") {
 let both = test.run([launcher, "sim", "lanterns", "--seeds", "50", "--jobs", "3"], environment, application, work + "/both", 600)
 test.check(both.status == 1, "a failing universe makes sim exit with status one\n" + both.output + both.errorOutput)
 test.check(both.errorOutput == "", "sim writes its report to standard output\n" + both.errorOutput)
@@ -102,9 +127,14 @@ let failing = test.run([launcher, "sim", "lanterns", "--seed", seed], environmen
 test.check(failing.status == 1 && failing.output == "sim lanterns: seed " + seed + " failed: " + message + "\n", "the reported seed fails again alone\n" + failing.output + failing.errorOutput)
 let replayed = test.run([launcher, "sim", "lanterns", "--replay", saved], environment, application, work + "/replayed", 600)
 test.check(replayed.status == 1 && replayed.output == "sim lanterns: the recorded run failed: " + message + "\n", "saved decisions fail again\n" + replayed.output + replayed.errorOutput)
+}
+
+if runsCases(requestedCases, "options") {
 let filtered = test.run([launcher, "sim", "quiet", "--seeds", "5", "--first", "100"], environment, application, work + "/filtered", 600)
 test.check(filtered.status == 0 && test.contains(filtered.output, "sim quiet: ran 5 universes, no failures (seeds 100..104, 1 jobs, ") && !test.contains(filtered.output, "lanterns"), "filter and first seed\n" + filtered.output + filtered.errorOutput)
+}
 
+if runsCases(requestedCases, "vault") {
 let explored = test.run([launcher, "sim", "vault", "--explore", "--seeds", "3000"], environment, application, work + "/explored", 600)
 test.check(explored.status == 1 && test.contains(explored.output, "sim vault: explored ") && test.contains(explored.output, "universes; one failed (") && test.contains(explored.output, "forked from recorded moments)"), "exploration reaches the vault\n" + explored.output + explored.errorOutput)
 test.check(test.contains(explored.output, "  replayed its decisions twice: same result\n") && test.contains(explored.output, "  moments reached: first tumbler, second tumbler, third tumbler\n"), "explored failures replay and report their moments\n" + explored.output)
@@ -113,7 +143,9 @@ let vaultFile = lineAfter(explored.output, "  decisions: ")
 let vaultReplay = test.run([launcher, "sim", "vault", "--replay", vaultFile], environment, application, work + "/vault-replay", 600)
 let vaultOpened = vaultMessage.slice(vaultMessage.find(": ") + 2, vaultMessage.length)
 test.check(vaultReplay.status == 1 && vaultReplay.output == "sim vault: the recorded run failed: " + vaultOpened + "\n", "an explored failure reproduces from its decisions\n" + vaultReplay.output + explored.output)
+}
 
+if runsCases(requestedCases, "beacons") {
 let plainBeacons = test.run([launcher, "sim", "beacons", "--seeds", "3000"], environment, application, work + "/beacons-plain", 600)
 test.check(plainBeacons.status == 0 && test.contains(plainBeacons.output, "sim beacons: ran 3000 universes, no failures"), "plain seeds miss the beacons\n" + plainBeacons.output + plainBeacons.errorOutput)
 let beacons = test.run([launcher, "sim", "beacons", "--explore", "--seeds", "3000"], environment, application, work + "/beacons", 600)
@@ -122,7 +154,9 @@ test.check(test.contains(beacons.output, "  replayed its decisions twice: same r
 let beaconsFile = lineAfter(beacons.output, "  decisions: ")
 let beaconsReplay = test.run([launcher, "sim", "beacons", "--replay", beaconsFile], environment, application, work + "/beacons-replay", 600)
 test.check(beaconsReplay.status == 1 && test.contains(beaconsReplay.output, "sim beacons: the recorded run failed: beacon "), "a mutated failure reproduces from its saved decisions\n" + beaconsReplay.output + beaconsReplay.errorOutput)
+}
 
+if runsCases(requestedCases, "options") {
 let unmatched = test.run([launcher, "sim", "no such scenario"], environment, application, work + "/unmatched", 60)
 test.check(unmatched.status != 0 && test.contains(unmatched.errorOutput, "no simulation in sim/ matched no such scenario"), "unmatched filter\n" + unmatched.errorOutput)
 let zero = test.run([launcher, "sim", "--seeds", "0"], environment, application, work + "/zero", 60)
@@ -152,19 +186,32 @@ test.check(leaky.status == 1 && test.contains(leaky.output, "sim leaky: seed 19 
 io.writeTextFile(application + "/sim/clock.min", "use \"simulation\" as sim\nuse \"system\" as system\npublic function universe(world: sim.World): Text { if system.monotonicNanoseconds() % 2 == 0 { return \"even\" }; return \"\" }\n")
 let clock = test.run([launcher, "sim", "clock"], environment, application, work + "/clock", 600)
 test.check(clock.status == 1 && test.contains(clock.errorOutput, "deterministic function 'attempt' can reach the host clock: attempt -> universe -> monotonicNanoseconds (native \"system\")") && !test.contains(clock.output, "universes"), "host clock rejected before any universe runs\n" + clock.output + clock.errorOutput)
+}
+
 // The pinned production neo-db engine: random statements, a crash keeping
 // part of the WAL, recovery checked against acknowledged commits.
 // Run from a copy so concurrent checks never share the project's target directory.
-let neodbWork = work + "/neodb"
-host.makeDirectories(neodbWork + "/tests/fixtures")
-let copied = test.run(["cp", "-R", root + "/tests/neodb-sim", root + "/tests/fixtures/neodb-engine", neodbWork + "/tests/"], environment, root, work + "/neodb-copy", 60)
-test.require(copied, "copy the neo-db simulation project")
-let moved = test.run(["mv", neodbWork + "/tests/neodb-engine", neodbWork + "/tests/fixtures/neodb-engine"], environment, root, work + "/neodb-move", 60)
-test.require(moved, "place the engine fixture")
-let neodb = neodbWork + "/tests/neodb-sim"
+function neodbProject(work: Text, root: Text, environment: List<Text>): Text {
+    let neodbWork = work + "/neodb"
+    host.makeDirectories(neodbWork + "/tests/fixtures")
+    let copied = test.run(["cp", "-R", root + "/tests/neodb-sim", root + "/tests/fixtures/neodb-engine", neodbWork + "/tests/"], environment, root, work + "/neodb-copy", 60)
+    test.require(copied, "copy the neo-db simulation project")
+    let moved = test.run(["mv", neodbWork + "/tests/neodb-engine", neodbWork + "/tests/fixtures/neodb-engine"], environment, root, work + "/neodb-move", 60)
+    test.require(moved, "place the engine fixture")
+    return neodbWork + "/tests/neodb-sim"
+}
+
+if runsCases(requestedCases, "durable") {
+let neodb = neodbProject(work, root, environment)
 let durable = test.run([launcher, "sim", "--manifest-path", neodb, "durable", "--seeds", "500", "--jobs", "2"], environment, root, work + "/neodb-durable", 900)
 test.check(durable.status == 0 && test.contains(durable.output, "sim durable: ran 500 universes, no failures (seeds 0..499, 2 jobs, ") && test.contains(durable.output, "crash cut a file's tail"), "neo-db recovers every acknowledged commit\n" + durable.output + durable.errorOutput)
+}
+
+if runsCases(requestedCases, "early") {
+let neodb = neodbProject(work, root, environment)
 let early = test.run([launcher, "sim", "--manifest-path", neodb, "early-ack", "--seeds", "100", "--jobs", "2"], environment, root, work + "/neodb-early", 900)
 test.check(early.status == 1 && test.contains(early.output, " of 100 universes failed (") && test.contains(early.output, "instead of 0:1/0 ") && test.contains(early.output, "  replayed its decisions twice: same result\n"), "acknowledging before durability is caught and reproduced\n" + early.output + early.errorOutput)
+}
+
 test.removeTree(work)
 print("Simulation CLI: passed")
