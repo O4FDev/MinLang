@@ -642,6 +642,33 @@ static size_t map_split_index_find(const MinyarRecord *map, MinyarText *index, l
     size_t bucket = map_range_probe(entries, capacity - 1, bytes, length, map_bytes_hash(bytes, length));
     return MAP_HASH(entries, bucket) ? bucket : SIZE_MAX;
 }
+static size_t map_text_range_find(const MinyarRecord *map, MinyarText *text, long long start,
+                                  long long end) {
+    long long first, last;
+    text_range_bytes(text, start, end, &first, &last);
+    size_t capacity = map_capacity(map);
+    if (!capacity) return SIZE_MAX;
+    const MinyarRecord *entries = map_entries(map);
+    const unsigned char *bytes = text->bytes + first;
+    size_t length = (size_t)(last - first);
+    size_t bucket = map_range_probe(entries, capacity - 1, bytes, length, map_bytes_hash(bytes, length));
+    return MAP_HASH(entries, bucket) ? bucket : SIZE_MAX;
+}
+/* Map.has(text.slice(a, b)) / Set.contains(...) / map[text.slice(a, b)]
+ * without making the slice. */
+MINYAR_INLINE_ENTRY _Bool minyar_map_text_range_has(const MinyarRecord *map, MinyarText *text,
+                                                    long long start, long long end) {
+    if (map->values[MAP_KEY_KIND] != 2 || minyar_recovery_pending()) return 0;
+    return map_text_range_find(map, text, start, end) != SIZE_MAX;
+}
+MINYAR_INLINE_ENTRY long long minyar_map_text_range_get(const MinyarRecord *map, MinyarText *text,
+                                                        long long start, long long end) {
+    if (map->values[MAP_KEY_KIND] != 2 || minyar_recovery_pending()) return 0;
+    size_t bucket = map_text_range_find(map, text, start, end);
+    if (bucket == SIZE_MAX) map_key_absent();
+    return MAP_VALUE(map_entries(map), bucket);
+}
+
 MINYAR_INLINE_ENTRY _Bool minyar_map_text_split_index_has(const MinyarRecord *map, MinyarText *index,
                                                           long long position) {
     if (map->values[MAP_KEY_KIND] != 2 || minyar_recovery_pending()) return 0;

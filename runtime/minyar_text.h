@@ -290,8 +290,10 @@ MinyarText *minyar_text_split_next(MinyarText *text, MinyarText *separator, long
 }
 
 static _Bool text_white_space(unsigned int scalar) {
-    return (scalar >= 0x09 && scalar <= 0x0d) || scalar == 0x20 || scalar == 0x85 ||
-           scalar == 0xa0 || scalar == 0x1680 || (scalar >= 0x2000 && scalar <= 0x200a) ||
+    /* ASCII first: most trimming tests one of these fifteen scalars. */
+    if (scalar < 0x80) return (scalar >= 0x09 && scalar <= 0x0d) || scalar == 0x20;
+    return scalar == 0x85 || scalar == 0xa0 || scalar == 0x1680 ||
+           (scalar >= 0x2000 && scalar <= 0x200a) ||
            scalar == 0x2028 || scalar == 0x2029 || scalar == 0x202f || scalar == 0x205f || scalar == 0x3000;
 }
 /* Scans bytes from both ends: ASCII bytes are tested directly and other
@@ -301,6 +303,12 @@ static long long text_trim_range(MinyarText *text, long long *first_byte, long l
     ensure_text_index(text);
     const unsigned char *bytes = text->bytes;
     long long first = 0, last = text->byte_length, dropped = 0;
+    /* Neither end is ASCII whitespace: no trimming, no scans. */
+    if (!last || (bytes[0] > 0x20 && bytes[0] < 0x80 && bytes[last - 1] > 0x20 && bytes[last - 1] < 0x80)) {
+        *first_byte = 0;
+        *last_byte = last;
+        return text->character_length;
+    }
     while (first < last) {
         long long width = 1;
         unsigned scalar = bytes[first];
@@ -403,17 +411,27 @@ long long minyar_text_integer_range(MinyarText *text, long long start, long long
     return text_integer_bytes(text->bytes, start, end);
 }
 
-/* text.slice(start, end) == other without the slice: the slice's bounds
- * check and stop, then the byte comparison of minyar_texts_are_equal. */
-_Bool minyar_text_range_equals(MinyarText *text, long long start, long long end, const MinyarText *other) {
+/* The byte range a slice of scalar positions covers: the slice's own bounds
+ * check and stop. Readers that only need the bytes use this instead of the
+ * slice, so a range costs no Text. */
+static void text_range_bytes(MinyarText *text, long long start, long long end,
+                             long long *first, long long *last) {
     ensure_text_index(text);
     if (start < 0 || end < start || end > text->character_length)
         slice_outside_text();
-    long long first = start, last = end;
+    *first = start;
+    *last = end;
     if (text->character_offsets) {
-        first = indexed_byte_offset(text, start);
-        last = indexed_byte_offset(text, end);
+        *first = indexed_byte_offset(text, start);
+        *last = indexed_byte_offset(text, end);
     }
+}
+
+/* text.slice(start, end) == other without the slice: the slice's bounds
+ * check and stop, then the byte comparison of minyar_texts_are_equal. */
+_Bool minyar_text_range_equals(MinyarText *text, long long start, long long end, const MinyarText *other) {
+    long long first, last;
+    text_range_bytes(text, start, end, &first, &last);
     return other->byte_length == last - first &&
            bytes_are_equal(text->bytes + first, other->bytes, (size_t)(last - first));
 }
