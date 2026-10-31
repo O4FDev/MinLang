@@ -314,7 +314,14 @@ def gate_tree(index, tree, checks, args, ips_ready):
         print(f"Failed check: {label}")
     verdict = "PASSED" if plan and not failed and not problems else "FAILED"
     counts = sorted(set(plan.get("runner_counts", {}).values())) if plan else []
-    print(f"FAST GATE {verdict}: {tree}: {count} checks in the plan (each shard's check-in-parallel: {counts}), {len(results)} run on {ctx.shards} shards, "
+    # Against the 340-check list of the 2026-10-31 single-box gates (reference-checks.txt): every one of those names
+    # must still be a check (a split check stays as the aggregate of its pieces); the rest are new checks or pieces.
+    reference = set(open(os.path.join(HERE, "reference-checks.txt")).read().split())
+    labels = {check["label"] for check in plan["checks"]} if plan else set()
+    missing = sorted(reference - labels)
+    coverage = f"{len(reference & labels)} of the {len(reference)} reference checks + {len(labels - reference)} new" + \
+        (f"; reference checks not in this tree: {' '.join(missing)}" if missing else "")
+    print(f"FAST GATE {verdict}: {tree}: {count} checks in the plan (each shard's check-in-parallel: {counts}; {coverage}), {len(results)} run on {ctx.shards} shards, "
           f"{len(failed)} failed, {len(problems)} problems; wall {elapsed:.0f} s; results {ctx.out}/merged.tsv", flush=True)
     return verdict == "PASSED"
 
