@@ -660,7 +660,18 @@ def select(index, database, checks, changed, added, removed, stale):
     else:
         old_rules, old_variables = index["rules"], index["variables"]
     new_rules = {name: rule_text(database, name) for name in database["rules"]}
-    changed_rules = {name for name in set(old_rules) | set(new_rules) if old_rules.get(name) != new_rules.get(name)}
+    phony = set(database["phony"])
+
+    def meaning(name, text):
+        # A file target's prerequisite list matters only through what Make rebuilds, which the stale set and
+        # the content cutoff already measure (every object lists every makefile, for example); its recipe and
+        # a phony check's prerequisites are compared as text.
+        if text is None or name in phony or name.startswith("pattern:"):
+            return text
+        return text.split("\n", 1)[1] if "\n" in text else ""
+
+    changed_rules = {name for name in set(old_rules) | set(new_rules)
+                     if meaning(name, old_rules.get(name)) != meaning(name, new_rules.get(name))}
     changed_variables = {name for name in set(old_variables) | set(database["variables"])
                          if old_variables.get(name) != database["variables"].get(name)}
     # A variable whose definition mentions a changed variable changes too.
@@ -672,7 +683,6 @@ def select(index, database, checks, changed, added, removed, stale):
                 changed_variables.add(name); grew = True
     pattern_changed = any(name.startswith("pattern:") for name in changed_rules) or any(
         variable_references(text or "") & changed_variables for name, text in new_rules.items() if name.startswith("pattern:"))
-    phony = set(database["phony"])
 
     def closure(check):
         seen, stack = set(), [check]
