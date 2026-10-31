@@ -63,7 +63,7 @@ Full history: `~/Projects/minyar-goal-20261030/reports/scoreboard.md`.
 - Box B (survives the shutdown): `/home/judge/minyar` now holds the final hidden set from box D (h01–h20 + b01–b07, score.sh
   with Rust-only fields and a CPU-keyed cache); the previous box-B copy is `/home/judge/minyar.boxB-20261030`. judge is in
   group agent. Before scoring there: sync the tree to `/home/agent/minyar/score` (`BB_HOST=agent@178.62.55.155 bb score …`)
-  and re-baseline with the 3832f4373 tree (Intel counts differ from AMD box D); wrap runs in `flock /home/agent/bench.lock`.
+  and wrap runs in `flock /home/agent/bench.lock`. Done 08:12 UTC: box B reproduces box D's instruction counts exactly (baseline 7.453, ff36ca1f2 5.028), so box B is the scoring box now.
 - Unmerged work on laptop branches: `goal/2026-10-30-tbaa` (Wafer Code, per-field alias tags U7 — unverified, still
   running at shutdown), `goal/2026-10-30-codegen-map-update` (superseded by maps), `goal/2026-10-30-maps-sort` (do not land).
 - Wafer Code spend for this goal (01:10 UTC onward, `~/.wafer-code/logs`): $0.27 over 294 requests (cap $5).

@@ -85,3 +85,8 @@ hidden h geomean=5.028 max=13.399 over2=18 failed=0 | vs Rust 3.373 / 9.850
 hidden b serial=3.487 parallel=1.918 (vs Rust serial 2.618) failed=0
 visible compare (22 programs) geomean 2.80 vs fastest, 2.26 vs Rust; worst json 8.76 (vs Rust exprparse 6.31)
 Logs: logs/score-final-boxD.log, logs/compare-b7-boxD.log
+
+## Box B (Intel, survives the shutdown), 2026-10-31 08:12 UTC — same Ir as box D (AMD)
+baseline 3832f4373: h geomean=7.453 max=19.471 | vs Rust 4.998 / 15.252 | b: 6 of 7 cannot build at baseline (no join/channels)
+goal ff36ca1f2:     h geomean=5.028 max=13.399 over2=18 failed=0 | vs Rust 3.373 / 9.850 | b serial 3.487, parallel 2.123 (Intel wall)
+→ instruction counts are identical across the two CPUs for these binaries; box B is a valid scoring box from now on.
