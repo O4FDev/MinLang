@@ -58,3 +58,13 @@ Full history: `~/Projects/minyar-goal-20261030/reports/scoreboard.md`.
 1. Free-path/RC debt (ownership3, then allocator size classes measured by wall time), json representation once you decide.
 2. Text scanning loop versioning (U4 rest), per-field TBAA (U7), Map lookups inline into generated code.
 3. Async I/O and SIMD (phase 2), neo-db adoption confirmations.
+
+## Handover notes (07:58 UTC)
+- Box B (survives the shutdown): `/home/judge/minyar` now holds the final hidden set from box D (h01–h20 + b01–b07, score.sh
+  with Rust-only fields and a CPU-keyed cache); the previous box-B copy is `/home/judge/minyar.boxB-20261030`. judge is in
+  group agent. Before scoring there: sync the tree to `/home/agent/minyar/score` (`BB_HOST=agent@178.62.55.155 bb score …`)
+  and re-baseline with the 3832f4373 tree (Intel counts differ from AMD box D); wrap runs in `flock /home/agent/bench.lock`.
+- Unmerged work on laptop branches: `goal/2026-10-30-tbaa` (Wafer Code, per-field alias tags U7 — unverified, still
+  running at shutdown), `goal/2026-10-30-codegen-map-update` (superseded by maps), `goal/2026-10-30-maps-sort` (do not land).
+- Wafer Code spend for this goal (01:10 UTC onward, `~/.wafer-code/logs`): $0.27 over 294 requests (cap $5).
+- Lane reports with full detail: `~/Projects/minyar-goal-20261030/reports/*.md`; scoreboard history `reports/scoreboard.md`.
