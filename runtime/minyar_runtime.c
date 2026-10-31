@@ -1604,3 +1604,13 @@ MinyarText *minyar_interpolate(long long count, ...) {
 #if MINYAR_THREADED
 #include "minyar_thread_os.h"
 #endif
+
+/* A parallel-for chunk whose iterations own managed values releases them on the
+ * participant's own domain. At the end of the chunk, free what that domain
+ * queued, so a worker's heap stays bounded across chunks. Profiles without
+ * per-thread ownership free on release and have nothing to drain. */
+void minyar_parallel_chunk_drain(void) {
+#if MINYAR_THREADED
+    rc_thread_domain_drain();
+#endif
+}

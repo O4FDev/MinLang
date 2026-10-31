@@ -80,30 +80,61 @@ bad:
 "
 }
 
-function parallelWorkerBody(text: Text): Text {
+// The highest ownership frame slot a worker body registers, plus one: the
+// frame the chunk enters must be at least that wide.
+function parallelWorkerOwners(text: Text): Integer {
+    let owners = 0
+    let prefixes: List<Text> = ["@minyar_rc_local_take(i64 ", "@minyar_rc_local(i64 ", "@minyar_rc_local_move(i64 ", "@minyar_rc_local_move_owner(i64 "]
+    let which = 0
+    while which < prefixes.length {
+        let prefix = prefixes[which]
+        let at = recoveryTextPosition(text, prefix)
+        while at >= 0 {
+            let cursor = at + prefix.length
+            let value = 0
+            while cursor < text.length && text[cursor] != ')' && text[cursor] != ',' {
+                value = value * 10 + (Integer(text[cursor]) - 48)
+                cursor = cursor + 1
+            }
+            if value + 1 > owners { owners = value + 1 }
+            let offset = recoveryTextPosition(text.slice(cursor, text.length), prefix)
+            if offset < 0 { at = -1 } else { at = cursor + offset }
+        }
+        which = which + 1
+    }
+    return owners
+}
+
+function parallelWorkerBody(text: Text, owned: Integer): Text {
     let result: List<Text> = []
     let first = 0
     let cursor = 0
     while cursor < text.length {
         if text[cursor] == '\n' {
             let line = text.slice(first, cursor + 1)
-            // The type/effect proof rules out owned producers and reference
-            // locals. Remaining ownership calls only protect caller borrows;
-            // the synchronous dispatch already keeps their owners alive. A
-            // worker has no cleanup to service, so its loops count as idle.
+            // A worker has no cleanup to service between iterations, so its loops
+            // count as idle; the chunk boundary drains what they release.
             let query = recoveryTextPosition(line, "call i1 @minyar_rc_idle()")
             if query >= 0 {
                 result.add(line.slice(0, query) + "or i1 true, true" + line.slice(query + 25, line.length))
-            } else if recoveryTextPosition(line, "@minyar_rc_") < 0 { result.add(line) }
+            } else if owned == 1 || recoveryTextPosition(line, "@minyar_rc_") < 0 { result.add(line) }
             first = cursor + 1
         }
         cursor = cursor + 1
     }
     result.add(text.slice(first, text.length))
-    return parallelByteCalls(joinText(result))
+    let body = parallelByteCalls(joinText(result))
+    if owned == 1 {
+        // The chunk owns a frame of its own on this participant's domain: the
+        // iteration's values are registered there and released at its scope
+        // ends, and what they queue is freed when the chunk ends.
+        let owners = parallelWorkerOwners(body)
+        return "  call void @minyar_rc_enter(i64 " + Text(owners) + ")\n" + body + "  call void @minyar_rc_leave()\n  call void @minyar_parallel_chunk_drain()\n"
+    }
+    return body
 }
 
-function outlineParallelFor(context: CompilerContext, captures: List<Text>, types: List<Integer>, ids: List<Integer>, firstLocal: Integer, start: Integer, body: Integer, parts: List<Integer>, guards: List<Integer>, parentBlock: Text, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>) {
+function outlineParallelFor(context: CompilerContext, captures: List<Text>, types: List<Integer>, ids: List<Integer>, firstLocal: Integer, start: Integer, body: Integer, parts: List<Integer>, guards: List<Integer>, parentBlock: Text, owns: Integer, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>) {
     let bytesMarker = "; minyar-data-parallel-bytes: 1\n"
     if findText(globals, bytesMarker) < 0 { globals.add(bytesMarker); globals.add(parallelByteHelpers()) }
     let loopEnd = output.length
@@ -183,7 +214,15 @@ function outlineParallelFor(context: CompilerContext, captures: List<Text>, type
         output[piece] = ""
         piece = piece + 1
     }
-    worker.add(parallelWorkerBody(joinText(loop)))
+    worker.add(parallelWorkerBody(joinText(loop), owns))
+    if owns == 1 {
+        let drain = "declare void @minyar_parallel_chunk_drain()\n"
+        if findText(globals, drain) < 0 { globals.add(drain) }
+        // A worker that owns values needs the per-thread ownership runtime:
+        // each participant allocates, counts and frees in its own domain.
+        let threaded = "; minyar-thread-runtime: 1\n"
+        if findText(globals, threaded) < 0 { globals.add(threaded) }
+    }
     if parts[6] >= 0 {
         let value = loadLocal(worker, textState, state, parts[6], parts[7])
         let raw = valueAsListSlot(worker, textState, state, value, parts[7])

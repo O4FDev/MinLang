@@ -29,10 +29,55 @@ function parallelDirectIndex(context: CompilerContext, first: Integer, after: In
     return after == first + 4 && texts[first] == name && texts[first + 1] == "[" && texts[first + 2] == index && texts[first + 3] == "]"
 }
 
-function checkParallelBody(context: CompilerContext, firstNode: Integer, body: Integer, index: Text, captures: List<Text>, types: List<Integer>, reduction: Text, windows: ParallelWindows) {
+// Names `let`/`var` binds inside one loop body. Every one of them is created by
+// this iteration, on this worker's own ownership domain.
+function parallelBodyLocals(context: CompilerContext, body: Integer): List<Text> {
+    let result: List<Text> = []
+    let node = 0
+    while node < context.syntax.nodes.length {
+        let kind = context.syntax.nodes[node].kind
+        let start = context.syntax.nodes[node].start
+        if start >= body && (kind == 103 || kind == 104) {
+            let name = context.tokenTexts[start + 1]
+            if findText(result, name) < 0 { result.add(name) }
+        }
+        node = node + 1
+    }
+    return result
+}
+
+// The root name of the member chain that starts at `token` (`a` in `a.b.c`).
+function parallelChainRoot(context: CompilerContext, token: Integer): Text {
+    let texts = context.tokenTexts
+    let start = token
+    while start >= 2 && texts[start - 1] == "." {
+        start = start - 2
+    }
+    return texts[start]
+}
+
+// Is this token a value the iteration created itself? Either a name the body
+// binds, or an expression with no receiver that the body evaluates here (a
+// literal, a conversion such as `Text(x)`, a record constructor, a list
+// literal). A member chain keeps its root: `doc.text` stays a read of shared
+// data and is checked as one, and every call is checked against the parallel
+// effect proof.
+function parallelWorkerLocal(context: CompilerContext, body: Integer, names: List<Text>, captures: List<Text>, token: Integer): Boolean {
+    if token < body { return false }
+    let root = parallelChainRoot(context, token)
+    if findText(names, root) >= 0 { return true }
+    // A capture is the caller's value, never this iteration's: reading it is
+    // checked by the capture rules above, not here.
+    if findText(captures, root) >= 0 { return false }
+    return context.tokenTexts[token - 1] != "."
+}
+
+function checkParallelBody(context: CompilerContext, firstNode: Integer, body: Integer, index: Text, captures: List<Text>, types: List<Integer>, reduction: Text, windows: ParallelWindows): Integer {
+    let owns = 0
     let nodes = context.syntax.nodes
     let texts = context.tokenTexts
     let written = parallelWrittenBuffers(context, firstNode, body, captures, types, windows)
+    let bodyLocals = parallelBodyLocals(context, body)
     let node = firstNode
     while node < nodes.length {
         let kind = nodes[node].kind
@@ -122,6 +167,12 @@ function checkParallelBody(context: CompilerContext, firstNode: Integer, body: I
                     // A captured atomic cell is only a method receiver: each method is one
                     // atomic operation, and workers take no ownership of the cell.
                     allowed = true
+                } else if capture < 0 && parallelWorkerLocal(context, body, bodyLocals, captures, start) {
+                    // A value this iteration created on its own domain: read it,
+                    // index it, measure it, call its methods. It never leaves the
+                    // iteration (an argument to a call is rejected below).
+                    allowed = true
+                    owns = 1
                 } else {
                     if allowed { allowed = parallelBuffer(types[capture]) }
                     if allowed && parent >= 0 {
@@ -146,6 +197,7 @@ function checkParallelBody(context: CompilerContext, firstNode: Integer, body: I
         }
         node = node + 1
     }
+    return owns
 }
 
 function compileParallelFor(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, returnType: Integer) {
@@ -178,7 +230,7 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
     let reduction = ""
     if parts[8] >= 0 { reduction = context.tokenTexts[parts[8]] }
     let windows = parallelWindowScan(context, body, state[0], index, captures, types)
-    checkParallelBody(context, firstNode, body, index, captures, types, reduction, windows)
+    let owns = checkParallelBody(context, firstNode, body, index, captures, types, reduction, windows)
     // Anything but this iteration's window reaches a callee read-only.
     let arguments = parallelArguments(globals, body, state[0])
     let argument = 0
@@ -241,7 +293,7 @@ function compileParallelFor(context: CompilerContext, localNames: List<Text>, lo
     // Recovery continuations belong to the owner's execution domain. Their
     // checked loops retain the sequential backend for now.
     if !recoveryEnabled(state) {
-        outlineParallelFor(context, captures, types, ids, firstLocal, start, body, parts, guards, blocks[0], state, textState, output, globals)
+        outlineParallelFor(context, captures, types, ids, firstLocal, start, body, parts, guards, blocks[0], owns, state, textState, output, globals)
     } else {
         let firstGuard = output.length
         emitParallelAliasGuards(types, ids, guards, parts, state, textState, output, globals)
@@ -459,21 +511,48 @@ function parallelRecordPaths(context: CompilerContext, type: Integer, target: In
     }
 }
 
+// A worker's own domain: these entry points allocate on it or touch a value the
+// iteration created (its record, List, Map, Text). They never reach program
+// state the caller shares, they carry no cross-thread count, and what they
+// allocate is released inside the iteration that made it.
+function parallelWorkerRuntime(callee: Text): Boolean {
+    if callee == "minyar_integer_text" || callee == "minyar_float_text" || callee == "minyar_boolean_text" || callee == "minyar_character_text" { return true }
+    if callee == "minyar_join_text_take_left" || callee == "minyar_join_text" || callee == "minyar_join_texts" || callee == "minyar_join_texts_with" || callee == "minyar_join_text3" || callee == "minyar_join_text4" { return true }
+    if callee == "minyar_text_slice" || callee == "minyar_text_length" || callee == "minyar_text_byte_length" || callee == "minyar_text_character_at" || callee == "minyar_text_is_ascii" || callee == "minyar_texts_are_equal" { return true }
+    if callee == "minyar_text_builder" || callee == "minyar_text_builder_finish" || callee == "minyar_text_builder_text" || callee == "minyar_text_builder_integer" || callee == "minyar_text_builder_boolean" || callee == "minyar_text_builder_character" { return true }
+    if callee == "minyar_record_new" || callee == "minyar_record_new_scalar" || callee == "minyar_record_set" || callee == "minyar_record_set_scalar" || callee == "minyar_record_set_reference" || callee == "minyar_record_set_take" || callee == "minyar_record_take_field" || callee == "minyar_record_get" { return true }
+    if callee == "minyar_list_new" || callee == "minyar_list_references" || callee == "minyar_list_add" || callee == "minyar_list_add_take" || callee == "minyar_list_add_all" || callee == "minyar_list_add_all_take" || callee == "minyar_list_append_scalars" || callee == "minyar_list_length" || callee == "minyar_list_get" { return true }
+    if callee == "minyar_list_insert_check" || callee == "minyar_list_insert_last" || callee == "minyar_list_set" || callee == "minyar_list_set_take" || callee == "minyar_list_set_owned" { return true }
+    if callee == "minyar_map_new" || callee == "minyar_map_new_record" || callee == "minyar_map_set" || callee == "minyar_map_get" || callee == "minyar_map_has" || callee == "minyar_map_length" || callee == "minyar_map_keys" { return true }
+    return false
+}
+
 function parallelLoopRuntime(callee: Text): Boolean {
     // Window bindings own nothing; the worker drops these ownership calls.
-    return parallelRuntimeAllowed(callee) || callee == "minyar_rc_local_take" || callee == "minyar_bytes_get" || callee == "minyar_bytes_set" || callee == "minyar_bytes_length" || callee == "minyar_rc_borrow" || callee == "minyar_rc_step" || callee == "minyar_rc_idle" || callee == "minyar_rc_local" || callee == "minyar_rc_retain" || callee == "minyar_rc_release"
+    return parallelRuntimeAllowed(callee) || parallelWorkerRuntime(callee) || callee == "minyar_rc_local_take" || callee == "minyar_bytes_get" || callee == "minyar_bytes_set" || callee == "minyar_bytes_length" || callee == "minyar_rc_borrow" || callee == "minyar_rc_step" || callee == "minyar_rc_idle" || callee == "minyar_rc_local" || callee == "minyar_rc_retain" || callee == "minyar_rc_release"
 }
 
 function checkParallelRuntime(context: CompilerContext, text: Text, position: Integer) {
     let cursor = 0
+    let offenders: List<Text> = []
     while cursor + 8 < text.length {
         if text.slice(cursor, cursor + 8) == "@minyar_" {
             let after = cursor + 8
             while after < text.length && text[after] != '(' && text[after] != ' ' { after = after + 1 }
             let callee = text.slice(cursor + 1, after)
-            if !parallelLoopRuntime(callee) { parallelRace(context, position, "iterations cannot call shared runtime operation '" + callee + "'") }
+            if !parallelLoopRuntime(callee) && findText(offenders, callee) < 0 { offenders.add(callee) }
             cursor = after
         } else { cursor = cursor + 1 }
+    }
+    if offenders.length > 0 {
+        let message = ""
+        let offender = 0
+        while offender < offenders.length {
+            if offender > 0 { message = message + "', '" }
+            message = message + offenders[offender]
+            offender = offender + 1
+        }
+        parallelRace(context, position, "iterations cannot call shared runtime operation '" + message + "'")
     }
 }
 

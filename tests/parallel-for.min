@@ -24,22 +24,41 @@ function checkWorkerIsolation(llvm: Text) {
     let worker = false
     let entry = false
     let count = 0
+    // A worker that creates managed values runs ownership calls on its own
+    // domain and drains them when its chunk ends; a worker of scalars and
+    // borrowed buffers still touches no owner-thread machinery at all.
+    let owns = false
+    let drains = false
     for line in test.lines(llvm) {
-        if test.contains(line, "define internal ") && test.contains(line, "@.minyar.parallel.") { worker = true; count += 1 }
-        if line == "entry:" { entry = true }
-        else { if line.endsWith(":") { entry = false } }
+        if test.contains(line, "define internal ") && test.contains(line, "@.minyar.parallel.") {
+            worker = true
+            count += 1
+            owns = false
+            drains = false
+        }
+        if line == "entry:" { entry = true } else { if line.endsWith(":") { entry = false } }
         if worker {
-            test.check(!test.contains(line, "@minyar_rc_") && !test.contains(line, "@minyar_stack_"), "a scalar worker touched owner-thread machinery")
+            if test.contains(line, "@minyar_rc_") { owns = true }
+            if test.contains(line, "@minyar_parallel_chunk_drain") { drains = true }
+            test.check(!test.contains(line, "@minyar_stack_"), "a worker touched owner-thread stack machinery")
         }
         if test.contains(line, "%parallel.environment.") && test.contains(line, " = alloca ") {
             test.check(entry, "a repeated dispatch would grow the native stack")
         }
-        if line == "}" { worker = false; entry = false }
+        if line == "}" {
+            if worker { test.check(!owns || drains, "a worker owned values but never drained its chunk") }
+            worker = false
+            entry = false
+        }
     }
     test.check(count > 0, "a hosted parallel test did not emit a worker")
 }
 
 function executes(compiler: test.Compiler, source: Text, expected: Text) {
+    executesOn(compiler, source, expected, compiler.runtime)
+}
+
+function executesOn(compiler: test.Compiler, source: Text, expected: Text, ownedRuntime: Text) {
     test.require(compileCase(compiler, source), "compile safe parallel loop")
     let path = compiler.directory + "/case" + Text(compiler.serial)
     checkWorkerIsolation(io.readTextFile(path + ".ll"))
@@ -47,7 +66,7 @@ function executes(compiler: test.Compiler, source: Text, expected: Text) {
     for optimization in ["-O0", "-O2"] {
         let command = [compiler.clang, optimization, "-Wno-override-module"]
         for flag in compiler.flags { command.add(flag) }
-        for option in [path + ".ll", compiler.runtime, "-pthread", "-lm", "-o", path + ".exe"] { command.add(option) }
+        for option in [path + ".ll", ownedRuntime, "-pthread", "-lm", "-o", path + ".exe"] { command.add(option) }
         test.require(test.run(command, system.environment(), "", path + ".link", 120), "link safe parallel loop")
         let result = test.run([path + ".exe"], system.environment(), "", path + ".run", 30)
         test.require(result, "execute safe parallel loop")
@@ -86,6 +105,12 @@ compiler.runtime = compiler.directory + "/runtime.o"
 let build = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-iquote", "runtime", "-c", compiler.directory + "/runtime.c", "-o", compiler.runtime]
 for flag in compiler.flags { build.add(flag) }
 test.require(test.run(build, system.environment(), "", compiler.directory + "/runtime-build", 120), "build parallel ownership oracle")
+// A worker that creates managed values needs the per-thread ownership runtime:
+// every participant allocates, counts and frees inside its own domain.
+let ownedRuntime = compiler.directory + "/runtime-owned.o"
+let ownedBuild = [compiler.clang, "-O1", "-DMINYAR_SYSTEM_HEAP=1", "-DMINYAR_THREADED=1", "-iquote", "runtime", "-c", compiler.directory + "/runtime.c", "-o", ownedRuntime]
+for flag in compiler.flags { ownedBuild.add(flag) }
+test.require(test.run(ownedBuild, system.environment(), "", compiler.directory + "/runtime-owned-build", 120), "build the per-thread ownership runtime")
 
 executes(compiler, io.readTextFile("tests/parallel-for/slots.min"), "0\n0.0\nfalse\n0\n12\n5.5\nfalse\n11\n15\n7.0\ntrue\n14\n20\n9.5\nfalse\n19\n27\n13.0\ntrue\n26\n0\n0.0\nfalse\n0\n1\n1\n42\n")
 executes(compiler, "let values = [0, 0, 0, 0]\nparallel for index in 0..4 { if index == 2 { continue }; let total = 0; for part in 0..index { total += part }; values[index] = total }\nfor value in values { print(value) }\n", "0\n0\n0\n3\n")
@@ -177,6 +202,7 @@ executes(compiler, io.readTextFile("tests/parallel-for/reductions.min"), "125125
 // recipe variants exercise the same composition without that import.
 executes(compiler, io.readTextFile("tests/parallel-for/generic-reductions.min"), "42\n")
 let reductionOutput = "12512508\n6256251.5\n42\n42\n-9223372036854775807\n9223372036854775806\n0.0\n-0.0\n43\n48\n"
+let workerLocalsOutput = "2\n5\n6\n5497\n5395\n"
 let reductionPrelude = "function identity<Item>(value: Item): Item { return value }\n"
 executes(compiler, reductionPrelude + io.readTextFile("tests/parallel-for/reductions.min"), reductionOutput)
 let pipelinePrelude = "function sameInt(value: Integer): Integer { return value }\nlet recipe = [1].map(sameInt)\nfor item in recipe {}\n"
@@ -199,10 +225,14 @@ let setup = "let output = [0, 0, 0, 0]\nlet total = 0\n"
 for body in ["output[0] = index", "output[index + 1] = index", "total += index", "total = index", "index = 0", "index += 1"] {
     rejects(compiler, setup + "parallel for index in 0..4 { " + body + " }\n", "parallel for:")
 }
-for body in ["let index = 0", "let total = 1", "let copy = output", "output.add(index)", "print(index)", "break", "let message = \"hello\"", "let f = function() {}", "parallel for other in 0..4 { output[other] = 0 }"] {
+for body in ["let index = 0", "let total = 1", "let copy = output", "output.add(index)", "print(index)", "break", "let f = function() {}", "parallel for other in 0..4 { output[other] = 0 }"] {
     rejects(compiler, setup + "function run() {}\nparallel for index in 0..4 { " + body + " }\n", "parallel for:")
 }
 rejects(compiler, "function run() { let output = [0]; parallel for index in 0..1 { return } }\nrun()\n", "parallel for:")
+// An iteration may create managed values of its own on the worker's domain:
+// Text, records and Lists are built and dropped inside the iteration, and only
+// scalars leave through the loop's slots.
+executesOn(compiler, io.readTextFile("tests/parallel-for/worker-locals.min"), workerLocalsOutput, ownedRuntime)
 rejects(compiler, setup + "parallel for index in output { output[index] = 0 }\n", "use an Integer range")
 rejects(compiler, setup + "parallel for index in 0..4 { output[index] = output[0] }\n", "another index while writing")
 rejects(compiler, "let output = [\"a\"]\nparallel for index in 0..1 { output[index] = \"b\" }\n", "parallel for:")
