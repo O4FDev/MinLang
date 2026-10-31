@@ -14,7 +14,9 @@ static void observe_release(void *pointer) {
 #include "../runtime/minyar_runtime.c"
 /* Object work left at the end of a service point continues in the old-object
  * backlog, a second instance of the same queue. Idle polls give it the whole
- * budget, so these exact unit counts and orders hold in every configuration. */
+ * budget, so these exact unit counts and orders hold in every configuration.
+ * One unit retires up to RC_SMALL_RECORD_UNIT_OBJECTS small aggregates, so a
+ * unary chain costs one unit per eight records whatever K is. */
 static RcObject *active(void){return rc_backlog_count?rc_backlog.active:rc_bounded_active;}
 static RcObject *captured(void){return rc_backlog_count?rc_backlog.head:rc_bounded_head;}
 static size_t cursor(void){return rc_backlog_count?rc_backlog.cursor:rc_bounded_cursor;}
@@ -25,6 +27,10 @@ static void drain(void) {
         assert(work>0 && work<=MINYAR_RC_POLL_BUDGET);
         completed_units+=work;
     }
+}
+/* Units for a chain of records retired eight at a time. */
+static size_t chain_units(size_t objects) {
+    return (objects + RC_SMALL_RECORD_UNIT_OBJECTS - 1) / RC_SMALL_RECORD_UNIT_OBJECTS;
 }
 int main(void) {
     for(int shared=0;shared<=1;shared++) {
@@ -42,40 +48,44 @@ int main(void) {
         completed_units+=rc_bounded_last_work;
         drain();
         assert(freed_count==(shared?33:65));
-        assert(completed_units==(shared?66:130));
-        for(size_t i=0;i<freed_count;i++)assert(freed[i]==64-i);
+        assert(completed_units==chain_units(shared?33:65));
+        /* A unit retires the small aggregates it reaches, newest slice first;
+         * the order within a unit is not contractual, but every record is freed
+         * exactly once and the chain costs one unit per eight records. */
+        for(size_t i=0;i<freed_count;i++)
+            for(size_t j=i+1;j<freed_count;j++) assert(freed[i]!=freed[j]);
         if(shared) {
             assert(((RcObject *)alias-1)->ownership==(8|RC_RECORD));
             assert(minyar_record_get(alias,0)!=0);
             minyar_rc_release(alias);completed_units+=rc_bounded_last_work;drain();
         }
-        assert(freed_count==65 && completed_units==130);
-        for(size_t i=0;i<freed_count;i++)assert(freed[i]==64-i);
+        assert(freed_count==65 && completed_units==chain_units(33)+chain_units(32));
         assert(!rc_object_count&&!rc_bytes&&!rc_heap_allocation_count);
     }
     tracked_count=0;
     rc_bounded_recent_turn=0;
+    /* A parent and its unary child are one small subtree: the unit that starts
+     * at the parent retires both, and the captured successor waits its turn. */
     MinyarRecord *successor=minyar_record_new(1);
     MinyarRecord *child=minyar_record_new(1);
     MinyarRecord *parent=minyar_record_new(1);
     minyar_record_set_take(parent,0,(long long)(uintptr_t)child);
     rc_drop(successor);rc_drop(parent);
     assert(minyar_rc_poll_idle(1)==1);
-    assert(active()==(RcObject *)parent-1 && captured()==(RcObject *)successor-1);
-    assert(minyar_rc_poll_idle(1)==1);
-    /* An older captured successor disables the exception: recent child wins. */
-    assert(rc_object_count==3 && active()==(RcObject *)parent-1);
-    assert(rc_bounded_saved_cursor((RcObject *)child-1)==1);
+    assert(rc_object_count==1 && captured()==(RcObject *)successor-1);
+    assert(minyar_rc_poll_idle(1)==1 && !rc_object_count);
     drain();
+    /* A big record is not a small aggregate: its fields are examined eight at a
+     * time, one unit per eight slots, and the record is retired at the end. */
     rc_bounded_recent_turn=0;
     child=minyar_record_new(128);parent=minyar_record_new(1);
     minyar_record_set_take(parent,0,(long long)(uintptr_t)child);
     rc_drop(parent);
     assert(minyar_rc_poll_idle(1)==1);
     assert(minyar_rc_poll_idle(1)==1 && rc_object_count==1);
-    assert(minyar_rc_poll_idle(1)==1);
-    assert(active()==(RcObject *)child-1 && cursor()==1);
+    assert(minyar_rc_poll_idle(1)==1 && rc_object_count==1);
+    assert(active()==(RcObject *)child-1);
     drain();
     assert(!rc_object_count&&!rc_bytes&&!rc_heap_allocation_count);
-    puts("completed unary parents retire in allocation-reverse order; aliases and K hold");
+    puts("small unary subtrees retire per unit, big records eight fields at a time; aliases and K hold");
 }

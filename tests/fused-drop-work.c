@@ -9,10 +9,13 @@ int main(void) {
         minyar_record_set_take(r,0,(long long)(uintptr_t)root);root=r;
     }
     rc_drop(root);size_t before=generic_drop_calls;
-    assert(minyar_rc_poll(32)==32);
-    assert(generic_drop_calls-before==1);
-    assert(rc_object_count==1 && rc_pending_count==1 && !rc_bounded_active);
-    /* The last record is left-over work: an idle poll finishes it at once. */
-    assert(minyar_rc_poll_idle(32)==2);
+    /* One unit retires up to RC_SMALL_RECORD_UNIT_OBJECTS small records of the
+     * chain: the child at the unit's object boundary follows the generic drop
+     * and is queued, so a unit enters that body exactly once. */
+    size_t units=minyar_rc_poll(32);
+    assert(units==3);
+    assert(generic_drop_calls-before==units);
+    assert(!rc_object_count && !rc_pending_count && !rc_bounded_active);
+    assert(minyar_rc_poll_idle(32)==0);
     assert(!rc_object_count&&!rc_bytes&&!rc_pending_count&&!rc_heap_allocation_count);
 }

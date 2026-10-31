@@ -125,8 +125,10 @@ static void chain(void) {
         root = next;
     }
     minyar_rc_release(root);
-    assert(rc_object_count >= 100000 - MINYAR_RC_POLL_BUDGET);
-    assert(drain() == 200000 - MINYAR_RC_POLL_BUDGET);
+    /* A unit retires up to RC_SMALL_RECORD_UNIT_OBJECTS small records. */
+    assert(rc_object_count >= 100000 - MINYAR_RC_POLL_BUDGET * RC_SMALL_RECORD_UNIT_OBJECTS);
+    size_t chain_units = (100000 + RC_SMALL_RECORD_UNIT_OBJECTS - 1) / RC_SMALL_RECORD_UNIT_OBJECTS;
+    assert(drain() == chain_units - MINYAR_RC_POLL_BUDGET);
     empty_pool();
 }
 static void aliases_and_mixed(void) {
