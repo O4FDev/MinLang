@@ -12,7 +12,7 @@ enum { MAP_ENTRIES, MAP_CAPACITY, MAP_SPARE, MAP_KEY_KIND, MAP_VALUE_REFERENCES,
 typedef uint64_t (*MinyarRecordHash)(const MinyarRecord *);
 typedef _Bool (*MinyarRecordEqual)(const MinyarRecord *, const MinyarRecord *);
 typedef MinyarRecord *(*MinyarRecordCopy)(const MinyarRecord *);
-static inline int map_key_references(long long kind) { return kind == 2 || kind >= 1000; }
+MINYAR_HOT int map_key_references(long long kind) { return kind == 2 || kind >= 1000; }
 
 /* Callback scopes keep every inspected Map alive and prevent callbacks from
  * invalidating cached bucket arrays. Cooperative recovery returns through the
@@ -39,20 +39,20 @@ static inline void map_read_end(const MinyarMapReadGuard *guard) {
     if (guard->second) minyar_rc_release((void *)guard->second);
     minyar_rc_release((void *)guard->first);
 }
-static inline void map_check_mutation(const MinyarRecord *map) {
+MINYAR_HOT void map_check_mutation(const MinyarRecord *map) {
     for (const MinyarMapReadGuard *guard = map_active_reads; guard; guard = guard->previous)
         if (guard->first == map || guard->second == map)
             minyar_stop("a Map cannot be mutated from its hash or equality method.");
 }
 
-static inline MinyarRecord *map_entries(const MinyarRecord *map) {
+MINYAR_HOT MinyarRecord *map_entries(const MinyarRecord *map) {
     return (MinyarRecord *)(uintptr_t)map->values[MAP_ENTRIES];
 }
-static inline size_t map_capacity(const MinyarRecord *map) { return (size_t)map->values[MAP_CAPACITY]; }
+MINYAR_HOT size_t map_capacity(const MinyarRecord *map) { return (size_t)map->values[MAP_CAPACITY]; }
 #define MAP_HASH(entries, bucket) ((entries)->values[3 * (bucket)])
 #define MAP_KEY(entries, bucket) ((entries)->values[3 * (bucket) + 1])
 #define MAP_VALUE(entries, bucket) ((entries)->values[3 * (bucket) + 2])
-static inline uint64_t map_mix(uint64_t x) {
+MINYAR_HOT uint64_t map_mix(uint64_t x) {
     x ^= x >> 30; x *= UINT64_C(0xbf58476d1ce4e5b9);
     x ^= x >> 27; x *= UINT64_C(0x94d049bb133111eb);
     return x ^ (x >> 31);
@@ -72,7 +72,7 @@ static long long map_canonical_key(long long kind, long long key) {
 #else
 #define MAP_GENERAL
 #endif
-static inline uint64_t map_nonzero_hash(uint64_t hash) { return hash ? hash : UINT64_C(0x9e3779b97f4a7c15); }
+MINYAR_HOT uint64_t map_nonzero_hash(uint64_t hash) { return hash ? hash : UINT64_C(0x9e3779b97f4a7c15); }
 /* Text hashing loops over the bytes; it stays one out-of-line function so the
  * inlined Map paths keep the same shape for every key kind. */
 static MAP_GENERAL uint64_t map_text_hash(const MinyarText *text) {
@@ -125,7 +125,7 @@ static inline uint64_t map_hash_key(const MinyarRecord *map, long long key) {
 }
 /* Equal byte runs of one length. Keys are mostly short: up to 16 bytes compare
  * as two overlapping words (or halves, or three bytes) with no library call. */
-static inline int map_bytes_equal(const unsigned char *a, const unsigned char *b, size_t n) {
+MINYAR_HOT int map_bytes_equal(const unsigned char *a, const unsigned char *b, size_t n) {
     if (n >= 8) {
         if (n > 16) return !memcmp(a, b, n);
         uint64_t a0, b0, a1, b1;
@@ -142,7 +142,7 @@ static inline int map_bytes_equal(const unsigned char *a, const unsigned char *b
     /* Positions 0, n/2 and n-1 cover every byte of a run of at most three. */
     return !n || (a[0] == b[0] && a[n / 2] == b[n / 2] && a[n - 1] == b[n - 1]);
 }
-static inline int map_key_equal(long long kind, long long a, long long b) {
+MINYAR_HOT int map_key_equal(long long kind, long long a, long long b) {
     if (a == b) return 1;
     if (kind != 2) return 0;
     const MinyarText *left = (const MinyarText *)(uintptr_t)a;
@@ -166,7 +166,7 @@ static inline int map_keys_equal(const MinyarRecord *map, long long a, long long
  * is verified against the key stored in that slot; keys are unique, so a stale
  * entry after growth, removal or address reuse only misses. */
 static MINYAR_THREAD_LOCAL struct { const MinyarRecord *map; long long key; size_t bucket; } map_recent;
-static inline size_t map_recent_find(const MinyarRecord *map, long long kind, long long key) {
+MINYAR_HOT size_t map_recent_find(const MinyarRecord *map, long long kind, long long key) {
     if (map_recent.map != map || map_recent.key != key || kind >= 1000) return SIZE_MAX;
     const MinyarRecord *entries = map_entries(map);
     size_t bucket = map_recent.bucket;
@@ -175,7 +175,7 @@ static inline size_t map_recent_find(const MinyarRecord *map, long long kind, lo
         return SIZE_MAX;
     return bucket;
 }
-static inline void map_remember(const MinyarRecord *map, long long kind, long long key, size_t bucket) {
+MINYAR_HOT void map_remember(const MinyarRecord *map, long long kind, long long key, size_t bucket) {
     if (kind >= 1000) return;
     map_recent.map = map;
     map_recent.key = key;
@@ -331,7 +331,7 @@ done:
     map_read_end(&guard);
     return result;
 }
-static inline void map_store_reference(MinyarRecord *entries, size_t field, long long value) {
+MINYAR_HOT void map_store_reference(MinyarRecord *entries, size_t field, long long value) {
 #ifdef MINYAR_MAP_CYCLE_RUNTIME
     /* Bucket owners are untraced, but their children can be traced. The store
      * must shade retained children during a collector snapshot. Grow and
@@ -343,11 +343,11 @@ static inline void map_store_reference(MinyarRecord *entries, size_t field, long
     minyar_record_replace(entries, (long long)field, value, 0);
 #endif
 }
-static inline void map_store_key(MinyarRecord *map, size_t bucket, long long key) {
+MINYAR_HOT void map_store_key(MinyarRecord *map, size_t bucket, long long key) {
     if (map_key_references(map->values[MAP_KEY_KIND])) map_store_reference(map_entries(map), 3 * bucket + 1, key);
     else MAP_KEY(map_entries(map), bucket) = key;
 }
-static inline void map_store_value(MinyarRecord *map, size_t bucket, long long value) {
+MINYAR_HOT void map_store_value(MinyarRecord *map, size_t bucket, long long value) {
     if (map->values[MAP_VALUE_REFERENCES]) map_store_reference(map_entries(map), 3 * bucket + 2, value);
     else MAP_VALUE(map_entries(map), bucket) = value;
 }
@@ -444,7 +444,7 @@ done:
  * general paths above. The probe and hash helpers are always inlined and the
  * general paths are never inlined, so each entry point has one fixed shape and
  * adding an entry point cannot change how another one is compiled. */
-static inline int map_builtin_kind(long long kind) { return kind < 7; }
+MINYAR_HOT int map_builtin_kind(long long kind) { return kind < 7; }
 MINYAR_HOT uint64_t map_builtin_hash(long long kind, long long key) {
     if (kind == 2) return map_text_hash((const MinyarText *)(uintptr_t)key);
     return map_nonzero_hash(map_mix((uint64_t)key));
