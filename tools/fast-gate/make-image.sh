@@ -27,7 +27,7 @@ $ssh root@$ip 'cloud-init clean --logs >/dev/null 2>&1; rm -f /root/fgcc /root/f
 doctl compute droplet-action power-off $id --wait >/dev/null
 doctl compute droplet-action snapshot $id --snapshot-name $name --wait >/dev/null
 image=$(doctl compute image list-user --format ID,Name --no-header | awk -v n=$name '$2 == n {print $1}')
-echo "$image $name (Ubuntu 24.04, LLVM 23.1.3 + FileCheck, fgcc as clang, Rust, base tree $commit)" > $here/image.txt
+echo "$image $name (Ubuntu 24.04, LLVM 23.1.3 + FileCheck, fgcc at /opt/fgcc, Rust, base tree $commit)" > $here/image.txt
 echo "image $image ($name), base $commit; recorded in $here/image.txt"
 echo "older shard images (delete with doctl compute image delete ID):"
 doctl compute image list-user --format ID,Name --no-header | awk -v n=$name '$2 ~ /^shard-image-/ && $2 != n'
