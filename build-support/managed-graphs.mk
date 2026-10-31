@@ -221,13 +221,39 @@ build/tooling/tests/cycle-private-retirement: TOOL_NATIVE = tests/evidence-suppo
 build/tooling/tests/cycle-private-retirement: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/cycle-private-retirement: tests/evidence-support-native.c runtime/native/sha256.c
 # Evidence retains Clang itself; permit files up to 512 MiB for these checks.
-check-cycle-private-retirement check-cycle-private-retirement-sanitize: export MINYAR_MAX_FILE_BLOCKS ?= 1048576
-check-cycle-private-retirement: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
-	@set -e; rm -rf -- build/cycle-private-retirement-native-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-XXXXXX"); \
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-private-retirement --evidence "$$evidence/run"
-check-cycle-private-retirement-sanitize: $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
-	@set -e; rm -rf -- build/cycle-private-retirement-sanitize-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-sanitize-XXXXXX"); \
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-private-retirement --sanitize --evidence "$$evidence/run"
+# One target per heap profile; each piece keeps its own mktemp evidence tree and only
+# removes its own stale evidence directories.
+CYCLE_PRIVATE_RETIREMENT_PARTS = check-cycle-private-retirement-part-system check-cycle-private-retirement-part-fixed check-cycle-private-retirement-part-lazy check-cycle-private-retirement-part-eager
+CYCLE_PRIVATE_RETIREMENT_SANITIZE_PARTS = check-cycle-private-retirement-sanitize-part-system check-cycle-private-retirement-sanitize-part-fixed check-cycle-private-retirement-sanitize-part-lazy check-cycle-private-retirement-sanitize-part-eager
+.PHONY: $(CYCLE_PRIVATE_RETIREMENT_PARTS) $(CYCLE_PRIVATE_RETIREMENT_SANITIZE_PARTS)
+check-cycle-private-retirement check-cycle-private-retirement-sanitize $(CYCLE_PRIVATE_RETIREMENT_PARTS) $(CYCLE_PRIVATE_RETIREMENT_SANITIZE_PARTS): export MINYAR_MAX_FILE_BLOCKS ?= 1048576
+check-cycle-private-retirement: $(CYCLE_PRIVATE_RETIREMENT_PARTS)
+check-cycle-private-retirement-sanitize: $(CYCLE_PRIVATE_RETIREMENT_SANITIZE_PARTS)
+$(CYCLE_PRIVATE_RETIREMENT_PARTS) $(CYCLE_PRIVATE_RETIREMENT_SANITIZE_PARTS): $(CYCLE_PRIVATE_RETIREMENT_INPUTS) | build
+check-cycle-private-retirement-part-system:
+	@set -e; rm -rf -- build/cycle-private-retirement-native-system-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-system-XXXXXX"); \
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-private-retirement --profiles system --evidence "$$evidence/run"
+check-cycle-private-retirement-part-fixed:
+	@set -e; rm -rf -- build/cycle-private-retirement-native-fixed-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-fixed-XXXXXX"); \
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-private-retirement --profiles fixed --evidence "$$evidence/run"
+check-cycle-private-retirement-part-lazy:
+	@set -e; rm -rf -- build/cycle-private-retirement-native-lazy-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-lazy-XXXXXX"); \
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-private-retirement --profiles lazy --evidence "$$evidence/run"
+check-cycle-private-retirement-part-eager:
+	@set -e; rm -rf -- build/cycle-private-retirement-native-eager-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-native-eager-XXXXXX"); \
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-private-retirement --profiles eager --evidence "$$evidence/run"
+check-cycle-private-retirement-sanitize-part-system:
+	@set -e; rm -rf -- build/cycle-private-retirement-sanitize-system-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-sanitize-system-XXXXXX"); \
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-private-retirement --sanitize --profiles system --evidence "$$evidence/run"
+check-cycle-private-retirement-sanitize-part-fixed:
+	@set -e; rm -rf -- build/cycle-private-retirement-sanitize-fixed-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-sanitize-fixed-XXXXXX"); \
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-private-retirement --sanitize --profiles fixed --evidence "$$evidence/run"
+check-cycle-private-retirement-sanitize-part-lazy:
+	@set -e; rm -rf -- build/cycle-private-retirement-sanitize-lazy-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-sanitize-lazy-XXXXXX"); \
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-private-retirement --sanitize --profiles lazy --evidence "$$evidence/run"
+check-cycle-private-retirement-sanitize-part-eager:
+	@set -e; rm -rf -- build/cycle-private-retirement-sanitize-eager-*; evidence=$$(mktemp -d "$(abspath build)/cycle-private-retirement-sanitize-eager-XXXXXX"); \
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-private-retirement --sanitize --profiles eager --evidence "$$evidence/run"
 check: check-cycle-private-retirement check-cycle-private-retirement-sanitize
 check-portable: check-cycle-private-retirement check-cycle-private-retirement-sanitize
 check-managed-graphs-profiles: check-cycle-private-retirement check-cycle-private-retirement-sanitize

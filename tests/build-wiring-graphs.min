@@ -115,6 +115,13 @@ function retirementBlock(fragment: Text, target: Text): List<Integer> {
     if end == index { return [] }
     return [start, end]
 }
+function retirementParts(kind: Text): List<Text> {
+    let parts: List<Text> = []
+    let target = "check-cycle-private-retirement"
+    if kind == "sanitize" { target = target + "-sanitize" }
+    for profile in ["system", "fixed", "lazy", "eager"] { parts.add(target + "-part-" + profile) }
+    return parts
+}
 function retirementProbe(w: wire.Wiring, candidate: Text, pair: List<Text>, inputs: List<Text>): Text {
     let c = wire.checks()
     let directory = wire.folder(w, "actual private retirement Make rules ")
@@ -126,28 +133,33 @@ function retirementProbe(w: wire.Wiring, candidate: Text, pair: List<Text>, inpu
     let database = wire.rules(result.output, wire.NAMED)
     for gate in ["check", "check-portable", "check-managed-graphs-profiles"] { wire.ensure(c, wire.subset(pair, wire.deps(database, gate)), gate) }
     wire.ensure(c, wire.has(wire.deps(database, "check-sanitize"), "check-cycle-private-retirement-sanitize"), "sanitize aggregate")
-    for target in pair { wire.ensure(c, wire.subset(inputs, wire.deps(database, target)), target + " inputs") }
     let all: List<Text> = []
     for kind in ["native", "sanitize"] {
-        let target = "check-cycle-private-retirement"
-        if kind == "sanitize" { target = target + "-sanitize" }
-        let recipe = wire.make(w, ["-rRn", "-f", probe, target], environment, "")
+        let aggregate = pair[0]
+        if kind == "sanitize" { aggregate = pair[1] }
+        let parts = retirementParts(kind)
+        wire.ensure(c, wire.subset(parts, wire.deps(database, aggregate)), kind + " aggregate pieces")
+        for part in parts { wire.ensure(c, wire.subset(inputs, wire.deps(database, part)), part + " inputs") }
+        let recipe = wire.make(w, ["-rRn", "-f", probe, aggregate], environment, "")
         if recipe.status != 0 { return recipe.errorOutput }
         let commands = recipe.output
         all.add(commands)
-        wire.ensure(c, wire.count(commands, "./build/tooling/tests/cycle-private-retirement") == 1, target + " command")
-        wire.ensure(c, wire.count(commands, "--evidence \"$evidence/run\"") == 1, target + " evidence")
         let sanitized = 0
         if kind == "sanitize" { sanitized = 1 }
-        wire.ensure(c, wire.count(commands, "--sanitize --evidence") == sanitized, target + " sanitizer")
-        wire.ensure(c, !wire.contains(commands, "--profiles"), target + " profiles")
-        wire.ensure(c, !wire.contains(commands, "--budgets"), target + " budgets")
-        wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/cycle-private-retirement-" + kind), target + " absolute evidence")
+        for profile in ["system", "fixed", "lazy", "eager"] {
+            let part = aggregate + "-part-" + profile
+            wire.ensure(c, wire.count(commands, "./build/tooling/tests/cycle-private-retirement") == 4, part + " command")
+            wire.ensure(c, wire.contains(commands, "--profiles " + profile + " "), part + " profile")
+        }
+        wire.ensure(c, wire.count(commands, "--evidence \"$evidence/run\"") == 4, kind + " evidence")
+        wire.ensure(c, wire.count(commands, "--sanitize") == 4 * sanitized, kind + " sanitizer")
+        wire.ensure(c, !wire.contains(commands, "--budgets"), kind + " budgets")
+        wire.ensure(c, wire.contains(wire.replaceAll(commands, "\\", "/"), w.root + "/build/cycle-private-retirement-" + kind), kind + " absolute evidence")
     }
     let commands = wire.joined(all, "\n")
-    wire.ensure(c, wire.count(commands, "./build/tooling/tests/cycle-private-retirement") == 2, "both commands")
-    wire.ensure(c, wire.count(commands, "--evidence \"$evidence/run\"") == 2, "both evidence")
-    wire.ensure(c, wire.count(commands, "--sanitize --evidence") == 1, "one sanitizer")
+    wire.ensure(c, wire.count(commands, "./build/tooling/tests/cycle-private-retirement") == 8, "both commands")
+    wire.ensure(c, wire.count(commands, "--evidence \"$evidence/run\"") == 8, "both evidence")
+    wire.ensure(c, wire.count(commands, "--sanitize") == 4, "sanitizers")
     return wire.failure(c)
 }
 public function test_private_retirement_gates_execute_actual_operation_contract(w: wire.Wiring) {
@@ -171,7 +183,8 @@ public function test_private_retirement_gates_execute_actual_operation_contract(
         wire.refuse(w, retirementProbe(w, wire.replaceFirst(fragment, dependency + " ", ""), pair, inputs), "missing input " + dependency)
     }
     let evidence = "--evidence \"$$evidence/run\""
-    for target in wire.sorted(pair) {
+    let pieces = wire.union(retirementParts("native"), retirementParts("sanitize"))
+    for target in wire.sorted(pieces) {
         let span = retirementBlock(fragment, target)
         wire.check(span.length == 2, "recipe block " + target)
         let recipe = wire.cut(fragment, span[0], span[1])
