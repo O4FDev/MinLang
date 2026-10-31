@@ -51,7 +51,7 @@ static long long expected_capacity(long long length) {
 #ifdef MINYAR_BOUNDED_HEAP
         capacity = capacity ? capacity * 2 + 1 : 3;
 #else
-        capacity = capacity ? capacity * (capacity >= 4096 ? 4 : 2) : 2;
+        capacity = capacity ? capacity * (capacity >= 4096 ? 4 : 2) : 4;
 #endif
     }
     return capacity;
