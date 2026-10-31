@@ -14,12 +14,12 @@ b = both-modes serial. "Price" = how much faster Minyar gets with the guarantee 
 
 | # | trade-off (what it buys) | price: visible / hidden / both-modes serial | recommendation |
 |---|---|---|---|
-| T5 | memory is reclaimed at all, deterministically (RC + frames) | **-30% / -49% / -22%** (never-free arena; not a real option: json needs >15.7 GB) | KEEP. Most of this is DEBT (Rust frees too): allocator, RC traffic, per-object teardown (U1, U6, U12, O1-O4). Fix those; optionally (d) an opt-in region/arena scope for parse-then-drop phases (new feature, Luke) |
-| T4 | bounded cleanup pauses (scheduler) instead of eager freeing | -2.5% (worst 16.6x -> 9.3x) / **-26%** (worst 18.8 -> 14.4) / see table | KEEP the bound, make it near zero-cost: free leaves/unshared objects immediately, batch List teardown, no polls in loops that free nothing (O1, O4 = DEBT). Already (d): `--memory-profile eager` exists. Luke: decide whether batch programs should default to eager |
+| T5 | memory is reclaimed at all, deterministically (RC + frames) | **-30% / -49% / -22%** (never-free arena; both-modes serial 1.95 -> 1.80, parallel 1.98 -> 1.63; not a real option: json needs >15.7 GB) | KEEP. Most of this is DEBT (Rust frees too): allocator, RC traffic, per-object teardown (U1, U6, U12, O1-O4). Fix those; optionally (d) an opt-in region/arena scope for parse-then-drop phases (new feature, Luke) |
+| T4 | bounded cleanup pauses (scheduler) instead of eager freeing | -2.5% (worst 16.6x -> 9.3x) / **-26%** (worst 18.8 -> 14.4) / -3% (1.95 -> 1.89) | KEEP the bound, make it near zero-cost: free leaves/unshared objects immediately, batch List teardown, no polls in loops that free nothing (O1, O4 = DEBT). Already (d): `--memory-profile eager` exists. Luke: decide whether batch programs should default to eager |
 | T7 | data-race freedom by construction (parallel restrictions C1/C3/C4/C5, O5) | not switchable; textindex 84% / mapreduce 44% of Ir forced serial; parallel geomean 1.98x par.rs | KEEP race freedom; lift the restrictions that it does not need (ordinary code in tasks, frozen sharing, growing per-task outputs, disjoint sub-window `join`) - DEBT-like work |
-| T6 | thread runtime safety for managed values | 0 on visible (only bothmodes/server links it); C2: +29-50% Ir on managed code at 1 thread; server see table | (b) zero-cost when unused: per-thread heaps/no TLS on single-thread paths (mostly DEBT) |
-| T2 | List/Bytes bounds checks | -0.8% / -1.3% / **-10%** (topk 23%, sort 16%) | KEEP (Rust keeps them too); (c) prove away: versioned loops with one hoisted check per window, range facts (U15) |
-| T3 | Unicode Character indexing | -0.6% / -2.8% / small | KEEP semantics; ASCII-known fast path hoisted out of scanning loops (DEBT) and byte-position stdlib scanners for parsers |
+| T6 | thread runtime safety for managed values | 0 on visible compare; bothmodes/server @1 thread +8.3% Ir; hidden b not separable (5 programs start threads); C2: +29-50% on managed code | (b) zero-cost when unused: per-thread heaps/no TLS on single-thread paths (mostly DEBT) |
+| T2 | List/Bytes bounds checks | -0.8% / -1.3% / **-10%** (topk 23%, sort 16%; parallel 1.98 -> 1.87) | KEEP (Rust keeps them too); (c) prove away: versioned loops with one hoisted check per window, range facts (U15) |
+| T3 | Unicode Character indexing | -0.6% / -2.8% / 0% | KEEP semantics; ASCII-known fast path hoisted out of scanning loops (DEBT) and byte-position stdlib scanners for parsers |
 | T1 | checked integer overflow | 0.0% / -0.5% / -0.5% (removing it RAISES Ir on grid +8%, par-reduce +23%) | KEEP; (c) range facts for induction/index arithmetic only. Dropping it buys nothing measurable |
 | T8 | automatic cycle collection | 0 on every suite program (none links the cycle runtime) | already (b) zero-cost when unused; fix the collector pathology on `List.add`-built trees (judge.md) as DEBT |
 | T9 | live patching | 0 in `--release` (no patch points in any benchmark IR) | already (b): dispatch slots only in `minyar build --hot` images |
@@ -39,10 +39,23 @@ T5/T4 decisions matter only after the allocation/RC debt is paid.
 | base | 3.60 | 16.58 exprparse | 2.90 | 13.05 exprparse | 1.95 / 1.35 | 1.98 | identical | 6.98 / 18.79 (b 4.17 / 2.09) |
 | overflow | 3.60 | 16.28 exprparse | 2.90 | 12.81 exprparse | 1.94 / 1.33 | 1.98 | identical | 6.95 / 18.72 (b 4.10 / 2.10) |
 | bounds | 3.57 | 16.58 exprparse | 2.87 | 13.05 exprparse | 1.76 / 1.21 | 1.87 | identical | 6.90 / 18.74 (b 3.99 / 2.17) |
-| unicode | 3.58 | 15.62 exprparse | 2.88 | 12.29 exprparse | pending | pending | base row used: json | 6.79 / 18.79 (b 4.05 / 2.17) |
-| reclaim | 2.53 | 11.98 json | 2.03 | 7.11 json | pending | pending | base row used: json | 3.59 / 11.91; Rust 2.41 / 8.75 (b 1.52 / 1.24, 5 b failed) |
-| scheduler | 3.51 | 9.31 exprparse | 2.83 | 7.33 exprparse | pending | pending | identical | 5.19 / 14.38; Rust 3.48 / 10.57 (b 3.62 / 2.16) |
-| all | 2.43 | 11.98 json | 1.95 | 7.11 json | pending | pending | base row used: json | 3.25 / 11.89; Rust 2.18 / 8.74 (b 1.36 / 1.20, 5 b failed) |
+| unicode | 3.58 | 15.62 exprparse | 2.88 | 12.29 exprparse | 1.95 / 1.35 | 1.90 | base row used: json | 6.79 / 18.79 (b 4.05 / 2.17) |
+| reclaim | 2.53 | 11.98 json | 2.03 | 7.11 json | 1.80 / 1.24 | 1.63 | base row used: json server(bm) | 3.59 / 11.91; Rust 2.41 / 8.75 (b 1.52 / 1.24, 5 b failed) |
+| scheduler | 3.51 | 9.31 exprparse | 2.83 | 7.33 exprparse | 1.89 / 1.30 | 1.96 | identical | 5.19 / 14.38; Rust 3.48 / 10.57 (b 3.62 / 2.16) |
+| all | 2.43 | 11.98 json | 1.95 | 7.11 json | 1.58 / 1.09 | 1.53 | base row used: json server(bm) | 3.25 / 11.89; Rust 2.18 / 8.74 (b 1.36 / 1.20, 5 b failed) |
+| threads | = base (no compare program links the thread runtime) | | | | server @1: 425.9M -> 393.2M Ir (-7.7%) | server traps @4 | identical @1 | 6.98 / 18.79; Rust 4.68 / 12.99 (5 b trap: they start threads) |
+
+Hidden: orchestrator, box D, same trees (vs fastest geomean / worst; b = both-modes serial / parallel geomean;
+parallel wall ±15-20%, box loaded). Visible: compare Ir (par-* at 4 threads, pool spin included); bothmodes serial
+Ir at 1 thread, parallel wall at 4 threads n=3 vs `par.rs`. "base row used" = ablated build not valid for that
+program (json: non-ASCII data under UNICODE, out of memory at 15.7 GB under RECLAIM; server: managed threads refuse
+the arena, and THREADS traps at 4 threads), so its baseline ratio stays in the geomean. Trees
+`/home/agent/minyar/abl-<config>`, raw results `/home/agent/minyar/abl-results/` (box D, deleted 09:40 UTC).
+
+Wall checks (box D, bench lock, n=5 interleaved, ms): OVERFLOW off: grid 1,622 -> 1,794 (slower, matches its +8% Ir),
+par-reduce 173 -> 130 (25% faster although Ir +23%: vectorised reduction), par-forkjoin 148 -> 136.
+THREADS off on server @1: Ir -7.7% but wall 2,305 -> 3,397 ms (n=3; the plain runtime's I/O path waits differently,
+not CPU) - so the thread-runtime tax on this program is ~8% Ir, not wall.
 
 Instructions removed by each switch (% of baseline Minyar Ir; bm- = bothmodes at 1 thread; '-' = not valid):
 
@@ -70,21 +83,12 @@ Instructions removed by each switch (% of baseline Minyar Ir; bm- = bothmodes at
 | tokenizer | 0.5 | 0.3 | 3.8 | 40.9 | 7.4 | 45.9 |
 | treewalk | 0.4 | 0.6 | -0.0 | 68.9 | -5.8 | 70.0 |
 | wordfreq | 0.5 | 0.0 | 0.4 | 19.2 | 4.3 | 19.8 |
-| bm-forkjoin | 2.0 | 5.5 | - | - | - | - |
-| bm-mapreduce | 0.1 | 4.9 | - | - | - | - |
-| bm-server | 2.2 | 0.4 | - | - | - | - |
-| bm-sort | 1.1 | 16.3 | - | - | - | - |
-| bm-textindex | 1.4 | 7.1 | - | - | - | - |
-| bm-topk | -1.3 | 23.1 | - | - | - | - |
-| threads | = base (no visible compare program links the thread runtime) | | | | server only: see T6 | | | 6.98 / 18.79; Rust 4.68 / 12.99 (5 b trap: they start threads) |
-
-Hidden numbers: orchestrator, box D, same trees (vs fastest geomean / worst; b = both-modes serial / parallel
-geomean; parallel wall ratios ±15-20%, box loaded). Visible: compare Ir (par-* at 4 threads, pool spin included),
-bothmodes serial Ir at 1 thread, parallel wall at 4 threads n=3 vs `par.rs`. "base row used" = the ablated build is
-not valid for that program (json: non-ASCII data under UNICODE, out of memory under RECLAIM), so its baseline ratio
-stays in the geomean. Trees: `/home/agent/minyar/abl-<config>`; raw: `/home/agent/minyar/abl-results/`.
-
-
+| bm-forkjoin | 2.0 | 5.5 | 0.0 | 4.5 | 2.5 | 12.0 |
+| bm-mapreduce | 0.1 | 4.9 | -0.0 | 13.7 | -11.3 | 19.5 |
+| bm-server | 2.2 | 0.4 | 0.0 | - | 12.0 | - |
+| bm-sort | 1.1 | 16.3 | 0.0 | 5.0 | 3.6 | 24.8 |
+| bm-textindex | 1.4 | 7.1 | -0.0 | 19.4 | 11.0 | 32.0 |
+| bm-topk | -1.3 | 23.1 | -0.0 | 2.0 | 1.2 | 22.8 |
 ## Classification of every known cause
 
 DEBT = the same semantics allow a cheaper implementation (fix, no approval). TRADE-OFF = cost of a guarantee
@@ -133,7 +137,7 @@ DEBT = the same semantics allow a cheaper implementation (fix, no approval). TRA
 Buys: arithmetic never silently wraps; overflow stops with a diagnostic. Switch: `%checked` intrinsics -> `nsw`
 (C semantics). Cost: visible geomean 3.60 -> 3.60; largest wins bytecode 2.9%, exprparse 1.8%, sortrows 1.7%,
 par-forkjoin 17.9% (Ir at 4 threads). Regressions: grid +8.2%, par-reduce +22.5% Ir (LLVM re-plans unrolling/
-vectorisation once the adds are plain; wall A/B below). Hidden -0.5%. Options: (a) keep; (c) range facts so loop
+vectorisation once the adds are plain; wall: grid 10% slower, par-reduce 25% faster). Hidden -0.5%. Options: (a) keep; (c) range facts so loop
 counters/indexes skip the check (keeps semantics); (d) a per-scope wrapping block; (e) drop. Recommend (a)+(c).
 
 ### T2 Bounds checks (part of U15)
@@ -172,7 +176,7 @@ Recommend (a)+(c); (d) is a feature proposal for Luke.
 ### T6 Thread runtime tax (C2)
 Buys: managed values are safe to hand between threads. Switch: plain runtime for programs carrying the thread marker
 (starting a thread traps). Visible: only bothmodes/server links it; hidden: 5 b programs start threads (not
-measurable by the switch). C2 measured +29-50% Ir at 1 thread on managed code. Recommend (b): single-thread paths
+measurable by the switch); bothmodes/server at 1 thread: 425.9M -> 393.2M Ir (-7.7%) without it. C2 measured +29-50% Ir at 1 thread on managed code. Recommend (b): single-thread paths
 pay nothing (per-thread heaps without TLS indirection when no thread was started) - mostly DEBT.
 
 ### T7 Parallel restrictions (C1, C3, C4, C5, O5)
