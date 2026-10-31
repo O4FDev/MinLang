@@ -1,4 +1,4 @@
-.PHONY: check-httpserver check-httpserver-sanitize
+.PHONY: check-httpserver check-httpserver-sanitize check-httpserver-tls check-httpserver-tls-sanitize
 # Aggregate hooks are POSIX-only until the server is qualified on Windows.
 build/tooling/tests/httpserver-test: TOOL_NATIVE = runtime/native/net.c tests/net-wire-native.c
 build/tooling/tests/httpserver-test: runtime/native/net.c tests/net-wire-native.c
