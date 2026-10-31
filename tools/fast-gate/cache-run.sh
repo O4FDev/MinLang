@@ -13,9 +13,6 @@ finish() { stamp "CACHE-DONE $1"; touch "$out/done"; exit "$1"; }
 . /etc/profile.d/goal-toolchains.sh
 export MINYAR_CLANG=/opt/llvm-23.1.3/bin/clang LLVM_CC=/opt/llvm-23.1.3/bin/clang MINYAR_TEST_TIMEOUT_SCALE=${MINYAR_TEST_TIMEOUT_SCALE:-2}
 checks=$(cat "$fg/checks.txt")
-# The image's clang is tools/fast-gate/fgcc: FAST_GATE_CC (off, log, cache, verify) sets its mode for this run.
-mkdir -p /home/agent/fgcc/cache
-printf 'mode=%s\ndir=/home/agent/fgcc/cache\nlog=%s\n' "${FAST_GATE_CC:-off}" "$out/fgcc.jsonl" > /home/agent/fgcc/config
 cd "$run/tree" || finish 9
 stamp START
 make build/minyarc > "$out/build.log" 2>&1 || { stamp BUILD-FAILED; finish 3; }

@@ -15,9 +15,13 @@ finish() { stamp "SHARD-DONE $1"; exit "$1"; }
 . /etc/profile.d/goal-toolchains.sh
 export MINYAR_CLANG=/opt/llvm-23.1.3/bin/clang LLVM_CC=/opt/llvm-23.1.3/bin/clang MINYAR_TEST_TIMEOUT_SCALE=${MINYAR_TEST_TIMEOUT_SCALE:-2}
 checks=$(cat "$fg/checks.txt")
-# The image's clang is tools/fast-gate/fgcc: FAST_GATE_CC (off, log, cache, verify) sets its mode for this run.
+# FAST_GATE_CC (log, cache, verify) makes the image's /opt/fgcc/bin/clang the fixture Clang, as the tree's own
+# MINYAR_TEST_CLANG_CACHE does with its wrapper: launcher builds and recorded identities keep the real compiler.
 mkdir -p /home/agent/fgcc/cache
 printf 'mode=%s\ndir=/home/agent/fgcc/cache\nlog=%s\n' "${FAST_GATE_CC:-off}" "$out/fgcc.jsonl" > /home/agent/fgcc/config
+if [[ ${FAST_GATE_CC:-off} != off && -x /opt/fgcc/bin/clang ]]; then
+  export TEST_CLANG=/opt/fgcc/bin/clang MINYAR_TEST_REAL_CLANG=$LLVM_CC
+fi
 cd "$tree" || finish 9
 stamp START
 if [[ -n ${FAST_GATE_CACHE:-} ]]; then

@@ -35,14 +35,13 @@ sysctl -q kernel.perf_event_paranoid=1
 apt-get -o DPkg::Lock::Timeout=900 install -y -q libssl-dev liblz4-dev libzstd-dev zlib1g-dev strace
 echo "fefc3fd7753e63ee9329e93eb2ef4e79aaa9c7545e9c5ebf0606cf2e4909d2e0  $here/FileCheck" | sha256sum --check
 install -m 755 "$here/FileCheck" /opt/llvm-$v/bin/FileCheck
-# The fast gate's compile cache (tools/fast-gate/fgcc) stands in for the clang driver; with no
-# /home/agent/fgcc/config it only execs clang-23. It is part of the image so every box made from it
-# has the same toolchain identity (build/.toolchain.json records the compiler's inode and ctime).
+# The fast gate's compile cache (tools/fast-gate/fgcc) lives beside the toolchain, never in place of clang: checks
+# record and copy the compiler binary itself (check-native-cache retains Clang as link provenance), so
+# /opt/llvm-23.1.3/bin/clang must stay the real driver. A run that asks for it uses fgcc as the fixture Clang only.
 if [[ -f $here/fgcc.c ]]; then
-  gcc -O2 -Wall -Wno-format-truncation -o "$here/fgcc" "$here/fgcc.c"
-  [[ -L /opt/llvm-$v/bin/clang && $(readlink /opt/llvm-$v/bin/clang) == clang-23 ]] && rm /opt/llvm-$v/bin/clang
-  install -m 755 "$here/fgcc" /opt/llvm-$v/bin/clang
-  /opt/llvm-$v/bin/clang --version | head -1
+  install -d /opt/fgcc/bin
+  gcc -O2 -Wall -Wno-format-truncation -o /opt/fgcc/bin/clang "$here/fgcc.c"
+  /opt/fgcc/bin/clang --version | head -1
 fi
 id agent >/dev/null 2>&1 || useradd -m -s /bin/bash agent
 getent group kvm >/dev/null && usermod -aG kvm agent

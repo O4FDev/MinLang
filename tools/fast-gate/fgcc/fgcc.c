@@ -1,7 +1,8 @@
 // fgcc: a content-addressed cache in front of Clang for fast-gate shards.
 //
-// Installed in place of /opt/llvm-23.1.3/bin/clang in the shard image (the real driver stays at clang-23), it execs
-// the real compiler unless the invocation is one it can prove it may replay: a compile or link whose every input is
+// Installed in the shard image as /opt/fgcc/bin/clang (never in place of the toolchain's own clang, which checks
+// inspect) and used as the gate's fixture Clang (TEST_CLANG) when a run asks for it, it execs the real compiler
+// unless the invocation is one it can prove it may replay: a compile or link whose every input is
 // a regular file and whose only output is the -o file. The key covers this program's version, the real compiler and
 // both linkers, the system packages (dpkg status: crt objects, libc), argv with the -o path replaced by its extension,
 // the working directory, the environment variables Clang and the linkers read, the bytes of every input file and
