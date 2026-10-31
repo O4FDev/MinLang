@@ -17,7 +17,11 @@ here, never tuned per program.
 
   run.py [--tree DIR] [--projects DIR] [--only NAME[,NAME]] [--json OUT]
          [--repeat N] [--no-build] [--baseline FILE] [--write-baseline FILE]
-         [--keep-going] [--profile]
+         [--against DIR] [--keep-going]
+
+`--against DIR` builds a second Minyar tree too, counts instructions for both,
+and alternates the wall samples between the two binaries, so a merge can be
+judged on one run instead of two sequential ones.
 
 `--projects` names the directory holding read-only copies of the upstream
 projects (see sync-projects.sh). Their identity is the commit recorded in each
@@ -287,26 +291,6 @@ def cachegrind(artifact, argv, env, work, tag, reset=(), stdin_path=None):
     raise Failure(f"{out_file}: no summary line")
 
 
-def wall_times(artifact, argv, env, stdin_path, repeats, reset=()):
-    samples = []
-    outputs = []
-    for _ in range(repeats):
-        reset_paths(reset)
-        stream = open(stdin_path, "rb") if stdin_path else subprocess.DEVNULL
-        try:
-            started = time.perf_counter()
-            result = subprocess.run([artifact, *argv], stdin=stream, capture_output=True, env=env)
-            samples.append(time.perf_counter() - started)
-        finally:
-            if stdin_path:
-                stream.close()
-        if result.returncode != 0:
-            raise Failure(f"{artifact}: workload failed (rc={result.returncode})\n"
-                          + result.stderr.decode(errors="replace")[-2000:])
-        outputs.append(result.stdout)
-    return samples, outputs
-
-
 def check_output(spec, data):
     """Verify the workload did the expected work; returns the output sha256."""
     digest = hashlib.sha256(data).hexdigest()
@@ -488,7 +472,12 @@ def resolve(spec, tree, project, work, artifact, prepared, clang):
     return argv
 
 
-def measure(spec, args, work, prepared, clang):
+def stage(spec, tree, args, work, prepared, clang, tag):
+    """Build the project with TREE and keep a copy of its workload executable.
+
+    Building twice into the same project copy would overwrite the first tree's
+    binaries, so each stage copies its executable out to `build/realworld/ab`.
+    """
     name = spec["name"]
     project = os.path.join(args.projects, spec["repo"])
     if not os.path.isdir(project):
@@ -502,69 +491,114 @@ def measure(spec, args, work, prepared, clang):
     row = {"name": name, "commit": recorded or spec["commit"], "repo": project}
     project_work = os.path.join(work, name)
     os.makedirs(project_work, exist_ok=True)
-    log = os.path.join(project_work, "build.log")
+    log = os.path.join(project_work, f"build-{tag}.log")
     environment = dict(os.environ)
     environment.update(spec.get("env", {}))
-    environment["MINYAR_ROOT"] = args.tree
+    environment["MINYAR_ROOT"] = tree
     environment["MINYAR_CLANG"] = clang
     environment["LLVM_CC"] = clang
     environment["MINYAR_PARALLEL_THREADS"] = str(THREADS)
     if spec.get("prerequisite"):
-        command = resolve(spec["prerequisite"], args.tree, project, work, "", prepared, clang)
-        with open(os.path.join(project_work, "prerequisite.log"), "w") as out:
+        command = resolve(spec["prerequisite"], tree, project, work, "", prepared, clang)
+        with open(os.path.join(project_work, f"prerequisite-{tag}.log"), "w") as out:
             result = subprocess.run(command, stdout=out, stderr=subprocess.STDOUT, env=environment)
         if result.returncode != 0:
             raise Failure(f"{name}: prerequisite failed")
+    stamp_file = os.path.join(project, spec["artifact"] + ".rw-tree")
     if args.no_build:
         artifact = os.path.join(project, spec["artifact"])
         if not os.path.exists(artifact):
             raise Failure(f"{name}: --no-build but {artifact} is missing")
+        built_by = open(stamp_file).read().strip() if os.path.exists(stamp_file) else ""
+        if built_by != tree_stamp(tree):
+            raise Failure(f"{name}: --no-build but {artifact} was built by another tree; run without --no-build")
         row["build_seconds"] = None
     else:
-        row["build_seconds"], artifact, _ = build_project(spec, args.tree, project, work, log, clang)
+        row["build_seconds"], artifact, _ = build_project(spec, tree, project, work, log, clang)
+        with open(stamp_file, "w") as f:
+            f.write(tree_stamp(tree))
     if name == "neo-db":
-        prepared["bench"], _fixture = prepare_neo_db(project, args.tree, clang, work)
+        prepared["bench"], _fixture = prepare_neo_db(project, tree, clang, work)
     else:
         prepared["bench"] = ""
     prepared["payload"] = vtebench_payload(project) if name == "minyar-terminal" else ""
-    if name == "neo-db":
-        os.makedirs(os.path.join(work, "neo-db-data"), exist_ok=True)
-    executable = resolve([spec["executable"]], args.tree, project, work, artifact, prepared, clang)[0] \
+    executable = resolve([spec["executable"]], tree, project, work, artifact, prepared, clang)[0] \
         if spec.get("executable") else artifact
-    argv = resolve(spec["workload"], args.tree, project, work, artifact, prepared, clang)
     if not os.path.exists(executable):
         raise Failure(f"{name}: workload executable {executable} is missing")
-    stdin_path = (spec["stdin"].replace("@DATA@", os.path.join(work, "data")).replace("@TREE@", args.tree)
+    argv = resolve(spec["workload"], tree, project, work, artifact, prepared, clang)
+    stdin_path = (spec["stdin"].replace("@DATA@", os.path.join(work, "data")).replace("@TREE@", tree)
                   if spec.get("stdin") else None)
     if stdin_path and not os.path.exists(stdin_path):
         raise Failure(f"{name}: workload input {stdin_path} is missing")
-    reset = [path.replace("@WORK@", work).replace("@TREE@", args.tree) for path in spec.get("reset", [])]
-    ir, first_output, ir_seconds = cachegrind(executable, argv, environment, project_work, name, reset, stdin_path)
+    stored_dir = os.path.join(work, "ab", f"{name}-{tag}")
+    os.makedirs(stored_dir, exist_ok=True)
+    stored = os.path.join(stored_dir, os.path.basename(executable))
+    with open(executable, "rb") as src, open(stored, "wb") as dst:
+        dst.write(src.read())
+    os.chmod(stored, 0o755)
+    return {"row": row, "executable": stored, "argv": argv, "environment": environment,
+            "stdin_path": stdin_path, "work": project_work, "tag": tag,
+            "reset": [path.replace("@WORK@", work).replace("@TREE@", tree) for path in spec.get("reset", [])],
+            "tree": tree}
+
+
+def measure_once(stage_, timeout=None):
+    reset_paths(stage_["reset"])
+    stream = open(stage_["stdin_path"], "rb") if stage_["stdin_path"] else subprocess.DEVNULL
+    started = time.perf_counter()
+    try:
+        result = subprocess.run([stage_["executable"], *stage_["argv"]], stdin=stream,
+                                capture_output=True, env=stage_["environment"], timeout=timeout)
+    finally:
+        if stage_["stdin_path"]:
+            stream.close()
+    seconds = time.perf_counter() - started
+    if result.returncode != 0:
+        raise Failure(f"{stage_['executable']}: workload failed (rc={result.returncode})\n"
+                      + result.stderr.decode(errors="replace")[-2000:])
+    return seconds, result.stdout
+
+
+def run_stage(spec, stage_, work, repeats):
+    """Instruction count (twice, must agree) and the output digest of one stage."""
+    name, tag = spec["name"], stage_["tag"]
+    project_work = os.path.join(work, name)
+    ir, first_output, ir_seconds = cachegrind(stage_["executable"], stage_["argv"], stage_["environment"],
+                                              project_work, f"{name}-{tag}", stage_["reset"], stage_["stdin_path"])
     digest = check_output(spec, first_output)
-    # A second identical run proves the workload and its output are deterministic.
-    second_ir, second_output, _ = cachegrind(executable, argv, environment, project_work, name + "-2", reset, stdin_path)
+    second_ir, second_output, _ = cachegrind(stage_["executable"], stage_["argv"], stage_["environment"],
+                                             project_work, f"{name}-{tag}-2", stage_["reset"], stage_["stdin_path"])
     tolerance = spec.get("ir_tolerance", 0.0)
     if abs(second_ir - ir) > tolerance * max(ir, second_ir):
         raise Failure(f"{name}: instruction count is not deterministic ({ir} then {second_ir}"
                       f", tolerance {tolerance:.4%})")
-    ir = min(ir, second_ir)
     if spec.get("stable_output", True) and hashlib.sha256(second_output).hexdigest() != digest:
         raise Failure(f"{name}: workload output is not deterministic")
-    samples, outputs = wall_times(executable, argv, environment, stdin_path, args.repeat, reset)
-    if spec.get("stable_output", True) and hashlib.sha256(outputs[0]).hexdigest() != digest:
-        raise Failure(f"{name}: workload output differs outside cachegrind")
-    row.update({
-        "ir": ir,
-        "output_sha256": digest,
-        "wall_seconds": samples,
-        "wall_median": statistics.median(samples),
-        "wall_min": min(samples),
-        "wall_max": max(samples),
-        "cachegrind_seconds": ir_seconds,
-        "executable": executable,
-        "argv": argv,
-    })
-    return row
+    samples = []
+    for _ in range(repeats):
+        seconds, output = measure_once(stage_)
+        if spec.get("stable_output", True) and hashlib.sha256(output).hexdigest() != digest:
+            raise Failure(f"{name}: workload output differs outside cachegrind")
+        samples.append(seconds)
+    return {"ir": min(ir, second_ir), "output_sha256": digest, "wall_seconds": samples,
+            "cachegrind_seconds": ir_seconds, "executable": stage_["executable"], "argv": stage_["argv"],
+            "build_seconds": stage_["row"].get("build_seconds")}
+
+
+def wall_pair(stages, repeats):
+    """Wall samples for two stages, alternating which stage runs first."""
+    keys = list(stages)
+    samples = {key: [] for key in keys}
+    digests = {key: None for key in keys}
+    for index in range(repeats):
+        order = keys if index % 2 == 0 else list(reversed(keys))
+        for key in order:
+            seconds, output = measure_once(stages[key])
+            samples[key].append(seconds)
+            if digests[key] is None:
+                digests[key] = hashlib.sha256(output).hexdigest()
+    return samples, digests
 
 
 # ------------------------------------------------------------------ reporting
@@ -597,40 +631,65 @@ def print_rows(results, baseline):
             print(f"{row['name']:<18} ERROR {row['error'].splitlines()[0]}", flush=True)
             continue
         build = row.get("build_seconds")
-        wall = row["wall_median"] * 1000
-        spread = (row["wall_max"] - row["wall_min"]) * 1000
+        wall = statistics.median(row["wall_seconds"]) * 1000
+        spread = (max(row["wall_seconds"]) - min(row["wall_seconds"])) * 1000
+        base_wall = base.get("wall_median")
         print(f"{row['name']:<18}"
               f"{(f'{build:.1f}' if build is not None else '--'):>9}"
               f"{fmt_ratio(ratio(build, base.get('build_seconds'))):>7}"
               f"{row['ir'] / 1e6:>12,.1f}M{fmt_ratio(ratio(row['ir'], base.get('ir'))):>7}"
-              f"{wall:>11.1f}{spread:>9.1f}{fmt_ratio(ratio(wall, base.get('wall_median', 0) * 1000 if base.get('wall_median') else None)):>7}"
+              f"{wall:>11.1f}{spread:>9.1f}{fmt_ratio(ratio(wall / 1000, base_wall)):>7}"
               f"  ok", flush=True)
 
 
-def summarize(results, baseline):
-    base = (baseline or {}).get("geomean", {})
-    irs = [r["ir"] for r in results if "ir" in r and (baseline or {}).get("projects", {}).get(r["name"], {}).get("ir")]
-    builds = [r["build_seconds"] for r in results if r.get("build_seconds")
-              and (baseline or {}).get("projects", {}).get(r["name"], {}).get("build_seconds")]
-    walls = [r["wall_median"] for r in results if "wall_median" in r
-             and (baseline or {}).get("projects", {}).get(r["name"], {}).get("wall_median")]
-    base_projects = (baseline or {}).get("projects", {})
-    ir_geo = geomean([r["ir"] / base_projects[r["name"]]["ir"] for r in results
-                      if "ir" in r and base_projects.get(r["name"], {}).get("ir")])
-    build_geo = geomean([r["build_seconds"] / base_projects[r["name"]]["build_seconds"] for r in results
-                         if r.get("build_seconds") and base_projects.get(r["name"], {}).get("build_seconds")])
-    wall_geo = geomean([r["wall_median"] / base_projects[r["name"]]["wall_median"] for r in results
-                        if "wall_median" in r and base_projects.get(r["name"], {}).get("wall_median")])
-    ok = [r for r in results if "ir" in r]
+def print_pair(rows, against):
+    """One line per project: the tree under test against the `--against` tree."""
+    print(f"{'project':<18}{'build a':>8}{'b':>8}{'ratio':>7}{'Ir a':>13}{'b':>13}{'ratio':>7}"
+          f"{'wall a':>9}{'b':>9}{'ratio':>7}  status", flush=True)
+    for row in rows:
+        if "error" in row:
+            print(f"{row['name']:<18} ERROR {row['error'].splitlines()[0]}", flush=True)
+            continue
+        a, b = row["a"], row["b"]
+        build_a, build_b = a.get("build_seconds"), b.get("build_seconds")
+        wall_a, wall_b = statistics.median(a["wall_seconds"]) * 1000, statistics.median(b["wall_seconds"]) * 1000
+        print(f"{row['name']:<18}"
+              f"{(f'{build_a:.1f}' if build_a is not None else '--'):>8}"
+              f"{(f'{build_b:.1f}' if build_b is not None else '--'):>8}"
+              f"{fmt_ratio(ratio(build_a, build_b)):>7}"
+              f"{a['ir'] / 1e6:>12,.1f}M{b['ir'] / 1e6:>12,.1f}M{fmt_ratio(ratio(a['ir'], b['ir'])):>7}"
+              f"{wall_a:>9.1f}{wall_b:>9.1f}{fmt_ratio(ratio(wall_a, wall_b)):>7}  ok", flush=True)
+    ok = [row for row in rows if "error" not in row]
     if ok:
-        worst = max(ok, key=lambda r: r["ir"] / base_projects[r["name"]]["ir"]
-                    if base_projects.get(r["name"], {}).get("ir") else 1)
-        line = f"{'geomean':<18}{'':>16}{'':>7}{'':>13}"
-        print(f"{'geomean':<18}{'':>16}{'':>7}{'':>13}{'':>7}{'':>11}{'':>9}{'':>7}  "
+        ir_geo = geomean([row["a"]["ir"] / row["b"]["ir"] for row in ok])
+        build_geo = geomean([row["a"]["build_seconds"] / row["b"]["build_seconds"] for row in ok
+                             if row["a"].get("build_seconds") and row["b"].get("build_seconds")])
+        wall_geo = geomean([statistics.median(row["a"]["wall_seconds"]) / statistics.median(row["b"]["wall_seconds"])
+                            for row in ok])
+        print(f"{'geomean':<18}{'':>30}{'':>13}{'':>13}{'':>7}{'':>9}{'':>9}{'':>7}  "
               f"build {fmt_ratio(build_geo)}  Ir {fmt_ratio(ir_geo)}  wall {fmt_ratio(wall_geo)}"
-              f"  ({len(ok)} projects)", flush=True)
-        if base_projects.get(worst["name"], {}).get("ir"):
-            print(f"worst project: {worst['name']} {fmt_ratio(worst['ir'] / base_projects[worst['name']]['ir'])}",
+              f"  ({len(ok)} projects, {against} is b)", flush=True)
+        return {"ir": ir_geo, "build": build_geo, "wall": wall_geo}
+    return {"ir": None, "build": None, "wall": None}
+
+
+def summarize(results, baseline):
+    base_projects = (baseline or {}).get("projects", {})
+    ir_geo = geomean([row["ir"] / base_projects[row["name"]]["ir"] for row in results
+                      if "ir" in row and base_projects.get(row["name"], {}).get("ir")])
+    build_geo = geomean([row["build_seconds"] / base_projects[row["name"]]["build_seconds"] for row in results
+                         if row.get("build_seconds") and base_projects.get(row["name"], {}).get("build_seconds")])
+    wall_geo = geomean([statistics.median(row["wall_seconds"]) / base_projects[row["name"]]["wall_median"]
+                        for row in results
+                        if "wall_seconds" in row and base_projects.get(row["name"], {}).get("wall_median")])
+    ok = [row for row in results if "ir" in row]
+    if ok:
+        comparable = [row["name"] for row in ok if base_projects.get(row["name"], {}).get("ir")]
+        if comparable:
+            worst = max(comparable, key=lambda name: next(
+                row["ir"] for row in ok if row["name"] == name) / base_projects[name]["ir"])
+            print(f"worst project: {worst} "
+                  f"{fmt_ratio(next(row['ir'] for row in ok if row['name'] == worst) / base_projects[worst]['ir'])}",
                   flush=True)
     return {"ir": ir_geo, "build": build_geo, "wall": wall_geo}
 
@@ -640,6 +699,7 @@ def main():
     parser.add_argument("--tree", default=REPO, help="Minyar tree under test (default: this checkout)")
     parser.add_argument("--projects", default="/home/agent/swarm/realworld",
                         help="directory holding the read-only project copies")
+    parser.add_argument("--against", help="second Minyar tree; both are built and wall samples alternate")
     parser.add_argument("--only", action="append", default=[], help="project names, comma separated")
     parser.add_argument("--json", help="write the full report here")
     parser.add_argument("--baseline", default=os.path.join(HERE, "baseline.json"))
@@ -649,6 +709,8 @@ def main():
     parser.add_argument("--keep-going", action="store_true", help="record failures and continue")
     args = parser.parse_args()
     args.tree = os.path.abspath(args.tree)
+    if args.against:
+        args.against = os.path.abspath(args.against)
     work = os.path.join(args.tree, "build", "realworld")
     os.makedirs(work, exist_ok=True)
     prepared = prepare_data(os.path.join(work, "data"))
@@ -666,29 +728,44 @@ def main():
     clang = default_clang(args.tree)
     identity = tree_identity(args.tree, clang)
     warmed = warm_tree(args.tree, clang, work)
+    other = None
+    if args.against:
+        other_clang = default_clang(args.against)
+        other = {"tree": tree_identity(args.against, other_clang),
+                 "warmup_seconds": warm_tree(args.against, other_clang, work)}
     print(f"tree {identity['path']} commit {identity['commit'][:12] or 'unknown'}"
           f"  projects {args.projects}  baseline {identity_commit(baseline)}"
           f"  warm-up {warmed:.1f}s", flush=True)
+    if other:
+        print(f"against {other['tree']['path']} commit {other['tree']['commit'][:12] or 'unknown'}"
+              f"  warm-up {other['warmup_seconds']:.1f}s", flush=True)
     results = []
     for spec in specs:
         try:
-            results.append(measure(spec, args, work, prepared, clang))
+            if args.against:
+                results.append(measure_pair(spec, args, work, prepared, clang, other_clang))
+            else:
+                staged = stage(spec, args.tree, args, work, prepared, clang, "a")
+                row = dict(staged["row"])
+                row.update(run_stage(spec, staged, work, args.repeat))
+                results.append(row)
         except (Failure, subprocess.CalledProcessError) as error:
-            row = {"name": spec["name"], "error": str(error)}
-            results.append(row)
+            results.append({"name": spec["name"], "error": str(error)})
             if not args.keep_going:
-                print_rows(results, baseline)
+                (print_pair if args.against else print_rows)(results, args.against or baseline)
                 sys.exit(f"{spec['name']}: {error}")
-    print_rows(results, baseline)
-    totals = summarize(results, baseline)
-    doc = {"tree": identity, "threads": THREADS, "warmup_seconds": warmed, "projects_root": os.path.abspath(args.projects),
-           "inputs": {"query_rows": QUERY_ROWS, "sales_sha256": file_hash(prepared["sales"]),
-                      "js_sha256": file_hash(prepared["js"]), "sandbox_requests": SANDBOX_REQUESTS,
-                      "sandbox_sha256": file_hash(prepared["requests"]),
-                      "sim_cases": SIM_CASES, "neo_db_rows": NEO_DB_ROWS,
-                      "neo_db_iterations": NEO_DB_ITERATIONS, "js_fuel": JS_FUEL,
-                      "sql": SQL, "sandbox_lines": SANDBOX_REQUESTS},
+    if args.against:
+        print_pair(results, args.against)
+        totals = pair_totals(results)
+    else:
+        print_rows(results, baseline)
+        totals = summarize(results, baseline)
+    doc = {"tree": identity, "threads": THREADS, "warmup_seconds": warmed,
+           "projects_root": os.path.abspath(args.projects),
+           "inputs": inputs_document(prepared),
            "geomean": totals, "projects": results}
+    if other:
+        doc["against"] = other["tree"]
     if args.json:
         os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
         with open(args.json, "w") as f:
@@ -696,14 +773,54 @@ def main():
     if args.write_baseline:
         base = {"tree": identity, "inputs": doc["inputs"],
                 "geomean": {"ir": 1.0, "build": 1.0, "wall": 1.0},
-                "projects": {r["name"]: {key: r.get(key) for key in
-                                         ("build_seconds", "ir", "wall_median", "output_sha256", "commit")}
-                             for r in results if "ir" in r}}
+                "projects": {row["name"]: {
+                    "build_seconds": row.get("build_seconds"),
+                    "ir": row.get("ir"),
+                    "wall_median": statistics.median(row["wall_seconds"]) if row.get("wall_seconds") else None,
+                    "output_sha256": row.get("output_sha256"),
+                    "commit": row.get("commit")}
+                    for row in results if "ir" in row}}
         with open(args.write_baseline, "w") as f:
             json.dump(base, f, indent=1)
         print(f"wrote baseline {args.write_baseline}", flush=True)
-    failed = [r for r in results if "error" in r]
+    failed = [row for row in results if "error" in row]
     return 1 if failed else 0
+
+
+def measure_pair(spec, args, work, prepared, clang, other_clang):
+    """Build both trees, count instructions for both, then interleave wall samples."""
+    a = stage(spec, args.tree, args, work, dict(prepared), clang, "a")
+    b = stage(spec, args.against, args, work, dict(prepared), other_clang, "b")
+    measured_a = run_stage(spec, a, work, 0)
+    measured_b = run_stage(spec, b, work, 0)
+    if spec.get("stable_output", True) and measured_a["output_sha256"] != measured_b["output_sha256"]:
+        raise Failure(f"{spec['name']}: the two trees produce different workload output")
+    samples, digests = wall_pair({"a": a, "b": b}, args.repeat)
+    for key, measured in (("a", measured_a), ("b", measured_b)):
+        if spec.get("stable_output", True) and digests[key] != measured["output_sha256"]:
+            raise Failure(f"{spec['name']}: wall output differs from the counted output")
+        measured["wall_seconds"] = samples[key]
+    return {"name": spec["name"], "commit": a["row"].get("commit"), "a": measured_a, "b": measured_b}
+
+
+def pair_totals(results):
+    ok = [row for row in results if "error" not in row]
+    if not ok:
+        return {"ir": None, "build": None, "wall": None}
+    return {"ir": geomean([row["a"]["ir"] / row["b"]["ir"] for row in ok]),
+            "build": geomean([row["a"]["build_seconds"] / row["b"]["build_seconds"] for row in ok
+                              if row["a"].get("build_seconds") and row["b"].get("build_seconds")]),
+            "wall": geomean([statistics.median(row["a"]["wall_seconds"]) / statistics.median(row["b"]["wall_seconds"])
+                             for row in ok])}
+
+
+def inputs_document(prepared):
+    return {"query_rows": QUERY_ROWS, "sales_sha256": file_hash(prepared["sales"]),
+            "js_sha256": file_hash(prepared["js"]), "sandbox_requests": SANDBOX_REQUESTS,
+            "sandbox_sha256": file_hash(prepared["requests"]),
+            "sim_cases": SIM_CASES, "neo_db_rows": NEO_DB_ROWS,
+            "neo_db_iterations": NEO_DB_ITERATIONS, "js_fuel": JS_FUEL,
+            "sql": SQL, "sandbox_lines": SANDBOX_REQUESTS}
 
 
 def identity_commit(baseline):

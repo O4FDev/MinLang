@@ -16,6 +16,18 @@ One line per project: build seconds, workload retired instructions
 against `baseline.json`, recorded on goal/2026-10-30; the final line is the
 geomean of each ratio column.
 
+To judge one change or one merged batch directly, name the base tree instead of
+relying on the stored baseline:
+
+```sh
+python3 benchmarks/realworld/run.py --tree /home/agent/swarm/batch3 \
+    --against /home/agent/swarm/base --projects /home/agent/swarm/realworld --repeat 5
+```
+
+Both trees are built; instruction counts are compared exactly and the wall
+samples alternate between the two binaries every round. `--no-build` reuses the
+artifacts only when they were built by the same tree (`<artifact>.rw-tree`).
+
 ## Projects and workloads
 
 | project | build | workload |
