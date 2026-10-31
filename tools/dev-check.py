@@ -425,21 +425,20 @@ def command_index(arguments):
                         "make", "--no-print-directory", "check-in-parallel", "CHECKS=" + " ".join(failed),
                         f"CHECK_JOBS={arguments.jobs}"], cwd=root, env=retry_environment)
         traces.append(retry)
-        retried, retry_times = latest_results(root)
-        for item in (retried or {}).get("checks", []):
-            if item["target"] in failed and item["passed"]:
-                passed[item["target"]] = True
-                times[item["target"]] = (retry_times or {}).get(item["target"], times.get(item["target"], {}))
-                times[item["target"]]["passed"] = True
+        _, retry_times = latest_results(root)  # results.json lists failures only; times.tsv lists every check
+        for name, timing in (retry_times or {}).items():
+            if name in failed and timing["passed"]:
+                passed[name] = True
+                times[name] = timing
         still = [name for name in failed if not passed.get(name)]
         if still:
             say(f"running {len(still)} check(s) untraced: {' '.join(still)}")
             subprocess.run(["make", "--no-print-directory", "check-in-parallel", "CHECKS=" + " ".join(still),
                             f"CHECK_JOBS={arguments.jobs}"], cwd=root, env=clean_environment())
-            plain, _ = latest_results(root)
-            for item in (plain or {}).get("checks", []):
-                if item["target"] in still:
-                    untraced_pass[item["target"]] = item["passed"]
+            _, plain_times = latest_results(root)
+            for name, timing in (plain_times or {}).items():
+                if name in still:
+                    untraced_pass[name] = timing["passed"]
     elif arguments.reuse_trace and trace.with_name(trace.stem + "-retry.log").exists():
         traces.append(trace.with_name(trace.stem + "-retry.log"))
     reads, listed, executed = {name: set() for name in checks}, {name: set() for name in checks}, {name: set() for name in checks}
@@ -462,7 +461,8 @@ def command_index(arguments):
         entries[check] = {
             "static": check in aggregate,
             "passed": bool(status) or untraced_pass.get(check, False) or check in aggregate,
-            "traced": bool(status) and bool(reads[check] or listed[check]),
+            # A phony check without a recipe has nothing of its own to observe.
+            "traced": bool(status) and bool(reads[check] or listed[check] or not database["rules"].get(check, {}).get("recipe")),
             "wall_ms": timing.get("wall_ms", 0), "cpu_ms": timing.get("cpu_ms", 0),
             "reads": sorted(number(path) for path in reads[check]),
             "listed": sorted(number(path) for path in listed[check]),
