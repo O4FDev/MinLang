@@ -34,7 +34,7 @@ static MINYAR_THREAD_LOCAL RcBoundedObjects rc_objects;
 /* One unit retires at most this many small records: the one it starts from and
  * the small-record children it reaches directly. Constant work per unit. */
 #ifndef RC_SMALL_RECORD_UNIT_OBJECTS
-#define RC_SMALL_RECORD_UNIT_OBJECTS 4
+#define RC_SMALL_RECORD_UNIT_OBJECTS 8
 #endif
 /* A reference List with at most this many slots is a small aggregate too: one
  * unit visits its elements and finalizes it. */
@@ -560,64 +560,6 @@ static size_t rc_bounded_schedule(size_t budget) {
          * Match the general scheduler's next queue after any object work;
          * empty and zero-budget polls leave that state unchanged. */
         while (work < budget && (*pending)) {
-            /* With one unvisited unary record, locality makes its field visit
-             * and finalization the next two units. There is no competing old
-             * task to bypass, and dropping one child creates at most one task.
-             * Keep per-unit state updates around rc_drop in reference order. */
-            if ((*pending) == 1 && !q->active && budget - work >= 2) {
-                RcObject *single = q->head ? q->head : q->recent_head;
-                if (single && (single->ownership & 7) == RC_RECORD) {
-                    MinyarRecord *record = (MinyarRecord *)(single + 1);
-                    if (record->length == 1) {
-                        unsigned char *map = (unsigned char *)(record->values + 1);
-                        if (!rc_bounded_saved_cursor(single)) {
-                            q->head = q->tail = NULL;
-                            q->recent_head = q->recent_tail = NULL;
-                            single->ownership = RC_RECORD;
-                            q->active = single;
-                            q->cursor = 1;
-                            for (;;) {
-                                RcObject *next = NULL;
-                                /* Carry a unique unary child only when this
-                                 * poll can also finish its next pair. The final
-                                 * pair publishes normal queue/count state, so
-                                 * an odd budget still resumes identically.
-                                 * Intermediate dead ownership is local to this
-                                 * non-reentrant poll, with no competing tasks. */
-                                if (budget - work >= 4 && (map[0] & 1) && record->values[0]) {
-                                    RcObject *child = (RcObject *)(uintptr_t)record->values[0] - 1;
-                                    if (child->ownership == (8 | RC_RECORD) &&
-                                        ((MinyarRecord *)(child + 1))->length == 1)
-                                        next = child;
-                                }
-                                if (next) {
-                                    /* Live maps contain flags0/1, hence their
-                                     * saved cursor is already zero. No queue or
-                                     * cursor initialization is needed in transit. */
-                                    next->ownership = RC_RECORD;
-                                    rc_bounded_finish_object(single, RC_RECORD);
-                                    work += 2;
-                                    single = next;
-                                    record = (MinyarRecord *)(single + 1);
-                                    map = (unsigned char *)(record->values + 1);
-                                    q->active = single;
-                                    continue;
-                                }
-                                q->recent_turn ^= 1;
-                                if (map[0] & 1) rc_drop_in(q, pending, (void *)(uintptr_t)record->values[0]);
-                                q->recent_turn ^= 1;
-                                rc_bounded_finish_object(single, RC_RECORD);
-                                --*pending;
-                                q->active = NULL;
-                                work += 2;
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                }
-            }
-
             if (!q->recent_head && q->active &&
                 (q->active->ownership & 7) == RC_RECORD) {
                 MinyarRecord *record = (MinyarRecord *)(q->active + 1);
