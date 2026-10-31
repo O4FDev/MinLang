@@ -34,29 +34,25 @@ check-quic-rfc check-quic-rfc-sanitize $(QUIC_RFC_PARTS:%=check-quic-rfc-%) $(QU
 # its drivers execute. The local/vn pieces bind MINYAR_QUIC_RFC_PORT, +1 and +2, so
 # every network piece owns its own block (44320/44330 native, 44340/44350 sanitized);
 # the migration/cipher pieces bind nothing and keep the historical sanitize port 44310.
+# The harness self-test runs once per variant, as before the split: in the O0 migration piece.
 
 check-quic-rfc-o0-migration: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
 	./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-native-o0-migration.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native-o0-migration.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization 0 --drivers migration --artifacts "$$artifacts/run"
 
 check-quic-rfc-o0-cipher: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-native-o0-cipher.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native-o0-cipher.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization 0 --drivers cipher --artifacts "$$artifacts/run"
 
 check-quic-rfc-o0-network: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	MINYAR_QUIC_RFC_PORT=44320 ./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-native-o0-network.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native-o0-network.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44320 MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization 0 --drivers local,vn --artifacts "$$artifacts/run"
 
 check-quic-rfc-o2-migration: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-native-o2-migration.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native-o2-migration.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization 2 --drivers migration --artifacts "$$artifacts/run"
 
 check-quic-rfc-o2-cipher: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-native-o2-cipher.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native-o2-cipher.XXXXXXXX"); MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization 2 --drivers cipher --artifacts "$$artifacts/run"
 
 check-quic-rfc-o2-network: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	MINYAR_QUIC_RFC_PORT=44330 ./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-native-o2-network.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-native-o2-network.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44330 MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/quic-rfc --optimization 2 --drivers local,vn --artifacts "$$artifacts/run"
 
 check-quic-rfc-sanitize-o0-migration: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
@@ -64,23 +60,18 @@ check-quic-rfc-sanitize-o0-migration: check-quic-protocol-artifacts $(QUIC_RFC_F
 	@set -e; rm -rf -- build/quic-rfc-sanitize-o0-migration.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize-o0-migration.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44310 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization 0 --drivers migration --sanitize --artifacts "$$artifacts/run"
 
 check-quic-rfc-sanitize-o0-cipher: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	MINYAR_QUIC_RFC_PORT=44310 ./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-sanitize-o0-cipher.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize-o0-cipher.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44310 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization 0 --drivers cipher --sanitize --artifacts "$$artifacts/run"
 
 check-quic-rfc-sanitize-o0-network: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	MINYAR_QUIC_RFC_PORT=44310 ./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-sanitize-o0-network.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize-o0-network.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44340 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization 0 --drivers local,vn --sanitize --artifacts "$$artifacts/run"
 
 check-quic-rfc-sanitize-o2-migration: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	MINYAR_QUIC_RFC_PORT=44310 ./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-sanitize-o2-migration.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize-o2-migration.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44310 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization 2 --drivers migration --sanitize --artifacts "$$artifacts/run"
 
 check-quic-rfc-sanitize-o2-cipher: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	MINYAR_QUIC_RFC_PORT=44310 ./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-sanitize-o2-cipher.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize-o2-cipher.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44310 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization 2 --drivers cipher --sanitize --artifacts "$$artifacts/run"
 
 check-quic-rfc-sanitize-o2-network: check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS) | build
-	MINYAR_QUIC_RFC_PORT=44310 ./build/tooling/tests/quic-rfc-harness
 	@set -e; rm -rf -- build/quic-rfc-sanitize-o2-network.*; artifacts=$$(mktemp -d "$(abspath build)/quic-rfc-sanitize-o2-network.XXXXXXXX"); MINYAR_QUIC_RFC_PORT=44350 $(NATIVE_SANITIZER_ENV) MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/quic-rfc --optimization 2 --drivers local,vn --sanitize --artifacts "$$artifacts/run"
 
 check-quic-rfc: $(QUIC_RFC_PARTS:%=check-quic-rfc-%) check-quic-protocol-artifacts $(QUIC_RFC_FRONTENDS) $(QUIC_RFC_INPUTS)
