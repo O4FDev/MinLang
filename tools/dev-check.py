@@ -456,11 +456,11 @@ def command_index(arguments):
         # A runner console log of the traced gate (the runner keeps only its latest run directory).
         results, times = {"checks": []}, {}
         for line in Path(arguments.results_log).read_text(errors="replace").splitlines():
-            match = re.match(r"^(check-[^:\s]+): (passed|FAILED) wall_ms=(\d+).*?rss_kib=([\d.]+) ([\d.]+)", line)
+            match = re.match(r"^([^:\s]+): (passed|FAILED) wall_ms=(\d+).*?rss_kib=([\d.]+) ([\d.]+)", line)
             if match:
                 times[match.group(1)] = {"wall_ms": int(match.group(3)), "passed": match.group(2) == "passed",
                                          "cpu_ms": int((float(match.group(4)) + float(match.group(5))) * 1000)}
-            elif re.match(r"^(check-[^:\s]+): FAILED", line):
+            elif re.match(r"^([^:\s]+): FAILED", line):
                 times[line.split(":")[0]] = {"wall_ms": 0, "cpu_ms": 0, "passed": False}
     times = dict(times or {})
     passed = {item["target"]: item["passed"] for item in (results or {}).get("checks", [])}
