@@ -609,7 +609,101 @@ function provisionalBorrow(context: CompilerContext, output: List<Text>, state: 
     borrows.values.add(value)
     borrows.types.add(type)
     borrows.functions.add(borrows.current)
+    borrows.bodyStarts.add(-1)
+    borrows.bodyEnds.add(-1)
     output.add("")
+}
+
+// A `for` element's owner, needed only because the loop body (pieces
+// bodyStart..bodyEnd) calls user code: reserve its slot and leave its owner
+// piece empty; finishProvisionalBorrows fills it unless every call there is
+// release-free.
+function provisionalElementOwner(context: CompilerContext, output: List<Text>, state: List<Integer>, piece: Integer, id: Integer, value: Text, type: Integer, bodyStart: Integer, bodyEnd: Integer) {
+    let borrows = context.provisionalBorrows
+    let slot = ownershipSlot(state, id)
+    if slot < 0 { return }
+    state[6] = 1
+    noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, piece, type, 0)
+    borrows.pieces.add(piece)
+    borrows.slots.add(slot)
+    borrows.values.add(value)
+    borrows.types.add(type)
+    borrows.functions.add(borrows.current)
+    borrows.bodyStarts.add(bodyStart)
+    borrows.bodyEnds.add(bodyEnd)
+}
+
+// Releasing an owner or temporary of one's own, or taking a field of a record
+// one owns, drops only counts the running function holds.
+function ownCountCallee(callee: Text): Boolean {
+    return callee.startsWith("@minyar_rc_release(") || callee.startsWith("@minyar_rc_enter(") || callee.startsWith("@minyar_record_take_field(")
+}
+
+// A field store into a record this code created (the store's record is the
+// value of a record_new call in the same code) fills a record no one else
+// holds yet: it can release only a count this code added.
+function freshRecordStore(code: Text, callee: Text): Boolean {
+    if !(callee.startsWith("@minyar_record_set(ptr %") || callee.startsWith("@minyar_record_set_take(ptr %") || callee.startsWith("@minyar_record_set_reference(ptr %")) { return false }
+    let open = callee.find("(ptr ")
+    let rest = callee.slice(open + 5, callee.length)
+    let comma = rest.find(",")
+    if comma < 0 { return false }
+    let record = rest.slice(0, comma)
+    return code.find(" " + record + " = call ptr @minyar_record_new(") >= 0 || code.find(" " + record + " = call ptr @minyar_record_new_scalar(") >= 0
+}
+
+// Whether code in pieces start..end calls only runtime operations in the
+// loop-body set (with `strict`, without container stores, plus releases of its
+// own counts) and internal functions that are release-free themselves. Such
+// calls cannot release a List slot, record field or Map value that a caller's
+// borrowed element depends on. memo, per provisional function: 0 unknown,
+// 1 being decided (a call cycle assumes free), 2 free, 3 not free; touched
+// lists those set to 1 or 2 by this query, for the caller to reset on failure.
+function releaseFreeCalls(context: CompilerContext, output: List<Text>, start: Integer, end: Integer, strict: Boolean, lookup: GenericIndex, memo: List<Integer>, touched: List<Integer>): Boolean {
+    let pieces: List<Text> = []
+    let index = start
+    while index < end {
+        pieces.add(output[index])
+        index = index + 1
+    }
+    let code = joinText(pieces)
+    if code.find("invoke ") >= 0 { return false }
+    // Each part after the first starts right after a "call " and holds its callee.
+    let parts = code.split("call ")
+    let part = 1
+    while part < parts.length {
+        let rest = parts[part]
+        let at = rest.find("@")
+        let indirect = rest.find("%")
+        if at < 0 || (indirect >= 0 && indirect < at) { return false }
+        let callee = rest.slice(at, rest.length)
+        if callee.startsWith("@.minyar.fn.") {
+            let open = callee.find("(")
+            if open < 0 { return false }
+            let function = genericIndexGet(lookup, callee.slice(1, open))
+            if function < 0 || !releaseFreeFunction(context, output, function, lookup, memo, touched) { return false }
+        } else if !(loopBodyCallee(callee, strict) || (strict && (ownCountCallee(callee) || freshRecordStore(code, callee))) || parallelCallee(context, callee)) { return false }
+        part = part + 1
+    }
+    return true
+}
+
+function releaseFreeFunction(context: CompilerContext, output: List<Text>, function: Integer, lookup: GenericIndex, memo: List<Integer>, touched: List<Integer>): Boolean {
+    let borrows = context.provisionalBorrows
+    if memo[function] == 1 || memo[function] == 2 { return true }
+    if memo[function] == 3 { return false }
+    if borrows.ends[function] < 0 {
+        memo[function] = 3
+        return false
+    }
+    memo[function] = 1
+    touched.add(function)
+    if releaseFreeCalls(context, output, borrows.starts[function] + 1, borrows.ends[function], true, lookup, memo, touched) {
+        memo[function] = 2
+        return true
+    }
+    memo[function] = 3
+    return false
 }
 
 // The owner slot an rc_local family call at this piece names, or -1.
@@ -694,12 +788,31 @@ function finishProvisionalBorrows(context: CompilerContext, output: List<Text>, 
     let activeTypes: List<Integer> = []
     let kept: List<Boolean> = []
     while kept.length < borrows.starts.length { kept.add(false) }
+    let lookup = newGenericIndex()
+    let memo: List<Integer> = []
+    while memo.length < borrows.starts.length {
+        if borrows.names[memo.length] != "" { genericIndexPut(lookup, borrows.names[memo.length], memo.length) }
+        if borrows.natives[memo.length] { memo.add(2) } else { memo.add(0) }
+    }
     let index = 0
     while index < borrows.pieces.length {
         let function = borrows.functions[index]
         let slot = borrows.slots[index]
         let type = choiceOwnershipType(context, borrows.types[index])
-        if roots.length > 0 && cycleTypeActive(type, roots, counts, fields, seenTypes, activeTypes) {
+        let keep = roots.length > 0 && cycleTypeActive(type, roots, counts, fields, seenTypes, activeTypes)
+        if !keep && borrows.bodyStarts[index] >= 0 {
+            let touched: List<Integer> = []
+            keep = !releaseFreeCalls(context, output, borrows.bodyStarts[index], borrows.bodyEnds[index], false, lookup, memo, touched)
+            if keep {
+                // Answers that assumed a function still being decided was free.
+                let reset = 0
+                while reset < touched.length {
+                    if memo[touched[reset]] != 3 { memo[touched[reset]] = 0 }
+                    reset = reset + 1
+                }
+            }
+        }
+        if keep {
             output[borrows.pieces[index]] = "  call void @minyar_rc_local(i64 " + Text(slot) + ", ptr " + borrows.values[index] + ")\n"
             kept[function] = true
         } else {

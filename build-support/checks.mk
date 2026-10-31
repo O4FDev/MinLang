@@ -32,6 +32,12 @@ check-match-payload-borrows: build/minyarc build/minyarc-sanitize build/tooling/
 	$(LIMITED) ./build/tooling/tests/match-payload-borrows
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/match-payload-borrows
 
+.PHONY: check-element-owner-calls
+check check-portable: check-element-owner-calls
+check-element-owner-calls: build/minyarc build/minyarc-sanitize build/tooling/tests/element-owner-calls
+	$(LIMITED) ./build/tooling/tests/element-owner-calls
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/element-owner-calls
+
 .PHONY: check-result-try-consumption
 check check-portable: check-result-try-consumption
 check-result-try-consumption: build/minyarc build/minyarc-sanitize build/tooling/tests/result-try-consumption

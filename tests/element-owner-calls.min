@@ -1,0 +1,111 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "./frontend-fixtures.min" as fixtures
+
+function body(ir: Text, name: Text): Text {
+    let found = false
+    let complete = false
+    let parts: List<Text> = []
+    for line in test.lines(ir) {
+        if !found && test.contains(line, "define ") && (test.contains(line, "@.minyar.fn." + name + "(") || test.moduleFunction(line, name)) { found = true }
+        else if found {
+            if line == "}" { complete = true; break }
+            parts.add(line + "\n")
+        }
+    }
+    test.check(found && complete, "missing element owner function " + name)
+    return joinText(parts)
+}
+
+function count(source: Text, needle: Text): Integer {
+    let found = 0
+    let rest = source
+    let position = rest.find(needle)
+    while position >= 0 {
+        found += 1
+        rest = rest.slice(position + needle.length, rest.length)
+        position = rest.find(needle)
+    }
+    return found
+}
+
+function owners(ir: Text, name: Text): Integer {
+    let emitted = body(ir, name)
+    return count(emitted, "call void @minyar_rc_local(") + count(emitted, "call void @minyar_rc_local_traced(")
+}
+
+let frontend = fixtures.fixture("MINYAR_TEST_COMPILER", "./build/minyarc")
+let compiler = frontend.compiler
+// A `for` element borrowed from its List needs an owner across a user call
+// only if some function that call can reach may release a List slot, record
+// field or Map value: then the List could drop the element mid-iteration.
+let source = #"""
+    use "process" as processInfo
+    record Item { name: Text; size: Integer }
+    record Bag { items: List<Item>; label: Text }
+
+    function weight(item: Item): Integer { return item.size + item.name.length }
+    function arguments(item: Item): Integer { return processInfo.argumentCount() * 0 + item.size }
+    function fresh(item: Item): Bag { return Bag { items: [item]; label: item.name + "!" } }
+    function even(depth: Integer, item: Item): Integer {
+        if depth == 0 { return weight(item) }
+        return odd(depth - 1, item)
+    }
+    function odd(depth: Integer, item: Item): Integer {
+        if depth == 0 { return 0 }
+        return even(depth - 1, item)
+    }
+    function total(items: List<Item>): Integer {
+        let sum = 0
+        for item in items { sum += weight(item) + fresh(item).label.length + even(3, item) + arguments(item) }
+        return sum
+    }
+    function shrink(items: List<Item>): Integer {
+        items.pop()
+        return 1
+    }
+    function popping(items: List<Item>): Integer {
+        let sum = 0
+        for item in items { sum += shrink(items) + item.name.length }
+        return sum
+    }
+    function relabel(bag: Bag): Integer {
+        bag.items = [Item { name: "new" + "!"; size: 1 }]
+        return 0
+    }
+    function replacing(bag: Bag): Integer {
+        let sum = 0
+        let items = bag.items
+        for item in items { sum += relabel(bag) + item.size }
+        return sum
+    }
+    function swap(items: List<Item>) {
+        items[0] = Item { name: "swapped" + "!"; size: 9 }
+    }
+    function indirect(items: List<Item>): Integer {
+        let sum = 0
+        for item in items { sum += odd(1, item); swap(items); sum += item.name.length }
+        return sum
+    }
+
+    let items = [Item { name: "ab" + "c"; size: 2 }, Item { name: "d" + "e"; size: 5 }]
+    print(total(items))
+    print(popping([Item { name: "xy" + "z"; size: 1 }, Item { name: "w" + ""; size: 1 }]))
+    print(replacing(Bag { items: [Item { name: "pq" + "r"; size: 4 }]; label: "b" + "" }))
+    print(indirect([Item { name: "kl" + "m"; size: 3 }]))
+    """#
+let expected = "26\n4\n4\n9\n"
+
+test.require(fixtures.compile(frontend, source), "compile element owner IR")
+let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+// Calls that only read, allocate, fill records they create, call a runtime
+// native given only scalars or Text, or recurse among themselves leave the
+// element borrowed.
+test.check(owners(ir, "total") == 0, "total: release-free calls leave the element borrowed")
+// A reachable List removal, record field store or indexed replacement keeps it.
+test.check(owners(ir, "popping") > 0, "popping: a callee that pops the walked List keeps the element owner")
+test.check(owners(ir, "replacing") > 0, "replacing: a callee that stores a record field keeps the element owner")
+test.check(owners(ir, "indirect") > 0, "indirect: a callee that replaces a List slot keeps the element owner")
+fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+test.removeTree(compiler.directory)
+print("Element owner calls: passed")
