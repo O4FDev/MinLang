@@ -451,9 +451,18 @@ runtime profile, including the compiler's arena, stores a record as its field
 count followed by its fields. The type checker resolves each field to a constant
 position below that count and records never resize, so the helpers
 (`.minyar.record.get`, `.minyar.record.set.scalar`) read or write the slot with
-no length test. Reference fields keep their ownership-aware runtime setters.
+no length test. Positions below 16 have their own accessor
+(`.minyar.record.get.K`) and their own child tag under `minyar record field`, so
+a store to one field position cannot force a reload of another; later positions
+share the parent tag, which aliases every tagged position. A tagged position is
+byte offset 8 + 8K in any record, so the separation holds without type
+information. The accessors are chosen where the call is emitted: a shared
+helper switching on the field would be simplified before inlining and would
+merge the tags. Reference fields keep their ownership-aware runtime setters.
 `make check-record-access` checks the helper IR, its inlining at O2, the absence
-of a failure path and the arena layout.
+of a failure path and the arena layout; `check-llvm-helper-contracts` proves at
+O2 that a store to field A keeps a load of field B, while a store to the same
+field still reloads it.
 
 A compound Map assignment `m[k] op= v` with an Integer, Text, Float, Boolean,
 Character or payload-free choice key and a non-reference value looks the key up

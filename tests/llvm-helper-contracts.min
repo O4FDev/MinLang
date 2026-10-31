@@ -96,6 +96,15 @@ for name in ["bytes.get.checked", "bytes.set.checked", "list.get.checked", "list
 for name in ["record.get", "record.set.scalar"] {
     test.check(test.contains(body(llvm, ".minyar." + name), "ptr %slot, !tbaa !{!{!\"minyar record field\", !{!\"minyar\"}, i64 0}"), name + " must tag the record field")
 }
+// Each tagged position has its own accessor and its own child tag; a store at
+// one position therefore cannot invalidate a load at another. The parent tag
+// above stays for later positions and aliases every child.
+for position in 0..16 {
+    let field = Text(position)
+    for name in ["record.get." + field, "record.set.scalar." + field] {
+        test.check(test.contains(body(llvm, ".minyar." + name), "ptr %slot, !tbaa !{!{!\"minyar record field " + field + "\", !{!\"minyar record field\", !{!\"minyar\"}, i64 0}"), name + " must tag its own field position")
+    }
+}
 test.check(test.contains(body(llvm, ".minyar.list.length"), "!tbaa !{!{!\"minyar list header\""), "List length must tag the header")
 
 // The tags let O2 keep a List length across a record field or List slot store;
@@ -119,6 +128,30 @@ if compiler.flags.length == 0 { for probe in [["field", "1"], ["slot", "1"], ["r
     let loads = 0
     for line in test.lines(body(optimized, ".minyar.fn." + probe[0])) { if test.contains(line, " = load i64, ptr ") { loads += 1 } }
     test.check(Text(loads) == probe[1], probe[0] + ": expected " + probe[1] + " length loads at O2, found " + Text(loads))
+} }
+
+// A store to one record field position must not force a reload of another
+// position: at O2 `apart` keeps q.b across the store to r.a. BasicAA cannot
+// separate two distinct record parameters, so only the per-position TBAA tag
+// does. The control stores the same position and still reloads.
+let positions = #"""
+record Pair2 { a: Integer; b: Integer }
+function apart(q: Pair2, r: Pair2): Integer { let current = q.b; r.a = 5; return current + q.b }
+function same(q: Pair2, r: Pair2): Integer { let current = q.b; r.b = 5; return current + q.b }
+print(apart(Pair2 { a: 1; b: 2 }, Pair2 { a: 3; b: 4 }))
+print(same(Pair2 { a: 1; b: 2 }, Pair2 { a: 3; b: 4 }))
+"""#
+test.executes(compiler, positions, "4\n4\n")
+let positionsPath = compiler.directory + "/case" + Text(compiler.serial)
+let positionsOptimize = [compiler.clang, "-O2", "-Wno-override-module", "-S", "-emit-llvm"]
+for flag in compiler.flags { positionsOptimize.add(flag) }
+for item in [positionsPath + ".ll", "-o", positionsPath + ".optimized.ll"] { positionsOptimize.add(item) }
+test.require(test.run(positionsOptimize, system.environment(), "", positionsPath + ".optimize", compiler.linkTimeout), "optimize record position probe")
+let positionsOptimized = io.readTextFile(positionsPath + ".optimized.ll")
+if compiler.flags.length == 0 { for probe in [["apart", "1"], ["same", "2"]] {
+    let loads = 0
+    for line in test.lines(body(positionsOptimized, ".minyar.fn." + probe[0])) { if test.contains(line, " = load i64, ptr ") { loads += 1 } }
+    test.check(Text(loads) == probe[1], probe[0] + ": expected " + probe[1] + " field loads at O2, found " + Text(loads))
 } }
 
 // A parallel function cannot resize a buffer and its caller waits for it, so

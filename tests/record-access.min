@@ -45,14 +45,24 @@ let llvm = io.readTextFile(path + ".ll")
 for expected in ["define internal i64 @.minyar.record.get(ptr %record, i64 %field) alwaysinline {\nentry:\n  %values = getelementptr inbounds i8, ptr %record, i64 8\n  %slot = getelementptr inbounds i64, ptr %values, i64 %field\n  %value = load i64, ptr %slot, !tbaa !{!{!\"minyar record field\", !{!\"minyar\"}, i64 0}, !{!\"minyar record field\", !{!\"minyar\"}, i64 0}, i64 0}\n  ret i64 %value\n}", "define internal void @.minyar.record.set.scalar(ptr %record, i64 %field, i64 %value) alwaysinline {\nentry:\n  %values = getelementptr inbounds i8, ptr %record, i64 8\n  %slot = getelementptr inbounds i64, ptr %values, i64 %field\n  store i64 %value, ptr %slot, !tbaa !{!{!\"minyar record field\", !{!\"minyar\"}, i64 0}, !{!\"minyar record field\", !{!\"minyar\"}, i64 0}, i64 0}\n  ret void\n}"] {
     test.check(test.contains(llvm, expected), "missing record helper IR: " + expected)
 }
+// Positions below the tagged limit each have a distinct accessor and tag, so a
+// store to one field position cannot invalidate another. Later positions share
+// the parent helper and tag.
+for position in 0..16 {
+    let field = Text(position)
+    test.check(test.contains(llvm, "define internal i64 @.minyar.record.get." + field + "(ptr %record) alwaysinline {"), "missing tagged record getter " + field)
+    test.check(test.contains(llvm, "define internal void @.minyar.record.set.scalar." + field + "(ptr %record, i64 %value) alwaysinline {"), "missing tagged record setter " + field)
+    test.check(test.contains(llvm, "ptr %slot, !tbaa !{!{!\"minyar record field " + field + "\", !{!\"minyar record field\", !{!\"minyar\"}, i64 0}"), "record accessor " + field + " must tag its own field position")
+}
 test.check(!test.contains(llvm, "noalias"), "record IR incorrectly claims noalias")
 
 // Program field reads and scalar writes use the inline helpers with constant fields.
 let program = test.withoutRuntimeHelpers(llvm)
 test.check(!test.contains(program, "call i64 @minyar_record_get("), "record field read called the runtime getter")
 test.check(!test.contains(program, "call void @minyar_record_set_scalar("), "scalar field write called the runtime setter")
-test.check(test.contains(program, "call i64 @.minyar.record.get(ptr ") && test.contains(program, ", i64 4)"), "record reads must name constant fields")
-test.check(count(program, "call void @.minyar.record.set.scalar(ptr ") >= 4, "scalar record writes must use the inline setter")
+test.check(test.contains(program, "call i64 @.minyar.record.get.4(ptr ") && test.contains(program, "call i64 @.minyar.record.get.0(ptr "), "record reads must name their constant field position")
+test.check(!test.contains(program, "call i64 @.minyar.record.get(ptr "), "a tagged field position must use its own accessor")
+test.check(count(program, "call void @.minyar.record.set.scalar") >= 4, "scalar record writes must use the inline setter")
 test.check(test.contains(program, "call void @minyar_record_set_take(") || test.contains(program, "call void @minyar_record_set_reference("), "reference fields keep their ownership-aware setters")
 
 // Optimized code inlines every field access.
@@ -61,7 +71,8 @@ for flag in compiler.flags { optimize.add(flag) }
 for item in [path + ".ll", "-o", path + ".optimized.ll"] { optimize.add(item) }
 test.require(test.run(optimize, system.environment(), "", path + ".optimize", compiler.linkTimeout), "optimize record IR")
 let optimized = io.readTextFile(path + ".optimized.ll")
-test.check(!test.contains(optimized, "call i64 @.minyar.record.get(") && !test.contains(optimized, "call void @.minyar.record.set.scalar("), "record helpers must inline")
+test.check(!test.contains(optimized, " = call i64 @.minyar.record.get") && !test.contains(optimized, "  call void @.minyar.record.set.scalar"), "record helpers must inline")
+test.check(!test.contains(optimized, "define internal i64 @.minyar.record.get") && !test.contains(optimized, "define internal void @.minyar.record.set.scalar"), "unused record helpers must be removed")
 test.check(!test.contains(optimized, "call i64 @minyar_record_get(") && !test.contains(optimized, "call void @minyar_record_set_scalar("), "static field access must not keep a length-check failure path")
 
 // The compiler's arena runtime shares the record layout the helpers read.

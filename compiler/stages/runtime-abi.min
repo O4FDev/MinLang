@@ -193,6 +193,9 @@ bad:
 ; Inline record fields. ABI: { length, values[] } in every runtime profile.
 ; Records never grow and the type checker resolves every field to a constant
 ; position below the record's field count, so access needs no length check.
+; Positions below the tagged limit have their own accessor and TBAA tag, so a
+; store to one field position cannot force a reload of another. Later positions
+; share the parent tag, which aliases every tagged position.
 define internal i64 @.minyar.record.get(ptr %record, i64 %field) alwaysinline {
 entry:
   %values = getelementptr inbounds i8, ptr %record, i64 8
@@ -319,6 +322,46 @@ good:
 }
 ")
 
+    // One accessor per tagged field position. A shared helper that switched on
+    // the field would be simplified before inlining, merging the per-position
+    // tags; distinct callees keep each access's tag through optimization.
+    let position = 0
+    while position < recordTaggedFieldLimit() {
+        let field = Text(position)
+        let tag = recordFieldTag(position)
+        output.add("define internal i64 @.minyar.record.get." + field + "(ptr %record) alwaysinline {\nentry:\n  %values = getelementptr inbounds i8, ptr %record, i64 8\n  %slot = getelementptr inbounds i64, ptr %values, i64 " + field + "\n  %value = load i64, ptr %slot, " + tag + "\n  ret i64 %value\n}\n")
+        output.add("define internal void @.minyar.record.set.scalar." + field + "(ptr %record, i64 %value) alwaysinline {\nentry:\n  %values = getelementptr inbounds i8, ptr %record, i64 8\n  %slot = getelementptr inbounds i64, ptr %values, i64 " + field + "\n  store i64 %value, ptr %slot, " + tag + "\n  ret void\n}\n")
+        position = position + 1
+    }
+}
+
+// Record positions below this limit have a distinct accessor and TBAA tag.
+// Two different positions never overlap (slot K is byte offset 8 + 8K of
+// whichever record holds the address), so the separation is sound without
+// type information; a position at or past the limit keeps the parent tag,
+// which aliases every tagged position.
+function recordTaggedFieldLimit(): Integer {
+    return 16
+}
+
+function recordFieldTagged(position: Integer): Boolean {
+    return position >= 0 && position < recordTaggedFieldLimit()
+}
+
+function recordFieldTag(position: Integer): Text {
+    let parent = "!{!\"minyar record field\", !{!\"minyar\"}, i64 0}"
+    let field = "!{!\"minyar record field " + Text(position) + "\", " + parent + ", i64 0}"
+    return "!tbaa !{" + field + ", " + field + ", i64 0}"
+}
+
+function recordGetCallee(position: Integer): Text {
+    if recordFieldTagged(position) { return "@.minyar.record.get." + Text(position) }
+    return "@.minyar.record.get"
+}
+
+function recordSetCallee(position: Integer): Text {
+    if recordFieldTagged(position) { return "@.minyar.record.set.scalar." + Text(position) }
+    return "@.minyar.record.set.scalar"
 }
 
 // String and List constants are named by a digest of their content (see
