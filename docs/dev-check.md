@@ -46,9 +46,17 @@ Selection comes from recorded dependencies, not from a list of areas:
    library change reaches exactly the harnesses that import it, and a compiler
    or runtime change reaches everything built with `build/minyarc` or linked
    with `build/minyar-runtime.o`.
-4. A check is selected when it read a changed source or a stale output, listed
+   Make's graph is coarse (every object lists every makefile), so `run` then
+   builds the stale outputs through the check runner's parallel builder and
+   keeps only those whose bytes changed (builds are deterministic); an output
+   left stale or unbuilt counts as changed. `--no-cutoff` skips this.
+4. A check is selected when it read a changed source or a changed output, listed
    a directory that gained or lost a file, or its Make rules (with all
-   prerequisites) or the Makefile variables they use changed. A check that is
+   prerequisites) or the Makefile variables they use changed. File targets are
+   compared by recipe; their prerequisite lists act through step 3. A `make`
+   that a check runs to build goals is treated like the check's own Make (its
+   goals join the comparison); one that prints or queries the database
+   (`-p`, `-n`, `-q`) keeps every makefile it reads as a dependency. A check that is
    new or has no trace is always selected. A check that failed at the indexed base is
    run only when its (partial) trace is hit, and listed as red at base otherwise:
    the gate is red there whatever the change does (`--include-base-red` runs them). If the check
@@ -92,3 +100,15 @@ time) when the base moves far; until then a moved base only widens selection.
   and `benchmarks/bothmodes` that import a changed module (directly or through
   library imports), or all of them for a compiler or runtime change.
   `--bench` measures only the compare programs; bothmodes ones are listed.
+
+## Measured on the 8-vCPU build box (shared with ten agents, `--jobs 4`)
+
+| change | selected | result |
+| --- | --- | --- |
+| docs/language.md edit | 4 of 337 checks | green in 166 s |
+| tests/http.min edit (no Linux gate check reads it) | 0 (+1 untraceable) | green in 24 s |
+| new test script + benchmarks.mk rule (batch 5) | 115 | red in 1,310 s, same root check as the gate |
+| library/json.min edit (the check runner imports json) | all | equals the gate |
+| compiler pass or runtime header edit | all | equals the gate (`build/minyarc` rebuild 52 s) |
+
+The full gate takes 22 to 24 minutes on the same box with `CHECK_JOBS=8`.
