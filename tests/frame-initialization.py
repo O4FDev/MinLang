@@ -265,6 +265,8 @@ def main():
     parser.add_argument("--cases", type=lambda value: choices(value, ("main", "lower", "activated")), default=["main", "lower", "activated"])
     parser.add_argument("--activated-matrix", choices=("reduced", "full"), default="reduced",
                         help="reduced: cycle native/O2 K1/7/32; full: every selected configuration")
+    parser.add_argument("--skip-negative", action="store_true",
+                        help="skip the frozen-control physical negative; another piece of the same check runs it")
     parser.add_argument("--compile-timeout", type=int, default=120)
     parser.add_argument("--run-timeout", type=int, default=60)
     args = parser.parse_args()
@@ -287,8 +289,9 @@ def main():
             runner.compare(kind, profile, int(budget), optimization, mode, case)
         if not runner.rows:
             raise ValueError("selected filters contain no applicable configuration; activated O0/sanitize/K2/K1024 requires --activated-matrix full")
-        for kind in args.runtimes:
-            runner.negative(kind)
+        if not args.skip_negative:
+            for kind in args.runtimes:
+                runner.negative(kind)
     except (OSError, RuntimeError, ValueError) as error:
         print(str(error) + "\nevidence retained: " + str(output), file=sys.stderr)
         return 1
