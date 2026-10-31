@@ -264,8 +264,10 @@ static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortCompa
     MinyarList *result = copying ? NULL : list;
     if (merge) {
         /* The callback's domain is this thread's for the whole sort, so it is
-         * checked once, before the first comparison, instead of per call. */
-        if (count > 1) minyar_callback_check(context);
+         * checked once, before the first comparison, instead of per call. A
+         * natural record sort has no callback (its compare calls the record's
+         * emitted compare directly), so a null context has no domain. */
+        if (count > 1 && context) minyar_callback_check(context);
         minyar_runtime_callers++; /* a stop here must not leave a merge half done */
         merge(indices, (long long)count, scratch, context);
         minyar_runtime_callers--;

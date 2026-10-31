@@ -104,6 +104,29 @@ let merges = defined(llvm, ".minyar.sort.merge.")
 test.check(merges.length == 7, "one merge per call site, got " + Text(merges.length))
 for merge in merges { test.check(test.contains(merge, "call i32 @minyar_sort_pending()"), "the merge must stop when recovery is pending") }
 
+// A natural record sort (no callback) uses the same per-site merge, with a
+// compare that calls the record's emitted three-way compare directly.
+test.executes(compiler, #"""
+record Point { x: Integer; y: Text }
+let points: List<Point> = [Point { x: 3; y: "c" }, Point { x: 1; y: "a" }, Point { x: 3; y: "b" }, Point { x: 2; y: "z" }]
+points.sort()
+print("\(points[0].x)\(points[0].y) \(points[1].x)\(points[1].y) \(points[2].x)\(points[2].y) \(points[3].x)\(points[3].y)")
+let ordered = points.sorted()
+print(ordered.length)
+"""#, "1a 2z 3b 3c\n4\n")
+let naturalPath = compiler.directory + "/case" + Text(compiler.serial)
+let naturalLlvm = io.readTextFile(naturalPath + ".ll")
+test.check(test.contains(naturalLlvm, "call void @minyar_list_sort_by_merge(ptr ") && test.contains(naturalLlvm, " = call ptr @minyar_list_sorted_by_merge(ptr "), "natural record sorts must use an emitted merge")
+test.check(!test.contains(naturalLlvm, "call void @minyar_list_sort_by(ptr ") && !test.contains(naturalLlvm, "@minyar_list_sorted_by(ptr "), "natural record sorts must not use the runtime merge")
+let naturalCompares = defined(naturalLlvm, ".minyar.sort.record.")
+test.check(naturalCompares.length == 2, "one record compare function per natural sort call site, got " + Text(naturalCompares.length))
+for compare in naturalCompares {
+    test.check(test.contains(compare, "call i64 @\".minyar.derived.compare|"), "a record compare must call the derived three-way compare by name")
+}
+let naturalMerges = defined(naturalLlvm, ".minyar.sort.merge.")
+test.check(naturalMerges.length == 2, "one merge per natural sort call site, got " + Text(naturalMerges.length))
+for merge in naturalMerges { test.check(test.contains(merge, "call i32 @minyar_sort_pending()"), "the merge must stop when recovery is pending") }
+
 // Failures inside or around the comparator are unchanged.
 stops(compiler, "let xs = [3, 1, 2]\nxs.sortBy(function(a: Integer, b: Integer): Integer { xs.add(0); return a - b })\nprint(xs.length)\n", "Minyar stopped: the List was mutated during its sort comparator.", "")
 stops(compiler, "let xs = [3, 1, 2]\nprint(\"before\")\nxs.sortBy(function(a: Integer, b: Integer): Integer { return 10 / (a - a) })\nprint(xs.length)\n", "Minyar stopped:", "before\n")
