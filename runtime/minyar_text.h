@@ -576,14 +576,14 @@ static MinyarText *text_index_piece(MinyarText *index, long long start, long lon
 #else
     MinyarText *root = index->backing;
 #if MINYAR_THREADED
+    /* A piece of shared frozen storage keeps sharing: there is no owning Text
+     * to measure, as text_slice_bytes says. */
     _Bool shared = text_backing_shared(index);
-    long long root_length = shared ? index->byte_length : root->byte_length;
 #else
     _Bool shared = 0;
-    long long root_length = root->byte_length;
 #endif
-    if (!shared && root_length > 4096 &&
-        (unsigned long long)length * 8 < (unsigned long long)root_length) {
+    if (!shared && root->byte_length > 4096 &&
+        (unsigned long long)length * 8 < (unsigned long long)root->byte_length) {
         MinyarText *copy = new_text_storage(length, known);
         unsigned char *target = (unsigned char *)copy->bytes;
         copy_bytes(target, bytes, (size_t)length);
