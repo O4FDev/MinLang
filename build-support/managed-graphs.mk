@@ -43,8 +43,34 @@ ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s))
 MANAGED_GRAPH_LAUNCHER_ARTIFACTS += build/minyarc-modules build/minyar-module-build
 endif
 
-check-managed-graphs-launcher: $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS) build/tooling/tests/managed-graphs-launcher
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher
+# Three selector pieces plus one piece per bakeoff heap profile; --bakeoff-profiles only
+# narrows that case, which without it still runs every profile in both modes.
+MANAGED_GRAPH_LAUNCHER_FILTERED = check-managed-graphs-launcher-part4 check-managed-graphs-launcher-part5 check-managed-graphs-launcher-part6 check-managed-graphs-launcher-part7 check-managed-graphs-launcher-part8 check-managed-graphs-launcher-part9 check-managed-graphs-launcher-part10
+MANAGED_GRAPH_LAUNCHER_PARTS = check-managed-graphs-launcher-part1 check-managed-graphs-launcher-part2 check-managed-graphs-launcher-part3 $(MANAGED_GRAPH_LAUNCHER_FILTERED)
+MANAGED_GRAPH_LAUNCHER_PIECE_DEPENDENCIES = $(MANAGED_GRAPH_LAUNCHER_ARTIFACTS) build/tooling/tests/managed-graphs-launcher
+.PHONY: $(MANAGED_GRAPH_LAUNCHER_PARTS)
+check-managed-graphs-launcher: $(MANAGED_GRAPH_LAUNCHER_PARTS)
+$(MANAGED_GRAPH_LAUNCHER_PARTS): $(MANAGED_GRAPH_LAUNCHER_PIECE_DEPENDENCIES)
+check-managed-graphs-launcher-part1:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_debug_and_release_preserve_selected_heap_and_owner_abi
+check-managed-graphs-launcher-part2:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_debug_and_release_preserve_lazy_heap_policy
+check-managed-graphs-launcher-part3:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_incremental_driver_preserves_parsed_fallback_and_check_mode
+check-managed-graphs-launcher-part4:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_preserved_bakeoff_workload_on_selected_heap_profiles --bakeoff-profiles system --bakeoff-modes native
+check-managed-graphs-launcher-part5:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_preserved_bakeoff_workload_on_selected_heap_profiles --bakeoff-profiles system --bakeoff-modes sanitize
+check-managed-graphs-launcher-part6:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_preserved_bakeoff_workload_on_selected_heap_profiles --bakeoff-profiles fixed --bakeoff-modes native
+check-managed-graphs-launcher-part7:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_preserved_bakeoff_workload_on_selected_heap_profiles --bakeoff-profiles fixed --bakeoff-modes sanitize
+check-managed-graphs-launcher-part8:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_preserved_bakeoff_workload_on_selected_heap_profiles --bakeoff-profiles lazy --bakeoff-modes native
+check-managed-graphs-launcher-part9:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_preserved_bakeoff_workload_on_selected_heap_profiles --bakeoff-profiles lazy --bakeoff-modes sanitize
+check-managed-graphs-launcher-part10:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/managed-graphs-launcher ManagedGraphLauncher.test_preserved_bakeoff_workload_on_selected_heap_profiles --bakeoff-profiles eager
 
 check-isolated-workers: build/minyarc build/minyar-default-runtime.o build/tooling/tests/isolated-workers
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/isolated-workers

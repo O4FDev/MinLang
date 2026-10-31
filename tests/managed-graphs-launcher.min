@@ -1,4 +1,5 @@
 use "io" as io
+use "process" as processInfo
 use "../tools/testing.min" as test
 use "./compiler-port-support.min" as port
 use "./thread-port-support.min" as support
@@ -47,7 +48,40 @@ function checkProfiles(context: Context, profiles: List<List<Text>>) {
 
 let names = ["test_debug_and_release_preserve_selected_heap_and_owner_abi", "test_debug_and_release_preserve_lazy_heap_policy",
     "test_incremental_driver_preserves_parsed_fallback_and_check_mode", "test_preserved_bakeoff_workload_on_selected_heap_profiles"]
-let selectors = port.selectors("ManagedGraphLauncher", names)
+function contains(values: List<Text>, wanted: Text): Boolean {
+    for value in values { if value == wanted { return true } }
+    return false
+}
+function modeName(sanitize: Boolean): Text {
+    if sanitize { return "sanitize" }
+    return "native"
+}
+// The bakeoff test is the long one; these options only narrow its loops. Without them
+// every profile in both native and sanitizer mode runs, exactly as before.
+let bakeoffProfiles: List<Text> = []
+let bakeoffModes: List<Text> = []
+let selectorArguments: List<Text> = []
+let cursor = 0
+while cursor < processInfo.argumentCount() {
+    let option = processInfo.argument(cursor)
+    if option == "--bakeoff-profiles" || option == "--bakeoff-modes" {
+        let values: List<Text> = []
+        cursor += 1
+        while cursor < processInfo.argumentCount() && !support.starts(processInfo.argument(cursor), "--") { values.add(processInfo.argument(cursor)); cursor += 1 }
+        test.check(values.length > 0, option + " needs values")
+        if option == "--bakeoff-profiles" {
+            for value in values { test.check(contains(["system", "fixed", "lazy", "eager"], value), "invalid bakeoff profile: " + value) }
+            bakeoffProfiles = values
+        } else {
+            for value in values { test.check(contains(["native", "sanitize"], value), "invalid bakeoff mode: " + value) }
+            bakeoffModes = values
+        }
+    } else {
+        selectorArguments.add(option)
+        cursor += 1
+    }
+}
+let selectors = port.selectorsFrom("ManagedGraphLauncher", names, selectorArguments)
 let work = test.scratch()
 let root = test.lines(test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10).output)[0]
 let context = Context { work: work; root: root; clang: test.setting("MINYAR_TEST_CLANG", "clang"); serial: 0 }
@@ -70,10 +104,12 @@ if port.selected(selectors, "ManagedGraphLauncher", names[3]) {
         ["--memory-profile", "fixed", "--heap-bytes", "1048576", "--cleanup-budget", "1"], ["--memory-profile", "fixed", "--heap-bytes", "1048576", "--cleanup-budget", "32"],
         ["--memory-profile", "eager"], ["--memory-profile", "lazy", "--heap-bytes", "1048576", "--cleanup-budget", "1"], ["--memory-profile", "lazy", "--heap-bytes", "1048576", "--cleanup-budget", "32"]]
     for profile in profiles {
+        if bakeoffProfiles.length > 0 && !contains(bakeoffProfiles, profile[1]) { continue }
         for optimization in ["--debug", "--release"] {
             let modes = [false, true]
             if profile[1] == "eager" { modes = [false] }
             for sanitize in modes {
+                if bakeoffModes.length > 0 && !contains(bakeoffModes, modeName(sanitize)) { continue }
                 let options: List<Text> = []
                 for item in profile { options.add(item) }
                 options.add(optimization)
@@ -83,4 +119,4 @@ if port.selected(selectors, "ManagedGraphLauncher", names[3]) {
     }
 }
 test.removeTree(work)
-print("ManagedGraphLauncher: passed")
+print("ManagedGraphLauncher: " + Text(context.serial) + " launcher runs passed")
