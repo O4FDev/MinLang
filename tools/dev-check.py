@@ -623,7 +623,7 @@ def file_digest(path):
         return None
 
 
-def changed_outputs(root, targets, jobs):
+def changed_outputs(root, targets, jobs, database):
     """Build targets through the check runner's parallel shared-prerequisite builder; return those whose content changed.
 
     A target that fails to build counts as changed, so its checks run and report the failure."""
@@ -635,7 +635,7 @@ def changed_outputs(root, targets, jobs):
     subprocess.run(["make", "--no-print-directory", "check-in-parallel", "CHECKS=dev-check-build", f"CHECK_JOBS={jobs}"],
                    cwd=root, env=environment, stdout=subprocess.DEVNULL)
     # Anything Make still calls stale was not built (a failed or skipped build): count it as changed.
-    left, _ = stale_outputs(root, targets)
+    left, _ = stale_outputs(root, targets, database)
     result = []
     for target in targets:
         after = file_digest(root / target)
@@ -745,7 +745,7 @@ def command_rebase(arguments):
     targets = [item for item in prerequisites if item in stale]
     say(f"{len(changed)} changed source(s); rebuilding {len(targets)} stale prerequisite(s)")
     if targets:
-        changed_outputs(root, targets, arguments.jobs)  # parallel, through the check runner's builder
+        changed_outputs(root, targets, arguments.jobs, database)  # parallel, through the check runner's builder
         left, _ = stale_outputs(root, prerequisites, database)
         if left:
             say(f"build failed: {len(left)} output(s) still stale, e.g. {', '.join(sorted(left)[:3])}; base not recorded")
@@ -785,7 +785,7 @@ def command_run(arguments):
         # outputs now (the checks need them anyway) and keep only those whose bytes changed.
         build_started = time.time()
         rebuilt = len(stale_build)
-        stale_build = changed_outputs(root, stale_build, arguments.jobs)
+        stale_build = changed_outputs(root, stale_build, arguments.jobs, database)
         stale = set(stale_build) | (stale - {path for path in stale if path.startswith("build/")})
         say(f"built {rebuilt} stale output(s) in {time.time() - build_started:.0f} s; {len(stale_build)} changed content")
     if arguments.only and ignored:
