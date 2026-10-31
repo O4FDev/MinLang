@@ -52,10 +52,17 @@ MINYAR_HOT size_t map_capacity(const MinyarRecord *map) { return (size_t)map->va
 #define MAP_HASH(entries, bucket) ((entries)->values[3 * (bucket)])
 #define MAP_KEY(entries, bucket) ((entries)->values[3 * (bucket) + 1])
 #define MAP_VALUE(entries, bucket) ((entries)->values[3 * (bucket) + 2])
-MINYAR_HOT uint64_t map_mix(uint64_t x) {
-    x ^= x >> 30; x *= UINT64_C(0xbf58476d1ce4e5b9);
-    x ^= x >> 27; x *= UINT64_C(0x94d049bb133111eb);
-    return x ^ (x >> 31);
+/* One widening multiply and one xor-shift per 8-byte word of a Text key. Folding
+ * the high half of the product back down lets the low bucket bits depend on
+ * every input bit after a single multiply, so keys that share a prefix, a suffix
+ * or a fixed stride still spread across buckets; the xor-shift then stirs the
+ * low bits again. Measured at least as even as the full finaliser on word
+ * lists, prefix/stride keys, paths, e-mail and city-shaped keys, for fewer
+ * instructions. */
+MINYAR_HOT uint64_t map_text_mix(uint64_t value) {
+    __uint128_t product = (__uint128_t)value * UINT64_C(0xff51afd7ed558ccd);
+    value = (uint64_t)product ^ (uint64_t)(product >> 64);
+    return value ^ (value >> 29);
 }
 static long long map_canonical_key(long long kind, long long key) {
     if (kind == 7) {
@@ -98,7 +105,7 @@ static MAP_GENERAL uint64_t map_text_hash(const MinyarText *text) {
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
         word = __builtin_bswap64(word);
 #endif
-        hash = map_mix(hash ^ word); p += 8; n -= 8;
+        hash = map_text_mix(hash ^ word); p += 8; n -= 8;
     }
     /* The same little-endian tail value from at most two loads; the
      * overlapping bytes are identical, so OR keeps them unchanged. */
@@ -115,7 +122,7 @@ static MAP_GENERAL uint64_t map_text_hash(const MinyarText *text) {
     } else if (n) {
         tail = (uint64_t)p[0] | (uint64_t)p[n / 2] << (8 * (n / 2)) | (uint64_t)p[n - 1] << (8 * (n - 1));
     }
-    hash = map_mix(hash ^ tail);
+    hash = map_text_mix(hash ^ tail);
     return map_nonzero_hash(hash);
 }
 static uint64_t minyar_map_hash(long long kind, long long key) {
@@ -519,7 +526,7 @@ MINYAR_HOT uint64_t map_text_hash_short(const MinyarText *text) {
         tail = (uint64_t)low | (uint64_t)high << (8 * (n - 4));
     } else if (n)
         tail = (uint64_t)p[0] | (uint64_t)p[n / 2] << (8 * (n / 2)) | (uint64_t)p[n - 1] << (8 * (n - 1));
-    return map_nonzero_hash(map_mix(hash ^ tail));
+    return map_nonzero_hash(map_text_mix(hash ^ tail));
 }
 MINYAR_HOT uint64_t map_builtin_hash(long long kind, long long key) {
     if (kind == 2) {
