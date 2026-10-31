@@ -74,11 +74,14 @@ test file runs the checks that enumerate its directory, such as
 
 A second index records which compiler and runtime functions each check
 executes. `tools/dev-check.py coverage` folds it in from one instrumented gate
-run: a clang wrapper compiles runtime C and the compiler's LLVM IR with
-function-entry coverage (`-fprofile-generate -mllvm -pgo-function-entry-coverage`,
-continuous mode so aborting programs keep their counts), every link gets the
-profile runtime, and a `make` shim on `PATH` sends the profiles of each
-`make -j1 check-x` to that check's directory. The index also keeps a function
+run (`sh tools/dev-check-coverage/run.sh`): a clang wrapper compiles runtime C
+and the compiler's LLVM IR with entry-instrumented IR profile counters
+(`-fprofile-generate -mllvm -pgo-instrument-entry`), every link gets the
+profile runtime plus a small object that also writes the profile on `_exit`,
+`abort` and fatal signals, and a `make` shim on `PATH` sends the profiles of
+each `make -j1 check-x` to that check's directory. A process killed with
+SIGKILL loses its counts; LLVM 23's function-entry-only and continuous modes
+produced unreadable profiles for runtime-linked programs and are not used. The index also keeps a function
 snapshot of `compiler/**/*.min` and `runtime/**/*.{c,h}`.
 
 For a change to those files, dev-check compares each file with the snapshot.
