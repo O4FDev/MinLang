@@ -161,13 +161,31 @@ static inline int map_keys_equal(const MinyarRecord *map, long long a, long long
     minyar_runtime_callers--;
     return !minyar_recovery_pending() && result;
 }
-/* The last present slot found for a scalar or Text key, per thread, so an
- * update such as `if m.has(k) { m[k] += 1 }` hashes and probes k once. A hit
- * is verified against the key stored in that slot; keys are unique, so a stale
- * entry after growth, removal or address reuse only misses. */
-static MINYAR_THREAD_LOCAL struct { const MinyarRecord *map; long long key; size_t bucket; } map_recent;
+/* The last slot found for a scalar or Text key, per thread, so an update such as
+ * `if m.has(k) { m[k] += 1 }` hashes and probes k once. A present hit is
+ * verified against the key stored in that slot; keys are unique, so a stale
+ * entry after growth, removal or address reuse only misses. An absent hit
+ * records the empty bucket that ended the probe and the hash, and is used only
+ * while `map_epoch` says no bucket array of this thread's world changed since,
+ * so a `has`/`getOr` miss followed by `m[k] = v` inserts at that bucket without
+ * hashing or probing again. */
+static MINYAR_THREAD_LOCAL struct {
+    const MinyarRecord *map;
+    long long key;
+    uint64_t hash;
+    size_t bucket;
+    size_t capacity;
+    unsigned long long epoch;
+    int present;
+} map_recent;
+/* Bumped whenever a bucket array changes shape or contents: insert, grow,
+ * removal and clear. A Map is never mutated by two threads at once, so a
+ * per-thread counter is enough to prove nothing touched the recorded slot. */
+static MINYAR_THREAD_LOCAL unsigned long long map_epoch = 1;
+MINYAR_HOT void map_structure_changed(void) { map_epoch++; }
 MINYAR_HOT size_t map_recent_find(const MinyarRecord *map, long long kind, long long key) {
-    if (map_recent.map != map || map_recent.key != key || kind >= 1000) return SIZE_MAX;
+    if (map_recent.map != map || map_recent.key != key || kind >= 1000 || !map_recent.present)
+        return SIZE_MAX;
     const MinyarRecord *entries = map_entries(map);
     size_t bucket = map_recent.bucket;
     if (bucket >= map_capacity(map) || !MAP_HASH(entries, bucket) ||
@@ -175,11 +193,27 @@ MINYAR_HOT size_t map_recent_find(const MinyarRecord *map, long long kind, long 
         return SIZE_MAX;
     return bucket;
 }
-MINYAR_HOT void map_remember(const MinyarRecord *map, long long kind, long long key, size_t bucket) {
+MINYAR_HOT void map_remember(const MinyarRecord *map, long long kind, long long key, size_t bucket,
+                             uint64_t hash) {
     if (kind >= 1000) return;
     map_recent.map = map;
     map_recent.key = key;
+    map_recent.hash = hash;
     map_recent.bucket = bucket;
+    map_recent.capacity = map_capacity(map);
+    map_recent.epoch = map_epoch;
+    map_recent.present = 1;
+}
+MINYAR_HOT void map_remember_absent(const MinyarRecord *map, long long kind, long long key, size_t bucket,
+                                    uint64_t hash) {
+    if (kind >= 1000) return;
+    map_recent.map = map;
+    map_recent.key = key;
+    map_recent.hash = hash;
+    map_recent.bucket = bucket;
+    map_recent.capacity = map_capacity(map);
+    map_recent.epoch = map_epoch;
+    map_recent.present = 0;
 }
 /* Zeroed buckets whose key and value fields are flagged as references when
  * the Map's keys or values are references. */
@@ -268,6 +302,7 @@ static MINYAR_COLD void map_grow(MinyarRecord *map) {
     map->values[MAP_ENTRIES] = (long long)(uintptr_t)fresh;
     map->values[MAP_CAPACITY] = capacity;
     minyar_rc_release(old);
+    map_structure_changed();
 }
 static MAP_GENERAL _Bool map_has_general(const MinyarRecord *map, long long key) {
     if (minyar_recovery_pending()) return 0;
@@ -281,7 +316,7 @@ static MAP_GENERAL _Bool map_has_general(const MinyarRecord *map, long long key)
     size_t bucket = map_find(map, key, hash);
     if (!minyar_recovery_pending())
         result = bucket != SIZE_MAX && MAP_HASH(map_entries(map), bucket) != 0;
-    if (result) map_remember(map, kind, key, bucket);
+    if (result) map_remember(map, kind, key, bucket, hash);
 done:
     map_read_end(&guard);
     return result;
@@ -302,7 +337,7 @@ static MAP_GENERAL long long map_get_general(const MinyarRecord *map, long long 
     if (bucket == SIZE_MAX || !MAP_HASH(map_entries(map), bucket)) absent = 1;
     else {
         result = MAP_VALUE(map_entries(map), bucket); /* Borrowed, like List.get. */
-        map_remember(map, kind, key, bucket);
+        map_remember(map, kind, key, bucket, hash);
     }
 done:
     map_read_end(&guard);
@@ -325,7 +360,7 @@ static MAP_GENERAL long long map_get_or_general(const MinyarRecord *map, long lo
     if (minyar_recovery_pending()) goto done;
     if (bucket != SIZE_MAX && MAP_HASH(map_entries(map), bucket)) {
         result = MAP_VALUE(map_entries(map), bucket);
-        map_remember(map, kind, key, bucket);
+        map_remember(map, kind, key, bucket, hash);
     }
 done:
     map_read_end(&guard);
@@ -392,7 +427,8 @@ static MAP_GENERAL void map_set_general(MinyarRecord *map, long long key, long l
     map_store_value(map, bucket, value);
     MAP_HASH(map_entries(map), bucket) = (long long)hash;
     map->values[MAP_LENGTH]++;
-    map_remember(map, kind, key, bucket);
+    map_structure_changed();
+    map_remember(map, kind, key, bucket, hash);
 done:
     map_read_end(&guard);
 }
@@ -416,6 +452,7 @@ static void map_remove_bucket(MinyarRecord *map, long long kind, size_t hole) {
     MAP_KEY(entries, hole) = 0;
     MAP_VALUE(entries, hole) = 0;
     map->values[MAP_LENGTH]--;
+    map_structure_changed();
     if (map_key_references(kind)) minyar_rc_release((void *)(uintptr_t)removed_key);
     if (map->values[MAP_VALUE_REFERENCES]) minyar_rc_release((void *)(uintptr_t)removed_value);
 }
@@ -464,7 +501,8 @@ MINYAR_HOT size_t map_builtin_probe(const MinyarRecord *entries, size_t mask, lo
         bucket = (bucket + 1) & mask;
     }
 }
-/* The present bucket for key, or SIZE_MAX; remembers a hit. */
+/* The present bucket for key, or SIZE_MAX; remembers a hit, and remembers the
+ * empty bucket a miss ended at so a following store inserts without probing. */
 MINYAR_HOT size_t map_builtin_find(const MinyarRecord *map, long long kind, long long key) {
     if (map_recent.map == map && map_recent.key == key) {
         size_t recent = map_recent_find(map, kind, key);
@@ -473,9 +511,13 @@ MINYAR_HOT size_t map_builtin_find(const MinyarRecord *map, long long kind, long
     size_t capacity = map_capacity(map);
     if (!capacity) return SIZE_MAX;
     const MinyarRecord *entries = map_entries(map);
-    size_t bucket = map_builtin_probe(entries, capacity - 1, kind, key, map_builtin_hash(kind, key));
-    if (!MAP_HASH(entries, bucket)) return SIZE_MAX;
-    map_remember(map, kind, key, bucket);
+    uint64_t hash = map_builtin_hash(kind, key);
+    size_t bucket = map_builtin_probe(entries, capacity - 1, kind, key, hash);
+    if (!MAP_HASH(entries, bucket)) {
+        map_remember_absent(map, kind, key, bucket, hash);
+        return SIZE_MAX;
+    }
+    map_remember(map, kind, key, bucket, hash);
     return bucket;
 }
 static MINYAR_COLD MINYAR_NORETURN void map_key_absent(void) { minyar_stop_program("Map key is absent."); }
@@ -494,17 +536,18 @@ static MAP_GENERAL void map_builtin_insert(MinyarRecord *map, long long kind, lo
     map_store_value(map, bucket, value);
     MAP_HASH(map_entries(map), bucket) = (long long)hash;
     map->values[MAP_LENGTH]++;
-    map_remember(map, kind, key, bucket);
+    map_structure_changed();
+    map_remember(map, kind, key, bucket, hash);
 }
 
 long long minyar_map_length(const MinyarRecord *map) { return map->values[MAP_LENGTH]; }
-_Bool minyar_map_has(const MinyarRecord *map, long long key) {
+MINYAR_INLINE_ENTRY _Bool minyar_map_has(const MinyarRecord *map, long long key) {
     long long kind = map->values[MAP_KEY_KIND];
     if (!map_builtin_kind(kind)) return map_has_general(map, key);
     if (minyar_recovery_pending()) return 0;
     return map_builtin_find(map, kind, key) != SIZE_MAX;
 }
-long long minyar_map_get(const MinyarRecord *map, long long key) {
+MINYAR_INLINE_ENTRY long long minyar_map_get(const MinyarRecord *map, long long key) {
     long long kind = map->values[MAP_KEY_KIND];
     if (!map_builtin_kind(kind)) return map_get_general(map, key);
     if (minyar_recovery_pending()) return 0;
@@ -514,14 +557,14 @@ long long minyar_map_get(const MinyarRecord *map, long long key) {
 }
 /* map.getOr(key, fallback): one probe; the stored value or the fallback,
  * borrowed either way like map[key]. */
-long long minyar_map_get_or(const MinyarRecord *map, long long key, long long fallback) {
+MINYAR_INLINE_ENTRY long long minyar_map_get_or(const MinyarRecord *map, long long key, long long fallback) {
     long long kind = map->values[MAP_KEY_KIND];
     if (!map_builtin_kind(kind)) return map_get_or_general(map, key, fallback);
     if (minyar_recovery_pending()) return fallback;
     size_t bucket = map_builtin_find(map, kind, key);
     return bucket == SIZE_MAX ? fallback : MAP_VALUE(map_entries(map), bucket);
 }
-void minyar_map_set(MinyarRecord *map, long long key, long long value) {
+MINYAR_INLINE_ENTRY void minyar_map_set(MinyarRecord *map, long long key, long long value) {
     long long kind = map->values[MAP_KEY_KIND];
     if (!map_builtin_kind(kind)) { map_set_general(map, key, value); return; }
     if (minyar_recovery_pending()) return;
@@ -531,6 +574,15 @@ void minyar_map_set(MinyarRecord *map, long long key, long long value) {
         if (recent != SIZE_MAX) { map_store_value(map, recent, value); return; }
     }
     size_t capacity = map_capacity(map), bucket = 0;
+    if (capacity && map_recent.map == map && map_recent.key == key && !map_recent.present &&
+        map_recent.epoch == map_epoch && map_recent.capacity == capacity &&
+        map_recent.bucket < capacity && !MAP_HASH(map_entries(map), map_recent.bucket)) {
+        /* `has` or `getOr` just found this key absent and left the empty bucket
+         * its probe ended at; nothing changed the bucket array since, so this is
+         * one find-or-insert: no second hash and no second probe. */
+        map_builtin_insert(map, kind, key, value, map_recent.hash, map_recent.bucket);
+        return;
+    }
     uint64_t hash = map_builtin_hash(kind, key);
     if (capacity) {
         const MinyarRecord *entries = map_entries(map);
@@ -538,7 +590,7 @@ void minyar_map_set(MinyarRecord *map, long long key, long long value) {
         if (MAP_HASH(entries, bucket)) {
             /* Retain before replacing, including m[k] = m[k]. Keep the first key. */
             map_store_value(map, bucket, value);
-            map_remember(map, kind, key, bucket);
+            map_remember(map, kind, key, bucket, hash);
             return;
         }
     }
@@ -552,7 +604,7 @@ void minyar_map_set(MinyarRecord *map, long long key, long long value) {
  * hash or equality method), the slot is a per-thread scratch copy and the
  * store runs minyar_map_set. */
 static MINYAR_THREAD_LOCAL long long map_scratch_slot;
-long long *minyar_map_value_slot(const MinyarRecord *map, long long key) {
+MINYAR_INLINE_ENTRY long long *minyar_map_value_slot(const MinyarRecord *map, long long key) {
     long long kind = map->values[MAP_KEY_KIND];
     if (!map_builtin_kind(kind) || map_active_reads) {
         long long value = minyar_map_get(map, key);
@@ -565,7 +617,7 @@ long long *minyar_map_value_slot(const MinyarRecord *map, long long key) {
     if (bucket == SIZE_MAX) map_key_absent();
     return &MAP_VALUE(map_entries(map), bucket);
 }
-void minyar_map_store_slot(MinyarRecord *map, long long key, long long *slot, long long value) {
+MINYAR_INLINE_ENTRY void minyar_map_store_slot(MinyarRecord *map, long long key, long long *slot, long long value) {
     if (slot == &map_scratch_slot || minyar_recovery_pending()) minyar_map_set(map, key, value);
     else *slot = value;
 }
@@ -591,6 +643,7 @@ void minyar_map_clear(MinyarRecord *map) {
                                                                     !!map->values[MAP_VALUE_REFERENCES]);
     map->values[MAP_CAPACITY] = 0;
     map->values[MAP_LENGTH] = 0;
+    map_structure_changed();
     /* In bounded profiles bucket scans run through the existing cleanup budget. */
     minyar_rc_release(old);
 }
