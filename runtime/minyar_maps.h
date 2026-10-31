@@ -6,7 +6,7 @@
  * Buckets never escape to language code. Empty hashes are zero; deletion closes
  * probe gaps, so repeated remove/insert never accumulates tombstones.
  * References occupy zeroed holes and are owned exactly once by the buckets. */
-enum { MAP_ENTRIES, MAP_CAPACITY, MAP_SPARE, MAP_KEY_KIND, MAP_VALUE_REFERENCES, MAP_LENGTH,
+enum { MAP_ENTRIES, MAP_CAPACITY, MAP_GROW_AT, MAP_KEY_KIND, MAP_VALUE_REFERENCES, MAP_LENGTH,
        MAP_FIELDS, MAP_EQUAL_CALLBACK = MAP_FIELDS, MAP_HASH_CALLBACK, MAP_COPY_CALLBACK,
        MAP_RECORD_FIELDS };
 typedef uint64_t (*MinyarRecordHash)(const MinyarRecord *);
@@ -319,6 +319,7 @@ static MINYAR_COLD void map_grow(MinyarRecord *map) {
     old->length = 0;
     map->values[MAP_ENTRIES] = (long long)(uintptr_t)fresh;
     map->values[MAP_CAPACITY] = capacity;
+    map->values[MAP_GROW_AT] = capacity - capacity / 4;
     minyar_rc_release(old);
     map_structure_changed();
 }
@@ -424,8 +425,7 @@ static MAP_GENERAL void map_set_general(MinyarRecord *map, long long key, long l
         map_store_value(map, bucket, value);
         goto done;
     }
-    long long capacity = map->values[MAP_CAPACITY];
-    if (!capacity || map->values[MAP_LENGTH] >= capacity - capacity / 4) {
+    if (map->values[MAP_LENGTH] >= map->values[MAP_GROW_AT]) {
         map_grow(map);
         /* Absence was established before mutation. Rehashing moves stored
          * hashes, so finding the new empty slot needs no further user call. */
@@ -567,8 +567,7 @@ static MINYAR_COLD MINYAR_NORETURN void map_key_absent(void) { minyar_stop_progr
 /* Insert an absent built-in key whose probe ended at the empty bucket. */
 MINYAR_HOT void map_builtin_insert(MinyarRecord *map, long long kind, long long key, long long value,
                                    uint64_t hash, size_t bucket) {
-    long long capacity = map->values[MAP_CAPACITY];
-    if (!capacity || map->values[MAP_LENGTH] >= capacity - capacity / 4) {
+    if (map->values[MAP_LENGTH] >= map->values[MAP_GROW_AT]) {
         map_grow(map);
         const MinyarRecord *entries = map_entries(map);
         size_t mask = map_capacity(map) - 1;
@@ -689,6 +688,7 @@ void minyar_map_clear(MinyarRecord *map) {
     map->values[MAP_ENTRIES] = (long long)(uintptr_t)map_new_entries(0, map_key_references(map->values[MAP_KEY_KIND]),
                                                                     !!map->values[MAP_VALUE_REFERENCES]);
     map->values[MAP_CAPACITY] = 0;
+    map->values[MAP_GROW_AT] = 0;
     map->values[MAP_LENGTH] = 0;
     map_structure_changed();
     /* In bounded profiles bucket scans run through the existing cleanup budget. */
