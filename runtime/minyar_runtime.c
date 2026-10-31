@@ -549,6 +549,24 @@ MINYAR_HOT MinyarText *new_text_storage(long long length, long long character_le
 #endif
 #include "minyar_sort.h"
 
+/* A Result returned in two registers (tag, payload slot holding one count) as
+ * a record again, laid out as the compiler builds Ok/Err: tag in field 0, the
+ * success payload in field 1 and the failure payload in field 2. */
+MinyarRecord *minyar_result_box(long long tag, long long slot, long long ok_reference,
+                                long long error_reference) {
+    long long field = tag ? 1 : 2;
+    if (tag ? ok_reference : error_reference) {
+        MinyarRecord *record = minyar_record_new(3);
+        minyar_record_set(record, 0, tag);
+        minyar_record_set_take(record, field, slot);
+        return record;
+    }
+    MinyarRecord *record = minyar_record_new_scalar(3);
+    minyar_record_set(record, 0, tag);
+    minyar_record_set(record, field, slot);
+    return record;
+}
+
 static _Bool validate_text_bytes(const unsigned char *bytes, long long length);
 
 static MinyarText *copy_c_text(const char *source) {

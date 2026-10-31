@@ -1,0 +1,358 @@
+// Final Result lowering: Results in two registers across direct calls.
+//
+// A whole-program function returning an untraced Result is marked by a
+// `; minyar.result.abi i64 OK, i64 ERROR` line (its payload reference flags)
+// before its definition. Its body becomes `NAME.r`, returning [tag, payload
+// slot] with the slot holding one count, and `NAME` stays as a wrapper that
+// boxes the pair, so every other reference to the function is unchanged. A
+// returned record that the body built right there and uses nowhere else is
+// never allocated; any other returned Result is unboxed by taking its payload.
+// A consumed `try` on a call to such a function (its value used only by the tag
+// read, the success take and the failure rebox) calls `NAME.r` instead, and
+// only the failure branch builds a record. Runs after scope lowering, on the
+// finished text, so no earlier text analysis sees the pairs.
+
+record ResultRegisterFunctions { index: GenericIndex; flags: List<Text>; starts: List<Integer>; ends: List<Integer>; wrappers: List<Text> }
+
+function resultLineName(line: Text, prefix: Text): Text {
+    if !line.startsWith(prefix) { return "" }
+    let rest = line.slice(prefix.length, line.length)
+    let end = rest.find(" ")
+    if end < 0 { return "" }
+    return rest.slice(0, end)
+}
+
+// The number of uses of the local name in line (not as a prefix of a longer name).
+function resultNameUses(line: Text, name: Text): Integer {
+    let count = 0
+    let rest = line
+    let at = rest.find(name)
+    while at >= 0 {
+        let after = at + name.length
+        if after >= rest.length || !scopeSSACharacter(rest[after]) { count = count + 1 }
+        rest = rest.slice(after, rest.length)
+        at = rest.find(name)
+    }
+    return count
+}
+
+function resultLastIndex(text: Text, pattern: Text): Integer {
+    let found = -1
+    let offset = 0
+    let rest = text
+    let at = rest.find(pattern)
+    while at >= 0 {
+        found = offset + at
+        offset = offset + at + pattern.length
+        rest = rest.slice(at + pattern.length, rest.length)
+        at = rest.find(pattern)
+    }
+    return found
+}
+
+// The callee name of `define ... ptr @NAME(`, or "".
+function resultDefinedName(line: Text): Text {
+    let at = line.find(" ptr @")
+    if at < 0 || !line.startsWith("define ") { return "" }
+    let rest = line.slice(at + 6, line.length)
+    let open = rest.find("(")
+    if open <= 0 { return "" }
+    return rest.slice(0, open)
+}
+
+function resultUses(lines: List<Text>, name: Text): Integer {
+    let count = 0
+    let index = 0
+    while index < lines.length {
+        if lines[index].find(name) >= 0 { count = count + resultNameUses(lines[index], name) }
+        index = index + 1
+    }
+    return count
+}
+
+function resultFind(lines: List<Text>, prefix: Text): Integer {
+    let index = 0
+    while index < lines.length {
+        if lines[index].startsWith(prefix) { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+// The line index starting with prefix after `from` and before `to` with no
+// block label in between, or -1.
+function resultFindInBlock(lines: List<Text>, prefix: Text, from: Integer, to: Integer): Integer {
+    let index = from + 1
+    while index < to {
+        let line = lines[index]
+        if line.startsWith(prefix) { return index }
+        if line.length > 0 && !line.startsWith(" ") && !line.startsWith(";") { return -1 }
+        index = index + 1
+    }
+    return -1
+}
+
+// Calls of marked functions whose Result a consumed `try` reads only through
+// the tag, the success take and the failure rebox.
+function resultLowerCalls(lines: List<Text>, functions: ResultRegisterFunctions) {
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        let pattern = " = call ptr @.minyar.record.result.rebox(ptr %"
+        let marker = line.find(pattern)
+        if marker >= 0 {
+            let failed = line.slice(2, marker)
+            let rest = line.slice(marker + pattern.length, line.length)
+            let comma = rest.find(", ")
+            let value = "%" + rest.slice(0, comma)
+            let flags = rest.slice(comma + 2, rest.length - 1)
+            let define = resultFind(lines, "  " + value + " = call ptr @")
+            if define >= 0 {
+                let call = lines[define]
+                let start = value.length + 15
+                let open = call.find("(")
+                let callee = call.slice(start, open)
+                let tag = -1
+                let take = -1
+                let scan = define + 1
+                while scan < lines.length && (tag < 0 || take < 0) {
+                    if lines[scan].find("@.minyar.record.get(ptr " + value + ", i64 0)") >= 0 { tag = scan }
+                    if lines[scan].find("@minyar_record_take_field(ptr " + value + ", i64 ") >= 0 { take = scan }
+                    scan = scan + 1
+                }
+                let entry = -1
+                if open > start { entry = genericIndexGet(functions.index, callee) }
+                if entry >= 0 && functions.flags[entry] != "" && tag >= 0 && take >= 0 && resultUses(lines, value) == 4 {
+                    let pair = value + ".pair"
+                    lines[define] = "  " + pair + " = call [2 x i64] @" + callee + ".r" + call.slice(open, call.length)
+                    let tagLine = lines[tag]
+                    lines[tag] = tagLine.slice(0, tagLine.find(" = ") + 3) + "extractvalue [2 x i64] " + pair + ", 0"
+                    let takeLine = lines[take]
+                    let element = "1"
+                    if takeLine.endsWith(", i64 0)") { element = "0" }
+                    lines[take] = takeLine.slice(0, takeLine.find(" = ") + 3) + "extractvalue [2 x i64] " + pair + ", " + element
+                    lines[index] = "  " + failed + ".tag = extractvalue [2 x i64] " + pair + ", 0\n  " + failed + ".slot = extractvalue [2 x i64] " + pair + ", 1\n  " + failed + " = call ptr @minyar_result_box(i64 " + failed + ".tag, i64 " + failed + ".slot, " + flags + ")"
+                }
+            }
+        }
+        index = index + 1
+    }
+}
+
+// Returns of a marked body: a record built in the returning block and used only
+// by its field stores becomes the pair, a marked call's Result used only by the
+// return passes its pair through, and any other Result is unboxed.
+// Returns whether a return needed the unbox.
+function resultLowerReturns(lines: List<Text>, functions: ResultRegisterFunctions): Boolean {
+    let index = 0
+    let count = 0
+    let unboxed = false
+    while index < lines.length {
+        let line = lines[index]
+        if line.startsWith("  ret ptr %") {
+            let value = line.slice(10, line.length)
+            let pair = value + ".ret." + Text(count)
+            count = count + 1
+            let made = false
+            // A Result returned straight from a call of a marked function passes its pair through.
+            let callPrefix = "  " + value + " = call ptr @"
+            let called = resultFind(lines, callPrefix)
+            if called >= 0 && called < index {
+                let call = lines[called]
+                let open = call.find("(")
+                let entry = -1
+                if open > callPrefix.length { entry = genericIndexGet(functions.index, call.slice(callPrefix.length, open)) }
+                if entry >= 0 && functions.flags[entry] != "" && resultUses(lines, value) == 2 {
+                    lines[called] = "  " + pair + " = call [2 x i64] @" + call.slice(callPrefix.length, open) + ".r" + call.slice(open, call.length)
+                    lines[index] = "  ret [2 x i64] " + pair
+                    made = true
+                }
+            }
+            let define = -1
+            if !made { define = resultFind(lines, "  " + value + " = call ptr @minyar_record_new") }
+            if define >= 0 && define < index {
+                let call = lines[define]
+                let fresh = call.endsWith(" = call ptr @minyar_record_new(i64 3)") || call.endsWith(" = call ptr @minyar_record_new_scalar(i64 3)")
+                let tagSet = resultFindInBlock(lines, "  call void @minyar_record_set(ptr " + value + ", i64 0, i64 ", define, index)
+                let uses = 3
+                let slot = "0"
+                let payloadSet = -1
+                if fresh && tagSet >= 0 {
+                    payloadSet = resultFindInBlock(lines, "  call void @minyar_record_set", tagSet, index)
+                    if payloadSet >= 0 && resultNameUses(lines[payloadSet], value) == 1 && lines[payloadSet].find("(ptr " + value + ", i64 ") >= 0 {
+                        uses = 4
+                    } else { payloadSet = -1 }
+                }
+                if fresh && tagSet >= 0 && resultFindInBlock(lines, "  ret ", define, index + 1) == index && resultUses(lines, value) == uses {
+                    let tagLine = lines[tagSet]
+                    let tag = tagLine.slice(tagLine.find(", i64 0, i64 ") + 13, tagLine.length - 1)
+                    if payloadSet >= 0 {
+                        let setLine = lines[payloadSet]
+                        let field = setLine.find("(ptr " + value + ", i64 ")
+                        let rest = setLine.slice(field + value.length + 11, setLine.length - 1)
+                        let comma = rest.find(", i64 ")
+                        slot = rest.slice(comma + 6, rest.length)
+                        if setLine.startsWith("  call void @minyar_record_set_reference(") {
+                            lines[payloadSet] = "  " + pair + ".owner = inttoptr i64 " + slot + " to ptr\n  call void @minyar_rc_retain(ptr " + pair + ".owner)"
+                        } else { lines[payloadSet] = "" }
+                    }
+                    lines[define] = ""
+                    lines[tagSet] = ""
+                    lines[index] = "  " + pair + ".0 = insertvalue [2 x i64] poison, i64 " + tag + ", 0\n  " + pair + " = insertvalue [2 x i64] " + pair + ".0, i64 " + slot + ", 1\n  ret [2 x i64] " + pair
+                    made = true
+                }
+            }
+            if !made {
+                unboxed = true
+                lines[index] = "  " + pair + ".tag = call i64 @.minyar.record.get(ptr " + value + ", i64 0)\n  " + pair + ".field = sub i64 2, " + pair + ".tag\n  " + pair + ".slot = call i64 @minyar_record_take_field(ptr " + value + ", i64 " + pair + ".field)\n  " + pair + ".0 = insertvalue [2 x i64] poison, i64 " + pair + ".tag, 0\n  " + pair + " = insertvalue [2 x i64] " + pair + ".0, i64 " + pair + ".slot, 1\n  ret [2 x i64] " + pair
+            }
+        }
+        index = index + 1
+    }
+    return unboxed
+}
+
+// Every return of a marked body must name a local value.
+function resultReturnsLocal(lines: List<Text>): Boolean {
+    let index = 0
+    while index < lines.length {
+        if lines[index].startsWith("  ret ") && !lines[index].startsWith("  ret ptr %") { return false }
+        index = index + 1
+    }
+    return true
+}
+
+function resultLowerFunction(lines: List<Text>, functions: ResultRegisterFunctions, flags: Text): Boolean {
+    let changed = false
+    let define = lines[0]
+    if flags != "" {
+        let name = resultDefinedName(define)
+        let at = define.find(" ptr @")
+        let open = at + 6 + name.length
+        let close = resultLastIndex(define, ")")
+        if close <= open || !resultReturnsLocal(lines) { failCompiler("Result register lowering: unexpected definition of " + name) }
+        if close > open {
+            let parameters = define.slice(open + 1, close)
+            lines[0] = "define internal [2 x i64] @" + name + ".r(" + parameters + define.slice(close, define.length)
+            if resultLowerReturns(lines, functions) { failCompiler("Result register lowering: an unboxed return in " + name) }
+            functions.wrappers.add(define.slice(0, at) + " ptr @" + name + "(" + parameters + ") uwtable {\nentry:\n  %result.pair = call [2 x i64] @" + name + ".r(" + parameters + ")\n  %result.tag = extractvalue [2 x i64] %result.pair, 0\n  %result.slot = extractvalue [2 x i64] %result.pair, 1\n  %result.record = call ptr @minyar_result_box(i64 %result.tag, i64 %result.slot, " + flags + ")\n  ret ptr %result.record\n}\n\n")
+            changed = true
+        }
+    }
+    let index = 1
+    while index < lines.length {
+        if lines[index].find("@.minyar.record.result.rebox(") >= 0 {
+            resultLowerCalls(lines, functions)
+            return true
+        }
+        index = index + 1
+    }
+    return changed
+}
+
+function lowerResultRegisters(pieces: List<Text>): List<Text> {
+    let module = joinText(pieces)
+    if module.find("\n; minyar.result.abi ") < 0 { return pieces }
+    let lines = module.split("\n")
+    let functions = ResultRegisterFunctions { index: newGenericIndex(); flags: []; starts: []; ends: []; wrappers: [] }
+    let pending = ""
+    let current = -1
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        if line.startsWith("; minyar.result.abi ") {
+            pending = line.slice(20, line.length)
+        } else if line.startsWith("define ") {
+            let name = resultDefinedName(line)
+            current = -1
+            if pending != "" && name != "" && genericIndexGet(functions.index, name) < 0 && resultLastIndex(line, ")") > line.find(" ptr @") + 6 + name.length {
+                current = functions.flags.length
+                genericIndexPut(functions.index, name, current)
+                functions.flags.add(pending)
+                functions.starts.add(index)
+            }
+            pending = ""
+        } else if current >= 0 && line.startsWith("  ret ") && !line.startsWith("  ret ptr %") {
+            // A body returning anything but a local Result keeps its record ABI.
+            functions.flags[current] = ""
+        } else if line == "}" {
+            if current >= 0 { functions.ends.add(index) }
+            current = -1
+        }
+        index = index + 1
+    }
+    // A function stays marked only when every return is built in place or
+    // passes a marked call's pair through: an unboxed return would cost a take
+    // in the body and a new record in every caller that still boxes.
+    let changed = true
+    while changed {
+        changed = false
+        let entry = 0
+        while entry < functions.flags.length {
+            if functions.flags[entry] != "" {
+                let body: List<Text> = []
+                let row = functions.starts[entry]
+                while row <= functions.ends[entry] {
+                    body.add(lines[row])
+                    row = row + 1
+                }
+                if resultLowerReturns(body, functions) {
+                    functions.flags[entry] = ""
+                    changed = true
+                }
+                body.clear()
+            }
+            entry = entry + 1
+        }
+    }
+    let output: List<Text> = []
+    let body: List<Text> = []
+    let position = 0
+    let copied = 0
+    let start = 0
+    let inFunction = false
+    index = 0
+    while index < lines.length {
+        let line = lines[index]
+        if line.startsWith("define ") {
+            inFunction = true
+            start = position
+            body.clear()
+        }
+        if inFunction {
+            body.add(line)
+            if line == "}" {
+                inFunction = false
+                let flags = ""
+                let name = resultDefinedName(body[0])
+                if name != "" {
+                    let entry = genericIndexGet(functions.index, name)
+                    if entry >= 0 { flags = functions.flags[entry] }
+                }
+                if resultLowerFunction(body, functions, flags) {
+                    if start > copied { output.add(module.slice(copied, start)) }
+                    let row = 0
+                    while row < body.length {
+                        if body[row] != "" {
+                            output.add(body[row])
+                            output.add("\n")
+                        }
+                        row = row + 1
+                    }
+                    copied = position + 2
+                }
+            }
+        }
+        position = position + line.length + 1
+        index = index + 1
+    }
+    if copied < module.length { output.add(module.slice(copied, module.length)) }
+    if !module.endsWith("\n") { output.add("\n") }
+    let wrapper = 0
+    while wrapper < functions.wrappers.length {
+        output.add(functions.wrappers[wrapper])
+        wrapper = wrapper + 1
+    }
+    lines.clear()
+    return output
+}

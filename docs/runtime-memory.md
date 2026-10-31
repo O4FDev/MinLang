@@ -237,6 +237,15 @@ both endpoints of traced ownership operations use the physical payload type.
   for field visits; a shared Result keeps its value and gives the expression a
   new count. Failure releases the Result after building the propagated error.
   Recoverable functions keep the temporary (`make check-result-try-consumption`).
+- In whole-program builds (not `--export-modules` live-patch builds) such a
+  Result crosses direct calls in two registers. A function returning an
+  untraced Result whose every `return` builds its `Ok`/`Err` in place, or
+  returns such a function's call, gets a body `NAME.r` returning
+  `[tag, payload]` with the payload's count; `NAME` stays as a wrapper that
+  boxes the pair (`minyar_result_box`) for every other use. A consumed `try`
+  on a call of `NAME` calls `NAME.r`: success allocates and frees no record,
+  and only the failing branch rebuilds one. The final lowering is
+  `compiler/stages/result-registers.min`, after scope lowering.
 - `minyar_rc_borrow` retains a borrowed field/element as an expression owner
   when its lifetime may extend across a later call or mutation.
 - A chain of field reads borrows intermediate receivers without count changes.

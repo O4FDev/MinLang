@@ -257,6 +257,12 @@ function parseResultConstructor(context: CompilerContext, localNames: List<Text>
     return value
 }
 
+// The reference flag minyar_result_box takes for a Result payload type.
+function resultReferenceFlag(payloadType: Integer): Text {
+    if payloadType != 5 && isReferenceType(payloadType) { return "1" }
+    return "0"
+}
+
 function parseResultTry(context: CompilerContext, localNames: List<Text>, localTypes: List<Integer>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, textState: List<Text>, output: List<Text>, globals: List<Text>, resultType: List<Integer>, returnType: Integer): Text {
     let tokenLines = context.tokenLines
     let functionNames = context.functionNames
@@ -309,7 +315,15 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
     output.add(conditionalBranch(tag, okLabel, errorLabel))
     output.add("\n" + errorLabel + ":\n")
     textState[0] = errorLabel
-    let error = readRecordField(output, textState, state, input, 2, errorType)
+    // A consumed, untraced Result reads its failure through the rebox helper,
+    // so the final Result lowering may return the call's Result in registers
+    // and rebuild the record only on this branch.
+    let failed = input
+    if consumed && !traceable {
+        failed = valueName(textState, newTemporary(state))
+        output.add("  " + failed + " = call ptr @.minyar.record.result.rebox(ptr " + input + ", i64 " + resultReferenceFlag(payloadType) + ", i64 " + resultReferenceFlag(errorType) + ")\n")
+    }
+    let error = readRecordField(output, textState, state, failed, 2, errorType)
     let errorPayload: List<Integer> = [errorType]
     // A context expression belongs to the failing branch, so its side effects
     // and temporary owners are absent on success. The public method is a
@@ -353,7 +367,7 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
         ownResult(output, state, error, errorPayload)
     }
     let returned = emitResultValue(output, textState, state, error, errorPayload, false, returnType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
-    if consumed { output.add("  call void @minyar_rc_release(ptr " + input + ")\n") }
+    if consumed { output.add("  call void @minyar_rc_release(ptr " + failed + ")\n") }
     output.add("  call void @minyar_rc_leave()\n")
     output.add(stackLeave(state))
     output.add("  ret ptr " + returned + "\n")

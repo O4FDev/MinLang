@@ -111,22 +111,32 @@ let expected = "ok w1+w2\nerr negative -2\nerr negative -1\nok 30\nerr three\ner
 
 test.require(fixtures.compile(frontend, source), "compile try consumption IR")
 let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
-// A fresh untraced Result is consumed by try: no temporary owner, one take per
-// try, and one release on each failing return.
-let joinedBody = body(ir, "joined")
-test.check(count(joinedBody, "call i64 @minyar_record_take_field(") == 2 && count(joinedBody, "call void @minyar_rc_release(") == 2, "joined: each try takes its payload and releases a failing Result")
+// A fresh untraced Result is consumed by try: no temporary owner and one
+// release on each failing return. Whole-program builds return these Results in
+// two registers: a function whose returns all build their Result in place has a
+// `NAME.r` body returning [tag, payload], its consumed tries call `.r` and take no
+// record, only a failing branch rebuilds one, and `NAME` boxes for other callers.
+let joinedBody = body(ir, "joined.r")
+test.check(count(joinedBody, "call i64 @minyar_record_take_field(") == 0 && count(joinedBody, "call [2 x i64] @") == 2, "joined: each try takes its payload from the callee's registers")
+test.check(count(joinedBody, "call ptr @minyar_result_box(") == 2 && count(joinedBody, "call void @minyar_rc_release(") == 2, "joined: each failing branch rebuilds and releases the failing Result")
+test.check(count(joinedBody, "@minyar_record_new") == 0 && count(joinedBody, "ret [2 x i64] ") == 3, "joined: every return builds its Result in registers")
 test.check(count(joinedBody, "@minyar_rc_keep(ptr %value.0)") == 0, "joined: a consumed Result is not a statement temporary")
-let totalBody = body(ir, "total")
-test.check(count(totalBody, "call i64 @minyar_record_take_field(") == 3, "total: scalar and payload-free successes are taken")
+let joinedWrapper = body(ir, "joined")
+test.check(count(joinedWrapper, ".r(") == 1 && count(joinedWrapper, "call ptr @minyar_result_box(") == 1, "joined: other callers get the Result boxed")
+let totalBody = body(ir, "total.r")
+test.check(count(totalBody, "call i64 @minyar_record_take_field(") == 0 && count(totalBody, "call [2 x i64] @") == 3, "total: scalar and payload-free successes come in registers")
 test.check(count(totalBody, "@minyar_rc_keep(") == 0, "total: scalar and payload-free tries keep no temporaries")
-// The shared case is decided at run time; the call site is the same.
-test.check(count(body(ir, "shared"), "call i64 @minyar_record_take_field(") == 1, "shared: a returned Result is taken; the runtime keeps a shared one intact")
+// A returned stored Result keeps the record ABI; its caller takes at run time
+// and the runtime keeps a shared Result intact.
+test.check(count(ir, "cached.r(") == 0, "cached: a function returning a stored Result keeps its record")
+test.check(count(body(ir, "shared.r"), "call i64 @minyar_record_take_field(") == 1, "shared: a returned Result is taken; the runtime keeps a shared one intact")
 // A borrowed Result keeps the ordinary temporary.
-test.check(count(body(ir, "borrowed"), "call i64 @minyar_record_take_field(") == 0 && count(body(ir, "borrowed"), "@minyar_rc_keep(") > 0, "borrowed: try on a local keeps its protecting count")
+test.check(count(body(ir, "borrowed.r"), "call i64 @minyar_record_take_field(") == 0 && count(body(ir, "borrowed.r"), "@minyar_rc_keep(") > 0, "borrowed: try on a local keeps its protecting count")
 // A traced payload is taken through the collector-aware form: the payload is
 // retained with a traced retain and the Result released, not freed in place.
-let tracedBody = body(ir, "traced")
+let tracedBody = body(ir, "traced.r")
 test.check(test.contains(ir, "; minyar-cycle-runtime: 1\n"), "traced: Node activates the cycle runtime")
+test.check(count(ir, "grow.r(") == 0, "traced: a Result carrying a traced payload keeps its record")
 test.check(count(tracedBody, "call i64 @minyar_record_take_field_traced(") == 1 && count(tracedBody, "call i64 @minyar_record_take_field(") == 0, "traced: a Result carrying a traced payload is taken through the traced form")
 test.check(count(tracedBody, "@minyar_rc_keep(ptr %value.0)") == 0, "traced: the consumed Result is not a statement temporary")
 test.check(count(joinedBody, "_traced(") == 0, "joined: untraced takes stay plain in a cycle program")
@@ -167,8 +177,9 @@ let quiet = #"""
 test.require(fixtures.compile(frontend, quiet), "compile untraced cycle-capable try IR")
 let quietIR = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
 test.check(!test.contains(quietIR, "; minyar-cycle-runtime: 1\n") && !test.contains(quietIR, "_traced("), "quiet: an unmutated cycle-capable type stays untraced")
+// Untraced is only known at module end here, so these Results keep records.
 test.check(count(body(quietIR, "make"), "call i64 @minyar_record_take_field(") == 2, "quiet: both tries take their payloads")
-test.check(count(body(quietIR, "measure"), "call i64 @minyar_record_take_field(") == 1, "quiet: measure takes its tree")
+test.check(count(body(quietIR, "measure.r"), "call i64 @minyar_record_take_field(") == 1, "quiet: measure (returning an Integer Result in registers) takes its tree")
 fixtures.executes(frontend, quiet, "ok 75\nerr negative -1\nok 5\n", ["-O0", "-O2"], 0, "", true)
 test.removeTree(compiler.directory)
 print("Result try consumption: passed")
