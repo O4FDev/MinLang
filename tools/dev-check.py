@@ -334,6 +334,22 @@ def clean_environment():
     return environment
 
 
+def trace_environment(root):
+    """LeakSanitizer stops the world with ptrace and aborts under a tracer. Its documented hook
+    __lsan_is_turned_off, preloaded, skips only the exit-time leak scan, which reads no repository files,
+    so traced sanitizer checks record the same dependencies. Pass/fail of a check that only failed traced
+    is taken from an untraced run."""
+    environment = clean_environment()
+    STATE.mkdir(parents=True, exist_ok=True)
+    source, library = STATE / "lsan-off.c", STATE / "lsan-off.so"
+    source.write_text("int __lsan_is_turned_off(void) { return 1; }\n")
+    compiler = environment.get("LLVM_CC") or "cc"
+    if subprocess.run([compiler, "-shared", "-fPIC", "-O1", str(source), "-o", str(library)],
+                      capture_output=True).returncode == 0:
+        environment["LD_PRELOAD"] = str(library)
+    return environment
+
+
 def latest_results(root):
     runs = sorted((root / "build" / "check-in-parallel").glob("run-*/results.json"), key=lambda path: path.stat().st_mtime)
     if not runs:
@@ -376,7 +392,7 @@ def command_index(arguments):
         command = ["strace", "-f", "-qq", "--seccomp-bpf", "-s", "4096", "-o", str(trace),
                    "-e", "trace=%file,%process", "make", "--no-print-directory", "check-in-parallel",
                    "CHECKS=" + " ".join(aggregate), f"CHECK_JOBS={arguments.jobs}"]
-        status = subprocess.run(command, cwd=root, env=clean_environment()).returncode
+        status = subprocess.run(command, cwd=root, env=trace_environment(root)).returncode
         say(f"traced gate exited {status} after {time.time() - started:.0f} s")
     results, times = latest_results(root)
     times = dict(times or {})
@@ -391,9 +407,8 @@ def command_index(arguments):
         retry = trace.with_name(trace.stem + "-retry.log")
         # LeakSanitizer stops the world with ptrace, which fails under a tracer; leak detection reads no
         # repository files, so the retry records the same dependencies without it.
-        retry_environment = clean_environment()
+        retry_environment = trace_environment(root)
         retry_environment["ASAN_OPTIONS"] = "detect_leaks=0"
-        retry_environment["LSAN_OPTIONS"] = "detect_leaks=0"
         say(f"retrying {len(failed)} failed check(s) under strace: {' '.join(failed)}")
         subprocess.run(["strace", "-f", "-qq", "--seccomp-bpf", "-s", "4096", "-o", str(retry), "-e", "trace=%file,%process",
                         "make", "--no-print-directory", "check-in-parallel", "CHECKS=" + " ".join(failed),
