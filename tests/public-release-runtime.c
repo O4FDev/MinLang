@@ -134,7 +134,9 @@ static void bounded_release_paths(void) {
     shared = minyar_record_new_scalar(1);
     minyar_rc_retain(shared);
     MinyarRecord *chain = NULL;
-    for (size_t i = 0; i < 160; i++) {
+    /* A unit retires up to RC_SMALL_RECORD_UNIT_OBJECTS small records, so the
+     * pending chain must outlast every K-unit service point below. */
+    for (size_t i = 0; i < 32 * MINYAR_RC_POLL_BUDGET + 4; i++) {
         MinyarRecord *next = minyar_record_new(1);
         minyar_record_set_take(next, 0, (long long)(uintptr_t)chain);
         chain = next;

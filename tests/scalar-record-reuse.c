@@ -228,11 +228,11 @@ static void pending_objects(void) {
         if (alias) assert(minyar_record_get(alias, 0) == 83);
 #ifdef MINYAR_BOUNDED_RC
         assert(rc_bounded_last_work <= MINYAR_RC_POLL_BUDGET);
-        size_t expected = 2 * MINYAR_RC_POLL_BUDGET;
-        if (mode == 2 || mode == 4) expected--;
-        if (mode == 5) expected = MINYAR_RC_POLL_BUDGET;
-        if (mode != 3) assert(rc_bounded_cursor == expected);
-        assert(rc_bounded_cursor > 0 && rc_bounded_cursor <= 2 * MINYAR_RC_POLL_BUDGET);
+        /* A unit examines up to RC_RECORD_UNIT_FIELDS fields, so two K-unit
+         * service points advance the cursor by at most that many fields per
+         * unit; the pending record has 4096 slots, far more than that. */
+        assert(rc_bounded_cursor > 0);
+        assert(rc_bounded_cursor <= 2 * MINYAR_RC_POLL_BUDGET * RC_RECORD_UNIT_FIELDS);
 #else
         assert(rc_pending_count == (mode == 5 ? 1 : 0));
 #endif

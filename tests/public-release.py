@@ -15,9 +15,19 @@ ENGINES = ["ordinary", "cycle"]
 PROFILES = ["eager", "system-k1", "system-k32", "fixed-k1", "fixed-k32"]
 OPTIMIZATIONS = ["0", "2"]
 SUCCESS = "public release accounting passed\n"
+# One unit retires up to RC_SMALL_RECORD_UNIT_OBJECTS small records, so the
+# fixture's pending chain outlasts the K-unit service points it counts and the
+# object queue loses eight records per unit. The traced runtime keeps its own
+# eight-field unit, so its counts differ from the ordinary runtime's.
 TRANSCRIPTS = {
-    "1": "immortal 1 2 161\nshared 1 1 160\nnull 1 2 160\nlast 1 2 159\n" + SUCCESS,
-    "32": "immortal 32 1 145\nshared 32 1 129\nnull 32 1 113\nlast 32 2 97\n" + SUCCESS,
+    "ordinary": {
+        "1": "immortal 1 1 29\nshared 1 1 21\nnull 1 1 13\nlast 1 1 12\n" + SUCCESS,
+        "32": "immortal 32 1 773\nshared 32 1 517\nnull 32 1 261\nlast 32 1 12\n" + SUCCESS,
+    },
+    "cycle": {
+        "1": "immortal 1 2 37\nshared 1 1 36\nnull 1 2 36\nlast 1 2 35\n" + SUCCESS,
+        "32": "immortal 32 1 1013\nshared 32 1 997\nnull 32 1 981\nlast 32 2 965\n" + SUCCESS,
+    },
 }
 
 
@@ -120,7 +130,7 @@ def main():
                     # tests/direct-service-transcript.c cover the paced old-object backlog.
                     flags += ["-DMINYAR_" + ("SYSTEM" if backend == "system" else "BOUNDED") + "_HEAP=1",
                               "-DMINYAR_RC_POLL_BUDGET=" + budget, "-DMINYAR_RC_BACKLOG_BUDGET=0"]
-                    expected = TRANSCRIPTS[budget]
+                    expected = TRANSCRIPTS[name][budget]
                 if options.mode == "sanitize":
                     flags += ["-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
                 for optimization in selected["optimizations"]:
