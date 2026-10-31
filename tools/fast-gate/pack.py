@@ -113,7 +113,12 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
         })
     # check-in-parallel starts the checks it knows to be longest first (build/tooling/check-durations: label, wall ms,
     # cpu ms); a fresh tree has no history and would start them last, leaving one long check running alone at the end.
-    durations = {check["label"]: [length(check), cost(check)] for check in checks}
+    # The estimate is the check's critical path: its own length plus its slowest shared build, so a long build that only
+    # a quick check needs (build/scope-compiler-stage3.ll for check-scope-fixed-point) still starts first.
+    durations = {}
+    for check in checks:
+        slowest = max([goal_ms.get(name, 0) for name in check["goals"] if name not in prebuilt] or [0])
+        durations[check["label"]] = [length(check) + slowest, cost(check)]
     return {"shards": shards, "jobs": jobs, "checks": len(all_checks), "goals": len(goals), "assignment": result,
             "durations": durations}
 
