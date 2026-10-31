@@ -690,6 +690,12 @@ def command_run(arguments):
     # Record what the build now reflects so the next run gives Make true timestamps.
     built_path.write_text(json.dumps(current))
     elapsed = time.time() - started
+    base_red_all = bool(failed) and all(name in index["checks"] and not index["checks"][name]["passed"] for name in failed)
+    verdict = "GREEN" if not failed else ("BASE-RED" if base_red_all else "RED")
+    (STATE / "last.json").write_text(json.dumps({
+        "verdict": verdict, "seconds": round(elapsed, 1), "changed": changed, "ignored": ignored,
+        "stale": stale_build, "selected": {check: reasons[check] for check in selected}, "failed": failed,
+        "considered": len(checks), "benchmarks": benchmarks}, indent=1))
     scope = f"{len(selected)} affected check(s)"
     if arguments.only and ignored:
         scope += f" for --only {' '.join(arguments.only)} ({len(ignored)} other changed path(s) NOT covered)"
