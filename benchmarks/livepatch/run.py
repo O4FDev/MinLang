@@ -30,8 +30,11 @@ LAUNCHER = ROOT / "minyar"
 CONNECTIONS = int(os.environ.get("LIVEPATCH_CONNECTIONS", "8"))
 SECONDS = float(os.environ.get("LIVEPATCH_SECONDS", "6"))
 EDIT_AT = float(os.environ.get("LIVEPATCH_EDIT_AT", "2"))
-CPUS = os.environ.get("LIVEPATCH_SERVER_CPUS", "0-3")
-LOAD_CPUS = os.environ.get("LIVEPATCH_LOAD_CPUS", "4-7")
+# Server and load generator get disjoint halves of the CPUs this process may use (0-3 / 4-7 on an 8-CPU box).
+_AVAILABLE = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(os.cpu_count() or 2))
+_HALF = max(1, len(_AVAILABLE) // 2)
+CPUS = os.environ.get("LIVEPATCH_SERVER_CPUS", ",".join(str(c) for c in _AVAILABLE[:_HALF]))
+LOAD_CPUS = os.environ.get("LIVEPATCH_LOAD_CPUS", ",".join(str(c) for c in (_AVAILABLE[_HALF:] or _AVAILABLE)))
 
 
 def edited(source, version):
