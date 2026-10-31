@@ -15,8 +15,19 @@ build/tooling/tests/managed-graphs-launcher: TOOL_NATIVE = tests/sha256-test-nat
 build/tooling/tests/managed-graphs-launcher: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/managed-graphs-launcher: tests/sha256-test-native.c runtime/native/sha256.c
 build/tooling/tests/managed-graphs-profiles.ll build/tooling/tests/managed-graphs-launcher.ll: tests/thread-port-support.min
-check-managed-graphs: build/minyarc build/minyarc-callbacks build/tooling/tests/managed-graphs
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/managed-graphs
+# One target per named selector group; each piece reuses one runtime object per process.
+MANAGED_GRAPH_PARTS = check-managed-graphs-part1 check-managed-graphs-part2 check-managed-graphs-part3 check-managed-graphs-part4
+.PHONY: $(MANAGED_GRAPH_PARTS)
+check-managed-graphs: $(MANAGED_GRAPH_PARTS)
+$(MANAGED_GRAPH_PARTS): build/minyarc build/minyarc-callbacks build/tooling/tests/managed-graphs
+check-managed-graphs-part1:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/managed-graphs ManagedGraphs.test_existing_recursive_programs_preserve_behavior
+check-managed-graphs-part2:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/managed-graphs ManagedGraphs.test_list_edge_can_close_a_self_cycle ManagedGraphs.test_enabling_cycles_preserves_index_contract_failure ManagedGraphs.test_record_edge_can_close_a_self_cycle ManagedGraphs.test_mutually_recursive_aliases_and_replacement ManagedGraphs.test_preserved_record_field_assignment_closes_shared_mutual_cycle
+check-managed-graphs-part3:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/managed-graphs ManagedGraphs.test_preserved_module_aliases_execute_cycle_writes ManagedGraphs.test_preserved_nested_list_helper_and_return_alias_cycles ManagedGraphs.test_preserved_alias_return_and_record_projection_cycles ManagedGraphs.test_unrelated_recursive_types_keep_untraced_allocations ManagedGraphs.test_closure_callback_retains_lexical_capture
+check-managed-graphs-part4:
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/managed-graphs ManagedGraphs.test_adapted_graph_churn_temporaries_and_shared_append
 
 check-callbacks: build/minyarc-callbacks build/closure-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/callbacks build/testing/cycle-runtime.o build/tooling/tests/compiler-behavior
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile callbacks --ir build/closure-compiler-stage3.ll
