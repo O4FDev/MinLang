@@ -149,8 +149,21 @@ def plan(tree, targets):
     for name in goal_order:
         closure(name, goals[name]["members"])
     own_recipe = {label: bool(rules[label]["recipe"]) for label in check_order}
+    # What shard-run.sh / cache-run.sh build before the runner starts: up to date when the runner plans, though
+    # `make -q` calls them stale (build/.toolchain.json depends on FORCE).
+    first = ["build/minyarc", "build/tooling/tools/check-in-parallel"]
+    built_first = make_database(tree, env, ["-pq"] + first)  # resolves the implicit rules those two use
+    prebuilt, pending = set(), list(first)
+    while pending:
+        name = pending.pop()
+        rule = built_first.get(name)
+        if name in prebuilt or rule is None or rule["phony"]:
+            continue
+        prebuilt.add(name)
+        pending.extend(rule["prerequisites"])
     return {
         "targets": targets,
+        "prebuilt": sorted(prebuilt),
         "checks": [dict(checks[label], recipe=own_recipe[label]) for label in check_order],
         "goals": [goals[name] for name in goal_order],
     }

@@ -7,7 +7,8 @@ build its checks need. Deterministic: every shard can run it on the same inputs 
 
 Each shard gets its checks, the shared builds those checks need, and a skip list for the make shim (every other check
 and shared build of the plan). A shared build that shares a recipe-built prerequisite with a needed one is kept too,
-so the runner still serialises them exactly as it would on one box.
+so the runner still serialises them exactly as it would on one box; prerequisites built before the runner starts
+(plan.py "prebuilt": the compiler and the runner itself) do not count.
 """
 import json
 import sys
@@ -28,8 +29,10 @@ def read_times(path, column):
     return times
 
 
-def pack(plan, check_ms, goal_ms, shards, jobs):
+def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
+    wall_ms = wall_ms or {}
     goals = {goal["name"]: goal for goal in plan["goals"]}
+    prebuilt = set(plan.get("prebuilt", []))
     checks = plan["checks"]
 
     def cost(check):
@@ -40,24 +43,37 @@ def pack(plan, check_ms, goal_ms, shards, jobs):
             return 1000
         return DEFAULT_CHECK_MS
 
+    def length(check):
+        # A check given several slots (peer suites) takes less wall time than CPU time.
+        return min(cost(check), wall_ms.get(check["label"], cost(check)))
+
     order = sorted(checks, key=lambda check: (-cost(check), check["label"]))
-    load = [0] * shards
-    longest = [0] * shards
+    # A shard's runner starts no check before all its shared builds are done, so a shard finishes at about
+    # (shared-build phase) + (check phase), each the larger of its longest item and its total over the jobs.
+    goal_sum, goal_max = [0] * shards, [0] * shards
+    load, longest = [0] * shards, [0] * shards
     owned = [set() for _ in range(shards)]
     assigned = [[] for _ in range(shards)]
+
+    def finish(index, extra_goals, check_cost, check_length=0):
+        gs = goal_sum[index] + sum(extra_goals)
+        gm = max([goal_max[index]] + extra_goals)
+        return max(gm, gs / jobs) + max((load[index] + check_cost) / jobs, max(longest[index], check_length))
+
     for check in order:
         best, best_finish = 0, None
         for index in range(shards):
-            extra = sum(goal_ms.get(name, DEFAULT_GOAL_MS) for name in check["goals"] if name not in owned[index])
-            finish = max((load[index] + extra + cost(check)) / jobs, max(longest[index], cost(check)))
-            if best_finish is None or finish < best_finish:
-                best, best_finish = index, finish
+            extra = [goal_ms.get(name, DEFAULT_GOAL_MS) for name in check["goals"] if name not in owned[index]]
+            value = finish(index, extra, cost(check), length(check))
+            if best_finish is None or value < best_finish:
+                best, best_finish = index, value
         for name in check["goals"]:
             if name not in owned[best]:
                 owned[best].add(name)
-                load[best] += goal_ms.get(name, DEFAULT_GOAL_MS)
+                goal_sum[best] += goal_ms.get(name, DEFAULT_GOAL_MS)
+                goal_max[best] = max(goal_max[best], goal_ms.get(name, DEFAULT_GOAL_MS))
         load[best] += cost(check)
-        longest[best] = max(longest[best], cost(check))
+        longest[best] = max(longest[best], length(check))
         assigned[best].append(check["label"])
 
     result = []
@@ -69,11 +85,11 @@ def pack(plan, check_ms, goal_ms, shards, jobs):
             changed = False
             built = set()
             for name in needed:
-                built.update(member for member, recipe in goals[name]["members"].items() if recipe)
+                built.update(member for member, recipe in goals[name]["members"].items() if recipe and member not in prebuilt)
             for name, goal in goals.items():
                 if name in needed:
                     continue
-                if any(recipe and member in built for member, recipe in goal["members"].items()):
+                if any(recipe and member in built and member not in prebuilt for member, recipe in goal["members"].items()):
                     needed.add(name)
                     changed = True
         mine = set(assigned[index])
@@ -82,7 +98,7 @@ def pack(plan, check_ms, goal_ms, shards, jobs):
             "shard": index,
             "checks": sorted(mine),
             "goals": sorted(needed),
-            "estimate_s": round(max(load[index] / jobs, longest[index]) / 1000, 1),
+            "estimate_s": round(finish(index, [], 0) / 1000, 1),
             "skip": skip,
         })
     return {"shards": shards, "jobs": jobs, "checks": len(all_checks), "goals": len(goals), "assignment": result}
@@ -92,5 +108,6 @@ if __name__ == "__main__":
     if len(sys.argv) != 6:
         sys.exit(__doc__)
     plan = json.load(open(sys.argv[1]))
-    json.dump(pack(plan, read_times(sys.argv[2], 2), read_times(sys.argv[3], 1), int(sys.argv[4]), int(sys.argv[5])), sys.stdout, indent=1)
+    json.dump(pack(plan, read_times(sys.argv[2], 2), read_times(sys.argv[3], 1), int(sys.argv[4]), int(sys.argv[5]),
+                   read_times(sys.argv[2], 1)), sys.stdout, indent=1)
     sys.stdout.write("\n")

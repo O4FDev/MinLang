@@ -38,7 +38,8 @@ install -m 755 "$here/FileCheck" /opt/llvm-$v/bin/FileCheck
 # The fast gate's compile cache (tools/fast-gate/fgcc) stands in for the clang driver; with no
 # /home/agent/fgcc/config it only execs clang-23. It is part of the image so every box made from it
 # has the same toolchain identity (build/.toolchain.json records the compiler's inode and ctime).
-if [[ -f $here/fgcc ]]; then
+if [[ -f $here/fgcc.c ]]; then
+  gcc -O2 -Wall -Wno-format-truncation -o "$here/fgcc" "$here/fgcc.c"
   [[ -L /opt/llvm-$v/bin/clang && $(readlink /opt/llvm-$v/bin/clang) == clang-23 ]] && rm /opt/llvm-$v/bin/clang
   install -m 755 "$here/fgcc" /opt/llvm-$v/bin/clang
   /opt/llvm-$v/bin/clang --version | head -1
