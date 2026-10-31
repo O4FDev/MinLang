@@ -75,11 +75,12 @@ def manifest(root, cache=None):
 
 # ---------------------------------------------------------------------------- make database
 
-def make_database(root, aggregate):
+def make_database(root, aggregate, goals=None):
     environment = clean_environment()
     # Ask about FORCE (as the check runner does) so no goal triggers implicit-rule search: the printed
     # rules are then the explicit ones only and do not depend on which goals were asked about.
-    text = subprocess.run(["make", "-pnq", "--no-print-directory", "FORCE"], cwd=root, env=environment,
+    command = ["make", "-pn", "--no-print-directory", *goals] if goals else ["make", "-pnq", "--no-print-directory", "FORCE"]
+    text = subprocess.run(command, cwd=root, env=environment,
                           capture_output=True, text=True, errors="replace").stdout
     variables, rules, phony = {}, {}, set()
     section = None
@@ -391,6 +392,199 @@ def make_goals(argv, root):
     return goals or None
 
 
+# ---------------------------------------------------------------------------- function-level changes
+
+def _skip_quoted(text, at):
+    quote = text[at]
+    at += 1
+    while at < len(text):
+        if text[at] == "\\":
+            at += 2
+            continue
+        if text[at] == quote or (quote == "'" and text[at] == "\n"):
+            return at + 1
+        at += 1
+    return at
+
+
+def _items(text, language):
+    """Top-level items of a source file with comments removed: brackets, strings and comments are respected.
+    C items end at `;` or a closing `}` at depth 0, or are preprocessor lines; Minyar items end at a newline
+    at depth 0."""
+    items, current, depth, at, line_start = [], [], 0, 0, True
+    while at < len(text):
+        c = text[at]
+        if c == "/" and text.startswith("//", at):
+            end = text.find("\n", at)
+            at = len(text) if end < 0 else end
+            continue
+        if c == "/" and text.startswith("/*", at):
+            end = text.find("*/", at + 2)
+            at = len(text) if end < 0 else end + 2
+            current.append(" ")
+            continue
+        if language == "c" and c == "#" and depth == 0 and "".join(current).strip() == "":
+            end = at
+            while True:
+                end = text.find("\n", end)
+                if end < 0:
+                    end = len(text)
+                    break
+                if text[end - 1] == "\\":
+                    end += 1
+                    continue
+                break
+            items.append(text[at:end].strip())
+            current = []
+            at = end
+            continue
+        if c in "\"'" and not (language == "minyar" and c == "'" and False):
+            end = _skip_quoted(text, at)
+            current.append(text[at:end])
+            at = end
+            continue
+        current.append(c)
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth = max(0, depth - 1)
+            if c == "}" and depth == 0 and language == "c":
+                items.append("".join(current).strip())
+                current = []
+        elif c == ";" and depth == 0 and language == "c":
+            items.append("".join(current).strip())
+            current = []
+        elif c == "\n" and depth == 0 and language == "minyar":
+            if "".join(current).strip():
+                items.append("".join(current).strip())
+            current = []
+        at += 1
+    if "".join(current).strip():
+        items.append("".join(current).strip())
+    return [item for item in items if item]
+
+
+def _normal(text):
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.split("\n")]
+    return "\n".join(line for line in lines if line)
+
+
+ATTRIBUTE_WORDS = {"__attribute__", "__declspec", "alignas", "_Alignas", "__asm__", "asm", "__typeof__", "typeof"}
+
+
+def _function(item, language):
+    """(name, signature, body) when the item is a function definition, else None."""
+    brace = None
+    depth = 0
+    index = 0
+    while index < len(item):
+        c = item[index]
+        if c in "\"'":
+            index = _skip_quoted(item, index)
+            continue
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif c == "{" and depth == 0:
+            brace = index
+            break
+        index += 1
+    if brace is None or not item.endswith("}"):
+        return None
+    signature, body = item[:brace], item[brace:]
+    if language == "minyar":
+        match = re.match(r"^(?:[a-z]+\s+)*function\s+([A-Za-z_][A-Za-z0-9_]*)", signature)
+        return (match.group(1), signature, body) if match else None
+    if re.match(r"^\s*(typedef|struct|union|enum)\b", signature) and "(" not in signature:
+        return None
+    depth, name = 0, None
+    for match in re.finditer(r"[()=]", signature):
+        c = match.group(0)
+        if c == "=" and depth == 0:
+            return None  # an initializer, not a function body
+        if c == "(":
+            if depth == 0:
+                before = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*$", signature[:match.start()])
+                if before and before.group(1) not in ATTRIBUTE_WORDS:
+                    name = before.group(1)
+            depth += 1
+        elif c == ")":
+            depth -= 1
+    return (name, signature, body) if name else None
+
+
+def function_snapshot(text, language):
+    """{"other": hash of everything outside function bodies, "functions": {key: [signature hash, body hash]}}."""
+    other, functions = [], {}
+    for item in _items(text, language):
+        found = _function(item, language)
+        if found is None:
+            other.append(_normal(item))
+            continue
+        name, signature, body = found
+        key, number = name, 1
+        while key in functions:
+            number += 1
+            key = f"{name}#{number}"
+        functions[key] = [hashlib.sha256(_normal(signature).encode()).hexdigest()[:16],
+                          hashlib.sha256(_normal(body).encode()).hexdigest()[:16]]
+    return {"other": hashlib.sha256("\n".join(other).encode()).hexdigest()[:16], "functions": functions}
+
+
+def attributable(path):
+    """Sources whose function bodies are covered by the function index: compiler Minyar and runtime C."""
+    if path.startswith("compiler/") and path.endswith(".min"):
+        return "minyar"
+    if path.startswith("runtime/") and path.endswith((".c", ".h")):
+        return "c"
+    return None
+
+
+def source_snapshots(root):
+    result = {}
+    for directory in ("compiler", "runtime"):
+        for path in sorted((root / directory).rglob("*")):
+            relative = path.relative_to(root).as_posix()
+            language = attributable(relative)
+            if language and path.is_file():
+                result[relative] = function_snapshot(path.read_text(errors="replace"), language)
+    return result
+
+
+def changed_functions(root, base_snapshots, paths):
+    """Changed function names per language, or a reason to widen to every check."""
+    names = {"minyar": set(), "c": set()}
+    for path in paths:
+        language = attributable(path)
+        if language is None:
+            continue
+        if path not in base_snapshots or not (root / path).exists():
+            return None, f"{path} was added or removed"
+        old = base_snapshots[path]
+        new = function_snapshot((root / path).read_text(errors="replace"), language)
+        if old["other"] != new["other"]:
+            return None, f"code outside function bodies changed in {path} (declarations, types, macros or constants)"
+        for key in set(old["functions"]) | set(new["functions"]):
+            before, after = old["functions"].get(key), new["functions"].get(key)
+            if before == after:
+                continue
+            if before and after and before[0] != after[0]:
+                return None, f"the signature of {key.split('#')[0]} changed in {path}"
+            names[language].add(key.split("#")[0])
+    return names, None
+
+
+def coverage_name(name):
+    """The source-level function a coverage name stands for: (language, bare name)."""
+    match = re.match(r"^\.minyar\.fn\.minyar_module_[0-9a-f]+_([A-Za-z_][A-Za-z0-9_]*)$", name)
+    if match:
+        return "minyar", match.group(1)
+    if name.startswith("."):
+        return "other", name
+    return "c", name.rsplit(";", 1)[-1]
+
+
 # ---------------------------------------------------------------------------- helpers
 
 def clean_environment():
@@ -556,6 +750,92 @@ def command_index(arguments):
     return 0
 
 
+def profile_functions(tool, path):
+    """(executed names, all names, problem) of one .profraw file."""
+    result = subprocess.run([tool, "show", "--all-functions", "--counts", str(path)], capture_output=True, text=True,
+                            errors="replace")
+    problem = None
+    if result.returncode != 0 or "warning" in result.stderr or "error" in result.stderr:
+        problem = (result.stderr.strip().splitlines() or [f"exit {result.returncode}"])[0][:200]
+    executed, seen, current = set(), set(), None
+    for line in result.stdout.splitlines():
+        if line.startswith("  ") and not line.startswith("   ") and line.endswith(":"):
+            current = line[2:-1]
+            seen.add(current)
+        elif current is not None and line.strip().startswith("Block counts: ["):
+            counts = line.strip()[len("Block counts: ["):-1]
+            if any(item.strip() not in ("", "0") for item in counts.split(",")):
+                executed.add(current)
+    return executed, seen, problem
+
+
+def command_coverage(arguments):
+    """Fold per-check function coverage from an instrumented gate run into a dependency index."""
+    from concurrent.futures import ThreadPoolExecutor
+    data = Path(arguments.data)
+    index = json.loads(Path(arguments.index).read_text())
+    tool = arguments.profdata or shutil.which("llvm-profdata") or "llvm-profdata"
+    results = {}
+    for line in Path(arguments.results).read_text(errors="replace").splitlines():
+        match = re.match(r"^([^:\s]+): (passed|FAILED)", line)
+        if match:
+            results[match.group(1)] = match.group(2) == "passed"
+    uninstrumented = {}
+    log = data / "_uninstrumented.log"
+    if log.exists():
+        for line in log.read_text(errors="replace").splitlines():
+            target = line.split("\t", 1)[0]
+            check = Path(target).parent.name if target else "_build"
+            uninstrumented.setdefault(check, line.split("\t", 1)[-1][:160])
+    buckets = [item.name for item in sorted(data.iterdir()) if item.is_dir()]
+    jobs = [(bucket, path) for bucket in buckets for path in sorted((data / bucket).glob("*.profraw"))]
+    say(f"reading {len(jobs)} profiles from {len(buckets)} buckets with {arguments.jobs} workers")
+    started = time.time()
+    with ThreadPoolExecutor(max_workers=arguments.jobs) as pool:
+        outputs = list(pool.map(lambda job: profile_functions(tool, job[1]), jobs))
+    say(f"read profiles in {time.time() - started:.0f} s")
+    names, numbers = [], {}
+
+    def number(name):
+        if name not in numbers:
+            numbers[name] = len(names); names.append(name)
+        return numbers[name]
+
+    covered = {bucket: set() for bucket in buckets}
+    problems, files, universe = {}, {}, set()
+    for (bucket, path), (executed, seen, problem) in zip(jobs, outputs):
+        covered[bucket] |= {number(name) for name in executed}
+        universe |= {number(name) for name in seen}
+        files[bucket] = files.get(bucket, 0) + 1
+        if problem and bucket not in problems:
+            problems[bucket] = f"{path.name}: {problem}"
+    checks = {}
+    for check in index["checks"]:
+        why = []
+        if not results.get(check, False):
+            why.append("did not pass in the instrumented run")
+        if check in problems:
+            why.append("unreadable profile " + problems[check])
+        if check in uninstrumented:
+            why.append("compiled runtime or compiler code without coverage: " + uninstrumented[check])
+        checks[check] = {"covered": sorted(covered.get(check, set())), "complete": not why, "why": "; ".join(why),
+                         "files": files.get(check, 0)}
+    index["coverage"] = {"names": names, "checks": checks, "universe": sorted(universe),
+                         "top": sorted(covered.get("_top", set())), "build": sorted(covered.get("_build", set())),
+                         "lost": sorted(covered.get("_lost", set())),
+                         "problems": {bucket: problems[bucket] for bucket in problems if bucket.startswith("_")},
+                         "snapshots": source_snapshots(ROOT)}
+    output = Path(arguments.output)
+    output.with_suffix(".tmp").write_text(json.dumps(index, sort_keys=True))
+    output.with_suffix(".tmp").replace(output)
+    incomplete = [check for check, entry in checks.items() if not entry["complete"]]
+    say(f"wrote {output}: {len(names)} functions, {len(universe)} instrumented, {len(incomplete)} checks without complete "
+        f"coverage, {len(index['coverage']['lost'])} functions run by processes whose check is unknown")
+    for check in incomplete:
+        say(f"  {check}: {checks[check]['why'][:200]}")
+    return 0
+
+
 def base_manifest(index):
     """The tree a change is measured against: the indexed base, or the tree recorded by `rebase`."""
     rebased = STATE / "base.json"
@@ -651,7 +931,7 @@ def changed_outputs(root, targets, jobs, database):
         after = file_digest(root / target)
         if after is None or after != before[target] or target in left:
             result.append(target)
-    return sorted(result)
+    return sorted(result), sorted(set(targets) & left)
 
 
 def select(index, database, checks, changed, added, removed, stale):
@@ -714,10 +994,11 @@ def select(index, database, checks, changed, added, removed, stale):
         elif entry.get("static"):
             # An aggregate goal's own recipe: its file prerequisites and the paths its recipe names.
             rule = database["rules"].get(check, {"prerequisites": [], "recipe": []})
-            named = set(rule["prerequisites"]) | {token.strip('"\'') for line in rule["recipe"] for token in line.split()}
+            # Its file prerequisites are built (and a failed build is red) before checks run; the recipe runs alone.
+            named = {token.strip('"\'') for line in rule["recipe"] for token in line.split()}
             hits = sorted(named & changed_set)
             if hits:
-                why.append("its own recipe uses " + ", ".join(hits[:4]) + " (runs the whole aggregate)")
+                why.append("its own recipe uses " + ", ".join(hits[:4]))
         else:
             if not entry["passed"]:
                 pass  # red at base whatever this change does; selected below only if its partial trace is hit
@@ -765,7 +1046,7 @@ def command_rebase(arguments):
     targets = [item for item in prerequisites if item in stale]
     say(f"{len(changed)} changed source(s); rebuilding {len(targets)} stale prerequisite(s)")
     if targets:
-        changed_outputs(root, targets, arguments.jobs, database)  # parallel, through the check runner's builder
+        changed_outputs(root, targets, arguments.jobs, database)[0]  # parallel, through the check runner's builder
         left, _ = stale_outputs(root, prerequisites, database)
         if left:
             say(f"build failed: {len(left)} output(s) still stale, e.g. {', '.join(sorted(left)[:3])}; base not recorded")
@@ -776,6 +1057,84 @@ def command_rebase(arguments):
         "rules": {name: rule_text(database, name) for name in database["rules"]}, "variables": database["variables"]}))
     say(f"recorded the current tree as the base ({len(current)} files)")
     return 0
+
+
+ROOT_OUTPUT = re.compile(r"^build/(minyarc[^/]*|compiler-stage[12](\.ll|-sanitize\.ll)?|compiler\.min|compiler-sources\.list"
+                         r"|[^/]*runtime[^/]*\.(o|ll|c|bc)|testing/[^/]*|tooling/runtime/native/[^/]*)$")
+
+
+def explained_outputs(root, outputs):
+    """Changed outputs whose only change is compiler or runtime code (covered by the function index): the
+    compiler and runtime artefacts themselves, and objects or executables linked from them whose other
+    changed inputs are explained too. A Minyar-compiled .ll that changed is never explained (codegen changed)."""
+    outputs = set(outputs)
+    explained = {item for item in outputs if ROOT_OUTPUT.match(item)}
+    rest = sorted(item for item in outputs if item not in explained)
+    if not rest:
+        return explained
+    rules = make_database(root, None, goals=rest)["rules"]
+    grew = True
+    while grew:
+        grew = False
+        for item in rest:
+            base = item.rsplit("/", 1)[-1]
+            if item in explained or ("." in base and not base.endswith(".o")):
+                continue
+            rule = rules.get(item)
+            if not rule:
+                continue
+            inputs = [p for p in rule["prerequisites"] if p in outputs]
+            if inputs and all(p in explained for p in inputs):
+                explained.add(item)
+                grew = True
+    return explained
+
+
+def function_selection(root, index, coverage, checks, core, outputs):
+    """(note, reasons, explained outputs): the checks that executed a changed compiler or runtime function, or
+    a note saying why function-level selection cannot be used for this change (then every reader is selected)."""
+    names, widen = changed_functions(root, coverage["snapshots"], core)
+    if widen:
+        return "Function-level selection off: " + widen, {}, set()
+    by_name = {}
+    for number, name in enumerate(coverage["names"]):
+        by_name.setdefault(coverage_name(name), []).append(number)
+    universe = set(coverage["universe"])
+    ids, missing, label = set(), [], {}
+    for language in ("minyar", "c"):
+        for name in sorted(names[language]):
+            hits = [number for number in by_name.get((language, name), []) if number in universe]
+            if not hits:
+                missing.append(name)
+            for number in hits:
+                ids.add(number)
+                label[number] = name
+    if missing:
+        return ("Function-level selection off: no coverage counter for " + ", ".join(missing[:5]) +
+                " (not instrumented at base)"), {}, set()
+    if ids & set(coverage["top"]):
+        return "Function-level selection off: the check runner itself executes a changed function", {}, set()
+    if ids & set(coverage["lost"]):
+        return "Function-level selection off: a process with an unknown check executed a changed function", {}, set()
+    explained = explained_outputs(root, outputs)
+    observed = set(core) | explained
+    reasons = {}
+    for check in checks:
+        why = []
+        entry = coverage["checks"].get(check)
+        if entry is None or not entry["complete"]:
+            why.append("no complete function coverage" + (f" ({entry['why'][:90]})" if entry else ""))
+        else:
+            hit = sorted({label[number] for number in ids & set(entry["covered"])})
+            if hit:
+                why.append("executes " + ", ".join(hit[:4]) + (f" (+{len(hit) - 4})" if len(hit) > 4 else ""))
+        inspected = sorted(index["checks"].get(check, {}).get("inspected", set()) & observed)
+        if inspected:
+            why.append("inspects " + ", ".join(inspected[:3]))
+        if why:
+            reasons[check] = why
+    changed = sum(len(items) for items in names.values())
+    return None, reasons, explained
 
 
 def command_run(arguments):
@@ -799,20 +1158,31 @@ def command_run(arguments):
     stale, _ = stale_outputs(root, sorted(set(prerequisites) | nested), database)
     stale_build = sorted(path for path in stale if path.startswith("build/"))
     compiler = sorted(path for path in changed if path.startswith(("compiler/", "bootstrap/")))
-    rebuilt = 0
+    rebuilt, build_failed = 0, []
     if stale_build and not arguments.plan and not arguments.no_cutoff:
         # Make's graph is coarse (for example every object depends on every .mk file). Build the stale
         # outputs now (the checks need them anyway) and keep only those whose bytes changed.
         build_started = time.time()
         rebuilt = len(stale_build)
-        stale_build = changed_outputs(root, stale_build, arguments.jobs, database)
+        stale_build, build_failed = changed_outputs(root, stale_build, arguments.jobs, database)
         stale = set(stale_build) | (stale - {path for path in stale if path.startswith("build/")})
         say(f"built {rebuilt} stale output(s) in {time.time() - build_started:.0f} s; {len(stale_build)} changed content")
     if arguments.only and ignored:
         say(f"--only: ignoring {len(ignored)} other changed path(s), e.g. {', '.join(ignored[:3])}")
-        stale_build = [path for path in stale_build]  # stale outputs still reflect every change on disk
-    reasons, changed_rules, changed_variables = select(index, database, checks, changed, added, removed, stale_build)
-    runner_changed = "build/tooling/tools/check-in-parallel" in stale
+    function_note, function_reasons, explained = None, {}, set()
+    core = [path for path in changed if attributable(path)]
+    coverage = index.get("coverage")
+    if core and coverage and not arguments.no_functions:
+        function_note, function_reasons, explained = function_selection(root, index, coverage, checks, core, stale_build)
+    if function_note is None and core and coverage and not arguments.no_functions:
+        v1_changed = [path for path in changed if path not in core]
+        v1_stale = [path for path in stale_build if path not in explained]
+    else:
+        v1_changed, v1_stale = changed, stale_build
+    reasons, changed_rules, changed_variables = select(index, database, checks, v1_changed, added, removed, v1_stale)
+    for check, why in function_reasons.items():
+        reasons.setdefault(check, []).extend(why)
+    runner_changed = "build/tooling/tools/check-in-parallel" in set(v1_stale) | (stale - {p for p in stale if p.startswith("build/")})
     if runner_changed:
         reasons = {check: (reasons.get(check) or []) + ["the check runner itself changed"] for check in checks}
     selected = [check for check in checks if check in reasons]
@@ -829,9 +1199,13 @@ def command_run(arguments):
         print("  " + path + (" (added)" if path in added else " (removed)" if path in removed else ""))
     if len(changed) > 40:
         print(f"  ... {len(changed) - 40} more")
-    if compiler:
-        print("Compiler sources changed: build/minyarc is rebuilt by its normal self-host stages (stage0 only if bootstrap/ changed);")
-        print("  every check that compiles Minyar code is affected, so expect close to the full gate.")
+    if core and coverage and not arguments.no_functions:
+        print(function_note or f"Function-level selection: {len(explained)} changed build output(s) are compiler or runtime "
+              "code whose execution the function index covers")
+    elif core:
+        print("Compiler or runtime sources changed and the index has no function coverage: close to the full gate.")
+    if build_failed:
+        print(f"BUILD FAILED for {len(build_failed)} output(s): " + ", ".join(build_failed[:6]))
     print(f"Stale build outputs: {len(stale_build)}" + (" (" + ", ".join(stale_build[:6]) + (" ..." if len(stale_build) > 6 else "") + ")" if stale_build else ""))
     if changed_rules or changed_variables:
         print(f"Make changes: {len(changed_rules)} rule(s), {len(changed_variables)} variable(s): " +
@@ -846,12 +1220,27 @@ def command_run(arguments):
     if arguments.plan:
         print(f"Plan only ({time.time() - started:.1f} s). " + GATE_REMINDER)
         return 0
-    status, failed = 0, []
+    status, failed = 0, [f"(build of {item} failed)" for item in build_failed]
     if selected:
-        command = ["make", "--no-print-directory", "check-in-parallel", "CHECKS=" + " ".join(selected), f"CHECK_JOBS={arguments.jobs}"]
-        status = subprocess.run(command, cwd=root, env=clean_environment()).returncode
+        environment = clean_environment()
+        targets, own = [], []
+        for check in selected:
+            if index["checks"].get(check, {}).get("static"):
+                # An aggregate goal's own recipe, run alone: the runner would otherwise run every prerequisite check.
+                rule = database["rules"][check]
+                files = [item for item in rule["prerequisites"] if item not in phony]
+                own.append(f".PHONY: dev-check-own-{check}\ndev-check-own-{check}: {' '.join(files)}\n" +
+                           "".join("\t" + line + "\n" for line in rule["recipe"]))
+                targets.append(f"dev-check-own-{check}")
+            else:
+                targets.append(check)
+        if own:
+            (STATE / "own-recipes.mk").write_text("".join(own))
+            environment["MAKEFILES"] = str(STATE / "own-recipes.mk")
+        command = ["make", "--no-print-directory", "check-in-parallel", "CHECKS=" + " ".join(targets), f"CHECK_JOBS={arguments.jobs}"]
+        status = subprocess.run(command, cwd=root, env=environment).returncode
         results, _ = latest_results(root)
-        failed = [item["target"] for item in (results or {}).get("checks", []) if not item["passed"]]
+        failed += [item["target"] for item in (results or {}).get("checks", []) if not item["passed"]]
         if status != 0 and not failed:
             failed = ["(runner failed before reporting checks)"]
     if arguments.bench and benchmarks:
@@ -968,6 +1357,7 @@ def main():
     run.add_argument("--jobs", type=int, default=int(os.environ.get("CHECK_JOBS", "4")))
     run.add_argument("--index", help="dependency index (default build/dev-check/index.json or $DEV_CHECK_INDEX)")
     run.add_argument("--no-cutoff", action="store_true", help="select by Make staleness alone, without building first")
+    run.add_argument("--no-functions", action="store_true", help="ignore the function index for compiler and runtime changes")
     run.add_argument("--include-base-red", action="store_true", help="also run checks that failed at the indexed base")
     run.add_argument("--bench", action="store_true", help="also measure Ir of affected benchmarks/compare programs")
     run.add_argument("--bench-base", default=os.environ.get("DEV_CHECK_BENCH_BASE"),
@@ -975,6 +1365,13 @@ def main():
     rebase = sub.add_parser("rebase", help="build the current tree and measure later changes against it")
     rebase.add_argument("--index")
     rebase.add_argument("--jobs", type=int, default=int(os.environ.get("CHECK_JOBS", "4")))
+    coverage = sub.add_parser("coverage", help="add per-check function coverage from an instrumented gate run")
+    coverage.add_argument("--data", required=True, help="profile directory with one subdirectory per check")
+    coverage.add_argument("--results", required=True, help="runner console log of the instrumented run")
+    coverage.add_argument("--index", required=True)
+    coverage.add_argument("--output", required=True)
+    coverage.add_argument("--profdata")
+    coverage.add_argument("--jobs", type=int, default=8)
     index = sub.add_parser("index", help="trace the gate on the base tree and write the dependency index")
     index.add_argument("--checks", default="check-portable")
     index.add_argument("--jobs", type=int, default=8)
@@ -983,11 +1380,13 @@ def main():
     index.add_argument("--reuse-trace", action="store_true", help="parse an existing trace instead of running the gate")
     index.add_argument("--results-log", help="with --reuse-trace: take base results from this runner console log")
     index.add_argument("--retry", action="store_true", help="with --reuse-trace: still retry the checks that failed")
-    arguments = parser.parse_args(sys.argv[1:] if len(sys.argv) > 1 and sys.argv[1] in ("run", "index", "rebase", "-h", "--help") else ["run", *sys.argv[1:]])
+    arguments = parser.parse_args(sys.argv[1:] if len(sys.argv) > 1 and sys.argv[1] in ("run", "index", "rebase", "coverage", "-h", "--help") else ["run", *sys.argv[1:]])
     if arguments.command == "index":
         return command_index(arguments)
     if arguments.command == "rebase":
         return command_rebase(arguments)
+    if arguments.command == "coverage":
+        return command_coverage(arguments)
     return command_run(arguments)
 
 

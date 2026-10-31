@@ -153,6 +153,57 @@ def timestamps(tree):
         dev.STATE = old_state
 
 
+def functions():
+    c = """#include "x.h"
+#define LIMIT 4 /* macro */
+struct pair { int a; int b; };
+static const int table[] = { 1, 2 };
+static inline __attribute__((always_inline)) int add(int a, int b) { return a + b; }
+int scale(struct pair p) {
+    if (p.a > LIMIT) { return p.b; } // comment
+    return add(p.a, "}"[0]);
+}
+"""
+    base = dev.function_snapshot(c, "c")
+    expect(set(base["functions"]) == {"add", "scale"}, f"C functions: {sorted(base['functions'])}")
+    names, why = diff(base, c.replace("return p.b;", "return p.b + 1;"), "c")
+    expect(names == {"scale"} and why is None, f"a body edit names its function: {names} {why}")
+    names, why = diff(base, c.replace("// comment", "// other words"), "c")
+    expect(names == set() and why is None, f"comment edits change nothing: {names} {why}")
+    _, why = diff(base, c.replace("LIMIT 4", "LIMIT 5"), "c")
+    expect(why is not None, "a macro edit widens")
+    _, why = diff(base, c.replace("{ 1, 2 }", "{ 1, 3 }"), "c")
+    expect(why is not None, "a table edit widens")
+    _, why = diff(base, c.replace("int scale(struct pair p)", "long scale(struct pair p)"), "c")
+    expect(why is not None, "a signature edit widens")
+    minyar = """use "text" as text
+let limit = 4
+function grow(value: Integer): Integer {
+    let doubled = value * 2 // twice
+    return doubled + limit
+}
+public function shrink(value: Integer): Integer { return value / 2 }
+"""
+    base = dev.function_snapshot(minyar, "minyar")
+    expect(set(base["functions"]) == {"grow", "shrink"}, f"Minyar functions: {sorted(base['functions'])}")
+    names, why = diff(base, minyar.replace("value * 2", "value * 3"), "minyar")
+    expect(names == {"grow"} and why is None, f"Minyar body edit: {names} {why}")
+    _, why = diff(base, minyar.replace("let limit = 4", "let limit = 5"), "minyar")
+    expect(why is not None, "a top-level constant edit widens")
+    expect(dev.coverage_name(".minyar.fn.minyar_module_12d08f43ace44eb8_grow") == ("minyar", "grow"), "compiler names")
+    expect(dev.coverage_name("runtime/minyar_runtime.c;add") == ("c", "add"), "static C names")
+
+
+def diff(base, text, language):
+    with tempfile.TemporaryDirectory() as temporary:
+        path = "compiler/a.min" if language == "minyar" else "runtime/a.c"
+        (Path(temporary) / path).parent.mkdir(parents=True)
+        (Path(temporary) / path).write_text(text)
+        names, why = dev.changed_functions(Path(temporary), {path: base}, [path])
+        return (names or {}).get(language, set()), why
+
+
+functions()
 with tempfile.TemporaryDirectory(prefix="dev-check-test ") as temporary:
     tree = Path(temporary)
     trace_attribution(tree)
