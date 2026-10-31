@@ -256,7 +256,7 @@ def merge(args, shard_dirs):
 
 
 GUARD = "agent@178.62.55.155"
-SHARD_BUDGET_USD = 8.29  # the guard's $10/day less the persistent shard-cache box (s-4vcpu-8gb, $1.71/day)
+SHARD_BUDGET_USD = 10.0  # test-shard-guard's daily limit; its ledger includes the shard-cache box (tagged test-shard)
 
 
 def guard_spend():
