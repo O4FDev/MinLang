@@ -30,6 +30,71 @@ function closureSortComparatorThunk(names: List<Text>, type: Integer, element: I
     return name
 }
 
+// sortBy/sortedBy with a callback: a merge emitted for this call site, the same
+// top-down stable merge as the runtime's list_sort_merge over snapshot indices,
+// but calling the comparator directly. A function literal's body is called by
+// name, so LLVM can inline it; other callbacks are called through their code
+// slot. The runtime checks the callback's domain once and brackets the merge
+// as a runtime caller; the merge returns as soon as recovery is pending.
+function closureSortMerge(names: List<Text>, type: Integer, element: Integer, globals: List<Text>, direct: Text): Text {
+    closureSortComparatorThunk(names, type, element, globals)
+    let pendingDeclaration = "declare i32 @minyar_sort_pending()\n"
+    if findText(globals, pendingDeclaration) < 0 { globals.add(pendingDeclaration) }
+    let id = Text(globals.length)
+    let compare = "@.minyar.sort.direct." + id
+    let merge = "@.minyar.sort.merge." + id
+    let code = "define internal i64 " + compare + "(ptr %callback, ptr %snapshot, i64 %a, i64 %b) {\nentry:\n"
+    code = code + "  %a.at = getelementptr i64, ptr %snapshot, i64 %a\n  %left.slot = load i64, ptr %a.at\n"
+    code = code + "  %b.at = getelementptr i64, ptr %snapshot, i64 %b\n  %right.slot = load i64, ptr %b.at\n"
+    code = code + "  %env.slot = call i64 @minyar_record_get(ptr %callback, i64 1)\n  %env = inttoptr i64 %env.slot to ptr\n"
+    let target = "@" + direct
+    if direct == "" {
+        code = code + "  %code.slot = call i64 @minyar_record_get(ptr %callback, i64 0)\n  %code = inttoptr i64 %code.slot to ptr\n"
+        target = "%code"
+    }
+    let left = "%left.slot"
+    let right = "%right.slot"
+    if element != 1 && !isScalarChoiceType(element) {
+        let conversion = "trunc"
+        if isReferenceType(element) { conversion = "inttoptr" }
+        if element == 7 { conversion = "bitcast" }
+        code = code + "  %left = " + conversion + " i64 %left.slot to " + llvmType(element) + "\n"
+        code = code + "  %right = " + conversion + " i64 %right.slot to " + llvmType(element) + "\n"
+        left = "%left"
+        right = "%right"
+    }
+    code = code + "  %result = call i64 " + target + "(ptr %env, " + llvmType(element) + " " + left + ", " + llvmType(element) + " " + right + ")\n  ret i64 %result\n}\n"
+    code = code + "define internal void " + merge + "(ptr %values, i64 %count, ptr %scratch, ptr %snapshot, ptr %callback) {\nentry:\n"
+    code = code + "  %few = icmp slt i64 %count, 2\n  br i1 %few, label %done, label %start\nstart:\n"
+    code = code + "  %pending.0 = call i32 @minyar_sort_pending()\n  %failed.0 = icmp ne i32 %pending.0, 0\n  br i1 %failed.0, label %done, label %split\nsplit:\n"
+    code = code + "  %left.count = lshr i64 %count, 1\n  %right.count = sub i64 %count, %left.count\n"
+    code = code + "  call void " + merge + "(ptr %values, i64 %left.count, ptr %scratch, ptr %snapshot, ptr %callback)\n"
+    code = code + "  %pending.1 = call i32 @minyar_sort_pending()\n  %failed.1 = icmp ne i32 %pending.1, 0\n  br i1 %failed.1, label %done, label %second\nsecond:\n"
+    code = code + "  %right.values = getelementptr i64, ptr %values, i64 %left.count\n"
+    code = code + "  call void " + merge + "(ptr %right.values, i64 %right.count, ptr %scratch, ptr %snapshot, ptr %callback)\n"
+    code = code + "  %last.index = sub i64 %left.count, 1\n  %last.at = getelementptr i64, ptr %values, i64 %last.index\n  %last = load i64, ptr %last.at\n  %first = load i64, ptr %right.values\n"
+    code = code + "  %ordered.result = call i64 " + compare + "(ptr %callback, ptr %snapshot, i64 %last, i64 %first)\n"
+    code = code + "  %pending.2 = call i32 @minyar_sort_pending()\n  %failed.2 = icmp ne i32 %pending.2, 0\n  br i1 %failed.2, label %done, label %ordered.test\nordered.test:\n"
+    code = code + "  %ordered = icmp sle i64 %ordered.result, 0\n  br i1 %ordered, label %done, label %copy\ncopy:\n"
+    code = code + "  %copy.index = phi i64 [ 0, %ordered.test ], [ %copy.next, %copy ]\n  %copy.from = getelementptr i64, ptr %values, i64 %copy.index\n  %copy.value = load i64, ptr %copy.from\n"
+    code = code + "  %copy.to = getelementptr i64, ptr %scratch, i64 %copy.index\n  store i64 %copy.value, ptr %copy.to\n  %copy.next = add i64 %copy.index, 1\n"
+    code = code + "  %copy.more = icmp slt i64 %copy.next, %left.count\n  br i1 %copy.more, label %copy, label %loop\nloop:\n"
+    code = code + "  %left = phi i64 [ 0, %copy ], [ %left.next, %step ]\n  %right = phi i64 [ %left.count, %copy ], [ %right.next, %step ]\n  %out = phi i64 [ 0, %copy ], [ %out.next, %step ]\n"
+    code = code + "  %left.in = icmp slt i64 %left, %left.count\n  %right.in = icmp slt i64 %right, %count\n  %both = and i1 %left.in, %right.in\n  br i1 %both, label %body, label %rest\nbody:\n"
+    code = code + "  %held.at = getelementptr i64, ptr %scratch, i64 %left\n  %held = load i64, ptr %held.at\n  %candidate.at = getelementptr i64, ptr %values, i64 %right\n  %candidate = load i64, ptr %candidate.at\n"
+    code = code + "  %order = call i64 " + compare + "(ptr %callback, ptr %snapshot, i64 %held, i64 %candidate)\n"
+    code = code + "  %pending.3 = call i32 @minyar_sort_pending()\n  %failed.3 = icmp ne i32 %pending.3, 0\n  br i1 %failed.3, label %done, label %step\nstep:\n"
+    code = code + "  %take.left = icmp sle i64 %order, 0\n  %taken = select i1 %take.left, i64 %held, i64 %candidate\n  %out.at = getelementptr i64, ptr %values, i64 %out\n  store i64 %taken, ptr %out.at\n"
+    code = code + "  %left.step = zext i1 %take.left to i64\n  %left.next = add i64 %left, %left.step\n  %right.step = sub i64 1, %left.step\n  %right.next = add i64 %right, %right.step\n  %out.next = add i64 %out, 1\n  br label %loop\n"
+    code = code + "rest:\n  %rest.more = icmp slt i64 %left, %left.count\n  br i1 %rest.more, label %tail, label %done\ntail:\n"
+    code = code + "  %tail.left = phi i64 [ %left, %rest ], [ %tail.left.next, %tail ]\n  %tail.out = phi i64 [ %out, %rest ], [ %tail.out.next, %tail ]\n"
+    code = code + "  %tail.from = getelementptr i64, ptr %scratch, i64 %tail.left\n  %tail.value = load i64, ptr %tail.from\n  %tail.to = getelementptr i64, ptr %values, i64 %tail.out\n  store i64 %tail.value, ptr %tail.to\n"
+    code = code + "  %tail.left.next = add i64 %tail.left, 1\n  %tail.out.next = add i64 %tail.out, 1\n  %tail.more = icmp slt i64 %tail.left.next, %left.count\n  br i1 %tail.more, label %tail, label %done\n"
+    code = code + "done:\n  ret void\n}\n"
+    globals.add(code)
+    return merge
+}
+
 function callbackTypePositions(kinds: List<Integer>, texts: List<Text>): List<Boolean> {
     let positions: List<Boolean> = []
     let position = 0

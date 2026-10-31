@@ -234,8 +234,18 @@ MinyarList *minyar_list_sorted(MinyarList *list, long long kind, long long refer
     return result;
 }
 
+/* A compiler-emitted merge for one sortBy call site: the same top-down merge as
+ * list_sort_merge over snapshot indices, with the comparator called directly
+ * (and inlinable) instead of through list_sort_compare. It checks recovery
+ * after every comparison and returns early when it is pending. */
+void minyar_callback_check(const MinyarRecord *callback);
+/* The emitted merges' recovery test (its own symbol: the compiler declares it
+ * whether or not the program's call-depth declarations are present). */
+int minyar_sort_pending(void) { return minyar_recovery_pending(); }
+typedef void (*MinyarSortMerge)(long long *indices, long long count, long long *scratch,
+                                const long long *snapshot, void *context);
 static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortComparator comparator,
-                                long long references, int copying) {
+                                long long references, int copying, MinyarSortMerge merge) {
     if (minyar_recovery_pending()) return copying ? NULL : list;
     SORT_RETAIN(list);
     SORT_RETAIN(context);
@@ -251,8 +261,17 @@ static MinyarList *list_sort_by(MinyarList *list, void *context, MinyarSortCompa
         if (references) SORT_RETAIN((void *)(uintptr_t)snapshot[i]);
     }
     MinyarList *result = copying ? NULL : list;
-    MinyarSortOrder order = {0, snapshot, context, comparator};
-    list_sort_merge(indices, count, scratch, &order);
+    if (merge) {
+        /* The callback's domain is this thread's for the whole sort, so it is
+         * checked once, before the first comparison, instead of per call. */
+        if (count > 1) minyar_callback_check(context);
+        minyar_runtime_callers++; /* a stop here must not leave a merge half done */
+        merge(indices, (long long)count, scratch, snapshot, context);
+        minyar_runtime_callers--;
+    } else {
+        MinyarSortOrder order = {0, snapshot, context, comparator};
+        list_sort_merge(indices, count, scratch, &order);
+    }
     /* A failed comparator may leave a partial permutation. Release its rooted
      * snapshot without committing that permutation or allocating a result. */
     if (minyar_recovery_pending()) goto done;
@@ -282,11 +301,18 @@ done:
 
 void minyar_list_sort_by(MinyarList *list, void *context, MinyarSortComparator comparator,
                           long long references) {
-    (void)list_sort_by(list, context, comparator, references, 0);
+    (void)list_sort_by(list, context, comparator, references, 0, NULL);
 }
 MinyarList *minyar_list_sorted_by(MinyarList *list, void *context, MinyarSortComparator comparator,
                                  long long references) {
-    return list_sort_by(list, context, comparator, references, 1);
+    return list_sort_by(list, context, comparator, references, 1, NULL);
+}
+void minyar_list_sort_by_merge(MinyarList *list, void *context, MinyarSortMerge merge, long long references) {
+    (void)list_sort_by(list, context, NULL, references, 0, merge);
+}
+MinyarList *minyar_list_sorted_by_merge(MinyarList *list, void *context, MinyarSortMerge merge,
+                                        long long references) {
+    return list_sort_by(list, context, NULL, references, 1, merge);
 }
 #undef SORT_RETAIN
 #undef SORT_ADD
