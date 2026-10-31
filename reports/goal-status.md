@@ -5,9 +5,7 @@
    (84e2e01a3): nested versioning emits `multiple definition of local value 'value.N.fastA.fastB'` on a hidden program's
    nested loops. Fix the copy naming for loops inside an already-versioned region, add that shape to
    tests/text-scanning.min, re-gate, re-score hidden.
-2. **c10 per-unit scheduler savings re-based on c4** — `goal/cake-c10-on-c4` if the agent finished it, else
-   `goal/cake-c10` 257edb3b4 (built on c3's d0f9d338a, exprparse/logstats −1.3%, json −1.1%); must show no program slower
-   on top of c4. Its recent-first-with-minimum-share variant is decision D1 below (needs the sustained-load test).
+2. ~~c10~~ — measured on top of c4 (`goal/cake-c10-on-c4` 75275c87c): neutral (word scan) or worse (inline frees, inventory +7.6%); c4's subunit drain already removed the costs it shaved. Dropped.
 3. **c5 region mechanism** — `goal/cake-c5` 663771786, a7e041b0d, only if Luke approves D2 (`region { … }`).
 4. **c1 header recycling** (treewalk −9.3%) — blocked by a latent double-release in borrow bookkeeping (reports/cake/c1.md);
    fix that bug first (it is a memory-safety bug regardless of recycling).
@@ -29,8 +27,8 @@ Phase 1 bars (≤ 1.25×, no program > 2×; Luke's ≤ 1.0×, none > 1.2×) are 
 not yet adopted by the projects that asked; async I/O and SIMD not started.
 
 ## Decisions for Luke (from the cake swarm, reports/cake.md has the code examples)
-- D1 recent-first cleanup with a guaranteed old-batch share (doc wording change only; gain −2.8% exprparse, −1.2% json for
-  the unbounded form; bounded form not finished).
+- D1 (recent-first cleanup order) — MOOT: on c4's subunit drain even pure recent-first cannot starve the old batch (c10's
+  sustained-load fixture drains a 4,000-record chain to one live object either way), and the order no longer changes Ir.
 - D2 opt-in `region { … }` block (new syntax; ceiling −29% to −76% Ir on parse-then-drop programs).
 - D3 json member index needs a private `Value` field (breaks `json.Value { … }` literals; wins only from ~32 members).
 - Already decided by Luke today: T4b coarser scheduler unit APPROVED (landed via c4's subunit drain); json API break and

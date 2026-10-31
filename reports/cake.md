@@ -17,7 +17,7 @@ outputs byte-identical to C/C++/Rust. "Merged" = on `goal/2026-10-30` after a fu
 | c7 | bounds checks proved away (T2) | one window test before a versioned loop, unchecked reads inside, same error message outside | topk **−9.3%** (1 and 4 threads) | topk −19% @1 | yes (checks stay; messages identical) | yes | **yes** |
 | c8 | Unicode at ASCII speed (T3) | Text scanning loops versioned on one counted-ASCII test (capped at 2000 pieces) | exprparse −4.0%, tokenizer −5.1% | — | yes (`t[i]` semantics unchanged) | yes | merged, then **reverted** (84e2e01a3): a hidden program's nested loops make the versioning emit a duplicate LLVM value (`value.N.fast8.fast4`) — compile failure; passed every visible check |
 | c9 | parallel tasks that allocate (T7) | `parallel for` bodies own worker-local Text/records/Lists, drained per chunk | 0 on all serial programs | demo 1.7× @4 | yes (race freedom; no escape) | yes (additive) | **yes** |
-| c10 | collection teardown / per-unit cost | word+ctz next-owner scan, inlined slot frees (built on c3) | exprparse −1.3%, logstats −1.3%, json −1.1% | — | yes | yes | no — being re-based on c4 (next session) |
+| c10 | collection teardown / per-unit cost | word+ctz next-owner scan, inlined slot frees (built on c3) | exprparse −1.3%, logstats −1.3%, json −1.1% (on c3) | — | yes | yes | no — on top of c4 neutral / inventory +7.6%; dropped |
 | c11 | shared frozen input | `frozen.decode(frozenBytes, start, end)` zero-copy Text views | shared-input join 3.7× fewer Ir | 2.5× @4 | yes (TSan) | yes (additive) | **yes** |
 | c12 | Map single probe | inlined Map entry points, `has`/`getOr` miss remembers the slot for the next insert, unzeroed grow | intmap −14.4%, wordfreq −7.2%, tokenizer −3.1% | intmap −9% | yes (iteration order pinned) | yes | **yes** |
 | c13 | Text chains + sort compares | every Text `+` chain as one sized write; one three-way compare per (a,b); per-site merge for record sorts | sortrows **−27%**, sorttext −15% | sortrows CPU −7.6% | yes | yes | **yes** |
@@ -33,7 +33,7 @@ merges; json 8.51 → 6.38, exprparse 5.74 → 4.74, treewalk 1.89 → 1.77, sor
   OOM (c8 uncapped), and three fixtures pinning old unit counts (c4).
 
 ## Decisions still for Luke (each with the consequence in code)
-- **D1 — c10's recent-first-with-minimum-share cleanup order** (exprparse −2.8%, json −1.2% measured for pure
+- **D1 — MOOT after c4** (c10 measured: no starvation and no Ir difference on c4's drain). Was: c10's recent-first-with-minimum-share cleanup order (exprparse −2.8%, json −1.2% measured for pure
   recent-first; the bounded variant with ≥1-in-8 old-batch share and the sustained-load retention test were not finished).
   User code: no observable difference (no finalizers; deterministic either way); only `docs/bounded-runtime-contract.md`
   wording about alternation changes.
@@ -52,7 +52,6 @@ merges; json 8.51 → 6.38, exprparse 5.74 → 4.74, treewalk 1.89 → 1.77, sor
 
 ## Not merged, worth having (next session's first batch)
 - **c8 Text loop versioning** (`goal/cake-c8` 821bca9bb; exprparse −4%, tokenizer −5%): fix nested versioning so a loop copy inside an already-versioned region gets unique value names (repro shape: a Text scanning loop nested inside another versioned loop → `multiple definition of local value named 'value.N.fastA.fastB'`), add that shape to tests, re-gate, re-score hidden.
-- c10 re-based on c4 (branch `goal/cake-c10-on-c4` if the agent finished; else `goal/cake-c10` 257edb3b4 on c3's d0f9d338a).
 - c5 region mechanism (`goal/cake-c5` 663771786, a7e041b0d) — opt-in, only if D2 is approved.
 - c1's header-recycling attempt (treewalk −9.3%) — blocked by a latent double-release in borrow bookkeeping (fix first).
 
