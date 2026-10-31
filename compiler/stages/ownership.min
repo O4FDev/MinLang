@@ -611,6 +611,7 @@ function provisionalBorrow(context: CompilerContext, output: List<Text>, state: 
     borrows.functions.add(borrows.current)
     borrows.bodyStarts.add(-1)
     borrows.bodyEnds.add(-1)
+    borrows.strictBodies.add(false)
     output.add("")
 }
 
@@ -631,6 +632,24 @@ function provisionalElementOwner(context: CompilerContext, output: List<Text>, s
     borrows.functions.add(borrows.current)
     borrows.bodyStarts.add(bodyStart)
     borrows.bodyEnds.add(bodyEnd)
+    borrows.strictBodies.add(false)
+}
+
+// A guarded binding's owner, needed only because code after it (pieces
+// bodyStart..bodyEnd) makes user calls: finishProvisionalBorrows fills the
+// piece unless every one of those calls is release-free.
+function provisionalGuardBorrow(context: CompilerContext, output: List<Text>, piece: Integer, slot: Integer, value: Text, type: Integer, bodyStart: Integer, bodyEnd: Integer) {
+    if slot < 0 || !context.provisionalBorrows.enabled { return }
+    let borrows = context.provisionalBorrows
+    noteCycleFixup(output, context.functionReturnTypes, context.functionParameterCounts, context.functionParameterTypes, piece, type, 0)
+    borrows.pieces.add(piece)
+    borrows.slots.add(slot)
+    borrows.values.add(value)
+    borrows.types.add(type)
+    borrows.functions.add(borrows.current)
+    borrows.bodyStarts.add(bodyStart)
+    borrows.bodyEnds.add(bodyEnd)
+    borrows.strictBodies.add(true)
 }
 
 // Releasing an owner or temporary of one's own, or taking a field of a record
@@ -802,7 +821,7 @@ function finishProvisionalBorrows(context: CompilerContext, output: List<Text>, 
         let keep = roots.length > 0 && cycleTypeActive(type, roots, counts, fields, seenTypes, activeTypes)
         if !keep && borrows.bodyStarts[index] >= 0 {
             let touched: List<Integer> = []
-            keep = !releaseFreeCalls(context, output, borrows.bodyStarts[index], borrows.bodyEnds[index], false, lookup, memo, touched)
+            keep = !releaseFreeCalls(context, output, borrows.bodyStarts[index], borrows.bodyEnds[index], borrows.strictBodies[index], lookup, memo, touched)
             if keep {
                 // Answers that assumed a function still being decided was free.
                 let reset = 0
@@ -1021,12 +1040,18 @@ function functionCycleFixups(returnTypes: List<Integer>, start: Integer): List<I
     return pieces
 }
 
-// A readonly parameter, a capture, a constant or a never-reassigned record
-// binding keeps its object alive for the whole scope that can name it.
+// A readonly parameter or capture, and a binding whose block never reassigns
+// it and whose value something keeps alive (its own count, or a source that
+// outlives it), keeps its object alive for the whole scope that can name it.
+// A binding that merely borrows from something mutable is not a root: that
+// source can drop the value before a reader of its fields is done.
 function stableBorrowRoot(context: CompilerContext, localNames: List<Text>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, name: Text): Boolean {
     if recoveryEnabled(state) { return false }
     let local = findLocal(localNames, localLengths, state, name)
-    return local >= 0 && (localIds[local] < 0 || localLengths[local] < 0)
+    if local < 0 { return false }
+    if localIds[local] < 0 { return true }
+    if localLengths[local] >= 0 { return false }
+    return ownedLocal(context, state, localIds[local]) || stableCopyLocal(context, state, localIds[local])
 }
 
 // A field is stable when no compiled token assigns a field of that name, so a
@@ -1054,6 +1079,36 @@ function stableRecordField(context: CompilerContext, type: Integer, name: Text):
 function markStableCopy(context: CompilerContext, state: List<Integer>, id: Integer) {
     if id < 0 { return }
     context.stableBorrowCopies.add(state[9] * 100000 + id)
+}
+
+// The binding took a count of its value: a field read through it stays alive
+// while the binding lives (its cell is released after the binding's scope).
+function markOwnedLocal(context: CompilerContext, state: List<Integer>, id: Integer) {
+    if id < 0 { return }
+    context.ownedLocals.add(state[9] * 100000 + id)
+}
+
+function ownedLocal(context: CompilerContext, state: List<Integer>, id: Integer): Boolean {
+    let key = state[9] * 100000 + id
+    let index = context.ownedLocals.length - 1
+    while index >= 0 {
+        let entry = context.ownedLocals[index]
+        if entry / 100000 != state[9] { return false }
+        if entry == key { return true }
+        index = index - 1
+    }
+    return false
+}
+
+// Whether the anchor of a stable path holds a count of its value (or is a
+// readonly parameter or capture, whose caller keeps it). A cycle collection
+// never frees a value reachable from such a count, so a traced value read
+// through the path needs no count of its own either.
+function stablePathAnchor(context: CompilerContext, localNames: List<Text>, localIds: List<Integer>, localLengths: List<Integer>, state: List<Integer>, atom: Integer): Boolean {
+    let local = findLocal(localNames, localLengths, state, context.tokenTexts[atom])
+    if local < 0 { return false }
+    if localIds[local] < 0 { return true }
+    return ownedLocal(context, state, localIds[local]) || stableCopyLocal(context, state, localIds[local])
 }
 
 function stableCopyLocal(context: CompilerContext, state: List<Integer>, id: Integer): Boolean {
@@ -1104,7 +1159,9 @@ function stableFieldBorrow(context: CompilerContext, localNames: List<Text>, loc
         type = context.functionParameterTypes[findRecordField(context.functionParameterCounts, context.functionParameterNames, type, name)]
         position = position + 2
     }
-    return type == resultType[0] && untracedBorrowType(context, type)
+    // A traced value needs no count either when the path's anchor holds a count
+    // of it: a cycle collection never frees a value reachable from such a count.
+    return type == resultType[0] && (untracedBorrowType(context, type) || stablePathAnchor(context, localNames, localIds, localLengths, state, start))
 }
 
 function rootLocal(output: List<Text>, state: List<Integer>, id: Integer, value: Text, type: Integer) {
