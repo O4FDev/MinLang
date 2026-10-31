@@ -13,6 +13,7 @@ PERFCS_GATE_BUDGETS = 1,32,1024
 PERFCS_OTHER_BUDGETS = 2,7
 
 PERFCS_RUNTIME_PROFILES = ordinary-system ordinary-fixed ordinary-lazy cycle-system cycle-fixed cycle-lazy
+PERFCS_TEMPORARY_CACHE_INPUTS = tests/temporary-owner-cache.py tests/temporary-owner-cache.c $(RUNTIME_HEADERS)
 PERFCS_FRAME_INITIALIZATION_INPUTS = tests/frame-initialization.py tests/frame-initialization.c $(RUNTIME_HEADERS)
 
 # $(1) target base, $(2) harness, $(3) inputs, $(4) command prefix, $(5) harness arguments, $(6) runtime-profile pair,
@@ -32,15 +33,19 @@ check-owner-queue-batching-budgets: tests/owner-queue-batching.py tests/owner-qu
 check-owner-queue-batching-sanitize: tests/owner-queue-batching.py tests/owner-queue-batching.c $(RUNTIME_HEADERS) | build
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) python3 "tests/owner-queue-batching.py" --modes sanitize
 
-.PHONY: check-temporary-owner-cache check-temporary-owner-cache-budgets check-temporary-owner-cache-sanitize
-check-temporary-owner-cache: tests/temporary-owner-cache.py tests/temporary-owner-cache.c $(RUNTIME_HEADERS) | build
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) python3 "tests/temporary-owner-cache.py" --modes native --budgets $(PERFCS_GATE_BUDGETS)
+.PHONY: check-temporary-owner-cache check-temporary-owner-cache-budgets check-temporary-owner-cache-sanitize \
+	$(addprefix check-temporary-owner-cache-part-,$(PERFCS_RUNTIME_PROFILES)) \
+	$(addprefix check-temporary-owner-cache-budgets-part-,$(PERFCS_RUNTIME_PROFILES)) \
+	$(addprefix check-temporary-owner-cache-sanitize-part-,$(PERFCS_RUNTIME_PROFILES))
+check-temporary-owner-cache: $(addprefix check-temporary-owner-cache-part-,$(PERFCS_RUNTIME_PROFILES))
 
-check-temporary-owner-cache-budgets: tests/temporary-owner-cache.py tests/temporary-owner-cache.c $(RUNTIME_HEADERS) | build
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) python3 "tests/temporary-owner-cache.py" --modes native --budgets $(PERFCS_OTHER_BUDGETS)
+check-temporary-owner-cache-budgets: $(addprefix check-temporary-owner-cache-budgets-part-,$(PERFCS_RUNTIME_PROFILES))
 
-check-temporary-owner-cache-sanitize: tests/temporary-owner-cache.py tests/temporary-owner-cache.c $(RUNTIME_HEADERS) | build
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) python3 "tests/temporary-owner-cache.py" --modes sanitize
+check-temporary-owner-cache-sanitize: $(addprefix check-temporary-owner-cache-sanitize-part-,$(PERFCS_RUNTIME_PROFILES))
+
+$(foreach pair,$(PERFCS_RUNTIME_PROFILES),$(eval $(call PERFCS_RUNTIME_PROFILE_PIECE,temporary-owner-cache,tests/temporary-owner-cache.py,$(PERFCS_TEMPORARY_CACHE_INPUTS),$(LIMITED),--modes native --budgets $(PERFCS_GATE_BUDGETS),$(pair),--skip-mutants)))
+$(foreach pair,$(PERFCS_RUNTIME_PROFILES),$(eval $(call PERFCS_RUNTIME_PROFILE_PIECE,temporary-owner-cache-budgets,tests/temporary-owner-cache.py,$(PERFCS_TEMPORARY_CACHE_INPUTS),$(LIMITED),--modes native --budgets $(PERFCS_OTHER_BUDGETS),$(pair),--skip-mutants)))
+$(foreach pair,$(PERFCS_RUNTIME_PROFILES),$(eval $(call PERFCS_RUNTIME_PROFILE_PIECE,temporary-owner-cache-sanitize,tests/temporary-owner-cache.py,$(PERFCS_TEMPORARY_CACHE_INPUTS),$(SANITIZER_LIMITED),--modes sanitize,$(pair),--skip-mutants)))
 
 .PHONY: check-frame-initialization check-frame-initialization-budgets check-frame-initialization-sanitize \
 	$(addprefix check-frame-initialization-part-,$(PERFCS_RUNTIME_PROFILES)) \

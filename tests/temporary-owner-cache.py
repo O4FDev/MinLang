@@ -216,6 +216,8 @@ def main():
     parser.add_argument("--modes", type=lambda value: selected(value, ("native", "sanitize")), default=["native", "sanitize"])
     parser.add_argument("--runtimes", type=lambda value: selected(value, ("ordinary", "cycle")), default=["ordinary", "cycle"])
     parser.add_argument("--caps", type=lambda value: selected(value, CAPS), default=list(CAPS))
+    parser.add_argument("--skip-mutants", action="store_true",
+                        help="skip the mutant and threaded cells; another piece of the same check runs them")
     parser.add_argument("--compile-timeout", type=int, default=120)
     parser.add_argument("--run-timeout", type=int, default=60)
     args = parser.parse_args()
@@ -233,12 +235,13 @@ def main():
             if cap != "default" and (budget, optimization, mode) != ("1", "O2", "native"):
                 continue
             runner.run(kind, profile, int(budget), optimization, mode, cap)
-        for kind in args.runtimes:
-            for variant in ("mutant-no-reuse", "mutant-pre-service", "mutant-churn"):
-                runner.run(kind, "system", 1, "O2", "native", "default", variant=variant)
-            if "system" in args.profiles:
-                for mode in args.modes:
-                    runner.run(kind, "system", 1, "O2", mode, "default", threaded=True)
+        if not args.skip_mutants:
+            for kind in args.runtimes:
+                for variant in ("mutant-no-reuse", "mutant-pre-service", "mutant-churn"):
+                    runner.run(kind, "system", 1, "O2", "native", "default", variant=variant)
+                if "system" in args.profiles:
+                    for mode in args.modes:
+                        runner.run(kind, "system", 1, "O2", mode, "default", threaded=True)
     except (OSError, RuntimeError, ValueError) as error:
         print(str(error) + "\nevidence retained: " + str(output), file=sys.stderr)
         return 1
