@@ -29,7 +29,12 @@ static MINYAR_THREAD_LOCAL RcBoundedObjects rc_objects;
  * visits its remaining owner slots and finalizes the record. Constant work,
  * so K units still bound a service point. */
 #ifndef RC_SMALL_RECORD_SLOTS
-#define RC_SMALL_RECORD_SLOTS 4
+#define RC_SMALL_RECORD_SLOTS 8
+#endif
+/* One unit retires at most this many small records: the one it starts from and
+ * the small-record children it reaches directly. Constant work per unit. */
+#ifndef RC_SMALL_RECORD_UNIT_OBJECTS
+#define RC_SMALL_RECORD_UNIT_OBJECTS 4
 #endif
 #define MINYAR_RC_RECENT_OBJECTS 1
 #define rc_bounded_recent_head (rc_objects.recent_head)
@@ -277,6 +282,41 @@ static void rc_bounded_retire_temporaries(RcFrame *frame) {
 #define RC_BOUNDED_INLINE static inline
 #endif
 
+/* Retire one small record and, while the unit's object allowance lasts, the
+ * children that are small records themselves, so one unit frees a whole small
+ * subtree instead of one record. A child not taken here follows the ordinary
+ * drop path, which frees a leaf or queues an aggregate. The stack is fixed and
+ * every record visits at most RC_SMALL_RECORD_SLOTS slots, so a unit's work is
+ * constant and K units still bound a service point. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static void rc_bounded_retire_small_in(RcBoundedObjects *q, size_t *pending, RcObject *object) {
+    RcObject *stack[RC_SMALL_RECORD_UNIT_OBJECTS];
+    size_t top = 0;
+    stack[top++] = object;
+    while (top) {
+        RcObject *current = stack[--top];
+        MinyarRecord *record = (MinyarRecord *)(current + 1);
+        size_t end = (size_t)record->length;
+        unsigned char *map = (unsigned char *)(record->values + end);
+        for (size_t index = 0; index < end; index++) {
+            if (!(map[index] & 1)) continue;
+            void *child = (void *)(uintptr_t)record->values[index];
+            RcObject *child_object = (RcObject *)child - 1;
+            if (child_object->ownership == (8 | RC_RECORD) &&
+                (size_t)((MinyarRecord *)(child_object + 1))->length <= RC_SMALL_RECORD_SLOTS &&
+                top < RC_SMALL_RECORD_UNIT_OBJECTS) {
+                child_object->ownership = RC_RECORD;
+                stack[top++] = child_object;
+                continue;
+            }
+            rc_drop_in(q, pending, child);
+        }
+        rc_bounded_finish_object(current, RC_RECORD);
+    }
+}
+
 RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t *pending) {
     if (!q->active) {
         q->active = q->head;
@@ -293,11 +333,8 @@ RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t
         size_t end = (size_t)record->length;
         if (q->cursor < end) {
             unsigned char *map = (unsigned char *)(record->values + end);
-            if (end <= RC_SMALL_RECORD_SLOTS) {
-                for (size_t index = q->cursor; index < end; index++)
-                    if (map[index] & 1)
-                        rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
-                rc_bounded_finish_object(object, RC_RECORD);
+            if (end <= RC_SMALL_RECORD_SLOTS && !q->cursor) {
+                rc_bounded_retire_small_in(q, pending, object);
                 --*pending;
                 q->active = NULL;
                 return;
@@ -337,15 +374,12 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit_in(RcBoundedObjects *q, siz
         size_t end = (size_t)record->length;
         if (cursor < end) {
             unsigned char *map = (unsigned char *)(record->values + end);
-            if (end <= RC_SMALL_RECORD_SLOTS) {
+            if (end <= RC_SMALL_RECORD_SLOTS && !cursor) {
                 /* Detach the record first: children this unit kills take the
                  * recent head, and the record retires in this same unit. */
                 q->recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
                 if (!q->recent_head) q->recent_tail = NULL;
-                for (size_t index = cursor; index < end; index++)
-                    if (map[index] & 1)
-                        rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
-                rc_bounded_finish_object(object, RC_RECORD);
+                rc_bounded_retire_small_in(q, pending, object);
                 --*pending;
                 return;
             }
