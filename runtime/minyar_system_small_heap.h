@@ -85,16 +85,20 @@ MINYAR_HOT void *rc_system_allocate(size_t bytes) {
     while (bytes > stride - sizeof(RcSystemSlot)) { stride <<= 1; index++; }
     RcSystemPage *page = rc_system_available[index];
     if (!page) page = rc_system_new_page(index);
+    /* A page leaves the available list when it has neither a free slot nor
+     * room for another: test that only where the free list or room ran out. */
     RcSystemSlot *slot = page->free_slots;
-    if (slot) page->free_slots = slot->value.next;
-    else {
+    if (slot) {
+        RcSystemSlot *next = slot->value.next;
+        page->free_slots = next;
+        if (!next && page->used + page->stride > RC_SYSTEM_PAGE_BYTES) rc_system_unlink(page);
+    } else {
         slot = (RcSystemSlot *)((unsigned char *)page + page->used);
         page->used += page->stride;
         SMALL_HEAP_UNPOISON(slot, sizeof(*slot));
         slot->page = page;
+        if (page->used + page->stride > RC_SYSTEM_PAGE_BYTES) rc_system_unlink(page);
     }
-    if (!page->free_slots && page->used + page->stride > RC_SYSTEM_PAGE_BYTES)
-        rc_system_unlink(page);
     page->live++;
     rc_system_live++;
     slot->value.bytes = bytes;
