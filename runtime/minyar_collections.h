@@ -547,9 +547,10 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
         unsigned char *references = (unsigned char *)(record->values + record->length);
         references[field] = 0;
 #ifdef MINYAR_BOUNDED_RC
-        long long owning = 0;
-        for (long long index = 0; index < record->length && !owning; index++) owning = references[index];
-        if (!owning) {
+        /* The map's byte stores may alias the length: read it once. */
+        long long fields = record->length, scan = 0;
+        while (scan < fields && !references[scan]) scan++;
+        if (scan == fields) {
             rc_bounded_finish_object(object, RC_RECORD);
             return value;
         }
