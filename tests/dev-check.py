@@ -100,7 +100,12 @@ def selection():
     expect("check-d" in reasons, f"a new check always runs: {reasons}")
     index["checks"]["check-a"]["passed"] = False
     reasons, _, _ = dev.select(index, old, checks, [], [], [], [])
-    expect(set(reasons) == {"check-a"}, f"a check failing at base always runs: {reasons}")
+    expect(not reasons, f"a check red at base is not rerun for an unrelated change: {reasons}")
+    reasons, _, _ = dev.select(index, old, checks, ["tests/a.min"], [], [], [])
+    expect(set(reasons) == {"check-a"}, f"a check red at base reruns when its partial trace is hit: {reasons}")
+    index["checks"]["check-a"].update(passed=True, traced=False)
+    reasons, _, _ = dev.select(index, old, checks, [], [], [], [])
+    expect(set(reasons) == {"check-a"}, f"a passing check without a trace always runs: {reasons}")
 
 
 def timestamps(tree):

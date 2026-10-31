@@ -610,7 +610,7 @@ def select(index, database, checks, changed, added, removed, stale):
                 why.append("its own recipe uses " + ", ".join(hits[:4]) + " (runs the whole aggregate)")
         else:
             if not entry["passed"]:
-                why.append("not passing at base")
+                pass  # red at base whatever this change does; selected below only if its partial trace is hit
             elif not entry["traced"]:
                 why.append("no base trace")
             hits = sorted(entry["reads"] & changed_set)
@@ -687,6 +687,14 @@ def command_run(arguments):
     if runner_changed:
         reasons = {check: (reasons.get(check) or []) + ["the check runner itself changed"] for check in checks}
     selected = [check for check in checks if check in reasons]
+    base_red = [check for check in checks if check in index["checks"] and not index["checks"][check]["passed"]]
+    if base_red and not arguments.include_base_red:
+        print(f"Red at the indexed base, not run unless this change touches what they read: {' '.join(base_red)}")
+        print("  (the gate is red there whatever this change does; --include-base-red runs them anyway)")
+    elif base_red:
+        for check in base_red:
+            reasons.setdefault(check, ["red at base"])
+        selected = [check for check in checks if check in reasons]
     print(f"Changed sources ({len(changed)}):" + ("" if changed else " none"))
     for path in changed[:40]:
         print("  " + path + (" (added)" if path in added else " (removed)" if path in removed else ""))
@@ -830,6 +838,7 @@ def main():
     run.add_argument("--plan", action="store_true", help="print the selection without running checks")
     run.add_argument("--jobs", type=int, default=int(os.environ.get("CHECK_JOBS", "4")))
     run.add_argument("--index", help="dependency index (default build/dev-check/index.json or $DEV_CHECK_INDEX)")
+    run.add_argument("--include-base-red", action="store_true", help="also run checks that failed at the indexed base")
     run.add_argument("--bench", action="store_true", help="also measure Ir of affected benchmarks/compare programs")
     run.add_argument("--bench-base", default=os.environ.get("DEV_CHECK_BENCH_BASE"),
                      help="compare.json of the base for Ir deltas (default $DEV_CHECK_BENCH_BASE)")

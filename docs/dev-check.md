@@ -49,7 +49,9 @@ Selection comes from recorded dependencies, not from a list of areas:
 4. A check is selected when it read a changed source or a stale output, listed
    a directory that gained or lost a file, or its Make rules (with all
    prerequisites) or the Makefile variables they use changed. A check that is
-   new, has no trace, or did not pass at base is always selected. If the check
+   new or has no trace is always selected. A check that failed at the indexed base is
+   run only when its (partial) trace is hit, and listed as red at base otherwise:
+   the gate is red there whatever the change does (`--include-base-red` runs them). If the check
    runner itself is stale, every check runs.
 
 So a docs or report edit runs only the checks that read that file, a test
