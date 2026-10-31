@@ -152,7 +152,7 @@ def prepare_cache(cache, tree, files, args, run_id, timeline):
     sync_tree(cache["public"], tree, files, f"{root}/tree")
     timeline["synced"] = time.monotonic() - started
     upload_tools(cache["public"], f"{root}/fg", args)
-    ssh(cache["public"], f"setsid nohup bash {root}/fg/cache-run.sh {run_id} {args.shards} {args.jobs} > {root}/run.log 2>&1 < /dev/null &")
+    ssh(cache["public"], f"FAST_GATE_CC={args.cc_cache} setsid nohup bash {root}/fg/cache-run.sh {run_id} {args.shards} {args.jobs} > {root}/run.log 2>&1 < /dev/null &")
     timeline["launched"] = time.monotonic() - started
 
 
@@ -168,7 +168,7 @@ def prepare_shard(ip, tree, files, index, args, timeline):
 
 
 def run_shard(ip, index, args, timeline):
-    cache = f"FAST_GATE_CACHE={args.cache['private']} FAST_GATE_RUN={args.run_id} " if args.cache else ""
+    cache = f"FAST_GATE_CC={args.cc_cache} " + (f"FAST_GATE_CACHE={args.cache['private']} FAST_GATE_RUN={args.run_id} " if args.cache else "")
     command = (f"{cache}setsid nohup bash {FG}/shard-run.sh {TREE} {index} {args.shards} {args.jobs} > {FG}/run.log 2>&1 < /dev/null & "
                f"until grep -q SHARD-DONE {FG}/out/status 2>/dev/null; do sleep 1; done")
     while True:
@@ -330,6 +330,8 @@ def main():
     parser.add_argument("--cache", default="auto", help="the shard-cache box: auto (the droplet named shard-cache, if any), none, or NAME")
     parser.add_argument("--keep", action="store_true", help="leave the shards running (debugging only)")
     parser.add_argument("--hosts", default="", help="comma-separated existing boxes to use as shards instead of creating droplets (debugging only; never deleted)")
+    parser.add_argument("--cc-cache", default="off", choices=["off", "log", "cache", "verify"],
+                        help="mode of the image's compile cache (fgcc): verify recompiles every hit and compares bytes")
     parser.add_argument("--ignore-budget", action="store_true", help="skip the daily shard budget check")
     args = parser.parse_args()
     specs = []
