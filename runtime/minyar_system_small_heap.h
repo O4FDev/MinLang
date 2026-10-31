@@ -138,6 +138,22 @@ static inline void rc_system_deallocate(void *pointer) {
     slot->value.next = page->free_slots;
     page->free_slots = slot;
 }
+/* The usual free, for hot call sites outside the bounded scheduler (inlining
+ * it into the scheduler loop costs more than the call): a small slot whose
+ * page stays in use and is already on its class's available list. */
+static inline void rc_system_deallocate_fast(void *pointer) {
+    RcSystemSlot *slot = (RcSystemSlot *)pointer - 1;
+    RcSystemPage *page = slot->page;
+    if (page && page->live > 1 && page->link) {
+        rc_system_live--;
+        page->live--;
+        SMALL_HEAP_POISON(pointer, page->stride - sizeof(*slot));
+        slot->value.next = page->free_slots;
+        page->free_slots = slot;
+        return;
+    }
+    rc_system_deallocate(pointer);
+}
 static inline void *rc_system_resize(void *pointer, size_t old_bytes, size_t bytes) {
     RcSystemSlot *slot = (RcSystemSlot *)pointer - 1;
     RcSystemPage *page = slot->page;

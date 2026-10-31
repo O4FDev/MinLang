@@ -123,6 +123,20 @@ MINYAR_HOT void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
 #define RC_QUEUE_INLINE static inline
 #endif
 
+/* rc_bounded_finish_object for a record with no queued fields, from a hot
+ * site outside the scheduler (a `try` taking a Result's payload): the free
+ * inlined (system heap). Testing builds keep the accounting and release
+ * observer; the pool heap keeps its own free. */
+RC_QUEUE_INLINE void rc_bounded_finish_record_fast(RcObject *object, unsigned kind) {
+#if defined(MINYAR_SYSTEM_HEAP) && !defined(MINYAR_RC_TESTING)
+    (void)kind;
+    rc_heap_deallocate_fast(object);
+#else
+    rc_bounded_finish_object(object, kind);
+#endif
+}
+#define RC_FINISH_RECORD_FAST(object, kind) rc_bounded_finish_record_fast((object), (kind))
+
 /* A dead record's cursor, for callers that already know the kind: with slot
  * headers it is one load or store, without the kind tests above. */
 RC_QUEUE_INLINE size_t rc_record_saved_cursor(RcObject *object) {

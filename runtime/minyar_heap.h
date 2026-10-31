@@ -45,6 +45,15 @@ static inline void rc_heap_deallocate(void *pointer) {
     free(pointer);
 #endif
 }
+/* rc_heap_deallocate of a non-null pointer with the small heap's fast free inline. */
+static inline void rc_heap_deallocate_fast(void *pointer) {
+    RC_ACCOUNT(rc_heap_allocation_count--);
+#if MINYAR_SYSTEM_SMALL_HEAP
+    rc_system_deallocate_fast(pointer);
+#else
+    free(pointer);
+#endif
+}
 static inline void *rc_heap_resize(void *pointer, size_t old_bytes, size_t bytes) {
     if (!pointer) return rc_heap_allocate(bytes);
 #if MINYAR_SYSTEM_SMALL_HEAP

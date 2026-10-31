@@ -529,6 +529,10 @@ void minyar_record_set_reference(MinyarRecord *record, long long field, long lon
  * field visits. A shared record keeps its value for its other owners: the
  * caller receives a new count and this owner is released. Never polls on the
  * unique path. */
+/* Runtimes without an inline record finish (the cycle runtime) use their own. */
+#ifndef RC_FINISH_RECORD_FAST
+#define RC_FINISH_RECORD_FAST(object, kind) rc_bounded_finish_object((object), (kind))
+#endif
 long long minyar_record_take_field(MinyarRecord *record, long long field) {
     if ((unsigned long long)field >= (unsigned long long)record->length)
         list_position_stop(field, record->length);
@@ -539,7 +543,7 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
     /* A unique scalar record (a success or failure with a scalar payload)
      * has nothing to visit either. */
     if (object->ownership == (8 | RC_SCALAR_RECORD)) {
-        rc_bounded_finish_object(object, RC_SCALAR_RECORD);
+        RC_FINISH_RECORD_FAST(object, RC_SCALAR_RECORD);
         return value;
     }
 #endif
@@ -551,7 +555,7 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
         long long fields = record->length, scan = 0;
         while (scan < fields && !references[scan]) scan++;
         if (scan == fields) {
-            rc_bounded_finish_object(object, RC_RECORD);
+            RC_FINISH_RECORD_FAST(object, RC_RECORD);
             return value;
         }
 #endif
