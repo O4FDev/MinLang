@@ -171,10 +171,44 @@ CYCLE_REGISTRATION_INPUTS = build/tooling/tests/cycle-registration build/tooling
 build/tooling/tests/cycle-registration: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/cycle-registration: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/cycle-registration: runtime/native/sha256.c
-check-cycle-registration-exposure: build/minyarc-errors $(CYCLE_REGISTRATION_INPUTS)
-	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-registration --evidence "$(CURDIR)/build/cycle-registration-exposure-native"
-check-cycle-registration-exposure-sanitize: build/minyarc-errors-sanitize $(CYCLE_REGISTRATION_INPUTS)
-	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-registration --sanitize --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize"
+# One target per heap profile and budget group; the eager piece also runs the Result
+# callback oracle exactly once, as the unsplit harness did.
+CYCLE_REGISTRATION_GROUPS = system-low system-high fixed-low fixed-high lazy-low lazy-high eager
+CYCLE_REGISTRATION_PARTS = $(addprefix check-cycle-registration-exposure-part-,$(CYCLE_REGISTRATION_GROUPS))
+CYCLE_REGISTRATION_SANITIZE_PARTS = $(addprefix check-cycle-registration-exposure-sanitize-part-,$(CYCLE_REGISTRATION_GROUPS))
+.PHONY: $(CYCLE_REGISTRATION_PARTS) $(CYCLE_REGISTRATION_SANITIZE_PARTS)
+check-cycle-registration-exposure: $(CYCLE_REGISTRATION_PARTS)
+check-cycle-registration-exposure-sanitize: $(CYCLE_REGISTRATION_SANITIZE_PARTS)
+$(CYCLE_REGISTRATION_PARTS): build/minyarc-errors $(CYCLE_REGISTRATION_INPUTS)
+$(CYCLE_REGISTRATION_SANITIZE_PARTS): build/minyarc-errors-sanitize $(CYCLE_REGISTRATION_INPUTS)
+check-cycle-registration-exposure-part-system-low:
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-registration --profiles system --budgets 1 32 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-native-system-low"
+check-cycle-registration-exposure-part-system-high:
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-registration --profiles system --budgets 1024 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-native-system-high"
+check-cycle-registration-exposure-part-fixed-low:
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-registration --profiles fixed --budgets 1 32 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-native-fixed-low"
+check-cycle-registration-exposure-part-fixed-high:
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-registration --profiles fixed --budgets 1024 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-native-fixed-high"
+check-cycle-registration-exposure-part-lazy-low:
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-registration --profiles lazy --budgets 1 32 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-native-lazy-low"
+check-cycle-registration-exposure-part-lazy-high:
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-registration --profiles lazy --budgets 1024 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-native-lazy-high"
+check-cycle-registration-exposure-part-eager:
+	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/cycle-registration --profiles eager --evidence "$(CURDIR)/build/cycle-registration-exposure-native-eager"
+check-cycle-registration-exposure-sanitize-part-system-low:
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-registration --sanitize --profiles system --budgets 1 32 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize-system-low"
+check-cycle-registration-exposure-sanitize-part-system-high:
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-registration --sanitize --profiles system --budgets 1024 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize-system-high"
+check-cycle-registration-exposure-sanitize-part-fixed-low:
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-registration --sanitize --profiles fixed --budgets 1 32 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize-fixed-low"
+check-cycle-registration-exposure-sanitize-part-fixed-high:
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-registration --sanitize --profiles fixed --budgets 1024 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize-fixed-high"
+check-cycle-registration-exposure-sanitize-part-lazy-low:
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-registration --sanitize --profiles lazy --budgets 1 32 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize-lazy-low"
+check-cycle-registration-exposure-sanitize-part-lazy-high:
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-registration --sanitize --profiles lazy --budgets 1024 --skip-result-oracle --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize-lazy-high"
+check-cycle-registration-exposure-sanitize-part-eager:
+	PATH="$(CYCLE_SANITIZER_PATH)" MINYAR_ERRORS_COMPILER=./build/minyarc-errors-sanitize MINYAR_TEST_CLANG="$(CYCLE_SANITIZER_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/cycle-registration --sanitize --profiles eager --evidence "$(CURDIR)/build/cycle-registration-exposure-sanitize-eager"
 check: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
 check-portable: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
 check-managed-graphs-profiles: check-cycle-registration-exposure check-cycle-registration-exposure-sanitize
