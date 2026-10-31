@@ -187,8 +187,9 @@ def unescape(text):
     return text.encode("latin-1", "backslashreplace").decode("unicode_escape").encode("latin-1", "replace").decode("utf-8", "replace")
 
 
-# Processes that read files only to compile or link them. A file any other process opens is inspected as
-# data (hashed, compared, parsed), which function coverage cannot see.
+# Processes that read files only to compile or link them (with clang drivers and wrappers). A file any other
+# process opens is inspected as data (hashed, compared, parsed, or compiled by minyarc), which function
+# coverage cannot see.
 BUILD_TOOLS = {"clang", "clang-23", "clang++", "cc", "c++", "gcc", "g++", "ld", "ld.lld", "lld", "ld.bfd", "ld.gold",
                "as", "opt", "llc", "llvm-link", "ar", "llvm-ar", "make"}
 
@@ -351,7 +352,7 @@ def parse_trace(trace, root, checks):
                 reads[check].add(relative)
             else:
                 reads[check].add(relative)
-                if name in ("open", "openat", "openat2") and exe not in BUILD_TOOLS:
+                if name in ("open", "openat", "openat2") and exe not in BUILD_TOOLS and "clang" not in exe:
                     inspected[check].add(relative)
     return reads, listed, executed, goals, inspected
 
