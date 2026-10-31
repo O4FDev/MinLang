@@ -16,6 +16,8 @@ PERFCS_MAP_GATE_BUDGETS = 1,32
 PERFCS_RUNTIME_PROFILES = ordinary-system ordinary-fixed ordinary-lazy cycle-system cycle-fixed cycle-lazy
 PERFCS_PROFILES = system fixed lazy
 PERFCS_MAP_PROFILES = system fixed lazy eager arena
+PERFCS_OWNER_QUEUE_INPUTS = tests/owner-queue-batching.py tests/owner-queue-batching.c $(RUNTIME_HEADERS)
+PERFCS_TEMPORARY_CACHE_INPUTS = tests/temporary-owner-cache.py tests/temporary-owner-cache.c $(RUNTIME_HEADERS)
 PERFCS_FRAME_INITIALIZATION_INPUTS = tests/frame-initialization.py tests/frame-initialization.c $(RUNTIME_HEADERS)
 PERFCS_EMPTY_MAP_INPUTS = tests/empty-map-traversal.py tests/empty-map-traversal.c $(RUNTIME_HEADERS)
 
@@ -33,15 +35,20 @@ check-$(1)-part-$(6): $(3) | build
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(4) python3 "$(2)" $(5) --profiles $(6) $(if $(filter system,$(6)),,$(7))
 endef
 
-.PHONY: check-owner-queue-batching check-owner-queue-batching-budgets check-owner-queue-batching-sanitize
-check-owner-queue-batching: tests/owner-queue-batching.py tests/owner-queue-batching.c $(RUNTIME_HEADERS) | build
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) python3 "tests/owner-queue-batching.py" --modes native --budgets $(PERFCS_GATE_BUDGETS)
+.PHONY: check-owner-queue-batching check-owner-queue-batching-budgets check-owner-queue-batching-sanitize \
+	$(addprefix check-owner-queue-batching-part-,$(PERFCS_PROFILES)) \
+	$(addprefix check-owner-queue-batching-budgets-part-,$(PERFCS_PROFILES)) \
+	$(addprefix check-owner-queue-batching-sanitize-part-,$(PERFCS_PROFILES))
+check-owner-queue-batching: $(addprefix check-owner-queue-batching-part-,$(PERFCS_PROFILES))
 
-check-owner-queue-batching-budgets: tests/owner-queue-batching.py tests/owner-queue-batching.c $(RUNTIME_HEADERS) | build
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) python3 "tests/owner-queue-batching.py" --modes native --budgets $(PERFCS_OTHER_BUDGETS)
+check-owner-queue-batching-budgets: $(addprefix check-owner-queue-batching-budgets-part-,$(PERFCS_PROFILES))
 
-check-owner-queue-batching-sanitize: tests/owner-queue-batching.py tests/owner-queue-batching.c $(RUNTIME_HEADERS) | build
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) python3 "tests/owner-queue-batching.py" --modes sanitize
+check-owner-queue-batching-sanitize: $(addprefix check-owner-queue-batching-sanitize-part-,$(PERFCS_PROFILES))
+
+# The two scheduler mutants rerun the system K7 transcript once per piece; that is the only work a split repeats here.
+$(foreach profile,$(PERFCS_PROFILES),$(eval $(call PERFCS_PROFILE_PIECE,owner-queue-batching,tests/owner-queue-batching.py,$(PERFCS_OWNER_QUEUE_INPUTS),$(LIMITED),--modes native --budgets $(PERFCS_GATE_BUDGETS),$(profile),)))
+$(foreach profile,$(PERFCS_PROFILES),$(eval $(call PERFCS_PROFILE_PIECE,owner-queue-batching-budgets,tests/owner-queue-batching.py,$(PERFCS_OWNER_QUEUE_INPUTS),$(LIMITED),--modes native --budgets $(PERFCS_OTHER_BUDGETS),$(profile),)))
+$(foreach profile,$(PERFCS_PROFILES),$(eval $(call PERFCS_PROFILE_PIECE,owner-queue-batching-sanitize,tests/owner-queue-batching.py,$(PERFCS_OWNER_QUEUE_INPUTS),$(SANITIZER_LIMITED),--modes sanitize,$(profile),)))
 
 .PHONY: check-temporary-owner-cache check-temporary-owner-cache-budgets check-temporary-owner-cache-sanitize \
 	$(addprefix check-temporary-owner-cache-part-,$(PERFCS_RUNTIME_PROFILES)) \
