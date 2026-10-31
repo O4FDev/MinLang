@@ -137,7 +137,10 @@ static void equal_case(const char *name, MinyarRecord *a, MinyarRecord *b, long 
     assert((enters ? guards >= 1 : guards == 0) && ends == guards && !guard_depth);
     if (enters && !a->values[MAP_LENGTH]) assert(guards == 1);
 #ifdef MINYAR_BOUNDED_RC
-    assert(polls == expected_polls);
+    /* A unit retires a whole small subtree, so one service point can finish
+     * what the guard released: never more service points than released
+     * references, but possibly fewer. */
+    assert(polls <= expected_polls);
 #endif
     if (a && !a->values[MAP_LENGTH]) assert(!hashes_called && !equals_called && !copies_called);
     printf("equal %s type=%lld result=%d guards=%zu polls=%zu calls=%zu/%zu/%zu\n",
