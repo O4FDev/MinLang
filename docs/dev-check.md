@@ -147,6 +147,13 @@ time) when the base moves far; until then a moved base only widens selection.
 | tests/http.min edit (no Linux gate check reads it) | 0 (+1 untraceable) | green in 24 s |
 | new test script + benchmarks.mk rule (batch 5) | 115 | red in 1,310 s, same root check as the gate |
 | library/json.min edit (the check runner imports json) | all | equals the gate |
-| compiler pass or runtime header edit | all | equals the gate (`build/minyarc` rebuild 52 s) |
+| compiler pass or runtime header edit, file-level index only | all | equals the gate (`build/minyarc` rebuild 52 s) |
+| compiler function body edit, function index (constant-overflow diagnostic) | 78 | red in 700 s on the one failing check |
+| runtime header function body edit, function index (`minyar_map_get_or`) | 90 | red in 1,022 s on the one failing check |
 
 The full gate takes 22 to 24 minutes on the same box with `CHECK_JOBS=8`.
+
+With the function index, most of the remaining selection for a compiler or
+runtime change comes from checks that read the compiler binary, a runtime
+object or the changed source as data (`sha256sum` for cache keys, copies, the
+launcher). They stay selected: a check may compare such hashes.
