@@ -123,6 +123,24 @@ MINYAR_HOT void *rc_bounded_finish_object(RcObject *object, unsigned kind) {
 #define RC_QUEUE_INLINE static inline
 #endif
 
+/* A dead record's cursor, for callers that already know the kind: with slot
+ * headers it is one load or store, without the kind tests above. */
+RC_QUEUE_INLINE size_t rc_record_saved_cursor(RcObject *object) {
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_OBJECT_SLOT_HEADERS
+    return ((RcSystemSlot *)object - 1)->value.bytes;
+#else
+    return rc_bounded_saved_cursor(object);
+#endif
+}
+
+RC_QUEUE_INLINE void rc_record_save_cursor(RcObject *object, size_t cursor) {
+#if defined(MINYAR_SYSTEM_HEAP) && MINYAR_OBJECT_SLOT_HEADERS
+    ((RcSystemSlot *)object - 1)->value.bytes = cursor;
+#else
+    rc_bounded_save_cursor(object, cursor);
+#endif
+}
+
 RC_QUEUE_INLINE void rc_bounded_enqueue_in(RcBoundedObjects *q, size_t *pending, RcObject *object) {
     rc_bounded_save_cursor(object, 0);
     object->ownership |= (size_t)(uintptr_t)q->recent_head;
@@ -178,6 +196,16 @@ RC_QUEUE_INLINE unsigned rc_drop_in(RcBoundedObjects *q, size_t *pending, void *
         }
         return 1;
     }
+    /* The usual interior node of a dead graph becomes a recent task with its
+     * cursor stored without the generic kind tests. */
+    if (kind == RC_RECORD && ((MinyarRecord *)(object + 1))->length) {
+        rc_record_save_cursor(object, 0);
+        object->ownership = RC_RECORD | (size_t)(uintptr_t)q->recent_head;
+        q->recent_head = object;
+        if (!q->recent_tail) q->recent_tail = object;
+        ++*pending;
+        return 0;
+    }
     if (kind == RC_LIST || kind == RC_REFERENCES_IMMORTAL ||
         (kind == RC_REFERENCES && !((MinyarList *)(object + 1))->length) ||
         (kind == RC_RECORD && !((MinyarRecord *)(object + 1))->length)) {
@@ -221,22 +249,23 @@ RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t
         q->head = (RcObject *)(uintptr_t)(q->active->ownership & ~(size_t)7);
         if (!q->head) q->tail = NULL;
         q->active->ownership &= 7;
-        q->cursor = rc_bounded_saved_cursor(q->active);
+        q->cursor = (q->active->ownership & 7) == RC_RECORD ? rc_record_saved_cursor(q->active)
+                                                             : rc_bounded_saved_cursor(q->active);
     }
     RcObject *object = q->active;
     unsigned kind = object->ownership & 7;
-    if (kind == RC_REFERENCES) {
-        MinyarList *list = (MinyarList *)(object + 1);
-        if (q->cursor < (size_t)list->length) {
-            rc_drop_in(q, pending, (void *)(uintptr_t)list->values[q->cursor++]);
-            return;
-        }
-    } else if (kind == RC_RECORD) {
+    if (kind == RC_RECORD) {
         MinyarRecord *record = (MinyarRecord *)(object + 1);
         if (q->cursor < (size_t)record->length) {
             unsigned char *map = (unsigned char *)(record->values + record->length);
             size_t index = q->cursor++;
             if (map[index] & 1) rc_drop_in(q, pending, (void *)(uintptr_t)record->values[index]);
+            return;
+        }
+    } else if (kind == RC_REFERENCES) {
+        MinyarList *list = (MinyarList *)(object + 1);
+        if (q->cursor < (size_t)list->length) {
+            rc_drop_in(q, pending, (void *)(uintptr_t)list->values[q->cursor++]);
             return;
         }
     }
@@ -251,20 +280,27 @@ RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t
 RC_BOUNDED_INLINE void rc_bounded_recent_object_unit_in(RcBoundedObjects *q, size_t *pending) {
     RcObject *object = q->recent_head;
     unsigned kind = object->ownership & 7;
+    if (kind == RC_RECORD) {
+        MinyarRecord *record = (MinyarRecord *)(object + 1);
+        size_t cursor = rc_record_saved_cursor(object);
+        if (cursor < (size_t)record->length) {
+            unsigned char *map = (unsigned char *)(record->values + record->length);
+            void *child = (map[cursor] & 1) ? (void *)(uintptr_t)record->values[cursor] : NULL;
+            rc_record_save_cursor(object, cursor + 1);
+            rc_drop_in(q, pending, child);
+            return;
+        }
+        q->recent_head = (RcObject *)(uintptr_t)(object->ownership & ~(size_t)7);
+        if (!q->recent_head) q->recent_tail = NULL;
+        rc_bounded_finish_object(object, RC_RECORD);
+        --*pending;
+        return;
+    }
     size_t cursor = rc_bounded_saved_cursor(object);
     if (kind == RC_REFERENCES) {
         MinyarList *list = (MinyarList *)(object + 1);
         if (cursor < (size_t)list->length) {
             void *child = (void *)(uintptr_t)list->values[cursor];
-            rc_bounded_save_cursor(object, cursor + 1);
-            rc_drop_in(q, pending, child);
-            return;
-        }
-    } else if (kind == RC_RECORD) {
-        MinyarRecord *record = (MinyarRecord *)(object + 1);
-        if (cursor < (size_t)record->length) {
-            unsigned char *map = (unsigned char *)(record->values + record->length);
-            void *child = (map[cursor] & 1) ? (void *)(uintptr_t)record->values[cursor] : NULL;
             rc_bounded_save_cursor(object, cursor + 1);
             rc_drop_in(q, pending, child);
             return;
@@ -377,7 +413,7 @@ static size_t rc_bounded_schedule(size_t budget) {
              * and finalization the next two units. There is no competing old
              * task to bypass, and dropping one child creates at most one task.
              * Keep per-unit state updates around rc_drop in reference order. */
-            if (budget - work >= 2 && (*pending) == 1 && !q->active) {
+            if ((*pending) == 1 && !q->active && budget - work >= 2) {
                 RcObject *single = q->head ? q->head : q->recent_head;
                 if (single && (single->ownership & 7) == RC_RECORD) {
                     MinyarRecord *record = (MinyarRecord *)(single + 1);
