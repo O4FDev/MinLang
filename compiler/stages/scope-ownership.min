@@ -505,6 +505,29 @@ function scopeCell(slot: Integer): Text {
     return "%rc.scope.slot." + Text(slot)
 }
 
+// Owner slots this body never stores a value into. Their cell starts null and
+// stays null, so every cleanup point's drop of it releases nothing; the
+// lowering skips those drops and their work units. A slot a coalesced borrow
+// no longer writes stays here too.
+function scopeLiveOwners(body: ScopeOwnershipBody): List<Boolean> {
+    let live: List<Boolean> = []
+    let owner = 0
+    while owner < body.owners {
+        live.add(false)
+        owner = owner + 1
+    }
+    let line = 0
+    while line < body.operations.length {
+        let operation = body.operations[line]
+        if operation == 6 || operation == 7 || operation == 9 || operation == 11 {
+            let slot = body.slots[line]
+            if slot >= 0 && slot < body.owners { live[slot] = true }
+        }
+        line = line + 1
+    }
+    return live
+}
+
 // An eager drop releases at once. A bounded drop (budget > 0) is one work
 // unit; its cleanup point then services what remains of the budget.
 function scopeDrop(output: List<Text>, line: Integer, slot: Integer, budget: Integer) {
@@ -558,6 +581,13 @@ function lowerScopeBody(module: Text, source: List<Text>, sourceStarts: List<Int
     if body.entry < 0 || count > 256 || !scopeCleanupPaths(body) { return copied }
     if !scopeCleanupsFit(body, budget) { return copied }
     count = body.owners + scopeReuseCells(body)
+    let liveOwners = scopeLiveOwners(body)
+    let liveOwnerCount = 0
+    let live = 0
+    while live < liveOwners.length {
+        if liveOwners[live] { liveOwnerCount = liveOwnerCount + 1 }
+        live = live + 1
+    }
     let index = 0
     while index < lines.length {
         let operation = body.operations[index]
@@ -588,8 +618,8 @@ function lowerScopeBody(module: Text, source: List<Text>, sourceStarts: List<Int
             }
             if operation != 3 {
                 let owner = 0
-                while owner < body.owners { scopeDrop(output, index, owner, budget); owner = owner + 1 }
-                units = units + body.owners
+                while owner < body.owners { if liveOwners[owner] { scopeDrop(output, index, owner, budget) }; owner = owner + 1 }
+                units = units + liveOwnerCount
                 // A bounded return is a service point like a frame exit.
                 if budget > 0 { output.add("  call void @minyar_rc_scope_service_v1(i64 " + Text(units) + ")\n") }
                 else if operation == 13 { output.add("  call void @minyar_rc_scope_poll_v1()\n") }
