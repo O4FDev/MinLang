@@ -96,3 +96,8 @@ goal ff36ca1f2:     h geomean=5.028 max=13.399 over2=18 failed=0 | vs Rust 3.373
 - `python3 benchmarks/livepatch/run.py soak` on 5da77df7f (run.py CPU defaults fixed for 4-vCPU boxes): errors 0,
   every_request_counted_once true, versions monotonic, 5 patches under load, 266,335 requests.
 - Hidden score on box B (ff36ca1f2): geomean 5.028 (vs Rust 3.373), max 13.399 — phase-1 perf bar NOT met.
+
+## Gate batch 9 (ownership4 + per-field TBAA + ownership5 + fixes incl. a use-after-free), box H, 2026-10-31 16:21 UTC
+336/339: check-determinism-runtime (box-H environment; passes on box B), check-osdev-workflow (load flake at load 8–10;
+reran 2/2 green). goal/2026-10-30 fast-forwarded to batch 9.
+Visible compare (box H, 22 programs): geomean 2.69 vs fastest, 2.17 vs Rust; worst json 8.51.
