@@ -482,8 +482,33 @@ done:
  * general paths are never inlined, so each entry point has one fixed shape and
  * adding an entry point cannot change how another one is compiled. */
 MINYAR_HOT int map_builtin_kind(long long kind) { return kind < 7; }
+/* map_text_hash's own result for byte_length < 8, without its out-of-line call:
+ * no whole words to mix, one tail word and one mix, so short keys stay inside
+ * the inlined entry point. */
+MINYAR_HOT uint64_t map_text_hash_short(const MinyarText *text) {
+    uint64_t hash = UINT64_C(0x9e3779b97f4a7c15) ^ (uint64_t)text->byte_length;
+    const unsigned char *p = text->bytes;
+    size_t n = (size_t)text->byte_length;
+    uint64_t tail = 0;
+    if (n >= 4) {
+        uint32_t low, high;
+        memcpy(&low, p, sizeof(low));
+        memcpy(&high, p + n - 4, sizeof(high));
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        low = __builtin_bswap32(low);
+        high = __builtin_bswap32(high);
+#endif
+        tail = (uint64_t)low | (uint64_t)high << (8 * (n - 4));
+    } else if (n)
+        tail = (uint64_t)p[0] | (uint64_t)p[n / 2] << (8 * (n / 2)) | (uint64_t)p[n - 1] << (8 * (n - 1));
+    return map_nonzero_hash(map_mix(hash ^ tail));
+}
 MINYAR_HOT uint64_t map_builtin_hash(long long kind, long long key) {
-    if (kind == 2) return map_text_hash((const MinyarText *)(uintptr_t)key);
+    if (kind == 2) {
+        const MinyarText *text = (const MinyarText *)(uintptr_t)key;
+        if ((size_t)text->byte_length < 8) return map_text_hash_short(text);
+        return map_text_hash(text);
+    }
     return map_nonzero_hash(map_mix((uint64_t)key));
 }
 /* The bucket holding key, or the empty bucket that ends its probe run. Stored
