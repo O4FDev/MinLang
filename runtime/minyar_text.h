@@ -461,6 +461,22 @@ long long minyar_runtime_jsonSpaceEnd(MinyarText *text, long long position) {
     while (i < length && (bytes[i] == ' ' || bytes[i] == '\n' || bytes[i] == '\r' || bytes[i] == '\t')) i++;
     return position + (i - start);
 }
+/* An integral spelling of one to eighteen digits fits an Integer exactly, so
+ * it needs no decimal conversion. `jsonInteger` reads it in place; anything
+ * else (fraction, exponent, sign other than '-', longer, empty) returns
+ * LLONG_MIN, which no such spelling can produce. */
+long long minyar_runtime_jsonInteger(MinyarText *text) {
+    const unsigned char *bytes = (const unsigned char *)text->bytes;
+    long long length = text->byte_length, i = 0, digits = 0, magnitude = 0;
+    _Bool negative = length > 0 && bytes[0] == '-';
+    if (negative) i = 1;
+    for (; i < length; i++, digits++) {
+        if (digits >= 18 || (unsigned char)(bytes[i] - '0') >= 10) return -9223372036854775807LL - 1;
+        magnitude = magnitude * 10 + (bytes[i] - '0');
+    }
+    if (digits == 0) return -9223372036854775807LL - 1;
+    return negative ? -magnitude : magnitude;
+}
 
 /* Everyday Text operations. Positions and lengths count Unicode scalars; all
  * searching and copying works on bytes. A result whose scalar count equals its

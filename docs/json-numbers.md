@@ -10,8 +10,12 @@ subnormal, and `-0e9999` is negative zero. `1e9999` remains invalid.
 The grammar and policy limits stay in `library/json.min`. Its private
 `jsonNumber` runtime call converts the validated lexeme using integer arithmetic
 in `runtime/minyar_decimal.h`. The helper also rejects malformed lexemes when
-called directly. The existing borrowed Text ABI remains a precondition; this
-is not validation of arbitrary C pointers or forged object lengths.
+called directly. Integral lexemes of at most 18 digits skip the helper: their
+digits fit an Integer exactly, so one Integer-to-Float conversion rounds once
+with the same nearest-even rule. Longer integral, fractional and exponent
+lexemes keep the `jsonNumber` path. The existing borrowed Text ABI remains a
+precondition; this is not validation of arbitrary C pointers or forged object
+lengths.
 
 ## Fixed-space exact rounding
 
