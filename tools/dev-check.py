@@ -554,6 +554,36 @@ def stale_outputs(root, targets, database=None):
     return stale - {"FORCE"}, result.stderr
 
 
+def file_digest(path):
+    try:
+        hasher = hashlib.sha256()
+        with open(path, "rb") as source:
+            for chunk in iter(lambda: source.read(1 << 20), b""):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except OSError:
+        return None
+
+
+def changed_outputs(root, targets, jobs):
+    """Build targets through the check runner's parallel shared-prerequisite builder; return those whose content changed.
+
+    A target that fails to build counts as changed, so its checks run and report the failure."""
+    before = {target: file_digest(root / target) for target in targets}
+    rules = STATE / "cutoff.mk"
+    rules.write_text(".PHONY: dev-check-build\ndev-check-build: " + " ".join(targets) + "\n\t@true\n")
+    environment = clean_environment()
+    environment["MAKEFILES"] = str(rules)
+    subprocess.run(["make", "--no-print-directory", "check-in-parallel", "CHECKS=dev-check-build", f"CHECK_JOBS={jobs}"],
+                   cwd=root, env=environment, stdout=subprocess.DEVNULL)
+    result = []
+    for target in targets:
+        after = file_digest(root / target)
+        if after is None or after != before[target]:
+            result.append(target)
+    return sorted(result)
+
+
 def select(index, database, checks, changed, added, removed, stale):
     reasons = {}
     changed_set = set(changed) | set(stale)
@@ -679,6 +709,15 @@ def command_run(arguments):
     stale, _ = stale_outputs(root, prerequisites, database)
     stale_build = sorted(path for path in stale if path.startswith("build/"))
     compiler = sorted(path for path in changed if path.startswith(("compiler/", "bootstrap/")))
+    rebuilt = 0
+    if stale_build and not arguments.plan and not arguments.no_cutoff:
+        # Make's graph is coarse (for example every object depends on every .mk file). Build the stale
+        # outputs now (the checks need them anyway) and keep only those whose bytes changed.
+        build_started = time.time()
+        rebuilt = len(stale_build)
+        stale_build = changed_outputs(root, stale_build, arguments.jobs)
+        stale = set(stale_build) | (stale - {path for path in stale if path.startswith("build/")})
+        say(f"built {rebuilt} stale output(s) in {time.time() - build_started:.0f} s; {len(stale_build)} changed content")
     if arguments.only and ignored:
         say(f"--only: ignoring {len(ignored)} other changed path(s), e.g. {', '.join(ignored[:3])}")
         stale_build = [path for path in stale_build]  # stale outputs still reflect every change on disk
@@ -838,6 +877,7 @@ def main():
     run.add_argument("--plan", action="store_true", help="print the selection without running checks")
     run.add_argument("--jobs", type=int, default=int(os.environ.get("CHECK_JOBS", "4")))
     run.add_argument("--index", help="dependency index (default build/dev-check/index.json or $DEV_CHECK_INDEX)")
+    run.add_argument("--no-cutoff", action="store_true", help="select by Make staleness alone, without building first")
     run.add_argument("--include-base-red", action="store_true", help="also run checks that failed at the indexed base")
     run.add_argument("--bench", action="store_true", help="also measure Ir of affected benchmarks/compare programs")
     run.add_argument("--bench-base", default=os.environ.get("DEV_CHECK_BENCH_BASE"),
