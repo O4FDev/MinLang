@@ -743,9 +743,11 @@ def command_rebase(arguments):
     targets = [item for item in prerequisites if item in stale]
     say(f"{len(changed)} changed source(s); rebuilding {len(targets)} stale prerequisite(s)")
     if targets:
-        status = subprocess.run(["make", "-k", "--no-print-directory", *targets], cwd=root, env=clean_environment()).returncode
-        if status != 0:
-            say("build failed; base not recorded"); return status
+        changed_outputs(root, targets, arguments.jobs)  # parallel, through the check runner's builder
+        left, _ = stale_outputs(root, prerequisites, database)
+        if left:
+            say(f"build failed: {len(left)} output(s) still stale, e.g. {', '.join(sorted(left)[:3])}; base not recorded")
+            return 1
     built_path.write_text(json.dumps(current))
     (STATE / "base.json").write_text(json.dumps(current))
     (STATE / "base-make.json").write_text(json.dumps({
@@ -950,6 +952,7 @@ def main():
                      help="compare.json of the base for Ir deltas (default $DEV_CHECK_BENCH_BASE)")
     rebase = sub.add_parser("rebase", help="build the current tree and measure later changes against it")
     rebase.add_argument("--index")
+    rebase.add_argument("--jobs", type=int, default=int(os.environ.get("CHECK_JOBS", "4")))
     index = sub.add_parser("index", help="trace the gate on the base tree and write the dependency index")
     index.add_argument("--checks", default="check-portable")
     index.add_argument("--jobs", type=int, default=8)
