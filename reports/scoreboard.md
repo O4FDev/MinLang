@@ -90,3 +90,9 @@ Logs: logs/score-final-boxD.log, logs/compare-b7-boxD.log
 baseline 3832f4373: h geomean=7.453 max=19.471 | vs Rust 4.998 / 15.252 | b: 6 of 7 cannot build at baseline (no join/channels)
 goal ff36ca1f2:     h geomean=5.028 max=13.399 over2=18 failed=0 | vs Rust 3.373 / 9.850 | b serial 3.487, parallel 2.123 (Intel wall)
 → instruction counts are identical across the two CPUs for these binaries; box B is a valid scoring box from now on.
+
+## Box B phase-1 checks, 2026-10-31 09:08 UTC
+- `make check-in-parallel CHECKS="check-portable check-benchmarks"` on 81044253f: 336/336 passed.
+- `python3 benchmarks/livepatch/run.py soak` on 5da77df7f (run.py CPU defaults fixed for 4-vCPU boxes): errors 0,
+  every_request_counted_once true, versions monotonic, 5 patches under load, 266,335 requests.
+- Hidden score on box B (ff36ca1f2): geomean 5.028 (vs Rust 3.373), max 13.399 — phase-1 perf bar NOT met.
