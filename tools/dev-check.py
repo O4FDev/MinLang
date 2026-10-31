@@ -634,10 +634,12 @@ def changed_outputs(root, targets, jobs):
     environment["MAKEFILES"] = str(rules)
     subprocess.run(["make", "--no-print-directory", "check-in-parallel", "CHECKS=dev-check-build", f"CHECK_JOBS={jobs}"],
                    cwd=root, env=environment, stdout=subprocess.DEVNULL)
+    # Anything Make still calls stale was not built (a failed or skipped build): count it as changed.
+    left, _ = stale_outputs(root, targets)
     result = []
     for target in targets:
         after = file_digest(root / target)
-        if after is None or after != before[target]:
+        if after is None or after != before[target] or target in left:
             result.append(target)
     return sorted(result)
 
