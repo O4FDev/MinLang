@@ -434,7 +434,7 @@ done:
 }
 /* Save references, close the cluster, then release. RC polls cannot see a
  * duplicate owner or a removed slot while buckets are being moved. */
-static void map_remove_bucket(MinyarRecord *map, long long kind, size_t hole) {
+MINYAR_HOT void map_remove_bucket(MinyarRecord *map, long long kind, size_t hole) {
     MinyarRecord *entries = map_entries(map);
     long long removed_key = MAP_KEY(entries, hole), removed_value = MAP_VALUE(entries, hole);
     size_t mask = map_capacity(map) - 1, scan = (hole + 1) & mask;
