@@ -336,5 +336,56 @@ test.check(test.contains(directSlice, "call i64 @minyar_text_integer_range(") &&
 let keptSlice = functionBody(sliceLLVM, "kept")
 test.check(test.contains(keptSlice, "@minyar_text_slice(") && test.contains(keptSlice, "@minyar_text_integer(") && !test.contains(keptSlice, "@minyar_text_integer_range("), "a stored slice is still a Text")
 
+// A loop that reads one Text's characters or length tests it once: a counted
+// ASCII Text reads its bytes directly in a copy of the loop, and every other
+// Text runs the counted loop unchanged with the same results and traps.
+fixtures.executes(frontend, #"""
+    record Cursor { text: Text; position: Integer }
+    function Cursor.spaces() {
+        while self.position < self.text.length && self.text[self.position] == ' ' { self.position += 1 }
+    }
+    function count(text: Text): Integer {
+        let found = 0
+        let index = 0
+        while index < text.length {
+            if text[index] == 'a' { found += 1 }
+            index += 1
+        }
+        return found
+    }
+    function letters(text: Text): Integer {
+        let total = 0
+        for character in text { if character != ' ' { total += 1 } }
+        return total
+    }
+    let cursor = Cursor { text: "   drei", position: 0 }
+    cursor.spaces()
+    print(cursor.position)
+    print(count("aña🙂a"))
+    print(count(""))
+    print(letters("a b c"))
+    let unicode = "añ🙂b"
+    let shown: List<Text> = []
+    for index in 0..unicode.length { shown.add(Text(unicode[index])) }
+    print(joinText(shown, "|") + " " + Text(unicode.length))
+    """#, "3\n3\n0\n3\na|ñ|🙂|b 4\n", levels, 0, "", true)
+let countPath = frontend.compiler.directory + "/case" + Text(frontend.compiler.serial)
+let countLLVM = io.readTextFile(countPath + ".ll")
+let counted = functionBody(countLLVM, "count")
+test.check(test.contains(counted, "@.minyar.text.character.known(") && test.contains(counted, "icmp sgt i64"), "a loop over one Text tests counted ASCII once and reads bytes directly")
+test.check(test.contains(counted, "call i32 @.minyar.text.character("), "the counted loop stays for a Text that is not counted ASCII")
+let letterBody = functionBody(countLLVM, "letters")
+test.check(test.contains(letterBody, "@.minyar.text.character.known("), "a for loop over a Text reads bytes directly")
+
+// The fast copy traps exactly where the counted loop does.
+fixtures.executes(frontend, #"""
+    let text = "abc"
+    let index = 0
+    while index <= text.length {
+        print(Text(text[index]))
+        index += 1
+    }
+    """#, "a\nb\nc\n", levels, 1, "Minyar stopped: a Text position was outside the Text.\n", false)
+
 test.removeTree(frontend.compiler.directory)
 print("Text scanning: passed")
