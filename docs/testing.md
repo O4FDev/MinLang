@@ -272,7 +272,9 @@ empty arguments. Both targets belong to `check-portable`.
 `make check-library-documentation` verifies every documented example across
 the whole standard library and gallery at debug/O0 and release/O2, including
 Error contexts, Maybe, generic choices, aliases and methods. It also checks
-that every source module appears in the generated metadata. The living-tests
+that every source module appears in the generated metadata. It runs as four
+pieces (`check-library-documentation-part-{debug,release}-{library,gallery}`,
+one `--profile`/`--input` pair each) under that aggregate. The living-tests
 gallery's ordinary program and in-module tests retain O0/O2 ownership checks.
 
 Use `make check-portable` for the cross-platform compiler/runtime gate and
@@ -1536,6 +1538,9 @@ chain optimizations remain covered.
 
 `make check-record-reconstruction-reuse` checks complete primitive-record
 reconstruction at O0/O2 with native and sanitized compiler/generated programs.
+Its four passes are separate pieces (`...-part1` plain, `...-part2` sanitized,
+`...-part3`/`...-part4` the `--scope-owners` wrapper variants, whose wrapper
+scripts are ordinary file prerequisites).
 It preserves swaps, source-order calls, mutations before replacement, alias
 fallbacks, borrowed parameters and early Result propagation. LLVM assertions
 place the owner move/helper and every field store after all initializers;
@@ -1552,7 +1557,8 @@ entry-only storage and O2 promotion for the pure fixture.
 
 `make check-last-use-sinks` checks final owned-local arguments to List insertion
 and indexed replacement under native and sanitized O0/O2, with both legacy and
-explicit scoped ownership. The fixtures exercise persistent aliases, cycles,
+explicit scoped ownership. Four pieces (`...-part-{native,sanitize}-{plain,scoped}`,
+one `--plain`/`--scoped` run each) make up the aggregate. The fixtures exercise persistent aliases, cycles,
 branch exits, loop-local freshness, shadowing, later rebinding and implicit
 field/index/compound assignment reads. Borrowed parameters, captures, recovery
 and native bodies retain their ordinary paths; exact runtime cleanup remains
