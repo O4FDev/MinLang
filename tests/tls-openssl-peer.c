@@ -170,7 +170,7 @@ static int client(int argc, char **argv) {
     SSL *ssl = SSL_new(context);
     SSL_set_fd(ssl, fd);
     SSL_set_tlsext_host_name(ssl, host);
-    SSL_set1_host(ssl, host);
+    X509_VERIFY_PARAM_set1_host(SSL_get0_param(ssl), host, 0);
     if (SSL_connect(ssl) != 1) { report("handshake"); return 1; }
     if (data[0] && SSL_write(ssl, data, (int)strlen(data)) != (int)strlen(data)) { report("write"); return 1; }
     char buffer[1024];
