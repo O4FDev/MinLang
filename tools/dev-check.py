@@ -440,8 +440,9 @@ def command_index(arguments):
     temporary.write_text(json.dumps(index, sort_keys=True))
     temporary.replace(output)
     (STATE / "built.json").write_text(json.dumps(base))
-    if (STATE / "base.json").exists():
-        (STATE / "base.json").unlink()
+    for stale in ("base.json", "base-make.json"):
+        if (STATE / stale).exists():
+            (STATE / stale).unlink()
     untraced = [name for name, entry in entries.items() if not entry["traced"]]
     failed = [name for name, entry in entries.items() if not entry["passed"]]
     say(f"wrote {output}: {len(entries)} checks, {len(table)} paths; {len(failed)} not passing at base, {len(untraced)} untraced")
@@ -464,7 +465,7 @@ def changed_sources(root, index, only, built_path):
         # bb copies files but never deletes; a base file missing from the synced list was deleted.
         synced = set(bb_files.read_text().splitlines())
         for path in base:
-            if path not in synced and (root / path).exists() and not path.startswith("."):
+            if path not in synced and (root / path).exists() and not path.startswith(".") and path != "tools/dev-check.py":
                 (root / path).unlink()
     current = manifest(root, built)
     changed = sorted(path for path in set(base) | set(current)
@@ -492,13 +493,28 @@ def changed_sources(root, index, only, built_path):
     return changed, added, removed, ignored, current
 
 
-def stale_outputs(root, targets):
+def stale_outputs(root, targets, database=None):
+    """Build outputs the working tree makes stale, by Make's own graph.
+
+    Targets that depend on FORCE (the toolchain stamp, Cargo builds) always "need remaking" in a dry run
+    but rewrite their output only when something changed, so run those for real first, count them stale
+    only if their output changed, and tell the dry run to treat them as old (-o)."""
     if not targets:
         return set(), ""
-    result = subprocess.run(["make", "-n", "--debug=b", "--no-print-directory", *targets], cwd=root,
+    stale, forced = set(), []
+    if database is not None:
+        forced = [name for name, rule in database["rules"].items()
+                  if "FORCE" in rule["prerequisites"] and (root / name).exists()]
+    if forced:
+        before = {name: (root / name).stat().st_mtime_ns for name in forced}
+        subprocess.run(["make", "--no-print-directory", "-s", *forced], cwd=root, env=clean_environment(),
+                       stdout=subprocess.DEVNULL)
+        stale |= {name for name in forced if not (root / name).exists() or (root / name).stat().st_mtime_ns != before[name]}
+    options = [item for name in forced for item in ("-o", name)]
+    result = subprocess.run(["make", "-n", "--debug=b", "--no-print-directory", *options, *targets], cwd=root,
                             env=clean_environment(), capture_output=True, text=True, errors="replace")
-    stale = set(re.findall(r"Must remake target '([^']+)'", result.stdout))
-    return stale, result.stderr
+    stale |= set(re.findall(r"Must remake target '([^']+)'", result.stdout))
+    return stale - {"FORCE"}, result.stderr
 
 
 def select(index, database, checks, changed, added, removed, stale):
@@ -510,7 +526,12 @@ def select(index, database, checks, changed, added, removed, stale):
         for depth in range(len(parts)):
             parents.add("/".join(parts[:depth]) or ".")
     # Make rules and variables that changed relative to the index.
-    old_rules, old_variables = index["rules"], index["variables"]
+    rebased = STATE / "base-make.json"
+    if rebased.exists() and index.get("manifest") is not None:
+        recorded = json.loads(rebased.read_text())
+        old_rules, old_variables = recorded["rules"], recorded["variables"]
+    else:
+        old_rules, old_variables = index["rules"], index["variables"]
     new_rules = {name: rule_text(database, name) for name in database["rules"]}
     changed_rules = {name for name in set(old_rules) | set(new_rules) if old_rules.get(name) != new_rules.get(name)}
     changed_variables = {name for name in set(old_variables) | set(database["variables"])
@@ -581,7 +602,7 @@ def command_rebase(arguments):
     changed, _, _, _, current = changed_sources(root, index, None, built_path)
     database = make_database(root, index["aggregate"])
     prerequisites = file_prerequisites(database, checks_of(database, index["aggregate"]))
-    stale, _ = stale_outputs(root, prerequisites)
+    stale, _ = stale_outputs(root, prerequisites, database)
     targets = [item for item in prerequisites if item in stale]
     say(f"{len(changed)} changed source(s); rebuilding {len(targets)} stale prerequisite(s)")
     if targets:
@@ -590,6 +611,8 @@ def command_rebase(arguments):
             say("build failed; base not recorded"); return status
     built_path.write_text(json.dumps(current))
     (STATE / "base.json").write_text(json.dumps(current))
+    (STATE / "base-make.json").write_text(json.dumps({
+        "rules": {name: rule_text(database, name) for name in database["rules"]}, "variables": database["variables"]}))
     say(f"recorded the current tree as the base ({len(current)} files)")
     return 0
 
@@ -609,7 +632,7 @@ def command_run(arguments):
     database = make_database(root, aggregate)
     checks = checks_of(database, aggregate)
     prerequisites = file_prerequisites(database, checks)
-    stale, _ = stale_outputs(root, prerequisites)
+    stale, _ = stale_outputs(root, prerequisites, database)
     stale_build = sorted(path for path in stale if path.startswith("build/"))
     compiler = sorted(path for path in changed if path.startswith(("compiler/", "bootstrap/")))
     if arguments.only and ignored:
@@ -650,6 +673,10 @@ def command_run(arguments):
         failed = [item["target"] for item in (results or {}).get("checks", []) if not item["passed"]]
         if status != 0 and not failed:
             failed = ["(runner failed before reporting checks)"]
+    if arguments.bench and benchmarks:
+        bench_status = run_benchmarks(root, benchmarks, arguments.bench_base)
+        if bench_status != 0 and not failed:
+            failed = ["(benchmark outputs differ from the C reference)"]
     # Record what the build now reflects so the next run gives Make true timestamps.
     built_path.write_text(json.dumps(current))
     elapsed = time.time() - started
@@ -672,6 +699,38 @@ def command_run(arguments):
         return 0
     print(f"GREEN: {scope} passed in {elapsed:.0f} s. " + GATE_REMINDER)
     return 0
+
+
+def run_benchmarks(root, benchmarks, base_path):
+    """Instruction counts (cachegrind) of the affected compare programs against a recorded base run."""
+    names = [item.split("/", 1)[1] for item in benchmarks if item.startswith("compare/")]
+    if not names:
+        print("Benchmarks: no affected benchmarks/compare programs (bothmodes programs are listed only).")
+        return 0
+    output = STATE / "compare.json"
+    command = ["python3", "benchmarks/compare/run.py", "--only", ",".join(names), "--json", str(output)]
+    print("Benchmarks: " + " ".join(command))
+    status = subprocess.run(command, cwd=root, env=clean_environment(), stdout=subprocess.DEVNULL).returncode
+    if status != 0 or not output.exists():
+        print(f"Benchmarks: compare run failed (exit {status})")
+        return 1
+    new = {item["name"]: item for item in json.loads(output.read_text())["programs"]}
+    base = {}
+    if base_path and Path(base_path).exists():
+        base = {item["name"]: item for item in json.loads(Path(base_path).read_text())["programs"]}
+    bad = 0
+    print(f"  {'program':<14} {'same':<5} {'minyar Ir':>14} {'base Ir':>14} {'change':>8}")
+    for name in names:
+        item = new.get(name)
+        if item is None:
+            print(f"  {name:<14} missing"); bad += 1; continue
+        ir = item.get("ir", {}).get("minyar")
+        old = base.get(name, {}).get("ir", {}).get("minyar")
+        change = f"{(ir / old - 1) * 100:+.2f}%" if ir and old else "n/a"
+        same = "yes" if item.get("identical") else "NO"
+        bad += 0 if item.get("identical") else 1
+        print(f"  {name:<14} {same:<5} {ir or 0:>14,} {old or 0:>14,} {change:>8}")
+    return 1 if bad else 0
 
 
 def select_benchmarks(root, changed, stale_build):
@@ -721,6 +780,9 @@ def main():
     run.add_argument("--plan", action="store_true", help="print the selection without running checks")
     run.add_argument("--jobs", type=int, default=int(os.environ.get("CHECK_JOBS", "4")))
     run.add_argument("--index", help="dependency index (default build/dev-check/index.json or $DEV_CHECK_INDEX)")
+    run.add_argument("--bench", action="store_true", help="also measure Ir of affected benchmarks/compare programs")
+    run.add_argument("--bench-base", default=os.environ.get("DEV_CHECK_BENCH_BASE"),
+                     help="compare.json of the base for Ir deltas (default $DEV_CHECK_BENCH_BASE)")
     rebase = sub.add_parser("rebase", help="build the current tree and measure later changes against it")
     rebase.add_argument("--index")
     index = sub.add_parser("index", help="trace the gate on the base tree and write the dependency index")

@@ -14,8 +14,11 @@ RED: 1 of 9 failed: check-suite-catalogue
 `--plan` prints the selection without running it. `--only PATH...` limits the
 claim to some changed paths or directories; the verdict then names how many
 other changed paths it did not cover. `--jobs N` (default 4) is passed to the
-check runner. The command exits 0 for green, 1 for red and 2 when it cannot
-decide (no index).
+check runner. The command exits 0 for green, 1 for red, 2 when it cannot
+decide (no index) and 3 (`BASE-RED`) when only checks that already failed at the
+indexed base failed. `--bench` also runs the affected `benchmarks/compare`
+programs under cachegrind and prints their Minyar Ir against
+`--bench-base` (a `compare.json` of the base), failing if an output differs.
 
 It is feedback, not a landing gate: always run the full gate before merging.
 
@@ -67,7 +70,7 @@ once (`cp -a` of the base, which includes `build/dev-check/index.json`), then
 sync your worktree over it and run, for example:
 
 ```
-BB_HOST=agent@HOST BB_ROOT=/home/agent/swarm bb <lane> 'minyar dev check'
+BB_HOST=agent@HOST BB_ROOT=/home/agent/swarm bb <lane> './minyar dev check'
 ```
 
 `bb` copies files but does not delete; dev-check removes base files missing
@@ -83,6 +86,7 @@ time) when the base moves far; until then a moved base only widens selection.
 - Reads through a directory descriptor the trace never saw opened, and
   `fchdir`, are not resolved. Checks that cannot run under `strace` (for
   example ones that use `ptrace`) fail at index time and are always selected.
-- Benchmarks are listed, not run: the programs under `benchmarks/compare` and
-  `benchmarks/bothmodes` that import a changed module, or all of them for a
-  compiler or runtime change.
+- Benchmark selection is by imports: the programs under `benchmarks/compare`
+  and `benchmarks/bothmodes` that import a changed module (directly or through
+  library imports), or all of them for a compiler or runtime change.
+  `--bench` measures only the compare programs; bothmodes ones are listed.
