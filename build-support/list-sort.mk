@@ -1,4 +1,4 @@
-.PHONY: check-list-sort check-list-sort-runtime check-list-sort-profiles check-list-sort-sanitize
+.PHONY: check-list-sort check-list-sort-runtime check-list-sort-profiles check-list-sort-sanitize check-sort-merge check-sort-merge-sanitize
 check-list-sort: build/minyarc build/minyarc-callbacks build/minyar-runtime.o build/tooling/tests/list-sort
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/list-sort
 
@@ -14,8 +14,13 @@ check-list-sort-profiles: build/minyarc-callbacks build/tooling/tests/list-sort
 check-list-sort-sanitize: build/minyarc build/minyarc-callbacks-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/list-sort
 	ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined MINYAR_TEST_RUNTIME=build/minyar-runtime-sanitize.o $(SANITIZER_LIMITED) ./build/tooling/tests/list-sort
 
-check check-portable: check-list-sort
-check-sanitize: check-list-sort-runtime check-list-sort-sanitize
+check-sort-merge: build/minyarc build/minyar-runtime.o build/tooling/tests/sort-merge
+	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/sort-merge
+check-sort-merge-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/sort-merge
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/sort-merge
+
+check check-portable: check-list-sort check-sort-merge
+check-sanitize: check-list-sort-runtime check-list-sort-sanitize check-sort-merge-sanitize
 
 build/tooling/benchmarks/list-sort/run: TOOL_NATIVE = benchmarks/list-sort/driver-native.c tests/maps-baseline-runtime.c tests/sha256-test-native.c runtime/native/sha256.c
 build/tooling/benchmarks/list-sort/run: TOOL_LIBS = $(TOOL_CRYPTO)

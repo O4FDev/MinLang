@@ -1,0 +1,111 @@
+use "io" as io
+use "../tools/testing.min" as test
+use "system" as system
+
+// sortBy/sortedBy emit one merge per call site. A function literal comparator
+// is called by name (so LLVM can inline it); any other callback is called
+// through its code slot. Results, stability, failures and the mutation check match the
+// runtime merge.
+function defined(llvm: Text, prefix: Text): List<Text> {
+    let bodies: List<Text> = []
+    let active = false
+    let body = ""
+    for line in test.lines(llvm) {
+        if line.startsWith("define ") && test.contains(line, " @" + prefix) { active = true; body = "" }
+        if active {
+            body += line + "\n"
+            if line == "}" { bodies.add(body); active = false }
+        }
+    }
+    return bodies
+}
+function stops(compiler: test.Compiler, source: Text, message: Text, printed: Text) {
+    test.require(test.compile(compiler, source), "compile failing program")
+    let path = compiler.directory + "/case" + Text(compiler.serial)
+    for optimization in ["-O0", "-O2"] {
+        let command = [compiler.clang, optimization, "-Wno-override-module"]
+        for flag in compiler.flags { command.add(flag) }
+        for item in [path + ".ll", compiler.runtime, "-lm", "-o", path + ".exe"] { command.add(item) }
+        test.require(test.run(command, system.environment(), "", path + ".link", compiler.linkTimeout), "link failing program")
+        let result = test.run([path + ".exe"], system.environment(), "", path + ".run", compiler.runTimeout)
+        test.check(result.status == 1, "expected failure status 1 at " + optimization + ", got " + Text(result.status))
+        test.check(result.errorOutput.startsWith(message), "unexpected failure at " + optimization + "\n" + result.errorOutput)
+        test.check(result.output == printed, "unexpected output at " + optimization + "\n" + result.output)
+    }
+}
+
+let compiler = test.compiler()
+test.executes(compiler, #"""
+record Row { id: Integer; score: Integer; name: Text }
+function joined(parts: List<Text>): Text {
+    let result = ""
+    for part in parts { result = result + part + "," }
+    return result
+}
+let rows: List<Row> = []
+let names = ["ada", "bob", "cy", "dee"]
+let seed = 7
+for i in 0..300 {
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    rows.add(Row { id: i; score: (seed / 1024) % 7; name: names[(seed / 16) % 4] })
+}
+rows.sortBy(function(a: Row, b: Row): Integer {
+    if a.score != b.score { return b.score - a.score }
+    if a.name < b.name { return -1 }
+    if a.name > b.name { return 1 }
+    return 0
+})
+let check = 0
+for i in 0..rows.length { check = (check * 31 + rows[i].id) % 1000000007 }
+print(check)
+print("\(rows[0].score) \(rows[0].name) \(rows[0].id) \(rows[299].score) \(rows[299].name) \(rows[299].id)")
+let byId = function(a: Row, b: Row): Integer { return a.id - b.id }
+rows.sortBy(byId)
+print("\(rows[0].id) \(rows[150].id) \(rows[299].id)")
+let words = "pear fig apple fig kiwi apple date".split(" ")
+let sorted = words.sortedBy(function(a: Text, b: Text): Integer {
+    if a.length != b.length { return a.length - b.length }
+    if a < b { return -1 }
+    if a > b { return 1 }
+    return 0
+})
+print(joined(sorted))
+print(joined(words))
+let floats = [2.5, -1.0, 0.0, 9.75, -3.5]
+floats.sortBy(function(a: Float, b: Float): Integer { if a < b { return 1 }; if a > b { return -1 }; return 0 })
+print("\(floats[0]) \(floats[1]) \(floats[2]) \(floats[3]) \(floats[4])")
+let empty: List<Integer> = []
+empty.sortBy(function(a: Integer, b: Integer): Integer { return a - b })
+let one = [4]
+one.sortBy(function(a: Integer, b: Integer): Integer { return a - b })
+print("\(empty.length) \(one[0])")
+let offset = 10
+let near = [3, 14, 9, 11, 10, 2]
+near.sortBy(function(a: Integer, b: Integer): Integer { return abs(a - offset) - abs(b - offset) })
+print("\(near[0]) \(near[1]) \(near[2]) \(near[3]) \(near[4]) \(near[5])")
+"""#, "380568901\n6 ada 18 0 dee 293\n0 150 299\nfig,fig,date,kiwi,pear,apple,apple,\npear,fig,apple,fig,kiwi,apple,date,\n9.75 2.5 0.0 -1.0 -3.5\n0 4\n10 9 11 14 3 2\n")
+
+let path = compiler.directory + "/case" + Text(compiler.serial)
+let llvm = io.readTextFile(path + ".ll")
+test.check(test.contains(llvm, "call void @minyar_list_sort_by_merge(ptr ") && test.contains(llvm, " = call ptr @minyar_list_sorted_by_merge(ptr "), "sortBy and sortedBy must use an emitted merge")
+test.check(!test.contains(llvm, "call void @minyar_list_sort_by(ptr ") && !test.contains(llvm, "@minyar_list_sorted_by(ptr "), "callback sorts must not use the runtime merge")
+let compares = defined(llvm, ".minyar.sort.direct.")
+test.check(compares.length == 7, "one compare function per sortBy/sortedBy call site, got " + Text(compares.length))
+let direct = 0
+let indirect = 0
+for compare in compares {
+    if test.contains(compare, "call i64 %code(") { indirect += 1 }
+    if test.contains(compare, "call i64 @\".minyar.closure") || test.contains(compare, "call i64 @.minyar.closure") { direct += 1 }
+}
+test.check(direct == 6, "function literal comparators must be called by name, got " + Text(direct))
+// Negative control: a callback held in a variable is called through its code slot.
+test.check(indirect == 1, "a callback value must be called through its code slot, got " + Text(indirect))
+let merges = defined(llvm, ".minyar.sort.merge.")
+test.check(merges.length == 7, "one merge per call site, got " + Text(merges.length))
+for merge in merges { test.check(test.contains(merge, "call i32 @minyar_sort_pending()"), "the merge must stop when recovery is pending") }
+
+// Failures inside or around the comparator are unchanged.
+stops(compiler, "let xs = [3, 1, 2]\nxs.sortBy(function(a: Integer, b: Integer): Integer { xs.add(0); return a - b })\nprint(xs.length)\n", "Minyar stopped: the List was mutated during its sort comparator.", "")
+stops(compiler, "let xs = [3, 1, 2]\nprint(\"before\")\nxs.sortBy(function(a: Integer, b: Integer): Integer { return 10 / (a - a) })\nprint(xs.length)\n", "Minyar stopped:", "before\n")
+test.removeTree(compiler.directory)
+print("sort merge: passed")
