@@ -609,6 +609,23 @@ every other access, Bytes (which may be shifted native views) and the runtime's
 C accesses stay outside the tree, and LLVM treats accesses from different trees
 as possibly aliasing. `make check-llvm-helper-contracts` checks the tags and that
 O2 reuses a List length across a field or slot store but not across a Bytes store.
+
+A parallel function cannot resize a buffer and its caller waits for it, so in
+one that contains a loop the compiler loads each List parameter's length and
+values pointer once at entry and indexes through them
+(`.minyar.list.get.known`/`.set.scalar.known`); a failing index still reports
+through the List. An index `base + c` or `base - c` with a constant c of at
+most nine digits, used by nothing else, is summed inside the bounds test
+(`.known.offset`): any overflowing sum lands outside every List (lengths stay
+below 2^61), and the failure path tests the overflow again, so the same error
+is reported. Appending to a List of scalars stores in place while the length is
+below the capacity (`.minyar.list.add.scalar`); a full List, a view and every
+reference element type take the runtime append. `make check-list-access` and
+`make check-llvm-helper-contracts` check the helpers, the rewrites and every
+failure path at O0/O2. On one Linux x86-64 host (cachegrind Ir, outputs
+identical) they cut topk by 14.0%, textindex by 4.8%, forkjoin by 4.2% and sort
+by 3.3% in `benchmarks/bothmodes` at one and four threads, and grid by 5.6% and
+par-forkjoin by 4.5% in `benchmarks/compare`; no program grew by more than 0.2%.
 Broader tag ranges, noalias and explicit noundef contracts remain deferred.
 Native scalar boundaries, nullable choice niches, shared native views and
 partially initialized payloads require more precise proofs; explicit noundef
