@@ -1,3 +1,9 @@
+# FOR LUKE (2026-11-01 00:00 UTC) — run-2 Wafer budget binds before Sunday 21:00
+$6.2 of the $15 run-2 Wafer budget is spent after 3.5 h (about $1.8/h with 10–11 lanes; one third of it is prompt-cache
+misses after idle waits, now being cut by ending agent sessions on waits and resuming at `medium` effort). At this rate
+the budget reaches $13 (where I stop re-dispatching, keeping $2 for fixes) around 04:00–06:00 UTC, 15+ hours before the
+21:00 stop. Raise it? Until you answer, lanes are paced, not stopped.
+
 # DECISION FOR LUKE — opt-in `region { … }` block (c5 measured a 29–76% Ir ceiling on parse-then-drop programs)
 ```minyar
 // before (today): every node of `tree` is freed object by object through the bounded cleanup scheduler
@@ -23,7 +29,7 @@ sentence saying so. Status: mechanism prototyped on `goal/cake-c5` (opt-in env f
 
 ---
 
-# CORRECTION (2026-10-31 21:10 UTC): the last two merged batches were gated red
+# CORRECTION (2026-10-31 21:10 UTC): the last two merged batches were gated red — RESOLVED 22:40 UTC
 The 3-way sharded gates for the final batch (tag f15) and the c8 revert (tag rv) each reported one failed check,
 `check-determinism-runtime`, and I merged anyway: the merged output listed the failure but printed no red/green verdict, and
 I misread it. Cause: three runtime helpers added by the Result-in-registers work and parallel-worker ownership
@@ -31,7 +37,20 @@ I misread it. Cause: three runtime helpers added by the Result-in-registers work
 Box B's full gate on 86f8a0405 confirmed it (2 of 337 failed: that check and `check-portable`, which depends on it;
 livepatch soak green: 0 errors, exactly-once).
 Fixed in 01a0bfe46 (all three only compute from their arguments → pure list). `shard/shard-collect.sh` now prints
-GREEN/RED and exits non-zero on RED. Box B full gate + soak on 01a0bfe46: running (result below when done).
+GREEN/RED and exits non-zero on RED. Box B full gate + soak on 01a0bfe46: **GREEN** (337/337; soak 282,733 requests, 0 errors, exactly-once), 22:40 UTC.
+Merge rule since 21:55: every batch is gated on `candidate/<name>`; the goal branch moves only on an explicit GREEN gate,
+a clean hidden re-score (no program slower than +0.1% Ir) and a clean visible compare.
+
+## Run 2 progress (2026-10-31 20:30 → 2026-11-01 00:00 UTC)
+| step | hidden h geomean (vs Rust) | b serial / parallel | visible compare (vs Rust) | notes |
+|---|---|---|---|---|
+| start 86f8a0405 (c8 reverted) | 4.826 (3.236) | 3.460 / 2.133 | 2.52 (2.03) | |
+| + 01a0bfe46 determinism fix + c8 re-land a9edf1232 | **4.671 (3.133)** | 3.282 / 2.175, b07 compiles | exprparse −5.6%, tokenizer −5.3% | nested Text loop copies get unique names |
+| candidate r2b (cg unroll, memmem, txt split) — not merged | 4.477 (3.002) | 3.168 / 1.850 | 2.37 (1.91) | h12 +4.9% (cg +3.2%, txt +1.6%), h04 +1.1% (txt), wordfreq +0.25% (memmem): lanes reworking |
+| candidate r2d (res eager small-aggregate retirement) — not merged | 4.611 (3.093) | 3.252 / 2.073 | — | h17 +0.45%: res reworking |
+| candidate r2e (tooling + docs: real-world suite, dev-check v3, reports) | unchanged | unchanged | unchanged | gating |
+Gap register: SYS-18 (`http.listenTLS`, blocks minyar-objstore) added and in progress; SYS-19 (projects behind the
+`Text(bytes)` API change) filed to the owning loops.
 
 # Minyar goal status (2026-10-31 20:25 UTC — end of the cake swarm window; boxes D/F/G/H–O deleted at 21:30)
 

@@ -159,6 +159,8 @@ workaround, **N** = nice-to-have. Status: open / partial / closed (with proof).
 | SYS-15 | seccomp filter construction | neo-vm isolation/neovm-seccomp.md:72-74 ("likely a Minyar gap") | N | not confirmed; done with raw syscall + Bytes (vmm/seccomp.min) | — | — | | |
 | SYS-16 | `clock_gettime` failures unchecked in worker/system clocks | M20 reports/concurrency-workers-research.md:62 | N | not re-tested | — | check return codes | | |
 | SYS-17 | No SQLite binding / vsock in `net` (sandbox host integration stays Python) | minyar-sandbox AGENTS.md:18, README.md:367 | N | open (sequencing, not blamed on Minyar) | — | — | | |
+| SYS-18 | No HTTPS listener: `http.listenTLS(host, port, limits, identity, key)` (the TLS server session and the HTTP server exist, nothing joins them) | minyar-objstore src/main.min:36 (E0302: module 'http' has no function named 'listenTLS'; project does not build) | B | in progress: run-2 lane `tls`, branch goal/r2-tls (4200478e8 + tests), objstore served over HTTPS with the tree in the lane report | `minyar build --release` in minyar-objstore | `http.listenTLS` in library/httpserver.min + O0/O2 TLS client round-trip tests | | |
+| SYS-19 | Six other Minyar projects no longer build against v2: `Text(bytes)` → `text.decode`/`text.decodeOrStop` (v2 4780f06e7, 2026-10-26; 27 call sites in 8 projects) | real-world suite, reports/run2/rw.md (minyar-query, -sandbox, -sim, -terminal, -js and others) | W | open for the owning loops (FYI row in ~/Projects/goal-loops/REQUESTS.md); minimal patches in benchmarks/realworld/adoption/*.patch | `python3 benchmarks/realworld/run.py --tree .` | each project adopts `text.decodeOrStop` (owner loops) | | |
 
 ### Language, runtime and correctness
 | id | gap | who hit it | sev | status | repro | closing needs | closure test | used in project |
@@ -270,8 +272,8 @@ workaround, **N** = nice-to-have. Status: open / partial / closed (with proof).
 ### Counts (rows in this register)
 | severity | open | partial | not re-tested / unconfirmed | total open-ish | closed |
 |---|---|---|---|---|---|
-| B blocks a project | 13 (PAR-6, SYS-1..10, LANG-1, PERF-6; SYS-10 from notes) | 7 (PAR-1..5, PERF-1, PERF-3) | 0 | 20 | — |
-| W workaround | 6 (PAR-7, LANG-2..4, TOOL-1, TOOL-5) | 5 (SYS-11..13, PERF-2, PERF-5) | 0 | 11 | — |
+| B blocks a project | 14 (PAR-6, SYS-1..10, SYS-18, LANG-1, PERF-6; SYS-10 from notes) | 7 (PAR-1..5, PERF-1, PERF-3) | 0 | 21 | — |
+| W workaround | 7 (PAR-7, SYS-19, LANG-2..4, TOOL-1, TOOL-5) | 5 (SYS-11..13, PERF-2, PERF-5) | 0 | 12 | — |
 | N nice-to-have | 12 | 1 (LANG-10) | 6 (PAR-9, SYS-14..16, LANG-8, TOOL-3) | 19 | — |
 | closed at 3832f4373 | | | | | 42 (nearly all were B when filed: C shims in neo-db/neo-vm, lost scope in neo-db search) |
 
