@@ -1,0 +1,32 @@
+#!/bin/sh
+# dev-check coverage clang: function-entry coverage for runtime C and compiler IR compiled to object code,
+# profile runtime on every link. Uninstrumentable runtime/compiler compiles are logged per check.
+real=${DEVCHECK_REAL_CLANG:?}
+lost=${DEVCHECK_COV_DATA:?}/_lost
+emit=0 link=1 skip=0 inst=0
+for a in "$@"; do
+    case "$a" in
+        -c) link=0 ;;
+        -S|-E|-M|-MM|-fsyntax-only|-emit-llvm|--version|-v|-print-*|-dumpversion) emit=1; link=0 ;;
+        -ffreestanding|-nostdlib|-nostartfiles|-nodefaultlibs|--target=*|-target|-fprofile-*|-fcoverage-*|-r|-Wl,-r|-shared|-mkernel|-fno-builtin) skip=1 ;;
+        *.c|*.ll|*.bc) case "$a" in *runtime*|*/runtime/*|*compiler*) inst=1 ;; esac ;;
+    esac
+done
+if [ $# -eq 0 ]; then exec "$real"; fi
+if [ $inst = 1 ] && [ $emit = 1 ] && [ -n "${DEVCHECK_COV_CHECK:-}" ]; then
+    # IR or assembly of runtime/compiler code read as text: function coverage cannot see this use.
+    printf '%s\t%s\n' "${LLVM_PROFILE_FILE:-}" "emitted, not run: $*" >> "${DEVCHECK_COV_DATA}/_uninstrumented.log"
+fi
+if [ $inst = 1 ] && [ $emit = 0 ]; then
+    if [ $skip = 0 ]; then
+        if [ $link = 1 ]; then set -- "$@" "${0%/*}/covexit.o" -Wl,--wrap=_exit -Wl,--wrap=_Exit -Wl,--wrap=abort; fi
+        exec "$real" "$@" -fprofile-generate="$lost" -mllvm -pgo-instrument-entry \
+            -mllvm -disable-preinline
+    fi
+    printf '%s\t%s\n' "${LLVM_PROFILE_FILE:-}" "$*" >> "${DEVCHECK_COV_DATA}/_uninstrumented.log"
+fi
+# Every program gets the profile runtime and writes its profile on _exit, abort and fatal signals too.
+if [ $link = 1 ] && [ $emit = 0 ] && [ $skip = 0 ]; then
+    exec "$real" "$@" -fprofile-generate "${0%/*}/covexit.o" -Wl,--wrap=_exit -Wl,--wrap=_Exit -Wl,--wrap=abort
+fi
+exec "$real" "$@"
