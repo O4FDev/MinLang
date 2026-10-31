@@ -113,7 +113,12 @@ def find_cache(choice):
 
 
 def ssh(ip, command, check=True, timeout=None):
-    return run(SSH + [f"agent@{ip}", command], check=check, timeout=timeout)
+    try:
+        return run(SSH + [f"agent@{ip}", command], check=check, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if check:
+            raise
+        return subprocess.CompletedProcess(args=command, returncode=255, stdout="", stderr="timed out")
 
 
 def tree_files(tree):
@@ -176,16 +181,31 @@ def prepare_shard(ip, tree, files, index, args, timeline):
 
 
 def run_shard(ip, index, args, timeline):
-    cache = f"FAST_GATE_CC={args.cc_cache} " + (f"FAST_GATE_CACHE={args.cache['private']} FAST_GATE_RUN={args.run_id} " if args.cache else "")
-    command = (f"{cache}setsid nohup bash {FG}/shard-run.sh {TREE} {index} {args.shards} {args.jobs} > {FG}/run.log 2>&1 < /dev/null & "
-               f"until grep -q SHARD-DONE {FG}/out/status 2>/dev/null; do sleep 1; done")
+    """Start shard-run.sh detached on the shard, wait for it with reconnecting ssh sessions, then fetch its out/.
+    A shard that cannot be reached for 5 minutes (deleted, dead) is given up: its checks are reported as missing."""
+    env = f"FAST_GATE_CC={args.cc_cache} " + (f"FAST_GATE_CACHE={args.cache['private']} FAST_GATE_RUN={args.run_id} " if args.cache else "")
+    launch = f"{env}setsid nohup bash {FG}/shard-run.sh {TREE} {index} {args.shards} {args.jobs} > {FG}/run.log 2>&1 < /dev/null & echo launched"
+    wait = f"until grep -q SHARD-DONE {FG}/out/status 2>/dev/null; do sleep 1; done"
+    for attempt in range(60):
+        result = ssh(ip, launch, check=False, timeout=60)
+        if result.returncode == 0 and "launched" in result.stdout:
+            break
+        time.sleep(5)
+    else:
+        say(f"shard {index}: could not start shard-run.sh")
+        return os.path.join(args.out, f"shard-{index}")
+    timeline["launched"] = time.monotonic() - started
+    unreachable_since = None
     while True:
-        result = ssh(ip, command if "launched" not in timeline else command.split(" & ", 1)[1], check=False)
-        timeline["launched"] = True
+        result = ssh(ip, wait, check=False)
         if result.returncode == 0:
             break
+        unreachable_since = unreachable_since or time.monotonic()
+        if time.monotonic() - unreachable_since > 300:
+            say(f"shard {index}: unreachable for 5 minutes; giving up on it")
+            break
         say(f"shard {index}: ssh dropped ({result.returncode}); reconnecting")
-        time.sleep(2)
+        time.sleep(3)
     timeline["done"] = time.monotonic() - started
     local = os.path.join(args.out, f"shard-{index}")
     os.makedirs(local, exist_ok=True)
