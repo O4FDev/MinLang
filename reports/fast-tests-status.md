@@ -35,6 +35,15 @@ checks) in ≤ 300 s wall with the same pass/fail as a single-box gate. Command:
 | shard boot (snapshot) to SSH | 65 s |
 | tree delta sync laptop → shard | 10 s |
 
+### For the Minyar loop's compiler-speed lane (run 2)
+- In the full gate, `minyarc` itself is 0.6% of CPU (10,204 compiles, ~5 ms each); clang compiling and linking the
+  IR it emits is 72% + 12% linkers. Cutting gate (and user build) time means emitting IR that is cheaper for LLVM,
+  not a faster front end.
+- The compiler's own cold build is two ~45 s single-module ThinLTO links. `clang -O2 -c build/compiler-stage2.ll`
+  (no LTO) takes 20.8 s; with ThinLTO the post-link backend alone is 46.7 s. No single huge function (largest
+  ~5,000 IR lines of 444k): the cost is spread over ISel (20%), RA, InstCombine.
+- Fast-tests already takes the bootstrap stage1 off the critical path (cde8375a9: linked -O0, identical stage2 IR).
+
 ### In progress
 - 4 Wafer agents split the 19 checks above ~90 s CPU into ≤ 60 s pieces (reports in
   `~/Projects/minyar-fast-tests/reports/split-*.md`), dev box shard-probe-1.
