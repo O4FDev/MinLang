@@ -31,3 +31,26 @@ borrow+drop inference (`brw`, `drp`), in-place reuse (`fbip`), SwissTable Maps (
 ## Log
 
 (pending base seed)
+
+### R1 — Text hash memoised in the header (measured, rejected)
+
+Idea: Text is immutable, so compute the Map hash once and keep it in the `MinyarText` header; key kinds 1-4 hash
+without running user code, so `m.has(k)` then `m[k]` hashes the same Text twice, and every `set` a third time.
+
+Prototype: one `unsigned long long hash` field (last, so existing positional initializers keep meaning), cleared at
+the five sites that mutate bytes/range (`append_in_place`, `text_compact_kept_piece`, `split_next` reuse, the ASCII
+character cache); relaxed atomics because a shared frozen Text can be hashed from two threads; immortal Texts may
+live in read-only data, so the cache writes only when the header has an owner count (the first version wrote to a
+rodata literal and SIGSEGV'd tokenizer/config — caught by `run.py`).
+
+| variant | config | tokenizer | json | wordfreq | intmap |
+|---|---|---|---|---|---|
+| base Ir (M) | 2765.3 | 4138.2 | 5587.6 | 2248.4 | 1555.0 |
+| cache all Text keys | 2683.9 (−2.9%) | 4100.7 (−0.9%) | 5594.9 (+0.1%) | 2319.8 (+3.2%) | 1576.6 (+1.4%) |
+| cache only keys ≥ 8 bytes | 2670.1 (**−3.4%**) | 4102.2 (−0.9%) | 5592.7 (+0.1%) | 2280.0 (+1.4%) | 1579.1 (+1.6%) |
+
+Verdict: rejected by the no-program-slower rule. Where it helps (config, long repeated section/key names) the saved
+hash is real; where it hurts (wordfreq, intmap) the extra 8 bytes per Text make every short inline-Text allocation
+one size class larger and add a header store per creation, and short keys hash in a handful of instructions anyway.
+Conclusion for the Text lane: only cache a hash if the header does not grow (e.g. overlaid on a field that is null
+for ASCII Text), otherwise the creation path pays for every temporary.
