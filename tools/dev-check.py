@@ -395,6 +395,16 @@ def command_index(arguments):
         status = subprocess.run(command, cwd=root, env=trace_environment(root)).returncode
         say(f"traced gate exited {status} after {time.time() - started:.0f} s")
     results, times = latest_results(root)
+    if arguments.results_log:
+        # A runner console log of the traced gate (the runner keeps only its latest run directory).
+        results, times = {"checks": []}, {}
+        for line in Path(arguments.results_log).read_text(errors="replace").splitlines():
+            match = re.match(r"^(check-[^:\s]+): (passed|FAILED) wall_ms=(\d+).*?rss_kib=([\d.]+) ([\d.]+)", line)
+            if match:
+                times[match.group(1)] = {"wall_ms": int(match.group(3)), "passed": match.group(2) == "passed",
+                                         "cpu_ms": int((float(match.group(4)) + float(match.group(5))) * 1000)}
+            elif re.match(r"^(check-[^:\s]+): FAILED", line):
+                times[line.split(":")[0]] = {"wall_ms": 0, "cpu_ms": 0, "passed": False}
     times = dict(times or {})
     passed = {item["target"]: item["passed"] for item in (results or {}).get("checks", [])}
     passed.update({name: entry["passed"] for name, entry in times.items()})
@@ -831,6 +841,7 @@ def main():
     index.add_argument("--trace")
     index.add_argument("--output")
     index.add_argument("--reuse-trace", action="store_true", help="parse an existing trace instead of running the gate")
+    index.add_argument("--results-log", help="with --reuse-trace: take base results from this runner console log")
     index.add_argument("--retry", action="store_true", help="with --reuse-trace: still retry the checks that failed")
     arguments = parser.parse_args(sys.argv[1:] if len(sys.argv) > 1 and sys.argv[1] in ("run", "index", "rebase", "-h", "--help") else ["run", *sys.argv[1:]])
     if arguments.command == "index":
