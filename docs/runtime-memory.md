@@ -242,14 +242,15 @@ both endpoints of traced ownership operations use the physical payload type.
   untraced Result whose every `return` builds its `Ok`/`Err` in place, or
   returns such a function's call, gets a body `NAME.r` returning
   `[tag, payload]` with the payload's count; `NAME` stays as a wrapper that
-  boxes the pair (`minyar_result_box`) for every other use. A consumed `try`
+  boxes the pair inline (the same record stores as `Ok`/`Err`) for every other use. A consumed `try`
   on a call of `NAME` calls `NAME.r`: success allocates and frees no record,
   and only the failing branch rebuilds one. The final lowering is
   `compiler/stages/result-registers.min`, after scope lowering.
   `return match x { arms }` compiles each arm as its own `return`, so arms
   that build a Result count as building it in place. Two-case choices whose
   cases carry at most one untraced payload each (a tagged Maybe<Integer>, for
-  example) use the same pair ABI (`minyar_choice_box`). A fresh such Result or
+  example) use the same pair ABI (the cold failing branch of a `try` boxes through
+  `minyar_result_box` / `minyar_choice_box`). A fresh such Result or
   choice matched with plain case arms (`Case`, `Case(x)`, `Case(_)`; no guard
   or `else`) or tested with `is Case(x)` is consumed: the arm that runs takes
   the payload and disposes of the record, so a call of `NAME` there reads
