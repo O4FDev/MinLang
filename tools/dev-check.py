@@ -77,7 +77,9 @@ def manifest(root, cache=None):
 
 def make_database(root, aggregate):
     environment = clean_environment()
-    text = subprocess.run(["make", "-pnq", "--no-print-directory", *aggregate], cwd=root, env=environment,
+    # Ask about FORCE (as the check runner does) so no goal triggers implicit-rule search: the printed
+    # rules are then the explicit ones only and do not depend on which goals were asked about.
+    text = subprocess.run(["make", "-pnq", "--no-print-directory", "FORCE"], cwd=root, env=environment,
                           capture_output=True, text=True, errors="replace").stdout
     variables, rules, phony = {}, {}, set()
     section = None
@@ -99,7 +101,7 @@ def make_database(root, aggregate):
             if not origin.startswith("# makefile"):
                 continue
             match = re.match(r"^([A-Za-z_.][A-Za-z0-9_.\-]*) (?::{1,3}=|\+=|\?=|=) ?(.*)$", line)
-            if match and match.group(1) not in ("MAKEFLAGS", "MFLAGS", "MAKECMDGOALS", "CURDIR", "MAKE_RESTARTS",
+            if match and match.group(1) not in ("MAKEFLAGS", "MFLAGS", "MAKECMDGOALS", "CURDIR", "MAKE_RESTARTS", "MAKEFILE_LIST",
                                                   ".VARIABLES", "MAKE_COMMAND", "MAKEOVERRIDES", "GNUMAKEFLAGS"):
                 variables[match.group(1)] = match.group(2)
             continue
@@ -117,6 +119,9 @@ def make_database(root, aggregate):
                 name = match.group(1).strip()
                 prerequisites = match.group(2).split("|")[0].split()
                 order_only = match.group(2).split("|")[1].split() if "|" in match.group(2) else []
+                if name == "Makefile" or name.endswith((".mk", ".d")):
+                    current = None
+                    continue  # makefiles themselves; their effect is in the rules and variables
                 key = ("pattern:" + name) if "%" in name else name
                 rules[key] = {"prerequisites": prerequisites, "order_only": order_only, "recipe": []}
                 current = key
@@ -384,10 +389,15 @@ def command_index(arguments):
         # Retry failures alone under the tracer (load or ordering), then untraced to tell a base failure
         # from a check that cannot run under strace. Either way they are selected on every run.
         retry = trace.with_name(trace.stem + "-retry.log")
+        # LeakSanitizer stops the world with ptrace, which fails under a tracer; leak detection reads no
+        # repository files, so the retry records the same dependencies without it.
+        retry_environment = clean_environment()
+        retry_environment["ASAN_OPTIONS"] = "detect_leaks=0"
+        retry_environment["LSAN_OPTIONS"] = "detect_leaks=0"
         say(f"retrying {len(failed)} failed check(s) under strace: {' '.join(failed)}")
         subprocess.run(["strace", "-f", "-qq", "--seccomp-bpf", "-s", "4096", "-o", str(retry), "-e", "trace=%file,%process",
                         "make", "--no-print-directory", "check-in-parallel", "CHECKS=" + " ".join(failed),
-                        f"CHECK_JOBS={arguments.jobs}"], cwd=root, env=clean_environment())
+                        f"CHECK_JOBS={arguments.jobs}"], cwd=root, env=retry_environment)
         traces.append(retry)
         retried, retry_times = latest_results(root)
         for item in (retried or {}).get("checks", []):
