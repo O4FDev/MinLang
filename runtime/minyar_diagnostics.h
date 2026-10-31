@@ -978,6 +978,26 @@ long long minyar_runtime_scopeNameEnd(MinyarText *line, long long start) {
     return start;
 }
 
+/* resultFindFrom in compiler/stages/result-registers.min: the position of
+ * pattern at or after start in text, or -1. Positions are Text characters. */
+long long minyar_runtime_resultFindFrom(MinyarText *text, MinyarText *pattern, long long start) {
+    ensure_text_index(text);
+    if (start < 0)
+        start = 0;
+    if (start > text->character_length)
+        return -1;
+    long long byte = text->character_offsets ? indexed_byte_offset(text, start) : start;
+    if (!pattern->byte_length)
+        return start;
+    long long small[TEXT_SEARCH_SMALL];
+    long long *table = text_search_table(pattern, text->byte_length, small);
+    long long found = text_search_next(text, pattern, byte, table);
+    text_search_free(table, small);
+    if (found < 0)
+        return -1;
+    return text->character_offsets ? start + text_scalar_count(text->bytes + byte, found - byte) : found;
+}
+
 /* compilerAppendIntegers and compilerFillIntegers in compiler/stages/source.min
  * append source[start, end), or count copies of value, to target. Both take a
  * CompilerIntegers record; this field order is their ABI. */

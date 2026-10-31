@@ -250,36 +250,41 @@ function resultLowerFunction(lines: List<Text>, functions: ResultRegisterFunctio
     return changed
 }
 
+// The position of pattern at or after start, or -1 (Text characters). Native:
+// a slice of the whole module would copy it in stage0-built compilers.
+function resultFindFrom(text: Text, pattern: Text, start: Integer): Integer { native "runtime" }
+
+// Only marked functions and functions with a consumed `try` are split into
+// lines; the rest of the module passes through as views.
 function lowerResultRegisters(pieces: List<Text>): List<Text> {
     let module = joinText(pieces)
-    if module.find("\n; minyar.result.abi ") < 0 { return pieces }
-    let lines = module.split("\n")
+    let markerText = "\n; minyar.result.abi "
+    let marker = module.find(markerText)
+    if marker < 0 { return pieces }
     let functions = ResultRegisterFunctions { index: newGenericIndex(); flags: []; starts: []; ends: []; wrappers: [] }
-    let pending = ""
-    let current = -1
-    let index = 0
-    while index < lines.length {
-        let line = lines[index]
-        if line.startsWith("; minyar.result.abi ") {
-            pending = line.slice(20, line.length)
-        } else if line.startsWith("define ") {
-            let name = resultDefinedName(line)
-            current = -1
-            if pending != "" && name != "" && genericIndexGet(functions.index, name) < 0 && resultLastIndex(line, ")") > line.find(" ptr @") + 6 + name.length {
-                current = functions.flags.length
-                genericIndexPut(functions.index, name, current)
-                functions.flags.add(pending)
-                functions.starts.add(index)
+    let bodies: List<List<Text>> = []
+    while marker >= 0 {
+        let flagsEnd = resultFindFrom(module, "\n", marker + 1)
+        let define = resultFindFrom(module, "\ndefine ", marker + 1)
+        let end = -1
+        if flagsEnd > 0 && define > 0 { end = resultFindFrom(module, "\n}\n", define) }
+        if end < 0 { marker = -1 } else {
+            let lines = module.slice(define + 1, end + 2).split("\n")
+            let name = resultDefinedName(lines[0])
+            // Only debug comments may lie between a marker and its definition.
+            let between = module.slice(flagsEnd, define + 1)
+            if name != "" && between.find("\n ") < 0 && between.find("}") < 0 && genericIndexGet(functions.index, name) < 0 && resultLastIndex(lines[0], ")") > lines[0].find(" ptr @") + 6 + name.length {
+                genericIndexPut(functions.index, name, functions.flags.length)
+                let flags = module.slice(marker + markerText.length, flagsEnd)
+                // A body returning anything but a local Result keeps its record ABI.
+                if !resultReturnsLocal(lines) { flags = "" }
+                functions.flags.add(flags)
+                functions.starts.add(define + 1)
+                functions.ends.add(end + 3)
+                bodies.add(lines)
             }
-            pending = ""
-        } else if current >= 0 && line.startsWith("  ret ") && !line.startsWith("  ret ptr %") {
-            // A body returning anything but a local Result keeps its record ABI.
-            functions.flags[current] = ""
-        } else if line == "}" {
-            if current >= 0 { functions.ends.add(index) }
-            current = -1
+            marker = resultFindFrom(module, markerText, end)
         }
-        index = index + 1
     }
     // A function stays marked only when every return is built in place or
     // passes a marked call's pair through: an unboxed return would cost a take
@@ -291,9 +296,9 @@ function lowerResultRegisters(pieces: List<Text>): List<Text> {
         while entry < functions.flags.length {
             if functions.flags[entry] != "" {
                 let body: List<Text> = []
-                let row = functions.starts[entry]
-                while row <= functions.ends[entry] {
-                    body.add(lines[row])
+                let row = 0
+                while row < bodies[entry].length {
+                    body.add(bodies[entry][row])
                     row = row + 1
                 }
                 if resultLowerReturns(body, functions) {
@@ -306,45 +311,39 @@ function lowerResultRegisters(pieces: List<Text>): List<Text> {
         }
     }
     let output: List<Text> = []
-    let body: List<Text> = []
-    let position = 0
     let copied = 0
-    let start = 0
-    let inFunction = false
-    index = 0
-    while index < lines.length {
-        let line = lines[index]
-        if line.startsWith("define ") {
-            inFunction = true
-            start = position
-            body.clear()
-        }
-        if inFunction {
-            body.add(line)
-            if line == "}" {
-                inFunction = false
+    let reboxText = "@.minyar.record.result.rebox("
+    let rebox = module.find(reboxText)
+    let candidate = 0
+    let start = resultFindFrom(module, "\ndefine ", 0)
+    while start >= 0 {
+        let end = resultFindFrom(module, "\n}\n", start)
+        if end < 0 { start = -1 } else {
+            while rebox >= 0 && rebox < start { rebox = resultFindFrom(module, reboxText, rebox + 1) }
+            while candidate < functions.starts.length && functions.starts[candidate] < start + 1 { candidate = candidate + 1 }
+            let marked = candidate < functions.starts.length && functions.starts[candidate] == start + 1
+            if marked || (rebox >= 0 && rebox < end) {
+                let lines: List<Text> = []
                 let flags = ""
-                let name = resultDefinedName(body[0])
-                if name != "" {
-                    let entry = genericIndexGet(functions.index, name)
-                    if entry >= 0 { flags = functions.flags[entry] }
-                }
-                if resultLowerFunction(body, functions, flags) {
-                    if start > copied { output.add(module.slice(copied, start)) }
+                if marked {
+                    lines = bodies[candidate]
+                    flags = functions.flags[candidate]
+                } else { lines = module.slice(start + 1, end + 2).split("\n") }
+                if resultLowerFunction(lines, functions, flags) {
+                    output.add(module.slice(copied, start + 1))
                     let row = 0
-                    while row < body.length {
-                        if body[row] != "" {
-                            output.add(body[row])
+                    while row < lines.length {
+                        if lines[row] != "" {
+                            output.add(lines[row])
                             output.add("\n")
                         }
                         row = row + 1
                     }
-                    copied = position + 2
+                    copied = end + 3
                 }
             }
+            start = resultFindFrom(module, "\ndefine ", end)
         }
-        position = position + line.length + 1
-        index = index + 1
     }
     if copied < module.length { output.add(module.slice(copied, module.length)) }
     if !module.endsWith("\n") { output.add("\n") }
@@ -353,6 +352,5 @@ function lowerResultRegisters(pieces: List<Text>): List<Text> {
         output.add(functions.wrappers[wrapper])
         wrapper = wrapper + 1
     }
-    lines.clear()
     return output
 }
