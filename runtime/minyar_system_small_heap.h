@@ -39,6 +39,22 @@ _Static_assert(_Alignof(max_align_t) <= 16,
 static MINYAR_THREAD_LOCAL RcSystemPage *rc_system_available[RC_SYSTEM_SIZE_CLASSES];
 /* Live small slots in every class. */
 static MINYAR_THREAD_LOCAL size_t rc_system_live;
+/* Pages kept empty in a class's available list, to skip the sweep when none. */
+static MINYAR_THREAD_LOCAL size_t rc_system_kept;
+#if !MINYAR_THREADED
+/* One page of static storage per class, so that allocating and freeing a
+ * single object of a class does not malloc and free a 4 KiB page each time.
+ * Static storage is never heap: a program that frees everything it allocated
+ * has no heap bytes left. Thread programs keep malloc'd pages, because their
+ * pages move between threads (rc_system_swap/rc_system_adopt). */
+static MINYAR_THREAD_LOCAL _Alignas(max_align_t)
+    unsigned char rc_system_static_page[RC_SYSTEM_SIZE_CLASSES][RC_SYSTEM_PAGE_BYTES];
+static MINYAR_THREAD_LOCAL unsigned char rc_system_static_used[RC_SYSTEM_SIZE_CLASSES];
+/* Set when a class first frees a page: a program's first page of a class still
+ * comes from malloc, and a repeated allocate-and-free of one object then does
+ * not malloc a page at all. */
+static MINYAR_THREAD_LOCAL unsigned char rc_system_static_ready[RC_SYSTEM_SIZE_CLASSES];
+#endif
 
 static inline void rc_system_unlink(RcSystemPage *page) {
     if (!page->link) abort(); /* An unlinked page must never be removed twice. */
@@ -58,6 +74,23 @@ static inline void rc_system_link(RcSystemPage *page) {
     *head = page;
 }
 static MINYAR_COLD RcSystemPage *rc_system_new_page(unsigned index) {
+#if !MINYAR_THREADED
+    if (rc_system_static_ready[index] && !rc_system_static_used[index]) {
+        RcSystemPage *page = (RcSystemPage *)(void *)rc_system_static_page[index];
+        rc_system_static_used[index] = 1;
+        page->free_slots = NULL;
+        page->live = 0;
+        page->index = index;
+        page->stride = 64u << index;
+        page->used = RC_SYSTEM_PAGE_PREFIX;
+        page->next = NULL;
+        page->link = NULL;
+        SMALL_HEAP_POISON((unsigned char *)page + RC_SYSTEM_PAGE_PREFIX,
+                          RC_SYSTEM_PAGE_BYTES - RC_SYSTEM_PAGE_PREFIX);
+        rc_system_link(page);
+        return page;
+    }
+#endif
     RcSystemPage *page = malloc(RC_SYSTEM_PAGE_BYTES);
     if (!page) out_of_memory();
     page->free_slots = NULL;
@@ -111,26 +144,50 @@ static inline void rc_system_deallocate(void *pointer) {
     if (!page) { free(slot); return; }
     rc_system_live--;
     if (--page->live == 0) {
-        RcSystemPage *first = rc_system_available[page->index];
-        if ((first && first != page) || !rc_system_live) {
+#if !MINYAR_THREADED
+        if (page == (RcSystemPage *)(void *)rc_system_static_page[page->index]) {
+            /* Static storage is never freed: reset it for the class's next
+             * object, which takes it again instead of allocating a page. */
             if (page->link) rc_system_unlink(page);
-            free(page);
-            /* Nothing small is live: no empty page stays either. */
-            if (!rc_system_live)
-                for (unsigned index = 0; index < RC_SYSTEM_SIZE_CLASSES; index++) {
-                    RcSystemPage *kept = rc_system_available[index];
-                    if (kept && !kept->live) { rc_system_unlink(kept); free(kept); }
-                }
-            return;
+            rc_system_static_used[page->index] = 0;
+            page->free_slots = NULL;
+            page->used = RC_SYSTEM_PAGE_PREFIX;
+            page->next = NULL;
+            page->link = NULL;
+            SMALL_HEAP_POISON((unsigned char *)page + RC_SYSTEM_PAGE_PREFIX,
+                              RC_SYSTEM_PAGE_BYTES - RC_SYSTEM_PAGE_PREFIX);
+        } else {
+#endif
+            RcSystemPage *first = rc_system_available[page->index];
+            if ((first && first != page) || !rc_system_live) {
+                if (page->link) rc_system_unlink(page);
+#if !MINYAR_THREADED
+                /* This class may take its static page next instead of malloc. */
+                rc_system_static_ready[page->index] = 1;
+#endif
+                free(page);
+            } else {
+                /* While other small objects live, the class's only available
+                 * page stays, emptied: a loop whose temporaries alone occupy
+                 * it would otherwise free and allocate a page per iteration. */
+                page->free_slots = NULL;
+                page->used = RC_SYSTEM_PAGE_PREFIX;
+                SMALL_HEAP_POISON((unsigned char *)page + RC_SYSTEM_PAGE_PREFIX,
+                                  RC_SYSTEM_PAGE_BYTES - RC_SYSTEM_PAGE_PREFIX);
+                if (!page->link) rc_system_link(page);
+                rc_system_kept++;
+            }
+#if !MINYAR_THREADED
         }
-        /* While other small objects live, the class's only available page
-         * stays, emptied: a loop whose temporaries alone occupy it would
-         * otherwise free it and allocate a fresh page on every iteration. */
-        page->free_slots = NULL;
-        page->used = RC_SYSTEM_PAGE_PREFIX;
-        SMALL_HEAP_POISON((unsigned char *)page + RC_SYSTEM_PAGE_PREFIX,
-                          RC_SYSTEM_PAGE_BYTES - RC_SYSTEM_PAGE_PREFIX);
-        if (!page->link) rc_system_link(page);
+#endif
+        /* Nothing small is live: no empty page stays either. */
+        if (!rc_system_live && rc_system_kept) {
+            rc_system_kept = 0;
+            for (unsigned index = 0; index < RC_SYSTEM_SIZE_CLASSES; index++) {
+                RcSystemPage *kept = rc_system_available[index];
+                if (kept && !kept->live) { rc_system_unlink(kept); free(kept); }
+            }
+        }
         return;
     }
     SMALL_HEAP_POISON(pointer, page->stride - sizeof(*slot));
@@ -138,9 +195,6 @@ static inline void rc_system_deallocate(void *pointer) {
     slot->value.next = page->free_slots;
     page->free_slots = slot;
 }
-/* The usual free, for hot call sites outside the bounded scheduler (inlining
- * it into the scheduler loop costs more than the call): a small slot whose
- * page stays in use and is already on its class's available list. */
 static inline void rc_system_deallocate_fast(void *pointer) {
     RcSystemSlot *slot = (RcSystemSlot *)pointer - 1;
     RcSystemPage *page = slot->page;
