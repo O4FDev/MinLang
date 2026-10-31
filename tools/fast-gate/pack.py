@@ -111,7 +111,11 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
             "estimate_s": round(finish(index, [], 0) / 1000, 1),
             "skip": skip,
         })
-    return {"shards": shards, "jobs": jobs, "checks": len(all_checks), "goals": len(goals), "assignment": result}
+    # check-in-parallel starts the checks it knows to be longest first (build/tooling/check-durations: label, wall ms,
+    # cpu ms); a fresh tree has no history and would start them last, leaving one long check running alone at the end.
+    durations = {check["label"]: [length(check), cost(check)] for check in checks}
+    return {"shards": shards, "jobs": jobs, "checks": len(all_checks), "goals": len(goals), "assignment": result,
+            "durations": durations}
 
 
 if __name__ == "__main__":

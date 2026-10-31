@@ -39,6 +39,10 @@ fi
 python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["assignment"][int(sys.argv[2])]; open(sys.argv[3],"w").write("".join(x+"\n" for x in a["skip"]))' \
   "$out/assignment.json" "$index" "$out/skip.txt" || finish 4
 stamp "PLANNED $(sha256sum < "$out/plan.json" | cut -c1-16) $(sha256sum < "$out/assignment.json" | cut -c1-16)"
+# Longest first: seed the runner's duration history (it only orders checks by it) with the packing estimates.
+mkdir -p build/tooling
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["durations"]; open(sys.argv[2],"w").write("".join(f"{k} {w} {c}\n" for k,(w,c) in sorted(d.items())))' \
+  "$out/assignment.json" build/tooling/check-durations
 PATH=$fg/shim:$PATH FAST_GATE_SKIP=$out/skip.txt FAST_GATE_ROOT=$(pwd -P) FAST_GATE_TIMELINE=$out/timeline \
   make check-in-parallel CHECKS="$checks" CHECK_JOBS="$jobs" > "$out/gate.log" 2>&1
 status=$?
