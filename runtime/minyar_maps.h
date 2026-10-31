@@ -646,7 +646,7 @@ MINYAR_INLINE_ENTRY void minyar_map_store_slot(MinyarRecord *map, long long key,
     if (slot == &map_scratch_slot || minyar_recovery_pending()) minyar_map_set(map, key, value);
     else *slot = value;
 }
-_Bool minyar_map_remove(MinyarRecord *map, long long key) {
+MINYAR_INLINE_ENTRY _Bool minyar_map_remove(MinyarRecord *map, long long key) {
     long long kind = map->values[MAP_KEY_KIND];
     if (!map_builtin_kind(kind)) return map_remove_general(map, key);
     if (minyar_recovery_pending()) return 0;
