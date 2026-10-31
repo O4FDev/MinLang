@@ -186,7 +186,7 @@ def run_shard(ip, index, args, timeline):
 
 
 def merge(args, shard_dirs):
-    plans, assignments, results, problems = {}, None, {}, []
+    plans, assignments, results, problems, runner_counts = {}, None, {}, [], {}
     for index, local in enumerate(shard_dirs):
         status = open(os.path.join(local, "status")).read() if os.path.exists(os.path.join(local, "status")) else ""
         for line in status.splitlines():
@@ -213,8 +213,12 @@ def merge(args, shard_dirs):
         for target in sorted(mine - seen):
             problems.append(f"shard {index}: no result for {target}")
         gate_log = os.path.join(local, "gate.log")
-        if os.path.exists(gate_log) and "Failed check: toolchain-stamp" in open(gate_log, errors="replace").read():
+        text = open(gate_log, errors="replace").read() if os.path.exists(gate_log) else ""
+        if "Failed check: toolchain-stamp" in text:
             results.setdefault("toolchain-stamp", {"passed": False, "wall_ms": 0, "cpu_ms": 0, "shard": index})
+        for line in text.splitlines():
+            if line.startswith("Parallel checks: ") and " checks, " in line:
+                runner_counts[index] = int(line.split()[2])
     if len(set(map(tuple, plans.values()))) > 1:
         problems.append(f"shards planned differently: {plans}")
     plan = json.load(open(os.path.join(shard_dirs[0], "plan.json"))) if os.path.exists(os.path.join(shard_dirs[0], "plan.json")) else None
@@ -235,12 +239,85 @@ def merge(args, shard_dirs):
                 problems.append(f"no shard ran {check['label']}")
     if "toolchain-stamp" in results:
         final["toolchain-stamp"] = False
+    # Every shard's own check runner planned the whole gate; its count must be the plan's.
+    if plan and any(count != len(plan["checks"]) for count in runner_counts.values()):
+        problems.append(f"runner check counts {runner_counts} differ from the plan's {len(plan['checks'])}")
+    if plan:
+        plan["runner_counts"] = runner_counts
     return plan, final, results, problems
+
+
+GUARD = "agent@178.62.55.155"
+SHARD_BUDGET_USD = 8.29  # the guard's $10/day less the persistent shard-cache box (s-4vcpu-8gb, $1.71/day)
+
+
+def guard_spend():
+    """Today's shard spend as the test-shard-guard on brief-crawl-1 last logged it (0 for a new UTC day)."""
+    result = run(SSH + [GUARD, "tail -n 50 /var/log/test-shard-guard.log"], check=False, timeout=20)
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    spend = 0.0
+    for line in result.stdout.splitlines():
+        if line.startswith(today) and "today's spend $" in line:
+            spend = float(line.split("today's spend $", 1)[1].split()[0])
+    return spend
+
+
+def gate_tree(index, tree, checks, args, ips_ready):
+    """One tree's full gate on the run's shards. ips_ready yields (shard index, ip) as shards become usable."""
+    t0 = time.monotonic()
+    ctx = argparse.Namespace(**vars(args))
+    ctx.run_id = f"{args.run_id}{chr(ord('a') + index)}"
+    ctx.out = args.out if args.single else os.path.join(args.out, f"{index}-{os.path.basename(tree)}")
+    os.makedirs(ctx.out, exist_ok=True)
+    open(os.path.join(ctx.out, "checks.txt"), "w").write(checks + "\n")
+    files = tree_files(tree)
+    say(f"tree {index}: {tree} ({len(files)} files), checks: {checks}")
+    cache_timeline = {}
+    if ctx.cache:
+        cache_thread = threading.Thread(target=prepare_cache, args=(ctx.cache, tree, files, ctx, ctx.run_id, cache_timeline))
+        cache_thread.start()
+    timelines = [dict() for _ in range(ctx.shards)]
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=ctx.shards)
+    futures = {}
+    for shard, ip in ips_ready():
+        timelines[shard]["active"] = time.monotonic() - t0
+
+        def work(ip=ip, shard=shard):
+            prepare_shard(ip, tree, files, shard, ctx, timelines[shard])
+            return run_shard(ip, shard, ctx, timelines[shard])
+
+        futures[shard] = pool.submit(work)
+    if ctx.cache:
+        cache_thread.join()
+    shard_dirs = [futures[shard].result() for shard in range(ctx.shards)]
+    plan, final, results, problems = merge(ctx, shard_dirs)
+    elapsed = time.monotonic() - t0
+    with open(os.path.join(ctx.out, "merged.tsv"), "w") as out:
+        out.write("target\twall_ms\tcpu_ms\tpassed\tshard\n")
+        for label in sorted(final):
+            r = results.get(label, {})
+            out.write(f"{label}\t{r.get('wall_ms', 0)}\t{r.get('cpu_ms', 0)}\t{str(final[label]).lower()}\t{r.get('shard', -1)}\n")
+    json.dump({"tree": tree, "checks": checks, "timelines": timelines, "cache": cache_timeline, "elapsed_s": elapsed,
+               "problems": problems}, open(os.path.join(ctx.out, "summary.json"), "w"), indent=1)
+    for shard, timeline in enumerate(timelines):
+        say(f"shard {shard}: " + " ".join(f"{k}={v:.0f}" for k, v in timeline.items() if isinstance(v, float)))
+    failed = sorted(label for label, ok in final.items() if not ok)
+    count = len(plan["checks"]) if plan else 0
+    for problem in problems:
+        print(f"PROBLEM: {problem}")
+    for label in failed:
+        print(f"Failed check: {label}")
+    verdict = "PASSED" if plan and not failed and not problems else "FAILED"
+    counts = sorted(set(plan.get("runner_counts", {}).values())) if plan else []
+    print(f"FAST GATE {verdict}: {tree}: {count} checks in the plan (each shard's check-in-parallel: {counts}), {len(results)} run on {ctx.shards} shards, "
+          f"{len(failed)} failed, {len(problems)} problems; wall {elapsed:.0f} s; results {ctx.out}/merged.tsv", flush=True)
+    return verdict == "PASSED"
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("tree")
+    parser.add_argument("trees", nargs="+", help="TREE, or TREE::CHECKS to gate that tree with its own check list; "
+                        "several trees are gated one after another on the same shards")
     parser.add_argument("--shards", type=int, default=8)
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--image", default=open(os.path.join(HERE, "image.txt")).read().split()[0])
@@ -253,12 +330,16 @@ def main():
     parser.add_argument("--cache", default="auto", help="the shard-cache box: auto (the droplet named shard-cache, if any), none, or NAME")
     parser.add_argument("--keep", action="store_true", help="leave the shards running (debugging only)")
     parser.add_argument("--hosts", default="", help="comma-separated existing boxes to use as shards instead of creating droplets (debugging only; never deleted)")
+    parser.add_argument("--ignore-budget", action="store_true", help="skip the daily shard budget check")
     args = parser.parse_args()
-    tree = os.path.abspath(args.tree)
+    specs = []
+    for spec in args.trees:
+        path, _, checks = spec.partition("::")
+        specs.append((os.path.abspath(path), checks.strip() or args.checks))
     run_id = datetime.datetime.now(datetime.timezone.utc).strftime("%H%M%S") + f"{os.getpid() % 100:02d}"
-    args.out = args.out or os.path.expanduser(f"~/Projects/minyar-fast-tests/runs/{run_id}")
+    args.out = os.path.abspath(args.out or os.path.expanduser(f"~/Projects/minyar-fast-tests/runs/{run_id}"))
+    args.single = len(specs) == 1
     os.makedirs(args.out, exist_ok=True)
-    open(os.path.join(args.out, "checks.txt"), "w").write(args.checks + "\n")
     args.run_id = run_id
     args.cache = find_cache(args.cache)
     shards = Shards(run_id, args.shards, args.image, args.size, args.region, args.key_id)
@@ -268,6 +349,12 @@ def main():
         shards = Shards(run_id, len(hosts), args.image, args.size, args.region, args.key_id)
         shards.create = lambda: None
         shards.addresses = lambda: {f"shard-{run_id}-{index}": ip for index, ip in enumerate(hosts)}
+    elif not args.ignore_budget:
+        spend, cost = guard_spend(), args.shards * 0.16667
+        if spend + cost > SHARD_BUDGET_USD:
+            sys.exit(f"fast gate: today's shard spend is ${spend:.2f}; {args.shards} more shards (${cost:.2f} as the guard counts "
+                     f"them) would pass the ${SHARD_BUDGET_USD:.2f} shard budget. Wait for the next UTC day or use fewer shards.")
+        say(f"today's shard spend ${spend:.2f} + this run ${cost:.2f} (guard accounting) of ${SHARD_BUDGET_USD:.2f}")
 
     def cleanup(*_):
         if not args.keep:
@@ -278,68 +365,36 @@ def main():
     signal.signal(signal.SIGINT, cleanup)
     signal.signal(signal.SIGTERM, cleanup)
     signal.signal(signal.SIGHUP, cleanup)
-    say(f"fast gate {run_id}: {tree} on {args.shards} x {args.size} (image {args.image}), results in {args.out}")
+    say(f"fast gate {run_id}: {len(specs)} tree(s) on {args.shards} x {args.size} (image {args.image}), results in {args.out}")
+    if args.cache:
+        say(f"cache box {args.cache['name']} {args.cache['public']} (VPC {args.cache['private']}) builds and plans")
+    known = {}
+    passed = True
     try:
         creator = threading.Thread(target=shards.create)
         creator.start()
-        files = tree_files(tree)
-        say(f"tree: {len(files)} files")
-        cache_timeline = {}
-        if args.cache:
-            say(f"cache box {args.cache['name']} {args.cache['public']} (VPC {args.cache['private']}) builds and plans")
-            cache_thread = threading.Thread(target=prepare_cache, args=(args.cache, tree, files, args, run_id, cache_timeline))
-            cache_thread.start()
-        creator.join()
-        say("droplets requested")
-        timelines = [dict() for _ in range(args.shards)]
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=args.shards)
-        futures, started_shards = {}, set()
-        while len(started_shards) < args.shards:
-            for name, ip in shards.addresses().items():
-                index = int(name.rsplit("-", 1)[1])
-                if index in started_shards:
-                    continue
-                started_shards.add(index)
-                timelines[index]["active"] = time.monotonic() - started
-                say(f"shard {index} active at {ip}")
 
-                def work(ip=ip, index=index):
-                    prepare_shard(ip, tree, files, index, args, timelines[index])
-                    say(f"shard {index} synced")
-                    return run_shard(ip, index, args, timelines[index])
+        def first_ready():
+            creator.join()
+            while len(known) < args.shards:
+                for name, ip in shards.addresses().items():
+                    index = int(name.rsplit("-", 1)[1])
+                    if index not in known:
+                        known[index] = ip
+                        say(f"shard {index} active at {ip}")
+                        yield index, ip
+                if time.monotonic() - started > 600:
+                    raise RuntimeError("shards did not become active within 600 s")
+                time.sleep(2)
 
-                futures[index] = pool.submit(work)
-            if time.monotonic() - started > 600:
-                raise RuntimeError("shards did not become active within 600 s")
-            time.sleep(2)
-        if args.cache:
-            cache_thread.join()
-        shard_dirs = [None] * args.shards
-        for index, future in futures.items():
-            shard_dirs[index] = future.result()
-            say(f"shard {index} done")
+        for index, (tree, checks) in enumerate(specs):
+            ready = first_ready if index == 0 else (lambda: iter(sorted(known.items())))
+            passed = gate_tree(index, tree, checks, args, ready) and passed
     finally:
         cleanup()
-    plan, final, results, problems = merge(args, shard_dirs)
-    elapsed = time.monotonic() - started
-    with open(os.path.join(args.out, "merged.tsv"), "w") as out:
-        out.write("target\twall_ms\tcpu_ms\tpassed\tshard\n")
-        for label in sorted(final):
-            r = results.get(label, {})
-            out.write(f"{label}\t{r.get('wall_ms', 0)}\t{r.get('cpu_ms', 0)}\t{str(final[label]).lower()}\t{r.get('shard', -1)}\n")
-    json.dump({"timelines": timelines, "elapsed_s": elapsed, "problems": problems}, open(os.path.join(args.out, "summary.json"), "w"), indent=1)
-    for index, timeline in enumerate(timelines):
-        say(f"shard {index}: " + " ".join(f"{k}={v:.0f}" for k, v in timeline.items() if isinstance(v, float)))
-    failed = sorted(label for label, ok in final.items() if not ok)
-    count = len(plan["checks"]) if plan else 0
-    for problem in problems:
-        print(f"PROBLEM: {problem}")
-    for label in failed:
-        print(f"Failed check: {label}")
-    verdict = "PASSED" if plan and not failed and not problems else "FAILED"
-    print(f"FAST GATE {verdict}: {count} checks in the plan, {len(results)} run on {args.shards} shards, "
-          f"{len(failed)} failed, {len(problems)} problems; wall {elapsed:.0f} s; results {args.out}/merged.tsv")
-    return 0 if verdict == "PASSED" else 1
+    if not args.single:
+        print(f"FAST GATE RUN {run_id}: {len(specs)} trees, all passed: {passed}; total wall {time.monotonic() - started:.0f} s")
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":
