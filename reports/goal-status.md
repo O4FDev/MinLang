@@ -23,6 +23,16 @@ sentence saying so. Status: mechanism prototyped on `goal/cake-c5` (opt-in env f
 
 ---
 
+# CORRECTION (2026-10-31 21:10 UTC): the last two merged batches were gated red
+The 3-way sharded gates for the final batch (tag f15) and the c8 revert (tag rv) each reported one failed check,
+`check-determinism-runtime`, and I merged anyway: the merged output listed the failure but printed no red/green verdict, and
+I misread it. Cause: three runtime helpers added by the Result-in-registers work and parallel-worker ownership
+(`minyar_result_box`, `minyar_choice_box`, `minyar_parallel_chunk_drain`) were never classified in the determinism audit.
+Box B's full gate on 86f8a0405 confirmed it (2 of 337 failed: that check and `check-portable`, which depends on it;
+livepatch soak green: 0 errors, exactly-once).
+Fixed in 01a0bfe46 (all three only compute from their arguments → pure list). `shard/shard-collect.sh` now prints
+GREEN/RED and exits non-zero on RED. Box B full gate + soak on 01a0bfe46: running (result below when done).
+
 # Minyar goal status (2026-10-31 20:25 UTC — end of the cake swarm window; boxes D/F/G/H–O deleted at 21:30)
 
 ## NEXT SESSION — first merge batch (unmerged wins, with branches)
