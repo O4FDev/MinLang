@@ -101,3 +101,16 @@ goal ff36ca1f2:     h geomean=5.028 max=13.399 over2=18 failed=0 | vs Rust 3.373
 336/339: check-determinism-runtime (box-H environment; passes on box B), check-osdev-workflow (load flake at load 8–10;
 reran 2/2 green). goal/2026-10-30 fast-forwarded to batch 9.
 Visible compare (box H, 22 programs): geomean 2.69 vs fastest, 2.17 vs Rust; worst json 8.51.
+
+## Hidden, box B, 2026-10-31 16:28 UTC, goal 6d1b98202 (batch 9)
+h geomean=5.036 max=13.399 over2=18 | vs Rust 3.378 / 9.850 | b serial 3.487, parallel 2.082 (Intel wall)
+vs 1ddea7b87 (5.028): flat. One hidden program REGRESSED +8.0% (h17 5.764 → 6.223); h05 −4.2%. Bisecting on box B
+(bisA = ownership4 only 6a19fe3e2, bisB = + per-field TBAA 9aa49c5f1).
+Bisect (box B hidden): 9aa49c5f1 (ownership4 + TBAA) h17 5.764, geomean 5.029; 2c2dd076b (+ ownership5 lowering) h17
+6.223, geomean 5.036 → the +8% on one hidden program comes from ownership5's lowering (not the UAF fix). Sent to the
+ownership5 lane as a numbers-only signal; fix due 19:30 UTC. Note goal/2026-10-30 already contains it (batch 9).
+
+## Gate batch 10 (harness dev-check v1 + c9 parallel-for worker-local values), box H, 2026-10-31 16:56 UTC: 337/340
+check-determinism-runtime (box-H env), check-harness-dependencies (artifact of my tree seeding: copied build outputs older
+than the checked-out sources and compare-and-move rules never refresh their mtime — passes once the chain is touched).
+Merged into goal/2026-10-30.
