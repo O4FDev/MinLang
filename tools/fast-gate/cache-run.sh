@@ -17,6 +17,8 @@ cd "$run/tree" || finish 9
 stamp START
 make build/minyarc > "$out/build.log" 2>&1 || { stamp BUILD-FAILED; finish 3; }
 make build/tooling/tools/check-in-parallel >> "$out/build.log" 2>&1 || { stamp RUNNER-BUILD-FAILED; finish 3; }
+early=$(python3 "$fg/plan.py" --early . 2>> "$out/build.log")
+[[ -n $early ]] && { make $early >> "$out/build.log" 2>&1 || stamp "EARLY-BUILD-FAILED $early"; }
 stamp BUILT
 python3 "$fg/plan.py" . $checks > "$out/plan.json" 2> "$out/plan.err" || { stamp PLAN-FAILED; finish 4; }
 python3 "$fg/pack.py" "$out/plan.json" "$fg/times.tsv" "$fg/goal-times.tsv" "$shards" "$jobs" > "$out/assignment.json" || { stamp PACK-FAILED; finish 4; }

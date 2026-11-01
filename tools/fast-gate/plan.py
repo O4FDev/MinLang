@@ -84,6 +84,16 @@ def make_database(tree, env, arguments):
     return database(result.stdout)
 
 
+EARLY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prebuild.txt")
+
+
+def early_targets(rules):
+    """The shared prerequisites of many checks (prebuild.txt) that this tree has; the shards build them before the
+    runner starts, so the runner never serialises dozens of shared builds behind them."""
+    names = [line.strip() for line in open(EARLY) if line.strip()] if os.path.exists(EARLY) else []
+    return [name for name in names if name in rules and not rules[name]["phony"]]
+
+
 def plan(tree, targets):
     env = runner_environment()
     rules = make_database(tree, env, ["-pq", "FORCE"])
@@ -151,8 +161,8 @@ def plan(tree, targets):
     own_recipe = {label: bool(rules[label]["recipe"]) for label in check_order}
     # What shard-run.sh / cache-run.sh build before the runner starts: up to date when the runner plans, though
     # `make -q` calls them stale (build/.toolchain.json depends on FORCE).
-    first = ["build/minyarc", "build/tooling/tools/check-in-parallel"]
-    built_first = make_database(tree, env, ["-pq"] + first)  # resolves the implicit rules those two use
+    first = ["build/minyarc", "build/tooling/tools/check-in-parallel"] + early_targets(rules)
+    built_first = make_database(tree, env, ["-pq"] + first)  # resolves the implicit rules those use
     prebuilt, pending = set(), list(first)
     while pending:
         name = pending.pop()
@@ -170,6 +180,9 @@ def plan(tree, targets):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 3 and sys.argv[1] == "--early":
+        print(" ".join(early_targets(make_database(os.path.abspath(sys.argv[2]), runner_environment(), ["-pq", "FORCE"]))))
+        sys.exit(0)
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     json.dump(plan(os.path.abspath(sys.argv[1]), sys.argv[2:]), sys.stdout, indent=1)

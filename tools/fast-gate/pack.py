@@ -15,6 +15,7 @@ import sys
 
 DEFAULT_CHECK_MS = 20000
 DEFAULT_GOAL_MS = 2000
+DEFER_MS = 20000  # shared builds at least this slow are built beside the runner instead of before every check
 
 
 def read_times(path, column):
@@ -34,57 +35,111 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
     goals = {goal["name"]: goal for goal in plan["goals"]}
     prebuilt = set(plan.get("prebuilt", []))
     checks = plan["checks"]
-    # A check split into pieces keeps its old name as their aggregate: until the pieces have times of their own, each
-    # gets an equal share of the old check's time.
+    # A check split into pieces keeps its old name as their aggregate: until the pieces have times of their own, they
+    # share the old check's time (less any of its children that have their own) and the aggregate costs nothing.
     check_ms, wall_ms = dict(check_ms), dict(wall_ms)
     for check in checks:
         label, children = check["label"], check["children"]
-        if label in check_ms and children and not any(child in check_ms for child in children):
-            for child in children:
-                check_ms[child] = check_ms[label] // len(children)
-                wall_ms[child] = wall_ms.get(label, check_ms[label]) // len(children)
+        unknown = [child for child in children if child not in check_ms]
+        if label in check_ms and unknown:
+            known_cpu = sum(check_ms[child] for child in children if child in check_ms)
+            known_wall = sum(wall_ms.get(child, check_ms[child]) for child in children if child in check_ms)
+            for child in unknown:
+                check_ms[child] = max(1000, (check_ms[label] - known_cpu) // len(unknown))
+                wall_ms[child] = max(1000, (wall_ms.get(label, check_ms[label]) - known_wall) // len(unknown))
             check_ms[label], wall_ms[label] = 1000, 1000
+    siblings = {}
+    for check in checks:
+        if len(check["children"]) > 1:
+            for child in check["children"]:
+                siblings.setdefault(child, set()).update(c for c in check["children"] if c != child)
 
     def cost(check):
+        # Runner slot time: a check holds its slot for its whole wall time, and several cores when it uses them.
         label = check["label"]
         if label in check_ms:
-            return check_ms[label]
-        if check["children"]:
-            return 1000
-        return DEFAULT_CHECK_MS
+            return max(check_ms[label], wall_ms.get(label, 0))
+        return 1000 if check["children"] else DEFAULT_CHECK_MS
 
     def length(check):
-        # A check given several slots (peer suites) takes less wall time than CPU time.
-        return min(cost(check), wall_ms.get(check["label"], cost(check)))
+        return wall_ms.get(check["label"], cost(check))
+
+    def waiting(check):
+        # Wall time spent not computing, mostly behind the launcher's build/bootstrap.lock: serial on one shard.
+        label = check["label"]
+        if label in check_ms and label in wall_ms and wall_ms[label] - check_ms[label] > 20000:
+            return wall_ms[label] - check_ms[label]
+        return 0
+
+    # The shared builds a check makes a shard run: its own, plus every build that shares a not-prebuilt prerequisite
+    # with them (the runner serialises those, so the shard keeps them).
+    def recipe_members(name):
+        return {m for m, recipe in goals[name]["members"].items() if recipe and m not in prebuilt} if name in goals else set()
+
+    effective = {}
+    for check in checks:
+        need = set(check["goals"])
+        changed = True
+        while changed:
+            changed = False
+            members = set().union(*(recipe_members(name) for name in need)) if need else set()
+            for name in goals:
+                if name not in need and recipe_members(name) & members:
+                    need.add(name)
+                    changed = True
+        effective[check["label"]] = need
 
     order = sorted(checks, key=lambda check: (-cost(check), check["label"]))
     # A shard's runner starts no check before all its shared builds are done, so a shard finishes at about
-    # (shared-build phase) + (check phase), each the larger of its longest item and its total over the jobs.
+    # (shared-build phase) + (check phase): each the larger of its longest item and its total over the jobs, and the
+    # check phase at least the waiting its checks do behind the shard's one launcher lock.
     goal_sum, goal_max = [0] * shards, [0] * shards
-    load, longest = [0] * shards, [0] * shards
+    load, longest, locked = [0] * shards, [0] * shards, [0] * shards
+    deferred_max, waiter_end = [0] * shards, [0] * shards
     owned = [set() for _ in range(shards)]
-    assigned = [[] for _ in range(shards)]
+    assigned = [set() for _ in range(shards)]
 
-    def finish(index, extra_goals, check_cost, check_length=0):
-        gs = goal_sum[index] + sum(extra_goals)
-        gm = max([goal_max[index]] + extra_goals)
-        return max(gm, gs / jobs) + max((load[index] + check_cost) / jobs, max(longest[index], check_length))
+    def heavy(name):
+        return goal_ms.get(name, DEFAULT_GOAL_MS) >= DEFER_MS
+
+    def finish(index, extra_goals, check_cost, check_length=0, check_wait=0, check_heavy=0, waits=False):
+        # Light shared builds run before any check; heavy ones run beside the checks on one core, and a check that
+        # needs one ("waiter") cannot finish before it is built.
+        light = [ms for ms in extra_goals if ms < DEFER_MS]
+        gs = goal_sum[index] + sum(light)
+        gm = max([goal_max[index]] + light)
+        dmax = max(deferred_max[index], check_heavy)
+        ends = max(waiter_end[index], dmax + check_length if waits else 0)
+        checks_phase = max((load[index] + check_cost + sum(ms for ms in extra_goals if ms >= DEFER_MS)) / jobs,
+                           longest[index], check_length, locked[index] + check_wait, ends)
+        return max(gm, gs / jobs) + checks_phase
 
     for check in order:
-        best, best_finish = 0, None
+        best, best_value = 0, None
         for index in range(shards):
-            extra = [goal_ms.get(name, DEFAULT_GOAL_MS) for name in check["goals"] if name not in owned[index]]
-            value = finish(index, extra, cost(check), length(check))
-            if best_finish is None or value < best_finish:
-                best, best_finish = index, value
-        for name in check["goals"]:
+            extra = [goal_ms.get(name, DEFAULT_GOAL_MS) for name in effective[check["label"]] if name not in owned[index]]
+            needs_heavy = [goal_ms.get(name, DEFAULT_GOAL_MS) for name in effective[check["label"]] if heavy(name)]
+            value = finish(index, extra, cost(check), length(check), waiting(check), max(needs_heavy or [0]), bool(needs_heavy))
+            # Pieces of one split check share their inputs and the launcher lock: keep them on different shards.
+            value += 0.5 * length(check) * len(siblings.get(check["label"], set()) & assigned[index])
+            if best_value is None or value < best_value:
+                best, best_value = index, value
+        needs_heavy = [goal_ms.get(name, DEFAULT_GOAL_MS) for name in effective[check["label"]] if heavy(name)]
+        for name in effective[check["label"]]:
             if name not in owned[best]:
                 owned[best].add(name)
-                goal_sum[best] += goal_ms.get(name, DEFAULT_GOAL_MS)
-                goal_max[best] = max(goal_max[best], goal_ms.get(name, DEFAULT_GOAL_MS))
+                if heavy(name):
+                    load[best] += goal_ms.get(name, DEFAULT_GOAL_MS)
+                    deferred_max[best] = max(deferred_max[best], goal_ms.get(name, DEFAULT_GOAL_MS))
+                else:
+                    goal_sum[best] += goal_ms.get(name, DEFAULT_GOAL_MS)
+                    goal_max[best] = max(goal_max[best], goal_ms.get(name, DEFAULT_GOAL_MS))
+        if needs_heavy:
+            waiter_end[best] = max(waiter_end[best], max(needs_heavy) + length(check))
         load[best] += cost(check)
         longest[best] = max(longest[best], length(check))
-        assigned[best].append(check["label"])
+        locked[best] += waiting(check)
+        assigned[best].add(check["label"])
 
     result = []
     all_checks = [check["label"] for check in checks]
@@ -102,12 +157,27 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
                 if any(recipe and member in built and member not in prebuilt for member, recipe in goal["members"].items()):
                     needed.add(name)
                     changed = True
-        mine = set(assigned[index])
-        skip = [label for label in all_checks if label not in mine] + [name for name in goals if name not in needed]
+        mine = assigned[index]
+        # Deferred: the shard's heavy shared builds and every needed build that shares a prerequisite with them or
+        # depends on them. shard-run.sh builds them in one background make; the shim finishes them at once for the
+        # runner and holds each check that needs one until that make is done. Nothing else touches their files.
+        deferred = {name for name in needed if heavy(name)}
+        changed = True
+        while changed:
+            changed = False
+            touched = set(deferred).union(*(recipe_members(name) for name in deferred)) if deferred else set()
+            for name in needed - deferred:
+                if recipe_members(name) & touched:
+                    deferred.add(name)
+                    changed = True
+        waiters = sorted(label for label in mine if effective[label] & deferred)
+        skip = [label for label in all_checks if label not in mine] + [name for name in goals if name not in needed or name in deferred]
         result.append({
             "shard": index,
             "checks": sorted(mine),
             "goals": sorted(needed),
+            "deferred": sorted(deferred),
+            "waiters": waiters,
             "estimate_s": round(finish(index, [], 0) / 1000, 1),
             "skip": skip,
         })

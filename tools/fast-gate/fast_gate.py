@@ -27,7 +27,7 @@ BASE = "/home/agent/base"
 FG = "/home/agent/fg"
 TREE = "/home/agent/swarm/gate"
 CACHE_ROOT = "/home/agent/fgc"
-FG_FILES = ["plan.py", "pack.py", "prebuild.py", "shard-run.sh", "cache-run.sh", "checks.txt", "times.tsv", "goal-times.tsv", "shim/make"]
+FG_FILES = ["plan.py", "pack.py", "prebuild.py", "prebuild.txt", "shard-run.sh", "cache-run.sh", "checks.txt", "times.tsv", "goal-times.tsv", "shim/make"]
 
 started = time.monotonic()
 log_lock = threading.Lock()

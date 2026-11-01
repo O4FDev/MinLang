@@ -35,19 +35,36 @@ if [[ -n ${FAST_GATE_CACHE:-} ]]; then
 fi
 make build/minyarc > "$out/build.log" 2>&1 || { stamp BUILD-FAILED; finish 3; }
 make build/tooling/tools/check-in-parallel >> "$out/build.log" 2>&1 || { stamp RUNNER-BUILD-FAILED; finish 3; }
+early=$(python3 "$fg/plan.py" --early . 2>> "$out/build.log")
+[[ -n $early ]] && { make $early >> "$out/build.log" 2>&1 || stamp "EARLY-BUILD-FAILED $early"; }
 stamp BUILT
 if [[ ! -s $out/assignment.json ]]; then
   python3 "$fg/plan.py" . $checks > "$out/plan.json" 2> "$out/plan.err" || { stamp PLAN-FAILED; finish 4; }
   python3 "$fg/pack.py" "$out/plan.json" "$fg/times.tsv" "$fg/goal-times.tsv" "$shards" "$jobs" > "$out/assignment.json" || { stamp PACK-FAILED; finish 4; }
 fi
-python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["assignment"][int(sys.argv[2])]; open(sys.argv[3],"w").write("".join(x+"\n" for x in a["skip"]))' \
-  "$out/assignment.json" "$index" "$out/skip.txt" || finish 4
+python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["assignment"][int(sys.argv[2])]
+for key, path in (("skip", sys.argv[3]), ("deferred", sys.argv[4]), ("waiters", sys.argv[5])): open(path, "w").write("".join(x+"\n" for x in a.get(key, [])))' \
+  "$out/assignment.json" "$index" "$out/skip.txt" "$out/deferred.txt" "$out/waiters.txt" || finish 4
 stamp "PLANNED $(sha256sum < "$out/plan.json" | cut -c1-16) $(sha256sum < "$out/assignment.json" | cut -c1-16)"
 # Longest first: seed the runner's duration history (it only orders checks by it) with the packing estimates.
 mkdir -p build/tooling
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["durations"]; open(sys.argv[2],"w").write("".join(f"{k} {w} {c}\n" for k,(w,c) in sorted(d.items())))' \
   "$out/assignment.json" build/tooling/check-durations
+# Deferred heavy shared builds (pack.py): one make beside the runner, with the runner's environment. It takes no
+# build/bootstrap.lock: their files are shared with no other build on this shard (pack.py closes the set over shared
+# prerequisites), and the launcher's own first-use targets are all built before the runner starts, so a launcher call
+# in a running check never waits a minute for them. The shim holds the checks that need them until it is done.
+rm -f "$out/deferred.exit"
+if [[ -s $out/deferred.txt ]]; then
+  ( deferred_tmp=$(mktemp -d /tmp/minyar-tests-deferred.XXXXXX)
+    env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL MINYAR_TEST_JOBS=1 MINYAR_TEST_SHARED_HOST=1 DEBUGINFOD_URLS= TMPDIR="$deferred_tmp" \
+      /usr/bin/make -j1 $(cat "$out/deferred.txt") > "$out/deferred.log" 2>&1
+    echo $? > "$out/deferred.exit.tmp" && mv "$out/deferred.exit.tmp" "$out/deferred.exit"; stamp "DEFERRED-DONE $(cat "$out/deferred.exit")" ) &
+else
+  echo 0 > "$out/deferred.exit"
+fi
 PATH=$fg/shim:$PATH FAST_GATE_SKIP=$out/skip.txt FAST_GATE_ROOT=$(pwd -P) FAST_GATE_TIMELINE=$out/timeline \
+  FAST_GATE_WAITERS=$out/waiters.txt FAST_GATE_DEFERRED=$out/deferred.exit \
   make check-in-parallel CHECKS="$checks" CHECK_JOBS="$jobs" > "$out/gate.log" 2>&1
 status=$?
 stamp "GATE-EXIT $status"
