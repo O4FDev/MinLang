@@ -1369,7 +1369,14 @@ def command_run(arguments):
         reasons.setdefault(check, []).extend(why)
     runner_changed = "build/tooling/tools/check-in-parallel" in set(v1_stale) | (stale - {p for p in stale if p.startswith("build/")})
     if runner_changed:
-        reasons = {check: (reasons.get(check) or []) + ["the check runner itself changed"] for check in checks}
+        # A changed runner does not change the programs under test; its own checks prove the runner still
+        # works. Selecting all 337 checks here made every edit to a library the runner imports (json, text)
+        # look like a full gate.
+        for check in ("check-in-parallel-tool", "check-dev-check", "check-changed-inputs"):
+            if check in reasons:
+                reasons[check].append("the check runner itself changed")
+            elif check in checks:
+                reasons[check] = ["the check runner itself changed"]
     selected = [check for check in checks if check in reasons]
     signatures, reused = {}, []
     cache = {} if arguments.no_cache else cached_results(root)
