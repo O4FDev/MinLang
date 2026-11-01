@@ -186,7 +186,7 @@ function normalizeResultTypes(kinds: List<Integer>, texts: List<Text>, lines: So
     return ResultTokenSet { kinds: resultKinds; texts: resultTexts; lines: resultLines }
 }
 
-function emitResultValue(output: List<Text>, textState: List<Text>, state: List<Integer>, payload: Text, payloadType: List<Integer>, success: Boolean, result: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>): Text {
+function emitResultValue(context: CompilerContext, output: List<Text>, textState: List<Text>, state: List<Integer>, payload: Text, payloadType: List<Integer>, payloadNode: Integer, success: Boolean, result: Integer, counts: List<Integer>, fields: List<Integer>, returnTypes: List<Integer>): Text {
     let value = valueName(textState, newTemporary(state))
     // A success or failure whose payload is a scalar (or Nothing) owns no slot:
     // a scalar record frees on its last release and never lies on a cycle.
@@ -205,7 +205,14 @@ function emitResultValue(output: List<Text>, textState: List<Text>, state: List<
     let setter = "minyar_record_set"
     if isReferenceType(payloadType[0]) {
         setter = "minyar_record_set_reference"
-        if takeResult(output, state, payload, payloadType) { setter = "minyar_record_set_take" }
+        if takeResult(output, state, payload, payloadType) {
+            setter = "minyar_record_set_take"
+        } else if payloadNode >= 0 {
+            // A payload that is a local's last use gives the Result that
+            // local's count: the store takes it and the local's cell is
+            // released empty instead of retaining a second count.
+            reserveLocalTake(context, state, output, payload, payloadNode)
+        }
     }
     noteCycleFixup(output, returnTypes, counts, fields, output.length, result, payloadType[0])
     output.add("  call void @" + setter + "(ptr " + value + ", i64 " + Text(field) + ", i64 " + slot + ")\n")
@@ -245,14 +252,16 @@ function parseResultConstructor(context: CompilerContext, localNames: List<Text>
     let payloadType: List<Integer> = [expected]
     let payloadLocation = state[0]
     let payload = ""
+    let payloadNode = -1
     if expected != 5 {
         payload = parseExpression(context, localNames, localTypes, localIds, localLengths, state, textState, output, globals, payloadType)
+        payloadNode = context.syntax.lastValue
     }
     expectToken(tokenKinds, tokenTexts, tokenLines, state, ")")
     if payloadType[0] != expected {
         requireContextType(context, payloadLocation, payloadType[0], expected, "result payload has the wrong type")
     }
-    let value = emitResultValue(output, textState, state, payload, payloadType, success, typeForSymbol(context, record), functionParameterCounts, functionParameterTypes, functionReturnTypes)
+    let value = emitResultValue(context, output, textState, state, payload, payloadType, payloadNode, success, typeForSymbol(context, record), functionParameterCounts, functionParameterTypes, functionReturnTypes)
     setType(resultType, typeForSymbol(context, record))
     return value
 }
@@ -366,7 +375,7 @@ function parseResultTry(context: CompilerContext, localNames: List<Text>, localT
         recoveryCheckpoint(output, textState, state)
         ownResult(output, state, error, errorPayload)
     }
-    let returned = emitResultValue(output, textState, state, error, errorPayload, false, returnType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
+    let returned = emitResultValue(context, output, textState, state, error, errorPayload, -1, false, returnType, functionParameterCounts, functionParameterTypes, functionReturnTypes)
     if consumed { output.add("  call void @minyar_rc_release(ptr " + failed + ")\n") }
     output.add("  call void @minyar_rc_leave()\n")
     output.add(stackLeave(state))

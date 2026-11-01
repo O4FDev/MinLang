@@ -346,5 +346,86 @@ fixtures.executes(frontend, swapSource, swapExpected, ["-O0", "-O2"], 0, "", tru
 frontend.extra = []
 frontend.runtimeFlags = []
 fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
+
+// Last-use moves: a count that already sits in a cell moves into the consumer
+// instead of being taken a second time and dropped. `set_take` takes the
+// local's count into the record field, and a `.r` return hands its local's
+// count to the pair, so neither shape retains the value first.
+let moveSource = #"""
+    choice Expr {
+        Number(value: Integer)
+        Binary(left: Expr, right: Expr)
+    }
+
+    function depth(expression: Expr): Integer {
+        return match expression {
+            Number(_) { 1 }
+            Binary(left, right) { 1 + depth(left) + depth(right) }
+        }
+    }
+
+    // Both payloads are locals at their last use: the fields take their counts.
+    function fieldTake(): Integer {
+        let left = Number(4)
+        let right = Number(5)
+        let node = Binary(left, right)
+        return depth(node)
+    }
+
+    // The returned local's count moves out of its scope cell into the pair,
+    // on the branch that returns and on the branch below it.
+    function pairReturn(flag: Boolean): Result<Expr, Text> {
+        let node = Binary(Number(2), Number(3))
+        if flag { return Ok(node) }
+        return Err("no")
+    }
+
+    // The loop reassigns the binding it reads, so a copy of it keeps a count.
+    function loopCarried(rounds: Integer): Integer {
+        let current = Number(1)
+        let total = 0
+        for i in 0..rounds {
+            let previous = current
+            current = Binary(previous, Number(i))
+            total += depth(current)
+        }
+        return total
+    }
+
+    function main() {
+        print(fieldTake())
+        match pairReturn(true) {
+            Ok(value) { print(depth(value)) }
+            Err(message) { print(message) }
+        }
+        match pairReturn(false) {
+            Ok(value) { print(depth(value)) }
+            Err(message) { print(message) }
+        }
+        print(loopCarried(3))
+    }
+    """#
+let moveExpected = "3\n3\nno\n15\n"
+// The scope-cell profile: the move is defined over the cells the launcher uses.
+frontend.extra = ["--scope-owners", "--bounded-owners", "32"]
+test.require(fixtures.compile(frontend, moveSource), "compile last-use move IR")
+let moveIr = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+// A field whose value is a local's last use takes that local's count, so the
+// record store is the taking setter and the local's cell is released empty.
+test.check(test.contains(body(moveIr, "fieldTake"), "call void @minyar_record_set_take("), "fieldTake: a field store takes a local's last use instead of retaining it")
+// The pair return moves the local's count out of its scope cell: no retain and
+// a moved cell, so the caller gets the one count the local already held.
+let pairBody = body(moveIr, "pairReturn.r")
+test.check(test.contains(pairBody, "minyar_rc_scope_move_v1(ptr ") && !test.contains(pairBody, "call void @minyar_rc_retain(ptr "), "pairReturn: the returned local's count moves into the pair instead of a retain and a drop")
+test.check(counts(moveIr, "loopCarried") > 0, "loopCarried: a copy the loop reassigns keeps a count")
+// The default launcher profile and the eager profile print the same totals at
+// -O0 and -O2, and the sanitized compiler run checks every access.
+fixtures.executes(frontend, moveSource, moveExpected, ["-O0", "-O2"], 0, "", true)
+frontend.extra = ["--scope-owners"]
+frontend.runtimeFlags = ["-DMINYAR_RC_POLL_BUDGET=32"]
+fixtures.executes(frontend, moveSource, moveExpected, ["-O0", "-O2"], 0, "", true)
+frontend.extra = []
+frontend.runtimeFlags = []
+fixtures.executes(frontend, moveSource, moveExpected, ["-O0", "-O2"], 0, "", true)
 test.removeTree(compiler.directory)
 print("Borrow copies: passed")

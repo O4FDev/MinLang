@@ -1,0 +1,375 @@
+// Last-use moves over the scope-owner (Perceus) shape.
+//
+// Two shapes appear once the result ABI and the scope cells are lowered, and
+// both move a count with work that could move it with none:
+//
+// 1. `return Ok(left)` in a `.r` function retains the payload for the caller
+//    and then drops the scope cell that already held that one count. The
+//    payload register is the cell's value itself, so when the cell provably
+//    holds the value's only count at that point, the return hands the cell's
+//    count to the caller instead (`minyar_rc_scope_move_v1` with an empty cell
+//    retains nothing) and the cleanup drop is removed.
+// 2. Any owner transfer out of a cell (`scope_move_v1`, or a null store) leaves
+//    the cell empty, so a later cleanup that loads the cell, nulls it again and
+//    drops the load can only drop null: all three lines are dead work.
+//
+// The proof for (1) is local and syntactic, which is what keeps it sound:
+//  - the value was stored into a scope cell exactly once in the whole body;
+//  - walking back from the retain along the only path that reaches it (every
+//    block on it has exactly one branch into it, so no other entry exists)
+//    touches neither the cell nor any ownership operation on the value, so the
+//    cell still holds the value's one count there;
+//  - the value is mentioned by no other ownership operation in the body except
+//    the stores of the record that consumed it with a taking setter;
+//  - after the retain only the return and the cleanup of that one cell run.
+// Everything else keeps the retain + drop pair it had.
+
+function returnMoveFind(lines: List<Text>, text: Text, from: Integer, to: Integer): Integer {
+    let index = from
+    while index < to {
+        if lines[index] == text { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+// The last line in [from, to) that starts with prefix, or -1.
+function returnMoveLast(lines: List<Text>, prefix: Text, from: Integer, to: Integer): Integer {
+    let found = -1
+    let index = from
+    while index < to {
+        if lines[index].startsWith(prefix) { found = index }
+        index = index + 1
+    }
+    return found
+}
+
+// Lines mentioning this register as a whole token (a name is never a prefix of
+// another register in this IR: a use is followed by a delimiter).
+function returnMoveTokenUses(lines: List<Text>, name: Text): Integer {
+    let seen = 0
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        let at = line.find(name)
+        if at >= 0 {
+            let after = at + name.length
+            if after >= line.length { seen = seen + 1 } else {
+                let next = line[after]
+                if next == ' ' || next == ',' || next == ')' || next == ']' || next == '}' { seen = seen + 1 }
+            }
+        }
+        index = index + 1
+    }
+    return seen
+}
+
+function returnMoveCount(lines: List<Text>, prefix: Text, from: Integer, to: Integer): Integer {
+    let seen = 0
+    let index = from
+    while index < to {
+        if lines[index].startsWith(prefix) { seen = seen + 1 }
+        index = index + 1
+    }
+    return seen
+}
+
+function returnMoveMentions(lines: List<Text>, prefix: Text, suffix: Text, from: Integer, to: Integer): Boolean {
+    let index = from
+    while index < to {
+        if lines[index].startsWith(prefix) && lines[index].endsWith(suffix) { return true }
+        index = index + 1
+    }
+    return false
+}
+
+// A line that cannot change ownership, order, or control flow. Anything else
+// between the cell store and the return ends the proof.
+function returnMoveStraight(line: Text): Boolean {
+    if line.endsWith(":") { return false }
+    if line.startsWith("  br ") || line.startsWith("  switch ") || line.startsWith("  ret ") || line.startsWith("  unreachable") { return false }
+    if line.startsWith("  invoke ") || line.startsWith("  resume ") { return false }
+    if line.startsWith("  call void @minyar_rc_") {
+        if line.startsWith("  call void @minyar_rc_scope_service_v1(") { return false }
+        if line.startsWith("  call void @minyar_rc_step(") { return false }
+        if line.startsWith("  call void @minyar_rc_local") { return false }
+        return true
+    }
+    return true
+}
+
+function returnMoveBlockStart(lines: List<Text>, index: Integer): Integer {
+    let start = index
+    while start > 0 {
+        if lines[start - 1].endsWith(":") { return start }
+        start = start - 1
+    }
+    return 0
+}
+
+// The pointer register a `ret` hands back: the value itself, or for a `.r` pair
+// the pointer its payload slot was converted from.
+function returnMoveValue(lines: List<Text>, ret: Integer): Text {
+    let line = lines[ret]
+    let block = returnMoveBlockStart(lines, ret)
+    if line.startsWith("  ret ptr %") { return line.slice(10, line.length) }
+    if !line.startsWith("  ret [2 x i64] %") { return "" }
+    let pair = line.slice(16, line.length)
+    let insert = returnMoveLast(lines, "  " + pair + " = insertvalue [2 x i64] ", block, ret)
+    if insert < 0 { return "" }
+    if !lines[insert].endsWith(", 1") { return "" }
+    let mark = lines[insert].find(", i64 ")
+    if mark < 0 { return "" }
+    let slot = lines[insert].slice(mark + 6, lines[insert].length - 3)
+    if slot == "0" || slot == "" { return "" }
+    let convert = returnMoveLast(lines, "  " + slot + " = ptrtoint ptr ", block, ret)
+    if convert < 0 { return "" }
+    let prefix = "  " + slot + " = ptrtoint ptr "
+    let lineText = lines[convert]
+    if !lineText.endsWith(" to i64") { return "" }
+    return lineText.slice(prefix.length, lineText.length - 7)
+}
+
+// Whether every ownership mention of value in the body is the one store into a
+// scope cell. A store of the record that consumed value with a taking setter is
+// allowed too: it moved the record's own count, never value's.
+function returnMoveOwnedOnce(lines: List<Text>, value: Text): Boolean {
+    // One retain is the return's own count; a second means another consumer.
+    if returnMoveCount(lines, "  call void @minyar_rc_retain(ptr " + value + ")", 0, lines.length) != 1 { return false }
+    if returnMoveMentions(lines, "  call void @minyar_rc_release(ptr ", value + ")", 0, lines.length) { return false }
+    if returnMoveMentions(lines, "  call void @minyar_rc_local_move_owner(i64 ", ", ptr " + value + ")", 0, lines.length) { return false }
+    if returnMoveMentions(lines, "  call void @minyar_rc_scope_release_v1(ptr ", value + ")", 0, lines.length) { return false }
+    if returnMoveMentions(lines, "  call void @minyar_rc_scope_drop_v1(ptr ", value + ")", 0, lines.length) { return false }
+    if returnMoveMentions(lines, "  call void @minyar_rc_borrow(ptr ", value + ")", 0, lines.length) { return false }
+    if returnMoveMentions(lines, "  call void @minyar_rc_keep(ptr ", value + ")", 0, lines.length) { return false }
+    return returnMoveCount(lines, "  store ptr " + value + ", ptr %rc.scope.slot.", 0, lines.length) == 1
+}
+
+// How many branches in the body target this label. A block with one
+// predecessor has exactly one line of control flow into it, so walking back
+// from the return visits every instruction the return really runs.
+function returnMoveBranches(lines: List<Text>, label: Text): Integer {
+    let needle = "label %" + label
+    let seen = 0
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        if line.find(needle) >= 0 && (line.endsWith(needle) || line.find(needle + ",") >= 0) { seen = seen + 1 }
+        index = index + 1
+    }
+    return seen
+}
+
+function returnMoveBranchLine(lines: List<Text>, label: Text): Integer {
+    let needle = "label %" + label
+    let index = 0
+    while index < lines.length {
+        let line = lines[index]
+        if line.find(needle) >= 0 && (line.endsWith(needle) || line.find(needle + ",") >= 0) { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+// Walk back from `retain` along the only path that reaches it, checking that
+// nothing on that path reaches the cell or leaves the function, and return the
+// index of the store of value into the cell. Every block on the path must have
+// exactly one predecessor; a block with more stops the proof, because another
+// entry could have emptied the cell first.
+function returnMoveStore(lines: List<Text>, retain: Integer, value: Text, cell: Text, storePrefix: Text, index: Text): Integer {
+    let position = retain - 1
+    while position >= 0 {
+        let line = lines[position]
+        if line.endsWith(":") {
+            let label = line.slice(0, line.length - 1)
+            if returnMoveBranches(lines, label) != 1 { return -1 }
+            let branch = returnMoveBranchLine(lines, label)
+            if branch <= 0 { return -1 }
+            position = branch - 1
+        } else if line.find(cell) >= 0 {
+            // The store we are looking for, if it is the one writing the value.
+            if line.startsWith(storePrefix) && line.slice(storePrefix.length, line.length) == index { return position }
+            return -1
+        } else if line.startsWith("  ret ") || line.startsWith("  unreachable") || line.startsWith("  invoke ") {
+            return -1
+        } else if line.find("recovery") >= 0 {
+            return -1
+        } else if line.find(value) >= 0 && line.find("@minyar_rc_") >= 0 {
+            // Any other ownership mention of the value on the path.
+            return -1
+        } else if line.startsWith("  switch ") {
+            return -1
+        } else {
+            position = position - 1
+        }
+    }
+    return -1
+}
+
+// The scope cell a returned value's count sits in at this return, or "".
+// The cleanup lines between the move and the return: the cell is emptied, so
+// its load and the drop of that load become nothing. Returns the number of
+// lines cleared, or -1 when the window holds anything else.
+function returnMoveCleanup(lines: List<Text>, retain: Integer, ret: Integer, cell: Text): Integer {
+    let load = ""
+    let loadIndex = -1
+    let drop = ""
+    let dropIndex = -1
+    let cleared = 0
+    let index = retain + 1
+    while index < ret {
+        let line = lines[index]
+        if line == "  store ptr null, ptr " + cell { cleared = cleared + 1 } else if line.startsWith("  call void @minyar_rc_scope_service_v1(") { cleared = cleared + 1 } else if line.startsWith("  call void @minyar_rc_scope_leave_v1(") { cleared = cleared + 1 } else if line.startsWith("  call void @minyar_rc_scope_leave_empty_v1(") { cleared = cleared + 1 } else if line.startsWith("  call void @minyar_rc_step(") { cleared = cleared + 1 } else {
+            let loadPrefix = "  "
+            let marker = " = load ptr, ptr " + cell
+            if line.startsWith(loadPrefix) && line.endsWith(marker) && loadIndex < 0 {
+                load = line.slice(2, line.find(marker))
+                loadIndex = index
+                cleared = cleared + 1
+            } else if loadIndex >= 0 && line == "  call void @minyar_rc_scope_drop_v1(ptr " + load + ")" && dropIndex < 0 {
+                drop = load
+                dropIndex = index
+                cleared = cleared + 1
+            } else if line.startsWith("  call void @minyar_rc_scope_drop_v1(ptr ") { return -1 } else if !returnMoveStraight(line) { return -1 } else { cleared = cleared + 1 }
+        }
+        index = index + 1
+    }
+    if loadIndex >= 0 && dropIndex < 0 { return -1 }
+    if loadIndex >= 0 {
+        // The loaded register may have no other use.
+        if returnMoveTokenUses(lines, load) != 2 { return -1 }
+        lines[loadIndex] = ""
+        lines[dropIndex] = ""
+        cleared = cleared + 0
+    }
+    return cleared
+}
+
+function returnMoveCell(lines: List<Text>, ret: Integer): Boolean {
+    let value = returnMoveValue(lines, ret)
+    if value == "" { return false }
+    if value.find("%") != 0 { return false }
+    if !returnMoveOwnedOnce(lines, value) { return false }
+    let block = returnMoveBlockStart(lines, ret)
+    let retain = returnMoveFind(lines, "  call void @minyar_rc_retain(ptr " + value + ")", block, ret)
+    if retain < 0 { return false }
+    let storePrefix = "  store ptr " + value + ", ptr %rc.scope.slot."
+    // The cell comes from the one store of this value into one in the body.
+    let store = returnMoveLast(lines, storePrefix, 0, retain)
+    if store < 0 { return false }
+    let index = lines[store].slice(storePrefix.length, lines[store].length)
+    let cell = "%rc.scope.slot." + index
+    if returnMoveStore(lines, retain, value, cell, storePrefix, index) < 0 { return false }
+    if returnMoveCleanup(lines, retain, ret, cell) < 0 { return false }
+    lines[retain] = "  call void @minyar_rc_scope_move_v1(ptr " + cell + ", ptr " + value + ")"
+    return true
+}
+
+// The scope cell this line empties, or "": a move out of the cell, or a store
+// of null into it.
+function returnMoveEmptiedCell(line: Text): Text {
+    let movePrefix = "  call void @minyar_rc_scope_move_v1(ptr "
+    if line.startsWith(movePrefix) {
+        let comma = line.find(", ptr ")
+        if comma < 0 { return "" }
+        return line.slice(movePrefix.length, comma)
+    }
+    let nullStore = "  store ptr null, ptr "
+    if line.startsWith(nullStore) { return line.slice(nullStore.length, line.length) }
+    return ""
+}
+
+// A cleanup that loads a cell already emptied on this path, nulls it again and
+// drops the load can only drop null: all three lines are dead work and go.
+function returnMoveDeadCells(lines: List<Text>): Boolean {
+    let changed = false
+    let index = 0
+    while index < lines.length {
+        let cell = returnMoveEmptiedCell(lines[index])
+        if cell != "" && cell.find("%rc.scope.slot.") == 0 {
+            let load = ""
+            let loadIndex = -1
+            let nullStore = -1
+            let dropIndex = -1
+            let position = index + 1
+            while position < lines.length {
+                let line = lines[position]
+                if line.endsWith(":") || line.startsWith("  br ") || line.startsWith("  switch ") || line.startsWith("  ret ") || line.startsWith("  invoke ") { position = lines.length } else if loadIndex >= 0 && dropIndex < 0 && line == "  call void @minyar_rc_scope_drop_v1(ptr " + load + ")" {
+                    dropIndex = position
+                    position = lines.length
+                } else if line.find(cell) < 0 { position = position + 1 } else if loadIndex < 0 && line.startsWith("  %rc.scope.drop.") && line.endsWith(" = load ptr, ptr " + cell) {
+                    load = line.slice(2, line.find(" = load ptr, ptr "))
+                    loadIndex = position
+                    position = position + 1
+                } else if loadIndex >= 0 && nullStore < 0 && line == "  store ptr null, ptr " + cell {
+                    nullStore = position
+                    position = position + 1
+                } else { position = lines.length }
+            }
+            if loadIndex >= 0 && dropIndex >= 0 && returnMoveTokenUses(lines, load) == 2 {
+                lines[loadIndex] = ""
+                lines[dropIndex] = ""
+                if nullStore >= 0 { lines[nullStore] = "" }
+                changed = true
+            }
+        }
+        index = index + 1
+    }
+    return changed
+}
+
+function returnMoveBody(lines: List<Text>): Boolean {
+    let changed = false
+    let index = 0
+    while index < lines.length {
+        if lines[index].startsWith("  ret ") {
+            if returnMoveCell(lines, index) { changed = true }
+        }
+        index = index + 1
+    }
+    if returnMoveDeadCells(lines) { changed = true }
+    return changed
+}
+
+// Whether this function's text holds the shape the move needs: a scope cell
+// store, a retain and a return, in that order.
+function returnMoveCandidate(module: Text, start: Integer, end: Integer): Boolean {
+    let slot = resultFindFrom(module, ", ptr %rc.scope.slot.", start)
+    if slot <= start || slot >= end { return false }
+    let ret = resultFindFrom(module, "  ret ", start)
+    if ret <= start || ret >= end { return false }
+    return true
+}
+
+// Only bodies holding a scope cell, a retain and a return are split into lines;
+// every other function and all module text passes through as a view.
+function lowerReturnMoves(pieces: List<Text>): List<Text> {
+    let module = joinText(pieces)
+    let output: List<Text> = []
+    let copied = 0
+    let start = resultFindFrom(module, "\ndefine ", 0)
+    while start >= 0 {
+        let end = resultFindFrom(module, "\n}\n", start)
+        if end < 0 { start = -1 } else {
+            if returnMoveCandidate(module, start, end) {
+                let lines = module.slice(start + 1, end + 2).split("\n")
+                if returnMoveBody(lines) {
+                    output.add(module.slice(copied, start + 1))
+                    let row = 0
+                    while row < lines.length {
+                        if lines[row] != "" {
+                            output.add(lines[row])
+                            output.add("\n")
+                        }
+                        row = row + 1
+                    }
+                    copied = end + 3
+                }
+            }
+            start = resultFindFrom(module, "\ndefine ", end)
+        }
+    }
+    if copied < module.length { output.add(module.slice(copied, module.length)) }
+    if !module.endsWith("\n") { output.add("\n") }
+    return output
+}

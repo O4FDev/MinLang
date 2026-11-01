@@ -18,6 +18,7 @@ COMPILER_SOURCES = build/choice-builtins.min build/capability-builtins.min \
 	compiler/stages/ownership.min \
 	compiler/stages/scope-ownership.min \
 	compiler/stages/result-registers.min \
+	compiler/stages/return-moves.min \
 	compiler/stages/operators.min \
 	compiler/stages/expressions.min \
 	compiler/stages/statements.min \
