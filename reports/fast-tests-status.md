@@ -3,7 +3,7 @@
 Goal: the full gate (`check-portable` + the benchmark checks: the 8 targets of the single-box gate queue, 340
 checks) in ≤ 300 s wall with the same pass/fail as a single-box gate. Command: `tools/fast-gate.sh TREE`.
 
-## 2026-11-01 02:00 UTC
+## 2026-11-01 03:00 UTC
 
 ### Timing (the full 8-shard plan run in waves on 2 boxes, projected to one box per shard)
 `tools/fast-gate.sh --shards 8 --boxes 2 TREE` runs the same 8-shard plan two shards at a time; `estimate.py RUN`
@@ -13,20 +13,31 @@ projects it: max(box ready 64 s, cache box done) + the slowest shard (pull → d
 | waves1 (14dd401cf) | first 8-shard plan, critical-path order (cache box done at 83 s) | 317 s | 405 s | green |
 | waves2 (e0debc410) | heavy shared builds beside the checks (cache 89 s) | 252 s | 346 s | green |
 | waves3 (7ef381401) | aggregate tails, 4-module compiler link | 247 s | 316 s | `check-net-loop` flake (4/4 green alone; REQUESTS.md row) |
-| waves4 (d035852f0) | parallel deferred chains, ssh multiplexing | 214 s | **283 s** | green: 440 checks, 0 failed |
-- Cache box (s-4vcpu): synced at 6 s, compiler + plan done at 53 s, before the shards are up (64–72 s to SSH).
-- In waves4 the slowest shard (1) ran `check-portable`'s own 50 s recipe last (160 → 209 s), after the 35 children
-  packed beside it. Fixed in 7d9f971ca: own-recipe aggregates are packed first, a child beside its parent costs the
-  chain it makes, and those children carry the parent's length in the runner's ordering so they start first. Packing
-  estimate 231 → 191 s per shard. waves5 measures it.
+| waves4 (d035852f0) | parallel deferred chains, ssh multiplexing | 214 s | 283 s | green: 440 checks, 0 failed |
+| waves5 (7d9f971ca) | check-portable children kept apart (wrong model, see below) | 264 s | 333 s | green |
+| waves6 (23997f4c3) | drain model, rebalancing passes, median times | 222 s | 291 s | green |
+| waves7 (4cb66bb14) | `check-portable-core`, a 9th shard on the cache box | 203 s | **272 s** | green: 441 checks, 0 failed |
+- Cache box (s-4vcpu): synced at 6 s, compiler + plan done at 48–54 s, before the shards are up (64–72 s to SSH).
+- **check-portable waits for its whole shard.** It sits above 436 of the 440 checks, including the runner's
+  exclusive `check-net-udp-offload`, which starts only once no other check runs on the shard, even where the shim
+  skips it. So check-portable's own 48–57 s single-threaded recipe always ran last on its shard (waves5: 216 → 264 s),
+  and the runner's priority propagation pushed the 3 checks outside it (ablation-switches, benchmarks) to the end of
+  every shard. Fixed in the product (5f12d1ee3): the recipe is now its own check, `check-portable-core` (same command;
+  check-portable fails if it fails). The plan grows to 441 checks.
+- **The cache box runs a 9th shard** (4cb66bb14) once it has built and planned: 4 jobs at 0.70 of a shard core
+  (measured), only short checks with known times, nothing that measures time or budgets or uses a sanitizer build,
+  in its own copy of the tree (the copy it serves is untouched). waves7: its 16 checks done at 224 s.
+- Shard boxes are shared-CPU: the same checks cost 9,386–10,163 CPU-s from run to run (±4%). The packing table now
+  takes each check's median over runs, less the time the shim held it for deferred builds.
 - Product change on this branch: `tools/compiler-link.sh` links minyarc and scope-compiler as 4 ThinLTO modules in
   parallel (identical stage3 output; cold compiler build 49 → 29 s on 4 vCPU).
 
 ### Next
+- Rehearsal (running): batch 9 and int13 on the new machinery, 8-shard plan in waves.
 - Capacity is still 3 free droplets (account limit 10) until the run-2 boxes go at Sun 1 Nov 21:45 UTC, or until
   Luke raises the limit. Then: freeze, `time tools/fast-gate.sh TIP` on 8 shards (the verdict prints the time since the
   command started), the recorded trees on the same code, `agree.py`, and the rollout.
-- Guard spend today: $1.55 of $10 at 01:38.
+- Guard spend today: $2.62 of $10 at 02:41.
 
 ## 2026-10-31 22:35 UTC
 
