@@ -181,6 +181,170 @@ test.check(counts(ir, "guardedRelease") > 0, "guardedRelease: a callee that remo
 // releases.
 let deferred = body(ir, "deferredTemporary")
 test.check(test.contains(deferred, "call void @minyar_rc_retain(ptr ") && test.contains(deferred, "call void @minyar_rc_release(ptr ") && !test.contains(deferred, "@minyar_rc_enter(") && !test.contains(deferred, "@minyar_rc_borrow(") && !test.contains(deferred, "@minyar_rc_local("), "deferredTemporary: a deferred statement borrow in a function that owns nothing else is a retain and a release without a frame")
+// A grid borrowed from a record field and swapped with a second grid: the
+// binding the loop reassigns is not a stable root, so every copy of it keeps
+// its own count. Without that count the next round's copy borrows a List the
+// reassignment already released.
+let swapSource = #"""
+    record World { cells: List<List<Integer>>; rows: Integer; columns: Integer; rounds: Integer }
+
+    function makeWorld(rows: Integer, columns: Integer): World {
+        let cells: List<List<Integer>> = []
+        for r in 0..rows {
+            let row: List<Integer> = []
+            for c in 0..columns { row.add((r * 37 + c * 11) % 1000) }
+            cells.add(row)
+        }
+        return World { cells: cells; rows: rows; columns: columns; rounds: 5 }
+    }
+
+    function zeros(rows: Integer, columns: Integer): List<List<Integer>> {
+        let grid: List<List<Integer>> = []
+        for r in 0..rows {
+            let row: List<Integer> = []
+            for c in 0..columns { row.add(0) }
+            grid.add(row)
+        }
+        return grid
+    }
+
+    function smooth(grid: List<List<Integer>>, next: List<List<Integer>>, k: Integer) {
+        let rows = grid.length
+        let columns = grid[0].length
+        for r in 0..rows {
+            let row = grid[r]
+            let out = next[r]
+            for c in 0..columns {
+                let h = row[c]
+                let level = h
+                if r > 0 { level += (grid[r - 1][c] - h) / 8 }
+                if r + 1 < rows { level += (grid[r + 1][c] - h) / 8 }
+                if c > 0 { level += (row[c - 1] - h) / 8 }
+                if c + 1 < columns { level += (row[c + 1] - h) / 8 }
+                if (r * 3 + c * 5 + k) % 41 == 0 { level += 2 }
+                out[c] = level
+            }
+        }
+    }
+
+    function totalOf(grid: List<List<Integer>>, rows: Integer, columns: Integer): Integer {
+        let total = 0
+        for r in 0..rows { for c in 0..columns { total += grid[r][c] * (c + 1) } }
+        return total
+    }
+
+    // The hidden program's shape: a grid borrowed from a record field, swapped
+    // with a second grid, and read through row and out bindings.
+    function stencilSwap(): Integer {
+        let world = makeWorld(24, 18)
+        let grid = world.cells
+        let next = zeros(world.rows, world.columns)
+        for k in 0..world.rounds {
+            smooth(grid, next, k)
+            let previous = grid
+            grid = next
+            next = previous
+        }
+        return totalOf(grid, world.rows, world.columns)
+    }
+
+    // The same swap written through a temporary before the assignment.
+    function thirdSwap(): Integer {
+        let world = makeWorld(16, 12)
+        let grid = world.cells
+        let next = zeros(world.rows, world.columns)
+        for k in 0..world.rounds {
+            let temporary = grid
+            grid = next
+            next = temporary
+            smooth(grid, next, k)
+        }
+        return totalOf(grid, world.rows, world.columns)
+    }
+
+    function twist(values: List<Integer>, k: Integer) {
+        for i in 0..values.length { values[i] = (values[i] + k + 1) % 101 }
+    }
+
+    // A flat List<Integer> instead of a List of rows.
+    function flatSwap(): Integer {
+        let a: List<Integer> = []
+        let b: List<Integer> = []
+        for i in 0..64 {
+            a.add(i * 7 % 13)
+            b.add(i % 5)
+        }
+        for k in 0..5 {
+            twist(a, k)
+            let previous = a
+            a = b
+            b = previous
+        }
+        let total = 0
+        for i in 0..a.length { total += a[i] * (i + 1) }
+        return total
+    }
+
+    record Tally { left: List<Integer>; right: List<Integer> }
+
+    // Record fields instead of bindings.
+    function fieldSwap(): Integer {
+        let leftValues: List<Integer> = []
+        let rightValues: List<Integer> = []
+        for i in 0..32 {
+            leftValues.add(i * 3 % 17)
+            rightValues.add(i % 7)
+        }
+        let tally = Tally { left: leftValues; right: rightValues }
+        for k in 0..4 {
+            twist(tally.left, k)
+            let previous = tally.left
+            tally.left = tally.right
+            tally.right = previous
+        }
+        let total = 0
+        for i in 0..tally.left.length { total += tally.left[i] * (i + 1) }
+        return total
+    }
+
+    // The reassignment sits inside an if branch under the copy's block.
+    function ifSwap(): Integer {
+        let world = makeWorld(20, 14)
+        let grid = world.cells
+        let next = zeros(world.rows, world.columns)
+        for k in 0..world.rounds {
+            smooth(grid, next, k)
+            let previous = grid
+            if k % 2 == 0 { grid = next }
+            next = previous
+        }
+        return totalOf(grid, world.rows, world.columns)
+    }
+
+    print(stencilSwap())
+    print(thirdSwap())
+    print(flatSwap())
+    print(fieldSwap())
+    print(ifSwap())
+    """#
+let swapExpected = "2173955\n264\n16640\n6339\n938238\n"
+test.require(fixtures.compile(frontend, swapSource), "compile swapped grid IR")
+let swapIr = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+// A count and its release for the copy; a bare copy from the swapped binding
+// would emit four ownership operations instead of six.
+test.check(counts(swapIr, "stencilSwap") == 6, "stencilSwap: a copy of a binding the loop reassigns keeps a count")
+test.check(counts(swapIr, "thirdSwap") == 6, "thirdSwap: a copy before the assignment keeps a count")
+test.check(counts(swapIr, "ifSwap") == 6, "ifSwap: a reassignment inside an if branch invalidates the copy")
+// The default launcher profile (scope cells with the 32-work bounded cleanup
+// budget) and the eager profile print the same totals, at -O0 and -O2, and the
+// sanitized compiler run checks every access.
+frontend.extra = ["--scope-owners", "--bounded-owners", "32"]
+fixtures.executes(frontend, swapSource, swapExpected, ["-O0", "-O2"], 0, "", true)
+frontend.extra = ["--scope-owners"]
+frontend.runtimeFlags = ["-DMINYAR_RC_POLL_BUDGET=32"]
+fixtures.executes(frontend, swapSource, swapExpected, ["-O0", "-O2"], 0, "", true)
+frontend.extra = []
+frontend.runtimeFlags = []
 fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
 test.removeTree(compiler.directory)
 print("Borrow copies: passed")
