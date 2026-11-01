@@ -179,3 +179,10 @@ Same-box parent-vs-candidate checks (box L, 2026-11-01 ~10:40 UTC, cachegrind Ir
 - r3b 1fa396a48 vs parent 58990cb8d — compare 22: httpparse −2.152%, exprparse −1.922%, json −1.751%, nothing slower;
   bothmodes: mapreduce −0.863% @1 / −0.862% @4, server −0.363% @1, nothing slower.
 - r3b hidden (box B): geomean 4.248 → 4.213, every program equal or faster.
+
+## Phase 1 (stabilisation): box-B single-box full gate on goal tip 993756afe — GREEN (2026-11-01 10:58 → 12:00 UTC)
+`make check-in-parallel CHECKS="check-portable check-benchmarks" CHECK_JOBS=4` on brief-crawl-1: 345 checks, 172 shared
+builds, **Parallel checks passed** (GATE-FINAL-EXIT 0). `python3 benchmarks/livepatch/run.py soak`: 291,309 requests,
+**0 errors**, 5 patches under load, versions monotonic per connection, every request counted exactly once (SOAK-FINAL-EXIT 0).
+Disk guard: minimum free 12 GB during the run (abort line 6 GB); gate tree deleted afterwards, box B back to 21 GB free.
+Logs: ~/Projects/minyar-goal-20261030/logs/gate-final-993756afe.log, soak-final.log.
