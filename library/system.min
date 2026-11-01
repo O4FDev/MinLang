@@ -1,8 +1,9 @@
-// Process-level services: real time, process identity and memory, and shutdown signals as socket readiness.
+// Process-level services: real time, process identity and memory, PTY sessions, and signals as socket readiness.
 //
-// Minyar has no signal handlers or closures, so shutdown signals are delivered the event-loop way:
-// shutdownSignalSocket() installs SIGTERM/SIGINT handlers (and ignores SIGPIPE) and returns a socket that becomes
-// readable when a signal arrives. Watch it with `eventloop`, call drainShutdownSignals(), then shut down in order.
+// Minyar has no signal handlers or closures, so signals are delivered the event-loop way: signalSocket() installs one
+// self-pipe handler per requested signal and returns a socket that becomes readable when one arrives. Watch it with
+// `eventloop`, then call readSignal() to get the next selector. shutdownSignalSocket() is the SIGTERM/SIGINT
+// subscription (it also ignores SIGPIPE) and returns that same socket; drainShutdownSignals() drains it the old way.
 
 public function wallClockMicroseconds(): Integer { native "system" }   // since the Unix epoch (CLOCK_REALTIME)
 public function monotonicNanoseconds(): Integer { native "system" }    // CLOCK_MONOTONIC
@@ -15,7 +16,32 @@ public function parallelWorkers(): Integer { native "system" }         // thread
 public function ignoreBrokenPipes(): Integer { native "system" }
 public function shutdownSignalSocket(): Integer { native "system" }
 // Its socket is process-owned and borrowed: remove watches when done; never close it through files/net.
-public function drainShutdownSignals(): Integer { native "system" }   // last signal number (15, 2) or 0
+public function drainShutdownSignals(): Integer { native "system" }   // last native signal number (15, 2) or 0
+
+// Stable signal selectors, never native signal numbers: SIGUSR1 is 10 on Linux and 30 on macOS.
+// Subscription is cumulative: signalSocket() keeps the signals already installed and returns the same socket.
+public constant SIGNAL_HANGUP = 1
+public constant SIGNAL_INTERRUPT = 2
+public constant SIGNAL_USER_ONE = 3
+public constant SIGNAL_USER_TWO = 4
+public constant SIGNAL_CHILD = 5
+public constant SIGNAL_WINDOW_CHANGE = 6
+public constant SIGNAL_TERMINATE = 7
+// Install handlers for these selectors and return the socket that becomes readable when one arrives. Delivery is
+// one read per delivery for each signal (standard signals coalesce while blocked), and all subscribers share the
+// process-owned socket, so read it from one thread. Unknown selectors are -EINVAL and install nothing. SIGKILL and
+// SIGSTOP cannot be caught. A SIGCHLD subscription means child exits also wake the loop; keep calling system.wait
+// so handles and zombies are released.
+public function signalSocket(signals: List<Integer>): Integer {
+    let encoded = Bytes(signals.length * 8)
+    for index in 0..signals.length { encoded.setInt64(index * 8, signals[index]) }
+    return signalSocketNative(encoded)
+}
+function signalSocketNative(signals: Bytes): Integer { native "system" }
+// The next delivered signal's selector, 0 when none is pending, or -errno for a handle that is not the socket.
+public function readSignal(handle: Integer): Integer { native "system" }
+// The native signal number of a selector, for sendSignal and for raising one in a test.
+public function signalNumber(kind: Integer): Integer { native "system" }
 // Native PID selectors are supported (0 = current process group; negative = OS group/broadcast selector).
 // PID and signal Integers must fit the native types exactly, otherwise -EINVAL is returned before the syscall.
 public function sendSignal(processId: Integer, signal: Integer): Integer { native "system" }
@@ -139,3 +165,43 @@ function decodeProcessStatus(raw: Bytes): ProcessStatus {
 // parent exit; wait every successful handle to avoid retained handles/zombies.
 
 public function releaseFreeMemory(): Integer { native "system" }
+
+// A PTY session: `controller` is the descriptor the parent owns and `terminal` is the terminal's path (for example
+// "/dev/pts/3" or "/dev/ttys001"). The controller is non-blocking and close-on-exec: read it with readTerminal, write
+// it with writeTerminal, watch it with `eventloop` like any other descriptor, and close it with files.close. A read
+// with no output ready reports -EAGAIN (errors.wouldBlockCode()), and on Linux a read after the last terminal
+// descriptor closes reports -EIO, the end of the session. The kernel's terminal layer converts newlines, so a
+// program's "\n" arrives as "\r\n" unless the child changes termios.
+public record Pty { controller: Integer; terminal: Text }
+// Open a controller/terminal pair. Failure is a negative controller with an empty path (system.lastError holds the
+// -errno). The terminal is not opened here, so the child is the only holder of the terminal's end and its exit is
+// observable; a caller that never spawns should close the controller.
+public function openPty(): Pty {
+    let raw = openPtyNative()
+    let controller = raw.getInt64(0)
+    if controller < 0 { return Pty { controller: controller; terminal: "" } }
+    match utf8Text(raw.slice(16, raw.length)) {
+        Some(path) { return Pty { controller: controller; terminal: path } }
+        None { }
+    }
+    return Pty { controller: controller; terminal: "" }
+}
+function openPtyNative(): Bytes { native "system" }
+// Start `path` on the terminal of `pty` as its controlling tty, in a new session (setsid), with the terminal on
+// standard input, output and error. argv[0] is the program name, as for spawn, and envp is the complete environment.
+// Returns an owned handle that system.wait/poll/childProcessId accept, or -errno. Windows is -ENOTSUP.
+public function spawnOnTerminal(path: Text, argv: List<Text>, envp: List<Text>, cwd: Text, pty: Pty): Integer {
+    return spawnOnTerminalNative(path, encodeProcessVector(argv), encodeProcessVector(envp), cwd, pty.controller)
+}
+function spawnOnTerminalNative(path: Text, argv: Bytes, envp: Bytes, cwd: Text, controller: Integer): Integer { native "system" }
+// Read what the terminal has ready, appending to `buffer` (like files.readAppend: start from Bytes() and resize it to
+// 0 to reuse its capacity), at most 64 KiB and at most `length` per call: the count, 0 when the terminal reported end
+// of input, -EAGAIN when nothing is ready yet, or -EIO at the Linux end of the session.
+public function readTerminal(controller: Integer, buffer: Bytes, length: Integer): Integer { native "system" }
+// Write once, like write(2): a count below `length` means the terminal is full, so retry from offset + count.
+public function writeTerminal(controller: Integer, data: Bytes, offset: Integer, length: Integer): Integer { native "system" }
+// Set the terminal's window size (TIOCSWINSZ): the kernel reports it to the child (stty size) and signals the
+// foreground group with SIGWINCH. Rows and columns must be 1..65535. Resizing before spawning works, but on macOS a
+// terminal has no state until something opens it, so a size requested that early is remembered and applied when
+// spawnOnTerminal opens the terminal for the child; a later resize takes effect immediately.
+public function resizeTerminal(controller: Integer, rows: Integer, columns: Integer): Integer { native "system" }

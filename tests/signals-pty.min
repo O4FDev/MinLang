@@ -1,0 +1,83 @@
+// Signal subscriptions (SIGHUP, SIGINT, SIGUSR1, SIGUSR2, SIGCHLD, SIGWINCH, SIGTERM) delivered as eventloop
+// readiness, and PTY sessions: open, resize, spawn a controlling-tty child, read and write through the controller.
+// POSIX only: the Windows backend reports -ENOTSUP for every signal socket and terminal call.
+use "io" as io
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "./sha256-support.min" as arguments
+use "system" as system
+use "files" as files
+
+function quote(source: Text): Text {
+    if source == "" { return "''" }
+    let safe = true
+    for byte in Bytes(source) {
+        if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 || byte == 64 || byte == 37 || byte == 43 || byte == 61 || byte == 58 || byte == 44 || byte == 46 || byte == 47 || byte == 45) { safe = false }
+    }
+    if safe { return source }
+    return "'" + test.replace(source, "'", "'\"'\"'") + "'"
+}
+
+function run(command: List<Text>, environment: List<Text>, cwd: Text, log: Text, timeout: Integer): test.Result {
+    let rendered = ""
+    for index in 0..command.length { if index > 0 { rendered += " " }; rendered += quote(command[index]) }
+    files.writeStandardOutput(rendered + "\n")
+    let result = test.run(command, environment, cwd, log, timeout)
+    if result.status != 0 {
+        files.writeStandardOutput(result.output)
+        files.writeStandardOutput(result.errorOutput)
+    }
+    test.require(result, "signals and terminals")
+    return result
+}
+
+let sanitize = false
+for index in 0..processInfo.argumentCount() {
+    let option = processInfo.argument(index)
+    if option == "--sanitize" { sanitize = true }
+    else { fail("unknown signals-pty option: " + option) }
+}
+let work = test.scratch()
+let platform = test.run(["uname", "-s"], system.environment(), "", work + "/platform", 10)
+test.require(platform, "signals backend platform query")
+let name = test.lines(platform.output)[0]
+test.check(name != "Windows" && !name.contains("MSYS") && !name.contains("MINGW") && !name.contains("CYGWIN"),
+    "the POSIX signal and PTY backend is pending on Windows")
+let clang = test.setting("MINYAR_TEST_CLANG", test.setting("MINYAR_CLANG", "clang"))
+let environment = system.environment()
+let leaks = "0"
+if name == "Linux" { leaks = "1" }
+environment = arguments.environment(environment, "ASAN_OPTIONS", "detect_leaks=" + leaks + ":halt_on_error=1")
+environment = arguments.environment(environment, "UBSAN_OPTIONS", "halt_on_error=1")
+environment = arguments.environment(environment, "TMPDIR", work)
+let configurations = [["-O0"], ["-O2"]]
+if sanitize { configurations = [["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]] }
+let rootResult = test.run(["pwd", "-P"], system.environment(), "", work + "/root", 10)
+test.require(rootResult, "signals-pty project directory")
+let root = test.lines(rootResult.output)[0]
+let source = root + "/tests/signals-pty-program.min"
+let llvm = work + "/signals-pty-program.ll"
+run([root + "/build/minyarc", source, llvm, "--library", root + "/library"], environment, root, llvm + ".compile", 120)
+if sanitize { io.writeTextFile(llvm, test.instrument(io.readTextFile(llvm))) }
+let expected = "signals-pty: signals and terminals ok\n"
+let checks = 0
+for index in 0..configurations.length {
+    let flags = configurations[index]
+    let executable = work + "/signals-pty-program" + Text(index)
+    let command = [clang]
+    for flag in flags { command.add(flag) }
+    for value in ["-Wno-override-module", "-DMINYAR_SYSTEM_HEAP=1", llvm, root + "/runtime/minyar_default_runtime.c",
+        root + "/runtime/native/files.c", root + "/runtime/native/net.c", root + "/runtime/native/system.c",
+        "-pthread", "-o", executable] { command.add(value) }
+    if name != "Darwin" { command.add("-lm") }
+    run(command, environment, root, executable + ".build", 120)
+    let result = run([executable], environment, work, executable + ".run", 120)
+    test.check(result.output == expected && result.errorOutput == "",
+        "signals and terminal transcript changed: output " + Text(result.output.length) + " error " +
+        Text(result.errorOutput.length) + "\n" + result.output + result.errorOutput)
+    checks += 1
+}
+test.removeTree(work)
+let profile = "native"
+if sanitize { profile = "sanitizer" }
+print(Text(checks) + " signals-pty " + profile + " controls passed")

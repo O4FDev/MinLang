@@ -2084,7 +2084,8 @@ syncers and preparation jobs, child processes and last-error values: a loop or
 syncer handle from another thread is not found, as if it had been closed.
 Sockets and files are operating-system descriptors, so a program can accept a
 connection on one thread and hand its Integer to another, which then owns it.
-Process-wide settings — `system.shutdownSignalSocket`,
+Process-wide settings — `system.signalSocket`,
+`system.shutdownSignalSocket`, `system.readSignal`, `system.signalNumber`,
 `system.drainShutdownSignals`, `system.ignoreBrokenPipes` and resource limits —
 stay on `main`. Closures and function values work on every thread; their bodies
 are checked like the code that can call them.

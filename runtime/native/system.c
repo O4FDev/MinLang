@@ -1,10 +1,10 @@
 /* Process-level services for the `system` package: wall-clock and monotonic time at sub-millisecond resolution,
- * process identity and resident memory, and shutdown signals delivered as socket readiness.
+ * process identity and resident memory, PTY sessions, and signals delivered as socket readiness.
  *
  * Minyar has no signal handling and no wall clock. A server needs both: SIGPIPE must not kill it when a client
- * disconnects mid-write, SIGTERM/SIGINT should trigger an orderly shutdown from inside its event loop, and SQL's
- * CURRENT_TIMESTAMP needs real time. Signal handlers here only call write(2), which is async-signal-safe; the
- * event loop watches the read end of a socketpair like any other socket.
+ * disconnects mid-write, SIGHUP should reload, SIGCHLD should reap, SIGTERM/SIGINT should trigger an orderly
+ * shutdown from inside its event loop, and SQL's CURRENT_TIMESTAMP needs real time. Signal handlers here only call
+ * write(2), which is async-signal-safe; the event loop watches the read end of a socketpair like any other socket.
  *
  * Ported from neo-db's native/dbio.c (2026-10-12). */
 #ifndef _GNU_SOURCE
@@ -112,12 +112,45 @@ long long minyar_system_ignoreBrokenPipes(void) {
     return sigaction(SIGPIPE, &sa, NULL) == 0 ? 0 : -errno;
 }
 
+/* Signals arrive as descriptor readiness. One process-owned socketpair carries the native signal number of every
+ * delivery; handlers call nothing but write(2), which is async-signal-safe. signalSocket subscribes to any subset of
+ * the portable selectors below and returns the read end; shutdownSignalSocket is the TERM/INT subscription servers
+ * already use and returns that same descriptor. A subscription is cumulative and idempotent: the socket and each
+ * handler are installed once per process, so a second call adds signals and returns the same descriptor. */
+enum { SYSTEM_SIGNAL_SELECTORS = 8 };   /* selectors 1..7; index 0 is unused */
+
 static int system_signal_pair[2] = {-1, -1};
-_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "shutdown handlers require lock-free integer atomics");
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "signal handlers require lock-free integer atomics");
 static _Atomic int system_signal_writer = -1;
 static _Atomic unsigned system_signal_readers;
+static unsigned char system_signal_subscribed[SYSTEM_SIGNAL_SELECTORS];
 
-static void system_on_shutdown(int sig) {
+/* Selectors are stable package identifiers, never native signal numbers: SIGHUP is 1 everywhere but SIGUSR1 is 10
+ * on Linux and 30 on macOS. */
+static int system_signal_number(int selector) {
+    switch (selector) {
+    case 1: return SIGHUP;
+    case 2: return SIGINT;
+    case 3: return SIGUSR1;
+    case 4: return SIGUSR2;
+    case 5: return SIGCHLD;
+    case 6: return SIGWINCH;
+    case 7: return SIGTERM;
+    default: return 0;
+    }
+}
+static int system_signal_selector(int number) {
+    for (int selector = 1; selector < SYSTEM_SIGNAL_SELECTORS; selector++)
+        if (system_signal_number(selector) == number) return selector;
+    return 0;
+}
+static uint64_t system_signal_u64(const unsigned char *bytes) {
+    uint64_t value = 0;
+    for (unsigned at = 0; at < 8; at++) value |= (uint64_t)bytes[at] << (at * 8);
+    return value;
+}
+
+static void system_on_signal(int sig) {
     int saved = errno;
     unsigned char byte = (unsigned char)sig;
     atomic_fetch_add(&system_signal_readers, 1);
@@ -130,68 +163,103 @@ static void system_on_shutdown(int sig) {
     errno = saved;
 }
 
-/* Install SIGTERM/SIGINT handlers and return a socket that becomes readable when one arrives (idempotent). */
-long long minyar_system_shutdownSignalSocket(void) {
+/* The notification socket, created once. It is non-blocking and close-on-exec, and it outlives every subscription. */
+static int system_signal_socket(void) {
     if (system_signal_pair[0] >= 0) return system_signal_pair[0];
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -errno;
-    int error;
-    for (int i = 0; i < 2; i++) {
-        int flags = fcntl(sv[i], F_GETFD);
-        if (flags < 0 || fcntl(sv[i], F_SETFD, flags | FD_CLOEXEC) < 0) goto fail_descriptors;
-        flags = fcntl(sv[i], F_GETFL);
-        if (flags < 0 || fcntl(sv[i], F_SETFL, flags | O_NONBLOCK) < 0) goto fail_descriptors;
+    int error = 0;
+    for (int at = 0; at < 2; at++) {
+        int flags = fcntl(sv[at], F_GETFD);
+        if (flags < 0 || fcntl(sv[at], F_SETFD, flags | FD_CLOEXEC) < 0) { error = errno; break; }
+        flags = fcntl(sv[at], F_GETFL);
+        if (flags < 0 || fcntl(sv[at], F_SETFL, flags | O_NONBLOCK) < 0) { error = errno; break; }
     }
-    sigset_t blocked, previous_mask;
-    sigemptyset(&blocked);
-    sigaddset(&blocked, SIGTERM); sigaddset(&blocked, SIGINT); sigaddset(&blocked, SIGPIPE);
-    if (sigprocmask(SIG_BLOCK, &blocked, &previous_mask) != 0) goto fail_descriptors;
-    struct sigaction old_term, old_int, old_pipe;
-    bool installed_term = false, installed_int = false, installed_pipe = false;
-    if (sigaction(SIGTERM, NULL, &old_term) != 0 || sigaction(SIGINT, NULL, &old_int) != 0 ||
-        sigaction(SIGPIPE, NULL, &old_pipe) != 0) goto fail_handlers;
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = system_on_shutdown;
-    sa.sa_flags = SA_RESTART;
-    sigemptyset(&sa.sa_mask);
-    if (sigaction(SIGTERM, &sa, NULL) != 0) goto fail_handlers;
-    installed_term = true;
-    if (sigaction(SIGINT, &sa, NULL) != 0) goto fail_handlers;
-    installed_int = true;
-    long long pipe_status = minyar_system_ignoreBrokenPipes();
-    if (pipe_status) { errno = (int)-pipe_status; goto fail_handlers; }
-    installed_pipe = true;
-    /* The handler sees no endpoint until every installation step succeeds.
-     * Failed transactions leave the writer unpublished throughout rollback. */
+    if (error) { close(sv[0]); close(sv[1]); return -error; }
     system_signal_pair[0] = sv[0];
     system_signal_pair[1] = sv[1];
     atomic_store(&system_signal_writer, sv[1]);
-    if (sigprocmask(SIG_SETMASK, &previous_mask, NULL) != 0) {
-        atomic_store(&system_signal_writer, -1);
-        system_signal_pair[0] = system_signal_pair[1] = -1;
-        goto fail_handlers;
-    }
-    return system_signal_pair[0];
-fail_handlers:
-    error = errno;
-    if (installed_pipe) sigaction(SIGPIPE, &old_pipe, NULL);
-    if (installed_int) sigaction(SIGINT, &old_int, NULL);
-    if (installed_term) sigaction(SIGTERM, &old_term, NULL);
-    /* A handler may run on an existing native syncer thread while this owner
-     * is masked. Invalidate first, then let its nonblocking write finish
-     * before closing an endpoint that another allocation could reuse. */
-    while (atomic_load(&system_signal_readers)) sched_yield();
-    close(sv[0]); close(sv[1]);
-    sigprocmask(SIG_SETMASK, &previous_mask, NULL);
-    return -error;
-fail_descriptors:
-    error = errno;
-    close(sv[0]); close(sv[1]);
-    return -error;
+    return sv[0];
 }
 
-/* Read every pending signal byte; returns the last signal number received (15 SIGTERM, 2 SIGINT) or 0. */
+/* Install one selector's handler with its signal blocked, so it cannot run before the writer is published. */
+static int system_subscribe_signal(int selector) {
+    int number = system_signal_number(selector);
+    if (!number) return EINVAL;
+    if (system_signal_subscribed[selector]) return 0;
+    sigset_t blocked, previous;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, number);
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous) != 0) return errno;
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = system_on_signal;
+    action.sa_flags = SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    int error = sigaction(number, &action, NULL) == 0 ? 0 : errno;
+    if (!error) system_signal_subscribed[selector] = 1;
+    if (sigprocmask(SIG_SETMASK, &previous, NULL) != 0 && !error) error = errno;
+    return error;
+}
+
+/* Validate every selector before installing any, so a rejected call installs nothing. */
+static long long system_signal_subscribe(const long long *selectors, size_t count) {
+    system_error = 0;
+    int descriptor = system_signal_socket();
+    if (descriptor < 0) return system_failure(-descriptor);
+    for (size_t at = 0; at < count; at++) {
+        int error = system_subscribe_signal((int)selectors[at]);
+        if (error) return system_failure(error);
+    }
+    return descriptor;
+}
+
+/* Subscribe to the portable selectors packed as little-endian u64 and return the socket that becomes readable. */
+long long minyar_system_signalSocketNative(const MinyarBytes *signals) {
+    if (!system_valid_buffer(signals) || signals->byte_length % 8) return system_failure(EINVAL);
+    size_t count = (size_t)signals->byte_length / 8;
+    if (count > SYSTEM_SIGNAL_SELECTORS - 1) return system_failure(EINVAL);
+    long long selectors[SYSTEM_SIGNAL_SELECTORS - 1];
+    for (size_t at = 0; at < count; at++) {
+        uint64_t value = system_signal_u64(signals->bytes + at * 8);
+        if (value < 1 || value >= SYSTEM_SIGNAL_SELECTORS || !system_signal_number((int)value))
+            return system_failure(EINVAL);
+        selectors[at] = (long long)value;
+    }
+    return system_signal_subscribe(selectors, count);
+}
+
+/* SIGTERM/SIGINT as readiness, ignoring SIGPIPE (idempotent; returns the shared notification socket). */
+long long minyar_system_shutdownSignalSocket(void) {
+    static const long long signals[] = {7, 2};
+    long long descriptor = system_signal_subscribe(signals, 2);
+    if (descriptor < 0) return descriptor;
+    long long pipe_status = minyar_system_ignoreBrokenPipes();
+    if (pipe_status) return pipe_status;
+    return descriptor;
+}
+
+/* The next delivered signal's selector (1..7), 0 when none is pending, or -errno. */
+long long minyar_system_readSignal(long long handle) {
+    if (system_signal_pair[0] < 0 || handle != system_signal_pair[0]) return -EBADF;
+    unsigned char byte = 0;
+    for (;;) {
+        ssize_t n = read(system_signal_pair[0], &byte, 1);
+        if (n == 1) return system_signal_selector(byte);
+        if (n == 0) return 0;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+        return -errno;
+    }
+}
+
+/* The native signal number for a selector, for sendSignal and for raising one from a test. */
+long long minyar_system_signalNumber(long long selector) {
+    int number = selector > 0 && selector < SYSTEM_SIGNAL_SELECTORS ? system_signal_number((int)selector) : 0;
+    return number ? number : system_failure(EINVAL);
+}
+
+/* Read every pending signal byte; returns the last native signal number received (15 SIGTERM, 2 SIGINT) or 0. */
 long long minyar_system_drainShutdownSignals(void) {
     if (system_signal_pair[0] < 0) return 0;
     unsigned char buf[64];
@@ -335,4 +403,5 @@ long long minyar_system_setResourceLimit(long long resource, long long soft, lon
 }
 #endif
 
+#include "system_terminal.h"
 #include "system_process.h"

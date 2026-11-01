@@ -1,0 +1,145 @@
+// Signal subscriptions and PTY sessions through the `system` package. The driver (tests/signals-pty.min) builds this
+// program and compares its transcript; nothing here depends on the host's signal numbering.
+use "system" as system
+use "files" as files
+use "eventloop" as loop
+use "errors" as errors
+use "text" as utf8
+
+function check(condition: Boolean, what: Text) {
+    if !condition { fail("signals-pty: " + what) }
+}
+
+function seconds(count: Integer): Integer { return count * 1000000000 }
+
+// The next delivered selector, waiting on the loop's notification socket until the deadline.
+function nextSignal(handle: Integer, reactor: Integer, timeout: Integer): Integer {
+    let deadline = system.monotonicNanoseconds() + timeout
+    while true {
+        let delivered = system.readSignal(handle)
+        if delivered != 0 { return delivered }
+        if system.monotonicNanoseconds() >= deadline { return 0 }
+        loop.wait(reactor, 20, 4)
+    }
+    return 0
+}
+
+// Read terminal output until `expected` appears, the session ends, or the deadline passes.
+function readTerminal(controller: Integer, reactor: Integer, expected: Text, timeout: Integer): Text {
+    let buffer = Bytes(0)
+    let chunk = 65536
+    let received = ""
+    let deadline = system.monotonicNanoseconds() + timeout
+    while true {
+        let count = system.readTerminal(controller, buffer, chunk)
+        if count > 0 {
+            received += utf8.decodeOrStop(buffer)
+            buffer.resize(0)
+            if received.contains(expected) { return received }
+        } else if count < 0 && count != -11 && count != -35 {
+            return received    // -EIO on Linux: the child closed the terminal
+        }
+        if system.monotonicNanoseconds() >= deadline { return received }
+        loop.wait(reactor, 20, 4)
+    }
+    return received
+}
+
+let selectors = [system.SIGNAL_HANGUP, system.SIGNAL_INTERRUPT, system.SIGNAL_USER_ONE, system.SIGNAL_USER_TWO,
+    system.SIGNAL_CHILD, system.SIGNAL_WINDOW_CHANGE, system.SIGNAL_TERMINATE]
+let names = ["hangup", "interrupt", "user one", "user two", "child", "window change", "terminate"]
+for index in 0..selectors.length {
+    check(system.signalNumber(selectors[index]) > 0, "native number for " + names[index])
+}
+check(system.signalNumber(0) == -22 && system.signalNumber(8) == -22, "unknown selector is rejected")
+
+// Subscribing delivers every selector the caller names, in delivery order, from one process-owned socket.
+let handle = system.signalSocket(selectors)
+check(handle >= 2, "signalSocket")
+check(system.shutdownSignalSocket() == handle, "shutdownSignalSocket shares the signal socket")
+check(system.signalSocket([system.SIGNAL_USER_ONE]) == handle, "a later subscription reuses the socket")
+check(system.signalSocket([9]) == -22 && system.signalSocket([0]) == -22, "unknown selector installs nothing")
+check(system.readSignal(handle) == 0, "nothing pending")
+check(system.readSignal(handle + 1000) == -9, "a foreign handle is rejected")
+let process = system.processId()
+for index in 0..selectors.length {
+    check(system.sendSignal(process, system.signalNumber(selectors[index])) == 0, "raising " + names[index])
+}
+for index in 0..selectors.length {
+    check(system.readSignal(handle) == selectors[index], "delivery order at " + names[index])
+}
+check(system.readSignal(handle) == 0, "the socket drains")
+
+// The same socket is an ordinary eventloop descriptor.
+let reactor = errors.integerValue(loop.create())
+check(reactor > 0, "loop create")
+let watch = errors.integerValue(loop.watch(reactor, handle, loop.readableInterest(), 73))
+check(watch > 0, "watch the signal socket")
+check(system.sendSignal(process, system.signalNumber(system.SIGNAL_USER_TWO)) == 0, "raise user two")
+let batch = loop.wait(reactor, 5000, 8)
+check(!errors.isError(loop.batchError(batch)), "loop error")
+let readable = false
+for event in loop.events(batch) {
+    if loop.isReadable(event) && event.token == 73 { readable = true }
+}
+check(readable, "a signal wakes the loop")
+check(system.readSignal(handle) == system.SIGNAL_USER_TWO, "user two through the loop")
+check(errors.booleanValue(loop.remove(reactor, watch)), "remove the signal watch")
+
+// The pre-existing shutdown path keeps working on the shared socket: readSignal returns selectors, and
+// drainShutdownSignals still reports the native number.
+check(system.sendSignal(process, system.signalNumber(system.SIGNAL_TERMINATE)) == 0, "raise terminate")
+check(nextSignal(handle, reactor, seconds(5)) == system.SIGNAL_TERMINATE, "terminate is delivered")
+check(system.drainShutdownSignals() == 0, "readSignal leaves nothing for the drain")
+check(system.sendSignal(process, system.signalNumber(system.SIGNAL_INTERRUPT)) == 0, "raise interrupt")
+check(system.drainShutdownSignals() == system.signalNumber(system.SIGNAL_INTERRUPT), "drain reports SIGINT")
+
+// A child's exit arrives as SIGCHLD and its handle still reaps normally.
+let child = system.spawn("/bin/sh", ["sh", "-c", "exit 0"], system.environment(), "")
+check(child > 0, "spawn a child")
+check(nextSignal(handle, reactor, seconds(20)) == system.SIGNAL_CHILD, "the child's exit is delivered")
+let status = system.wait(child)
+check(status.state == system.EXITED && status.exitCode == 0 && status.error == 0, "the child is reaped")
+
+// A PTY: resize before spawning, so the child's own first query sees the size.
+let pty = system.openPty()
+check(pty.controller >= 3, "openPty controller")
+check(pty.terminal.startsWith("/dev/"), "openPty terminal path")
+check(system.resizeTerminal(pty.controller, 40, 100) == 0, "resize before spawn")
+check(system.resizeTerminal(pty.controller, 0, 100) == -22, "zero rows rejected")
+check(system.resizeTerminal(pty.controller, 40, 65536) == -22, "too many columns rejected")
+let shell = system.spawnOnTerminal("/bin/sh", ["sh", "-c", "stty size; echo ok"], system.environment(), "", pty)
+check(shell > 0, "spawn on the terminal")
+let session = readTerminal(pty.controller, reactor, "ok", seconds(20))
+
+check(session == "40 100\r\nok\r\n", "the child sees the resized terminal: " + session)
+let shellStatus = system.wait(shell)
+check(shellStatus.state == system.EXITED && shellStatus.exitCode == 0 && shellStatus.error == 0, "the shell exits")
+// The session ends once the child is gone: the controller reports the end of the terminal.
+let drain = Bytes(0)
+let drainLimit = 65536
+let ended = false
+let deadline = system.monotonicNanoseconds() + seconds(10)
+while !ended && system.monotonicNanoseconds() < deadline {
+    let count = system.readTerminal(pty.controller, drain, drainLimit)
+    if count > 0 { drain.resize(0) }
+    else if count < 0 && (count == -11 || count == -35) { loop.wait(reactor, 20, 4) }
+    else { ended = true }
+}
+check(ended, "the terminal session ends with the child")
+check(files.close(pty.controller) == 0, "close the controller")
+
+// Writing to the terminal, readiness through the loop, and the kernel's own echo.
+let second = system.openPty()
+check(second.controller >= 3, "second openPty controller")
+let cat = system.spawnOnTerminal("/bin/sh", ["sh", "-c", "cat"], system.environment(), "", second)
+check(cat > 0, "spawn cat on the terminal")
+let ping = Bytes("ping\n")
+check(system.writeTerminal(second.controller, ping, 0, ping.length) == 5, "write to the terminal")
+let echoed = readTerminal(second.controller, reactor, "ping\r\nping\r\n", seconds(20))
+check(echoed == "ping\r\nping\r\n", "the terminal echoes and cat answers: " + echoed)
+check(files.close(second.controller) == 0, "close the second controller")
+let catStatus = system.wait(cat)
+check(catStatus.error == 0, "the cat session ends")
+
+print("signals-pty: signals and terminals ok")

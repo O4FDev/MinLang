@@ -291,11 +291,20 @@ static int system_apple_credentials(posix_spawnattr_t *attributes, long long uid
 }
 #endif
 static int system_posix_spawn(SystemProcess *process, const char *path, char **argv, char **envp,
-                              const char *cwd, long long uid, long long gid, gid_t *groups, size_t count, bool credentials, bool session) {
+                              const char *cwd, long long uid, long long gid, gid_t *groups, size_t count, bool credentials, bool session,
+                              long long terminal) {
+    /* A terminal child redirects through spawn file actions, which the Linux
+     * clone-vfork path does not have. */
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
-    if (credentials) return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, true, session);
+    if (credentials) {
+        if (terminal >= 0) return ENOTSUP;
+        return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, true, session);
+    }
 #ifndef POSIX_SPAWN_SETSID
-    if (session) return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, false, true);
+    if (session) {
+        if (terminal >= 0) return ENOTSUP;
+        return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, false, true);
+    }
 #endif
 #elif !defined(__APPLE__)
     if (credentials) return ENOTSUP;
@@ -308,8 +317,23 @@ static int system_posix_spawn(SystemProcess *process, const char *path, char **a
     if (error) return error;
     bool actions_ready = false;
     sigset_t mask, defaults;
+    char terminal_path[SYSTEM_TERMINAL_PATH];
+    bool have_terminal_path = false;
+    if (terminal >= 0) {
+        if (!system_terminal_path((int)terminal, terminal_path, sizeof(terminal_path))) {
+            posix_spawnattr_destroy(&attributes);
+            return errno ? errno : ENODEV;
+        }
+        have_terminal_path = true;
+    }
     error = pthread_sigmask(SIG_SETMASK, NULL, &mask);
     sigemptyset(&defaults); sigaddset(&defaults, SIGPIPE);
+    if (have_terminal_path) {
+        /* Interactive children expect these at their default dispositions. */
+        const int terminal_signals[] = {SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGCHLD, SIGTSTP, SIGTTIN, SIGTTOU, SIGWINCH};
+        for (size_t at = 0; at < sizeof(terminal_signals) / sizeof(terminal_signals[0]); at++)
+            sigaddset(&defaults, terminal_signals[at]);
+    }
     if (!error) sigdelset(&mask, SIGPIPE);
     if (!error) error = posix_spawnattr_setsigdefault(&attributes, &defaults);
     if (!error) error = posix_spawnattr_setsigmask(&attributes, &mask);
@@ -342,11 +366,16 @@ static int system_posix_spawn(SystemProcess *process, const char *path, char **a
         error = ENOTSUP;
 #endif
     }
+    /* Spawn attributes run before file actions: after setsid, opening the
+     * terminal without O_NOCTTY makes it the child's controlling tty. */
+    if (!error && have_terminal_path) error = posix_spawn_file_actions_addopen(&actions, 0, terminal_path, O_RDWR, 0);
+    if (!error && have_terminal_path) error = posix_spawn_file_actions_adddup2(&actions, 0, 1);
+    if (!error && have_terminal_path) error = posix_spawn_file_actions_adddup2(&actions, 0, 2);
     if (!error) error = posix_spawn(&process->pid, path, &actions, &attributes, argv, envp);
     if (actions_ready) posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attributes);
 #if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
-    if (error == ENOTSUP && *cwd) return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, false, session);
+    if (error == ENOTSUP && *cwd && !have_terminal_path) return system_clone_spawn(process, path, argv, envp, cwd, uid, gid, groups, count, false, session);
 #endif
     return error;
 }
@@ -356,7 +385,7 @@ static int system_posix_spawn(SystemProcess *process, const char *path, char **a
 
 static long long system_spawn(const MinyarText *path, const MinyarBytes *arguments,
     const MinyarBytes *environment, const MinyarText *cwd, long long uid, long long gid,
-    const MinyarBytes *group_bytes, bool credentials, bool session) {
+    const MinyarBytes *group_bytes, bool credentials, bool session, long long terminal) {
     system_error = 0;
     if (uid < -1 || gid < -1 || uid >= UINT32_MAX || gid >= UINT32_MAX ||
         (!credentials && (uid != -1 || gid != -1)) || !system_valid_buffer(group_bytes) || group_bytes->byte_length % 8)
@@ -381,7 +410,7 @@ static long long system_spawn(const MinyarText *path, const MinyarBytes *argumen
         if (atexit(system_process_cleanup)) { atomic_store(&system_process_cleanup_installed, false); system_error = ENOMEM; goto failed; }
     }
 #ifdef _WIN32
-    system_error = credentials || session ? ENOTSUP : system_windows_spawn(process, executable, &argv, &envp, working);
+    system_error = credentials || session || terminal >= 0 ? ENOTSUP : system_windows_spawn(process, executable, &argv, &envp, working);
 #else
     if (credentials) {
         long maximum = sysconf(_SC_NGROUPS_MAX);
@@ -396,7 +425,7 @@ static long long system_spawn(const MinyarText *path, const MinyarBytes *argumen
             system_error = EINVAL; goto failed;
         }
     }
-    system_error = system_posix_spawn(process, executable, argv.values, envp.values, working, uid, gid, groups, count, credentials, session);
+    system_error = system_posix_spawn(process, executable, argv.values, envp.values, working, uid, gid, groups, count, credentials, session, terminal);
 #endif
 failed:
     free(executable); free(working); system_vector_clear(&argv); system_vector_clear(&envp);
@@ -411,11 +440,32 @@ failed:
 long long minyar_system_spawnNative(const MinyarText *path, const MinyarBytes *arguments,
     const MinyarBytes *environment, const MinyarText *cwd, long long uid, long long gid,
     const MinyarBytes *group_bytes, bool credentials) {
-    return system_spawn(path, arguments, environment, cwd, uid, gid, group_bytes, credentials, false);
+    return system_spawn(path, arguments, environment, cwd, uid, gid, group_bytes, credentials, false, -1);
 }
 
 long long minyar_system_spawnSessionNative(const MinyarText *path, const MinyarBytes *arguments,
     const MinyarBytes *environment, const MinyarText *cwd) {
     static const MinyarBytes groups = {(const unsigned char *)"", 0, 0, NULL, NULL};
-    return system_spawn(path, arguments, environment, cwd, -1, -1, &groups, false, true);
+    return system_spawn(path, arguments, environment, cwd, -1, -1, &groups, false, true, -1);
+}
+
+/* Spawn on the terminal `controller` owns: the child gets a new session and that terminal as its controlling tty,
+ * so job control, terminal signals and window-size changes reach it. The handle belongs to the process registry,
+ * so system.wait, system.poll and system.childProcessId accept it. */
+long long minyar_system_spawnOnTerminalNative(const MinyarText *path, const MinyarBytes *arguments,
+    const MinyarBytes *environment, const MinyarText *cwd, long long controller) {
+#ifndef _WIN32
+    static const MinyarBytes groups = {(const unsigned char *)"", 0, 0, NULL, NULL};
+    char terminal_path[SYSTEM_TERMINAL_PATH];
+    if (controller < 0 || controller > INT_MAX) return system_failure(EBADF);
+    if (!system_terminal_path((int)controller, terminal_path, sizeof(terminal_path)))
+        return system_failure(ENOTTY);
+    int guard = system_terminal_guard((int)controller);
+    long long handle = system_spawn(path, arguments, environment, cwd, -1, -1, &groups, false, true, controller);
+    if (guard >= 0) close(guard);
+    return handle;
+#else
+    (void)path; (void)arguments; (void)environment; (void)cwd; (void)controller;
+    return system_failure(ENOTSUP);
+#endif
 }
