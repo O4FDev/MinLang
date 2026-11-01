@@ -97,6 +97,13 @@ enum { TEXT_SEARCH_SMALL = 32, TEXT_SEARCH_SHORT = 16 };
 static MINYAR_COLD long long *text_search_table_build(const MinyarText *needle,
                                                       long long small[TEXT_SEARCH_SMALL]) {
     long long length = needle->byte_length;
+#if defined(__linux__) && defined(MINYAR_COMPILER_ARENA)
+    /* text_search_next searches these with the C library's memmem, which
+     * needs no table; building one for every search of an IR line was the
+     * larger half of a self-compile's Text search time. */
+    (void)small;
+    return NULL;
+#else
     if ((unsigned long long)length > SIZE_MAX / sizeof(long long))
         minyar_stop("the Text search pattern is too large.");
     long long *table = small;
@@ -118,20 +125,13 @@ static MINYAR_COLD long long *text_search_table_build(const MinyarText *needle,
         table[i] = matched;
     }
     return table;
+#endif
 }
 static inline long long *text_search_table(const MinyarText *needle, long long available,
                                            long long small[TEXT_SEARCH_SMALL]) {
     long long length = needle->byte_length;
     if (length <= TEXT_SEARCH_SHORT || length > available) return NULL;
-#if defined(__linux__) && defined(MINYAR_COMPILER_ARENA)
-    /* text_search_next searches these with the C library's memmem, which
-     * needs no table; building one for every search of an IR line was the
-     * larger half of a self-compile's Text search time. */
-    (void)small;
-    return NULL;
-#else
     return text_search_table_build(needle, small);
-#endif
 }
 static inline void text_search_free(long long *table, const long long *small) {
     if (!table || table == small)

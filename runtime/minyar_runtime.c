@@ -1432,21 +1432,23 @@ static MinyarText *text_slice_bytes(MinyarText *text, long long first_byte, long
     {
         long long length = last_byte - first_byte;
         MinyarText *root = text->backing ? text->backing : text;
-#if MINYAR_THREADED
-        _Bool shared = text_backing_shared(text);
-#else
-        _Bool shared = 0;
-#endif
         /* A full slice is the same immutable value. For a tiny portion of a
          * large allocation, copy so a short-lived token cannot retain the
          * whole source; otherwise use a zero-copy view. A view of shared
-         * frozen storage has no owning Text to measure, so it keeps sharing. */
+         * frozen storage has no owning Text to measure, so it keeps sharing:
+         * that read runs after the size test, which only a large source and a
+         * small piece pass. */
         if (first_byte == 0 && length == text->byte_length) {
             minyar_rc_retain(text);
             return text;
         }
-        if (!shared && root->byte_length > 4096 &&
-            (unsigned long long)length * 8 < (unsigned long long)root->byte_length) {
+        _Bool tiny = root->byte_length > 4096 &&
+                     (unsigned long long)length * 8 < (unsigned long long)root->byte_length;
+#if MINYAR_THREADED
+        if (tiny && !text_backing_shared(text)) {
+#else
+        if (tiny) {
+#endif
             MinyarText *copy = new_text_storage(length, length == characters ? characters : -1);
             unsigned char *bytes = (unsigned char *)copy->bytes;
             copy_bytes(bytes, text->bytes + first_byte, (size_t)length);
