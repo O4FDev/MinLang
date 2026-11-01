@@ -1,0 +1,124 @@
+use "errors" as errors
+use "time" as time
+use "../tools/testing.min" as test
+
+// SYS-5: UTC calendar arithmetic, RFC 9110 IMF-fixdate, ISO 8601 formatting and
+// parsing, against the epoch, leap days, the 32-bit boundary, the last
+// representable date and negative times.
+
+function accepted(result: Result<Integer, errors.Error>, what: Text): Integer {
+    match result {
+        Ok(seconds) { return seconds }
+        Err(problem) { fail(what + ": " + errors.describe(problem)) }
+    }
+}
+
+function refused(result: Result<Integer, errors.Error>): Boolean {
+    match result {
+        Ok(seconds) { return false }
+        Err(problem) { return errors.code(problem) == errors.invalidDataCode() }
+    }
+}
+
+// ------------------------------------------------------------- civil fields
+
+let epoch = time.civilFromSeconds(0)
+test.check(epoch.year == 1970 && epoch.month == 1 && epoch.day == 1, "the epoch is 1970-01-01")
+test.check(epoch.hour == 0 && epoch.minute == 0 && epoch.second == 0, "the epoch is midnight")
+test.check(epoch.weekday == time.THURSDAY, "1970-01-01 was a Thursday")
+test.check(epoch.microsecond == 0, "whole seconds have no fraction")
+
+let leap = time.civilFromSeconds(951782400)
+test.check(leap.year == 2000 && leap.month == 2 && leap.day == 29, "2000-02-29 exists")
+let tuesday = time.civilFromSeconds(1709164800)
+test.check(tuesday.year == 2024 && tuesday.month == 2 && tuesday.day == 29, "2024-02-29 exists")
+test.check(tuesday.weekday == time.THURSDAY, "2024-02-29 was a Thursday")
+// 1900 is not a leap year and 2000 is: the 400-year rule, not the 4-year rule.
+let century = time.civilFromSeconds(-2203891200)
+test.check(century.year == 1900 && century.month == 3 && century.day == 1, "1900-03-01 is a day after February")
+let yearOne = time.civilFromSeconds(-62135596800)
+test.check(yearOne.year == 1 && yearOne.month == 1 && yearOne.day == 1, "year 1 is representable")
+let millisecond = time.civilFromMicroseconds(-1000000)
+test.check(millisecond.year == 1969 && millisecond.second == 59 && millisecond.microsecond == 0,
+    "a negative microsecond time floors into the previous second")
+let fraction = time.civilFromMicroseconds(1234567)
+test.check(fraction.second == 1 && fraction.microsecond == 234567, "the sub-second part fills microsecond")
+
+// --------------------------------------------------------------- back to epoch
+
+test.check(time.secondsFromCivil(epoch) == 0, "the epoch round trips")
+for seconds in [0, 1, -1, 951782400, 2147483648, 253402300799, -62135596800, 1234567890, -2203891200] {
+    test.check(time.secondsFromCivil(time.civilFromSeconds(seconds)) == seconds,
+        "seconds round trip: " + Text(seconds))
+    let micro = seconds * 1000000 + 123456
+    test.check(time.microsecondsFromCivil(time.civilFromMicroseconds(micro)) == micro,
+        "microseconds round trip: " + Text(micro))
+}
+
+// ------------------------------------------------------------- HTTP dates
+
+test.check(time.formatHttpDate(784111777) == "Sun, 06 Nov 1994 08:49:37 GMT", "the RFC 9110 example date")
+test.check(time.formatHttpDate(0) == "Thu, 01 Jan 1970 00:00:00 GMT", "the epoch as IMF-fixdate")
+test.check(time.formatHttpDate(2147483648) == "Tue, 19 Jan 2038 03:14:08 GMT", "the 32-bit boundary as IMF-fixdate")
+test.check(time.formatHttpDate(253402300799) == "Fri, 31 Dec 9999 23:59:59 GMT", "the last IMF-fixdate")
+test.check(time.formatHttpDate(-1) == "Wed, 31 Dec 1969 23:59:59 GMT", "a time one second before the epoch")
+test.check(time.formatHttpDate(1234567890) == "Fri, 13 Feb 2009 23:31:30 GMT", "a Friday the thirteenth")
+
+// ------------------------------------------------------------- ISO 8601 out
+
+test.check(time.formatIso8601(0) == "1970-01-01T00:00:00Z", "the epoch as ISO 8601")
+test.check(time.formatIso8601(784111777) == "1994-11-06T08:49:37Z", "1994-11-06 as ISO 8601")
+test.check(time.formatIso8601(-1) == "1969-12-31T23:59:59Z", "a negative time as ISO 8601")
+test.check(time.formatIso8601(253402300799) == "9999-12-31T23:59:59Z", "the last ISO 8601 second")
+test.check(time.formatIso8601Milliseconds(784111777000000) == "1994-11-06T08:49:37.000Z",
+    "milliseconds keep three digits")
+test.check(time.formatIso8601Milliseconds(784111777123456) == "1994-11-06T08:49:37.123Z",
+    "sub-millisecond digits are dropped")
+test.check(time.formatIso8601Microseconds(784111777123456) == "1994-11-06T08:49:37.123456Z",
+    "microseconds keep six digits")
+test.check(time.formatIso8601Microseconds(784111777000001) == "1994-11-06T08:49:37.000001Z",
+    "a single microsecond is written")
+
+// -------------------------------------------------------------- ISO 8601 in
+
+test.check(accepted(time.parseIso8601("1994-11-06T08:49:37Z"), "parsing the RFC example") == 784111777,
+    "a Z date parses to the epoch second")
+test.check(accepted(time.parseIso8601("1970-01-01T00:00:00Z"), "parsing the epoch") == 0, "the epoch parses")
+test.check(accepted(time.parseIso8601("1969-12-31T23:59:59Z"), "parsing a pre-epoch second") == -1,
+    "a pre-epoch date parses")
+test.check(accepted(time.parseIso8601("9999-12-31T23:59:59Z"), "parsing the last date") == 253402300799,
+    "the last date parses")
+test.check(accepted(time.parseIso8601("1994-11-06T09:49:37+01:00"), "parsing an offset") == 784111777,
+    "a positive offset is applied")
+test.check(accepted(time.parseIso8601("1994-11-06T03:49:37-05:00"), "parsing a negative offset") == 784111777,
+    "a negative offset is applied")
+test.check(accepted(time.parseIso8601("1994-11-06T08:49:37.123456Z"), "parsing a fraction") == 784111777,
+    "the seconds form drops the fraction")
+test.check(accepted(time.parseIso8601("1994-11-06t08:49:37z"), "parsing lowercase") == 784111777,
+    "lowercase t and z are accepted")
+test.check(accepted(time.parseIso8601("1994-11-06 08:49:37Z"), "parsing a space separator") == 784111777,
+    "a space may stand in for T")
+test.check(accepted(time.parseIso8601Microseconds("1994-11-06T08:49:37.123456Z"), "parsing microseconds") ==
+    784111777123456, "the microseconds form keeps the fraction")
+test.check(time.formatIso8601Microseconds(accepted(time.parseIso8601Microseconds(
+    "1994-11-06T09:49:37.123456+01:00"), "round trip through an offset")) == "1994-11-06T08:49:37.123456Z",
+    "a parsed offset date formats back to UTC")
+
+for rejected in ["", "1994-11-06", "1994-11-06T08:49", "1994-11-06T08:49:37", "1994-13-01T00:00:00Z",
+    "1994-02-30T00:00:00Z", "1994-11-06T24:00:00Z", "1994-11-06T08:60:00Z", "1994-11-06T08:49:60Z",
+    "1994-11-06T08:49:37.Z", "1994-11-06T08:49:37+0100", "1994-11-06T08:49:37+24:00",
+    "0000-01-01T00:00:00Z", " 1994-11-06T08:49:37Z", "1994-11-06T08:49:37ZZ", "1994-11-06T08:49:37Z "] {
+    test.check(refused(time.parseIso8601(rejected)), "ISO 8601 rejects '" + rejected + "'")
+}
+
+// Round trips through every form.
+for seconds in [0, 1, -1, 1234567890, 951782400, 253402300799, -62135596800] {
+    test.check(accepted(time.parseIso8601(time.formatIso8601(seconds)), "round trip " + Text(seconds)) == seconds,
+        "ISO 8601 seconds round trip: " + Text(seconds))
+    let micro = seconds * 1000000 + 987654
+    test.check(accepted(time.parseIso8601Microseconds(time.formatIso8601Microseconds(micro)),
+        "microsecond round trip " + Text(micro)) == micro,
+        "ISO 8601 microseconds round trip: " + Text(micro))
+}
+
+print("UTC calendar, HTTP dates and ISO 8601 dates passed")

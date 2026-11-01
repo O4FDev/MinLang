@@ -190,6 +190,12 @@ public function prepareStop(handle: Integer): Integer { native "files" }
 public function removeDirectory(path: Text): Integer { native "files" }
 public function link(existing: Text, created: Text): Integer { native "files" }   // hard link; same file system
 function pathStatus(path: Text): Bytes { native "files" }
+function lockNative(file: Integer, exclusive: Boolean, wait: Boolean): Integer { native "files" }
+function unlockNative(file: Integer): Integer { native "files" }
+function realPathNative(path: Text): Text { native "files" }
+function canonicalPathNative(path: Text): Text { native "files" }
+function identityNative(path: Text): Bytes { native "files" }
+function temporaryDirectoryNative(prefix: Text): Text { native "files" }
 
 /// The kinds `status` reports. Symbolic links are followed, so a link reports
 /// the kind of the file it names.
@@ -305,3 +311,187 @@ public function preparationDone(handle: Integer): Result<Boolean, errors.Error> 
 public function drainPreparation(handle: Integer): Result<Integer, errors.Error> { return countResult(prepareDrain(handle), "draining file preparation") }
 public function waitForPreparation(handle: Integer, timeoutMs: Integer): Result<Nothing, errors.Error> { return statusResult(prepareWait(handle, timeoutMs), "waiting for file preparation") }
 public function stopPreparation(handle: Integer): Result<Nothing, errors.Error> { return statusResult(prepareStop(handle), "stopping file preparation") }
+
+// ---------------------------------------------------------------- advisory locks
+
+/// Take a whole-file advisory lock on an open descriptor.
+/// `exclusive` takes a write lock and `false` a shared read lock. With `wait`
+/// the call sleeps until the lock is granted; without it a lock held elsewhere
+/// fails at once with `errors.wouldBlockCode()`. Locks belong to the open file
+/// description, so two separate opens of one file conflict even inside one
+/// program, and closing any descriptor for the description drops its lock. On
+/// failure the returned error carries the `-errno` as its native code.
+///
+/// ```minyar
+/// let first = api.open("lock.txt", api.WRITE | api.CREATE | api.TRUNCATE)
+/// let second = api.open("lock.txt", api.READ)
+/// match api.lock(first, true, false) {
+///     Ok() { print("locked") }
+///     Err(problem) { print("busy") }
+/// }
+/// match api.lock(second, true, false) {
+///     Ok() { print("locked again") }
+///     Err(problem) { print("busy") }
+/// }
+/// api.close(first)
+/// match api.lock(second, true, false) {
+///     Ok() { print("free after close") }
+///     Err(problem) { print("busy") }
+/// }
+/// api.close(second)
+/// ```
+/// ```output
+/// locked
+/// busy
+/// free after close
+/// ```
+public function lock(file: Integer, exclusive: Boolean, wait: Boolean): Result<Nothing, errors.Error> {
+    return lockResult(lockNative(file, exclusive, wait))
+}
+
+// A held lock is not an operating-system fault, so it reports wouldBlock.
+// EWOULDBLOCK is 35 on macOS and 11 on Linux, so both are recognised.
+function lockResult(value: Integer): Result<Nothing, errors.Error> {
+    if value == -35 || value == -11 {
+        return Err(errors.make(errors.wouldBlockCode(), -value, errorText(value)).withContext("locking the file"))
+    }
+    return statusResult(value, "locking the file")
+}
+
+/// Release a lock on a descriptor, or succeed if it holds none.
+/// Closing the descriptor releases the lock too, so this is only needed to keep
+/// holding the file open while letting other programs work on it.
+public function unlock(file: Integer): Result<Nothing, errors.Error> {
+    return statusResult(unlockNative(file), "unlocking the file")
+}
+
+// ------------------------------------------------------------- file identity
+
+/// What the file system says one path names: the device holding it and its
+/// inode on that device. Two paths with equal identity name one file, which is
+/// how a program recognises a hard link, a symbolic link target, or the same
+/// file reached by two routes.
+public record Identity { device: Integer; inode: Integer }
+
+/// Resolve a path to its canonical absolute form, with `.`, `..`, repeated
+/// slashes and symbolic links resolved. The result names the same file and is
+/// the form to compare or publish. A missing path is an error.
+///
+/// ```minyar
+/// let file = api.open("beacon.txt", api.WRITE | api.CREATE | api.TRUNCATE)
+/// api.close(file)
+/// match api.realPath("./beacon.txt") {
+///     Ok(found) { print(found.endsWith("/beacon.txt")) }
+///     Err(problem) { print("no beacon") }
+/// }
+/// match api.realPath("./no-such-beacon.txt") {
+///     Ok(found) { print("found") }
+///     Err(problem) { print("missing") }
+/// }
+/// ```
+/// ```output
+/// true
+/// missing
+/// ```
+public function realPath(path: Text): Result<Text, errors.Error> {
+    let resolved = realPathNative(path)
+    let code = lastError()
+    if code < 0 { return Err(nativeFailure(code, "resolving " + path)) }
+    return Ok(resolved)
+}
+
+/// Resolve the canonical absolute path a path will have, whether or not its
+/// last component exists yet.
+/// `.`, `..` and repeated slashes are resolved, symbolic links are followed, and
+/// a missing final name is appended to its resolved parent directory, so a path
+/// for a file about to be created is already canonical. A missing parent, an
+/// empty final name and an existing dangling symbolic link are errors; use
+/// `realPath` when the file itself must exist.
+///
+/// ```minyar
+/// match api.canonicalPath("./not-created-yet.txt") {
+///     Ok(found) { print(found.endsWith("/not-created-yet.txt")) }
+///     Err(problem) { print("unresolved") }
+/// }
+/// match api.realPath("./not-created-yet.txt") {
+///     Ok(found) { print("real") }
+///     Err(problem) { print("unresolved") }
+/// }
+/// ```
+/// ```output
+/// true
+/// unresolved
+/// ```
+public function canonicalPath(path: Text): Result<Text, errors.Error> {
+    let resolved = canonicalPathNative(path)
+    let code = lastError()
+    if code < 0 { return Err(nativeFailure(code, "resolving " + path)) }
+    return Ok(resolved)
+}
+
+/// Read the device and inode of the file a path names, following symbolic
+/// links. A missing path is an error.
+public function identity(path: Text): Result<Identity, errors.Error> {
+    let raw = identityNative(path)
+    let code = lastError()
+    if code < 0 { return Err(nativeFailure(code, "identifying " + path)) }
+    if raw.length != 16 { return Err(nativeFailure(-22, "identifying " + path)) }
+    return Ok(Identity { device: raw.getInt64(0); inode: raw.getInt64(8) })
+}
+
+/// Report whether two paths name one file, comparing their identity rather than
+/// their spelling. Hard links, symbolic links and different routes to one file
+/// compare equal; two files with identical contents do not.
+///
+/// ```minyar
+/// let file = api.open("first.txt", api.WRITE | api.CREATE | api.TRUNCATE)
+/// api.close(file)
+/// match api.hardLink("first.txt", "second.txt") {
+///     Ok() { print("linked") }
+///     Err(problem) { print("unlinked") }
+/// }
+/// match api.sameFile("first.txt", "second.txt") {
+///     Ok(same) { print(same) }
+///     Err(problem) { print("unknown") }
+/// }
+/// ```
+/// ```output
+/// linked
+/// true
+/// ```
+public function sameFile(first: Text, second: Text): Result<Boolean, errors.Error> {
+    let one = Identity { device: 0; inode: 0 }
+    match identity(first) {
+        Ok(found) { one = found }
+        Err(problem) { return Err(problem) }
+    }
+    let other = Identity { device: 0; inode: 0 }
+    match identity(second) {
+        Ok(found) { other = found }
+        Err(problem) { return Err(problem) }
+    }
+    return Ok(one.device == other.device && one.inode == other.inode)
+}
+
+/// Create a new empty directory that only this user can enter, and return its
+/// path. The directory is made under `TMPDIR` (or `/tmp`) with `prefix` in its
+/// name followed by six random characters, and mode 0700 from `mkdtemp`, so it
+/// is a safe place for a private socket or a temporary file tree. The prefix is
+/// a name, not a path: it cannot be empty or contain `/`. Nothing is removed
+/// automatically; delete the directory when the work is done.
+///
+/// ```minyar
+/// match api.makeTemporaryDirectory("minyar-example-") {
+///     Ok(directory) { print(directory.contains("minyar-example-")) }
+///     Err(problem) { print("no directory") }
+/// }
+/// ```
+/// ```output
+/// true
+/// ```
+public function makeTemporaryDirectory(prefix: Text): Result<Text, errors.Error> {
+    let directory = temporaryDirectoryNative(prefix)
+    let code = lastError()
+    if code < 0 { return Err(nativeFailure(code, "creating a temporary directory")) }
+    return Ok(directory)
+}

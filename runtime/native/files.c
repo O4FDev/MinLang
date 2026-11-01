@@ -23,6 +23,8 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -523,6 +525,141 @@ long long minyar_files_makeDirectory(const MinyarText *path) {
     struct stat st;
     if (e == EEXIST && stat(p, &st) == 0 && S_ISDIR(st.st_mode)) return 0;
     return -e;
+}
+
+/* A Text result that reports failure through files.lastError(), which is how
+ * the other Bytes-returning and Text-returning path calls stay recoverable. */
+static MinyarText *files_empty_text(int err) {
+    files_last_error = err;
+    return minyar_native_copy_text((const unsigned char *)"", 0);
+}
+
+/* ------------------------------------------------------------- advisory locks */
+
+/* files.lock(fd, exclusive, wait): a whole-file flock on this open file
+ * description. Locks belong to the description, so two separate opens of one
+ * file conflict even inside one process, and closing any descriptor for the
+ * description releases its lock. Try-locking a held file returns -EWOULDBLOCK.
+ * Returns zero on success and -errno otherwise; EINTR while waiting retries. */
+long long minyar_files_lockNative(long long fd, _Bool exclusive, _Bool wait) {
+    if (!files_valid_fd(fd)) return -EBADF;
+    int operation = (exclusive ? LOCK_EX : LOCK_SH) | (wait ? 0 : LOCK_NB);
+    int rc;
+    for (;;) {
+        rc = flock((int)fd, operation);
+        if (rc == 0) return 0;
+        if (errno != EINTR || !wait) return -errno;
+    }
+}
+
+long long minyar_files_unlockNative(long long fd) {
+    if (!files_valid_fd(fd)) return -EBADF;
+    return flock((int)fd, LOCK_UN) == 0 ? 0 : -errno;
+}
+
+/* ------------------------------------------------------- canonical paths */
+
+/* files.realPath(path): the canonical absolute path, with symbolic links and
+ * ".." resolved. A missing path or a resolution error returns empty and sets
+ * lastError(). */
+MinyarText *minyar_files_realPathNative(const MinyarText *path) {
+    char p[PATH_MAX];
+    int rc = files_path(path, p);
+    if (rc) return files_empty_text(rc);
+    char resolved[PATH_MAX];
+    if (!realpath(p, resolved)) return files_empty_text(-errno);
+    files_last_error = 0;
+    return minyar_native_copy_text((const unsigned char *)resolved, (long long)strlen(resolved));
+}
+
+/* files.canonicalPath(path): the canonical absolute path, resolving symbolic
+ * links and ".." like realPath, but also for a last component that does not
+ * exist yet: the parent directory is resolved and the final name appended. A
+ * dangling symbolic link, an empty final component or an unresolvable parent
+ * is an error, so a caller never publishes a path built from a guess. */
+MinyarText *minyar_files_canonicalPathNative(const MinyarText *path) {
+    char p[PATH_MAX];
+    int rc = files_path(path, p);
+    if (rc) return files_empty_text(rc);
+    char resolved[PATH_MAX];
+    if (realpath(p, resolved)) {
+        files_last_error = 0;
+        return minyar_native_copy_text((const unsigned char *)resolved, (long long)strlen(resolved));
+    }
+    if (errno != ENOENT) return files_empty_text(-errno);
+    struct stat entry;
+    /* An existing entry that realpath could not resolve is a dangling link. */
+    if (lstat(p, &entry) == 0) return files_empty_text(-ENOENT);
+    char *slash = strrchr(p, '/');
+    const char *name = slash ? slash + 1 : p;
+    if (!*name) return files_empty_text(-EINVAL);
+    const char *parent = ".";
+    char prefix[PATH_MAX];
+    if (slash) {
+        size_t length = (size_t)(slash - p);
+        if (length == 0) {
+            parent = "/";
+        } else {
+            memcpy(prefix, p, length);
+            prefix[length] = 0;
+            parent = prefix;
+        }
+    }
+    char directory[PATH_MAX];
+    if (!realpath(parent, directory)) return files_empty_text(-errno);
+    size_t used = strlen(directory);
+    int joined = snprintf(resolved, sizeof resolved, "%s%s%s", directory,
+                          used > 0 && directory[used - 1] == '/' ? "" : "/", name);
+    if (joined < 0 || (size_t)joined >= sizeof resolved) return files_empty_text(-ENAMETOOLONG);
+    files_last_error = 0;
+    return minyar_native_copy_text((const unsigned char *)resolved, (long long)joined);
+}
+
+/* files.identity(path): 16 bytes holding the device and inode of the entry the
+ * path names after following symbolic links, both little-endian Int64. Two
+ * paths that name one file (hard links, symlinks, bind mounts inside one
+ * device) have equal identity. Failure returns empty Bytes and sets lastError. */
+MinyarBytes *minyar_files_identityNative(const MinyarText *path) {
+    char p[PATH_MAX];
+    int rc = files_path(path, p);
+    if (rc) return files_empty(rc);
+    struct stat st;
+    if (stat(p, &st) != 0) return files_empty(-errno);
+    uint64_t fields[2] = {(uint64_t)st.st_dev, (uint64_t)st.st_ino};
+    MinyarBytes *identity = minyar_bytes_new(16);
+    unsigned char *bytes = (unsigned char *)identity->bytes;
+    for (int field = 0; field < 2; field++)
+        for (int i = 0; i < 8; i++) bytes[field * 8 + i] = (unsigned char)(fields[field] >> (8 * i));
+    files_last_error = 0;
+    return identity;
+}
+
+/* files.makeTemporaryDirectory(prefix): mkdtemp under $TMPDIR (or /tmp) with a
+ * mode-0700 directory named prefix + six random characters. The prefix is a
+ * name, not a path: it cannot be empty, contain '/', or contain a zero byte.
+ * Failure returns empty Text and sets lastError(). */
+MinyarText *minyar_files_temporaryDirectoryNative(const MinyarText *prefix) {
+    if (!prefix || prefix->byte_length <= 0 || prefix->byte_length > 200)
+        return files_empty_text(-EINVAL);
+    if (memchr(prefix->bytes, 0, (size_t)prefix->byte_length) ||
+        memchr(prefix->bytes, '/', (size_t)prefix->byte_length))
+        return files_empty_text(-EINVAL);
+    const char *base = getenv("TMPDIR");
+    if (!base || !*base) base = "/tmp";
+    size_t length = strlen(base);
+    if (length + (size_t)prefix->byte_length + 8 > PATH_MAX) return files_empty_text(-ENAMETOOLONG);
+    char path[PATH_MAX];
+    memcpy(path, base, length);
+    while (length > 1 && path[length - 1] == '/') length--;
+    if (length == 1 && path[0] == '/') length = 0;
+    memcpy(path + length, "/", 1);
+    length += 1;
+    memcpy(path + length, prefix->bytes, (size_t)prefix->byte_length);
+    length += (size_t)prefix->byte_length;
+    memcpy(path + length, "XXXXXX", 7);
+    if (!mkdtemp(path)) return files_empty_text(-errno);
+    files_last_error = 0;
+    return minyar_native_copy_text((const unsigned char *)path, (long long)strlen(path));
 }
 
 long long minyar_files_syncDirectory(const MinyarText *path) {

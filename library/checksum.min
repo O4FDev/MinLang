@@ -1,9 +1,13 @@
+use "text" as text
+
 // Checksums over Bytes ranges.
 //
 // crc32c is CRC-32C (Castagnoli), the checksum of iSCSI, ext4, Btrfs and many storage formats. It runs on the
 // processor's CRC32C instructions where they exist (SSE4.2 on x86-64, the ARMv8 CRC extension), checked once at
-// run time, and on lookup tables elsewhere. It reads the range only, so parallel functions and `parallel for`
-// bodies may call it.
+// run time, and on lookup tables elsewhere. crc32 is the older IEEE 802.3 polynomial that zip, gzip and PNG use,
+// and crc64 is the NVME variant that S3's CRC64NVME objects and minyar-objstore carry.
+//
+// All three read the range only, so parallel functions and `parallel for` bodies may call them.
 
 /// Return the CRC-32C of `data[offset, offset + length)`, continuing `crc`.
 /// Start a new checksum with zero; pass a previous result to append more bytes:
@@ -22,3 +26,82 @@
 /// true
 /// ```
 public parallel function crc32c(crc: Integer, data: Bytes, offset: Integer, length: Integer): Integer { native "runtime" }
+
+/// Return the CRC-32 of `data[offset, offset + length)`, continuing `crc`.
+/// This is CRC-32/ISO-HDLC, the checksum zip, gzip and PNG store: the reflected
+/// polynomial `0xEDB88320` with all-ones input and output. It chains exactly like `crc32c`.
+/// A range outside `data` stops the program, like a Bytes getter.
+///
+/// ```minyar
+/// let data = Bytes("123456789")
+/// print(api.crc32(0, data, 0, data.length) == 0xCBF43926)
+/// let first = api.crc32(0, data, 0, 4)
+/// print(api.crc32(first, data, 4, 5) == 0xCBF43926)
+/// ```
+/// ```output
+/// true
+/// true
+/// ```
+public parallel function crc32(crc: Integer, data: Bytes, offset: Integer, length: Integer): Integer { native "runtime" }
+
+/// Return the CRC-32 of `data` as four big-endian bytes.
+/// This is the byte form S3's `x-amz-checksum-crc32` carries, so
+/// `encoding.base64Encode` of the result is the value a client sends.
+///
+/// ```minyar
+/// let digest = api.crc32Digest(Bytes("123456789"))
+/// print(digest.length)
+/// print(api.crc32Hex(Bytes("123456789")))
+/// ```
+/// ```output
+/// 4
+/// cbf43926
+/// ```
+public function crc32Digest(data: Bytes): Bytes {
+    return spelled(crc32(0, data, 0, data.length), 4)
+}
+
+/// Return `crc32Digest`'s bytes as eight lowercase hexadecimal digits.
+public function crc32Hex(data: Bytes): Text { return hexText(crc32Digest(data)) }
+
+// The low `count` bytes of `value`, most significant first.
+function spelled(value: Integer, count: Integer): Bytes {
+    let bytes = Bytes(count)
+    for index in 0..count { bytes[index] = (value >> (8 * (count - 1 - index))) & 255 }
+    return bytes
+}
+
+function hexText(bytes: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let written = Bytes()
+    for byte in bytes {
+        written.add(digits[byte >> 4])
+        written.add(digits[byte & 15])
+    }
+    return text.decodeOrStop(written)
+}
+
+/// Return the CRC-64/NVME checksum of `data` as eight big-endian bytes.
+/// This is the reflected polynomial `0x9A6C9329AC4BC9B5` with all-ones input and
+/// output, the checksum S3 exposes as an object's `x-amz-checksum-crc64nvme` and
+/// that minyar-objstore's `src/crc64.c` computes. Eight bytes are big-endian so
+/// base64 of the result is the value a client sends, and so the digest compares
+/// byte for byte with `crc64Hex`.
+///
+/// ```minyar
+/// let digest = api.crc64(Bytes("123456789"))
+/// print(digest.length)
+/// print(api.crc64Hex(Bytes("123456789")))
+/// print(api.crc64(Bytes("")).length)
+/// ```
+/// ```output
+/// 8
+/// ae8b14860a799888
+/// 8
+/// ```
+public function crc64(data: Bytes): Bytes { native "runtime" }
+
+/// Return `crc64`'s digest of `data` as sixteen lowercase hexadecimal digits.
+/// The digits are the digest's bytes in order, so they spell the value the CRC
+/// catalogue publishes and `crc64` returns.
+public function crc64Hex(data: Bytes): Text { return hexText(crc64(data)) }

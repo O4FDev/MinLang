@@ -1,0 +1,149 @@
+use "errors" as errors
+use "files" as files
+use "io" as io
+use "system" as system
+use "../tools/testing.min" as test
+
+// SYS-3 and SYS-4: advisory locks, canonical paths, file identity and private
+// temporary directories, all reached through the recoverable Result API.
+
+let root = test.scratch()
+
+// Unwrap a successful result, or stop with the whole error chain.
+function required<Item>(result: Result<Item, errors.Error>, fallback: Item, what: Text): Item {
+    match result {
+        Ok(found) { return found }
+        Err(problem) { fail(what + ": " + errors.describe(problem)) }
+    }
+    return fallback
+}
+
+// `must` is a builtin test verb, so the helper is named requirement.
+function requirement(result: Result<Nothing, errors.Error>, what: Text) {
+    match result {
+        Ok() { }
+        Err(problem) { fail(what + ": " + errors.describe(problem)) }
+    }
+}
+
+// The error of a failed result, or no error when it succeeded. `Nothing`
+// payloads need their own shape: a generic parameter cannot infer it.
+function problemOf(result: Result<Nothing, errors.Error>): errors.Error {
+    match result {
+        Ok() { return errors.none() }
+        Err(problem) { return problem }
+    }
+}
+
+function valueProblem<Item>(result: Result<Item, errors.Error>): errors.Error {
+    match result {
+        Ok(found) { return errors.none() }
+        Err(problem) { return problem }
+    }
+}
+
+function tried(result: Result<Nothing, errors.Error>): Boolean {
+    match result {
+        Ok() { return true }
+        Err(problem) { return false }
+    }
+}
+
+// --------------------------------------------------------------- SYS-3 locks
+
+let first = required(files.openFile(root + "/lock.txt", files.WRITE | files.CREATE | files.TRUNCATE), -1,
+    "opening the lock file")
+let second = required(files.openFile(root + "/lock.txt", files.READ), -1, "reopening the lock file")
+test.check(tried(files.lock(second, false, false)), "a shared lock is granted on a free file")
+test.check(tried(files.lock(second, false, false)), "one descriptor may hold its own shared lock again")
+let exclusive = problemOf(files.lock(first, true, false))
+test.check(errors.code(exclusive) == errors.wouldBlockCode(),
+    "an exclusive try-lock on another descriptor of the held file reports would-block")
+test.check(errors.nativeCode(exclusive) == 35 || errors.nativeCode(exclusive) == 11,
+    "the try-lock keeps the platform's EWOULDBLOCK number")
+test.check(errors.contexts(exclusive).length == 1, "the try-lock failure names the operation it failed")
+requirement(files.unlock(second), "unlocking the shared lock")
+requirement(files.unlock(second), "unlocking an already unlocked descriptor")
+requirement(files.lock(first, true, false), "the exclusive lock is granted once the shared lock is dropped")
+requirement(files.unlock(first), "releasing the exclusive lock")
+// Closing a descriptor drops its lock, so the next descriptor can take it.
+let third = required(files.openFile(root + "/lock.txt", files.READ), -1, "opening the lock file again")
+requirement(files.lock(third, true, false), "a fresh descriptor takes the free lock")
+let fourth = required(files.openFile(root + "/lock.txt", files.READ), -1, "opening the lock file a fourth time")
+test.check(errors.code(problemOf(files.lock(fourth, true, false))) == errors.wouldBlockCode(),
+    "the third descriptor holds the exclusive lock")
+requirement(files.closeFile(third), "closing the locking descriptor")
+requirement(files.lock(fourth, true, false), "closing the descriptor released its lock")
+requirement(files.unlock(fourth), "releasing the remaining lock")
+requirement(files.closeFile(fourth), "closing the fourth descriptor")
+requirement(files.closeFile(first), "closing the writer descriptor")
+requirement(files.closeFile(second), "closing the reader descriptor")
+test.check(errors.nativeCode(problemOf(files.lock(-1, true, false))) == 9,
+    "locking an invalid descriptor reports EBADF")
+
+// ------------------------------------------------------------ SYS-4 identity
+
+io.writeTextFile(root + "/one.txt", "lantern")
+requirement(files.hardLink(root + "/one.txt", root + "/two.txt"), "creating a hard link")
+io.writeTextFile(root + "/other.txt", "lantern")
+test.check(required(files.sameFile(root + "/one.txt", root + "/two.txt"), false, "comparing hard links"),
+    "hard links share one identity")
+test.check(!required(files.sameFile(root + "/one.txt", root + "/other.txt"), true, "comparing different files"),
+    "equal contents in different files do not share an identity")
+// A path through a real subdirectory and back resolves to the same file.
+requirement(files.createDirectory(root + "/sub"), "creating a subdirectory")
+let one = required(files.identity(root + "/one.txt"), files.Identity { device: -1; inode: -1 }, "identifying one.txt")
+let spelled = required(files.identity(root + "/./sub/../one.txt"), files.Identity { device: -1; inode: -1 },
+    "identifying one.txt through . and ..")
+test.check(one.device == spelled.device && one.inode == spelled.inode, "a path through . and .. keeps the identity")
+test.check(one.inode != 0, "a real file has a non-zero inode")
+
+// The library has no link-creation call, so the test asks ln(1) for a symlink.
+let symbolic = test.run(["ln", "-s", "one.txt", root + "/link.txt"], system.environment(), root, root + "/ln.log", 60)
+test.require(symbolic, "creating a symbolic link")
+let target = required(files.realPath(root + "/link.txt"), "", "resolving a symbolic link")
+let direct = required(files.realPath(root + "/one.txt"), "", "resolving the link target")
+test.check(target == direct, "realPath follows a symbolic link to the target's canonical path")
+test.check(direct.startsWith("/"), "a canonical path is absolute")
+test.check(!test.contains(direct, "/./") && !test.contains(direct, "/../"), "a canonical path keeps no . or .. parts")
+test.check(required(files.sameFile(root + "/link.txt", root + "/one.txt"), false, "comparing a symbolic link"),
+    "a symbolic link compares equal to its target")
+
+// A path whose last component does not exist yet still canonicalises, so a
+// program can publish it before creating the file.
+let pending = required(files.canonicalPath(root + "/sub/../not-created-yet.txt"), "", "canonicalising a pending path")
+test.check(pending == root + "/not-created-yet.txt", "a missing final name joins its resolved parent")
+test.check(valueProblem(files.realPath(pending)) != errors.none(), "realPath still requires the file to exist")
+test.check(errors.nativeCode(valueProblem(files.canonicalPath(root + "/no-such-dir/file.txt"))) == 2,
+    "a missing parent directory is ENOENT")
+test.check(errors.nativeCode(valueProblem(files.canonicalPath(root + "/absent-dir/"))) == 22,
+    "a missing path with no final name is EINVAL")
+let missing = valueProblem(files.realPath(root + "/no-such-lantern.txt"))
+test.check(errors.code(missing) == errors.systemCode() && errors.nativeCode(missing) == 2,
+    "resolving a missing path is ENOENT, not a crash")
+test.check(errors.message(missing) != "", "a missing path has a diagnostic")
+test.check(errors.nativeCode(valueProblem(files.identity(root + "/no-such-lantern.txt"))) == 2,
+    "identifying a missing path is ENOENT")
+test.check(errors.nativeCode(valueProblem(files.sameFile(root + "/no-such-lantern.txt", root + "/one.txt"))) == 2,
+    "comparing a missing path is ENOENT")
+
+// ------------------------------------------------ SYS-4 temporary directories
+
+let temporary = required(files.makeTemporaryDirectory("minyar-sys-"), "", "creating a temporary directory")
+let another = required(files.makeTemporaryDirectory("minyar-sys-"), "", "creating a second temporary directory")
+test.check(temporary != another, "two temporary directories differ")
+test.check(test.contains(temporary, "minyar-sys-"), "the prefix is part of the name")
+test.check(temporary.startsWith("/"), "a temporary directory path is absolute")
+let created = required(files.status(temporary), files.PathStatus { kind: 0; size: -1 }, "checking the directory")
+test.check(created.kind == files.KIND_DIRECTORY, "a temporary directory is a directory")
+test.check(required(files.entries(temporary), ["unreadable"], "listing the directory").length == 0,
+    "a new temporary directory is empty")
+test.check(tried(files.deleteDirectory(another)), "the spare temporary directory is removed")
+test.check(tried(files.deleteDirectory(temporary)), "the temporary directory is removed")
+for prefix in ["", "with/slash"] {
+    test.check(errors.code(valueProblem(files.makeTemporaryDirectory(prefix))) == errors.systemCode(),
+        "a prefix that is not a name is refused: '" + prefix + "'")
+}
+
+test.removeScratch(root)
+print("Advisory locks, canonical paths, identities and temporary directories passed")

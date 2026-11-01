@@ -1829,6 +1829,8 @@ MinyarText *minyar_interpolate(long long count, ...) {
 #endif
 
 #include "minyar_library.h"
+#include "minyar_checksums.h"
+#include "minyar_stdin.h"
 #include "minyar_diagnostics.h"
 #include "minyar_boundary.h"
 /* Callback domain checks are ordinary entry points in every profile. Cycle

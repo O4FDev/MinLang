@@ -1,0 +1,389 @@
+use "errors" as errors
+
+// UTC civil time: calendar fields from a Unix time, the time back from calendar
+// fields, and the two date spellings that protocols exchange (RFC 9110's
+// IMF-fixdate, ISO 8601) in both directions.
+//
+// A Unix time counts seconds since 1970-01-01T00:00:00Z and knows no time zone.
+// Everything here is UTC: no time-zone database is read, no locale is consulted,
+// and no ambient state changes the result. `civilFromSeconds` follows the
+// proleptic Gregorian calendar (leap years divisible by four, except centuries
+// not divisible by 400) for every Integer, including times before 1970.
+//
+// The formats cover the years 1 to 9999, which is what IMF-fixdate and the
+// common ISO 8601 spelling can carry. Formatting a time outside that range is a
+// program error and stops, like a Bytes position outside its length; parsing
+// reports bad input as an `errors.Error` instead.
+
+public constant MONDAY = 1
+public constant TUESDAY = 2
+public constant WEDNESDAY = 3
+public constant THURSDAY = 4
+public constant FRIDAY = 5
+public constant SATURDAY = 6
+public constant SUNDAY = 0
+
+/// A UTC calendar reading.
+/// `weekday` is 0 for Sunday through 6 for Saturday; `microsecond` is the
+/// fraction of `second` in microseconds, from 0 to 999999.
+public record Civil {
+    year: Integer
+    month: Integer
+    day: Integer
+    hour: Integer
+    minute: Integer
+    second: Integer
+    weekday: Integer
+    microsecond: Integer
+}
+
+function floorDivide(value: Integer, divisor: Integer): Integer {
+    let quotient = value / divisor
+    if (value - quotient * divisor < 0) { quotient -= 1 }
+    return quotient
+}
+
+function daysInMonth(year: Integer, month: Integer): Integer {
+    if month == 2 {
+        if year % 4 != 0 { return 28 }
+        if year % 100 != 0 { return 29 }
+        if year % 400 != 0 { return 28 }
+        return 29
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 { return 30 }
+    return 31
+}
+
+// The number of days from 1970-01-01 to `year`-`month`-`day`, in the proleptic
+// Gregorian calendar. This is Howard Hinnant's days_from_civil: shifting the
+// year so March starts the year makes the leap day the last day of the cycle.
+function daysFromCivil(year: Integer, month: Integer, day: Integer): Integer {
+    let shifted = year
+    if month <= 2 { shifted -= 1 }
+    let era = floorDivide(shifted, 400)
+    let yearOfEra = shifted - era * 400
+    let shiftedMonth = month
+    if month > 2 { shiftedMonth -= 3 } else { shiftedMonth += 9 }
+    let dayOfYear = (153 * shiftedMonth + 2) / 5 + day - 1
+    let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+    return era * 146097 + dayOfEra - 719468
+}
+
+function secondsFromDays(days: Integer): Integer { return days * 86400 }
+
+// 1970-01-01 was a Thursday, so day zero is weekday 4; the remainder is
+// normalized because `%` keeps the sign of a negative time.
+function weekdayOfDays(days: Integer): Integer {
+    let weekday = (days + 4) % 7
+    if weekday < 0 { weekday += 7 }
+    return weekday
+}
+
+/// Read a Unix time as UTC calendar fields.
+///
+/// ```minyar
+/// let departure = api.civilFromSeconds(784111777)
+/// print(api.formatHttpDate(784111777))
+/// print(departure.year)
+/// print(departure.weekday == api.SUNDAY)
+/// ```
+/// ```output
+/// Sun, 06 Nov 1994 08:49:37 GMT
+/// 1994
+/// true
+/// ```
+public function civilFromSeconds(seconds: Integer): Civil {
+    let days = floorDivide(seconds, 86400)
+    return civilFromDays(days, seconds - days * 86400, 0)
+}
+
+/// Read a Unix time in microseconds as UTC calendar fields; the sub-second part
+/// fills `microsecond`.
+public function civilFromMicroseconds(microseconds: Integer): Civil {
+    let seconds = floorDivide(microseconds, 1000000)
+    let fraction = microseconds - seconds * 1000000
+    let days = floorDivide(seconds, 86400)
+    return civilFromDays(days, seconds - days * 86400, fraction)
+}
+
+// Calendar fields from whole days plus a second of the day and a microsecond.
+function civilFromDays(days: Integer, secondOfDay: Integer, microsecond: Integer): Civil {
+    let shifted = days + 719468
+    let era = floorDivide(shifted, 146097)
+    let dayOfEra = shifted - era * 146097
+    let yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
+    let year = yearOfEra + era * 400
+    let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+    let marchMonth = (5 * dayOfYear + 2) / 153
+    let day = dayOfYear - (153 * marchMonth + 2) / 5 + 1
+    let month = marchMonth + 3
+    if marchMonth >= 10 { month = marchMonth - 9 }
+    if month <= 2 { year += 1 }
+    return Civil {
+        year: year; month: month; day: day
+        hour: secondOfDay / 3600
+        minute: secondOfDay / 60 % 60
+        second: secondOfDay % 60
+        weekday: weekdayOfDays(days)
+        microsecond: microsecond
+    }
+}
+
+/// Turn UTC calendar fields back into a Unix time in seconds.
+/// The fields are read as written, with no range check; `civilFromSeconds`
+/// returns the canonical fields for the result. `microsecond` is ignored.
+///
+/// ```minyar
+/// let arrival = api.civilFromSeconds(0)
+/// print(api.secondsFromCivil(arrival))
+/// print(api.formatIso8601(api.secondsFromCivil(api.Civil { year: 2000; month: 2; day: 29;
+///     hour: 12; minute: 0; second: 0; weekday: 0; microsecond: 0 })))
+/// ```
+/// ```output
+/// 0
+/// 2000-02-29T12:00:00Z
+/// ```
+public function secondsFromCivil(civil: Civil): Integer {
+    let days = daysFromCivil(civil.year, civil.month, civil.day)
+    return secondsFromDays(days) + civil.hour * 3600 + civil.minute * 60 + civil.second
+}
+
+/// Turn UTC calendar fields back into a Unix time in microseconds, including
+/// `microsecond`.
+public function microsecondsFromCivil(civil: Civil): Integer {
+    return secondsFromCivil(civil) * 1000000 + civil.microsecond
+}
+
+// Zero-padded decimal spelling of a non-negative field.
+function pad(value: Integer, width: Integer): Text {
+    return Text(value).padStart(width, "0")
+}
+
+function monthName(month: Integer): Text {
+    if month == 1 { return "Jan" }
+    if month == 2 { return "Feb" }
+    if month == 3 { return "Mar" }
+    if month == 4 { return "Apr" }
+    if month == 5 { return "May" }
+    if month == 6 { return "Jun" }
+    if month == 7 { return "Jul" }
+    if month == 8 { return "Aug" }
+    if month == 9 { return "Sep" }
+    if month == 10 { return "Oct" }
+    if month == 11 { return "Nov" }
+    return "Dec"
+}
+
+function weekdayName(weekday: Integer): Text {
+    if weekday == 1 { return "Mon" }
+    if weekday == 2 { return "Tue" }
+    if weekday == 3 { return "Wed" }
+    if weekday == 4 { return "Thu" }
+    if weekday == 5 { return "Fri" }
+    if weekday == 6 { return "Sat" }
+    return "Sun"
+}
+
+// The four-digit year IMF-fixdate and ISO 8601 require, or a stop.
+function checkedYear(civil: Civil): Text {
+    if civil.year < 1 || civil.year > 9999 {
+        fail("a calendar year of " + Text(civil.year) + " cannot be written as an IMF-fixdate or ISO 8601 date")
+    }
+    return pad(civil.year, 4)
+}
+
+/// Spell a Unix time as an RFC 9110 IMF-fixdate, the only date format HTTP
+/// responses and headers may now use: `Sun, 06 Nov 1994 08:49:37 GMT`.
+/// The time is UTC and the day name is exact. Years outside 1 to 9999 stop.
+///
+/// ```minyar
+/// print(api.formatHttpDate(0))
+/// print(api.formatHttpDate(2147483648))
+/// ```
+/// ```output
+/// Thu, 01 Jan 1970 00:00:00 GMT
+/// Tue, 19 Jan 2038 03:14:08 GMT
+/// ```
+public function formatHttpDate(seconds: Integer): Text {
+    let civil = civilFromSeconds(seconds)
+    return weekdayName(civil.weekday) + ", " + pad(civil.day, 2) + " " + monthName(civil.month) + " " +
+        checkedYear(civil) + " " + pad(civil.hour, 2) + ":" + pad(civil.minute, 2) + ":" +
+        pad(civil.second, 2) + " GMT"
+}
+
+/// Spell a Unix time in seconds as ISO 8601 UTC: `1994-11-06T08:49:37Z`.
+/// Years outside 1 to 9999 stop.
+///
+/// ```minyar
+/// print(api.formatIso8601(784111777))
+/// print(api.formatIso8601(-1))
+/// ```
+/// ```output
+/// 1994-11-06T08:49:37Z
+/// 1969-12-31T23:59:59Z
+/// ```
+public function formatIso8601(seconds: Integer): Text {
+    let civil = civilFromSeconds(seconds)
+    return checkedYear(civil) + "-" + pad(civil.month, 2) + "-" + pad(civil.day, 2) + "T" +
+        pad(civil.hour, 2) + ":" + pad(civil.minute, 2) + ":" + pad(civil.second, 2) + "Z"
+}
+
+/// Spell a Unix time in microseconds as ISO 8601 UTC with milliseconds:
+/// `1994-11-06T08:49:37.000Z`. Sub-millisecond digits are dropped, which is the
+/// precision S3 and most timestamp fields carry. Years outside 1 to 9999 stop.
+///
+/// ```minyar
+/// print(api.formatIso8601Milliseconds(784111777000000))
+/// print(api.formatIso8601Milliseconds(784111777123456))
+/// ```
+/// ```output
+/// 1994-11-06T08:49:37.000Z
+/// 1994-11-06T08:49:37.123Z
+/// ```
+public function formatIso8601Milliseconds(microseconds: Integer): Text {
+    let civil = civilFromMicroseconds(microseconds)
+    return checkedYear(civil) + "-" + pad(civil.month, 2) + "-" + pad(civil.day, 2) + "T" +
+        pad(civil.hour, 2) + ":" + pad(civil.minute, 2) + ":" + pad(civil.second, 2) + "." +
+        pad(civil.microsecond / 1000, 3) + "Z"
+}
+
+/// Spell a Unix time in microseconds as ISO 8601 UTC with all six fraction
+/// digits: `1994-11-06T08:49:37.123456Z`. Years outside 1 to 9999 stop.
+public function formatIso8601Microseconds(microseconds: Integer): Text {
+    let civil = civilFromMicroseconds(microseconds)
+    return checkedYear(civil) + "-" + pad(civil.month, 2) + "-" + pad(civil.day, 2) + "T" +
+        pad(civil.hour, 2) + ":" + pad(civil.minute, 2) + ":" + pad(civil.second, 2) + "." +
+        pad(civil.microsecond, 6) + "Z"
+}
+
+function invalidDate(message: Text): Result<Integer, errors.Error> {
+    return Err(errors.make(errors.invalidDataCode(), 0, message))
+}
+
+function digits(source: Bytes, at: Integer, count: Integer): Integer {
+    let value = 0
+    for index in at..(at + count) {
+        let byte = source[index]
+        if byte < 48 || byte > 57 { return -1 }
+        value = value * 10 + (byte - 48)
+    }
+    return value
+}
+
+// A parsed date: epoch seconds, epoch microseconds and the fraction's digits.
+record Reading { seconds: Integer; microseconds: Integer; fractionDigits: Integer }
+
+function readDate(source: Bytes): errors.ValueResult<Reading> {
+    // YYYY-MM-DD
+    if source.length < 19 { return errors.failure(Reading { seconds: 0; microseconds: 0; fractionDigits: 0 },
+        errors.make(errors.invalidDataCode(), 0, "an ISO 8601 date needs at least 19 characters")) }
+    if digits(source, 0, 4) < 0 || digits(source, 5, 2) < 0 || digits(source, 8, 2) < 0 ||
+        digits(source, 11, 2) < 0 || digits(source, 14, 2) < 0 || digits(source, 17, 2) < 0 ||
+        source[4] != 45 || source[7] != 45 || source[13] != 58 || source[16] != 58 {
+        return errors.failure(Reading { seconds: 0; microseconds: 0; fractionDigits: 0 },
+            errors.make(errors.invalidDataCode(), 0, "expected an ISO 8601 date of the form YYYY-MM-DDTHH:MM:SS"))
+    }
+    let separator = source[10]
+    if separator != 84 && separator != 116 && separator != 32 {
+        return errors.failure(Reading { seconds: 0; microseconds: 0; fractionDigits: 0 },
+            errors.make(errors.invalidDataCode(), 0, "an ISO 8601 date needs T, t or a space between date and time"))
+    }
+    let year = digits(source, 0, 4)
+    if year < 1 { return invalidReadingFields() }
+    let month = digits(source, 5, 2)
+    let day = digits(source, 8, 2)
+    let hour = digits(source, 11, 2)
+    let minute = digits(source, 14, 2)
+    let second = digits(source, 17, 2)
+    if month < 1 || month > 12 { return invalidReadingFields() }
+    if day < 1 || day > daysInMonth(year, month) { return invalidReadingFields() }
+    if hour > 23 || minute > 59 || second > 59 { return invalidReadingFields() }
+    let at = 19
+    let fraction = 0
+    let fractionDigits = 0
+    if at < source.length && source[at] == 46 {
+        at += 1
+        let start = at
+        while at < source.length && source[at] >= 48 && source[at] <= 57 && at - start < 9 {
+            if at - start < 6 { fraction = fraction * 10 + (source[at] - 48) }
+            at += 1
+        }
+        fractionDigits = at - start
+        if fractionDigits == 0 { return invalidFraction() }
+        while fractionDigits < 6 { fraction *= 10; fractionDigits += 1 }
+    }
+    // Z, z, or a signed offset of whole minutes.
+    let offset = 0
+    if at < source.length && (source[at] == 90 || source[at] == 122) {
+        at += 1
+    } else if at < source.length && (source[at] == 43 || source[at] == 45) {
+        if source.length - at != 6 || source[at + 3] != 58 { return invalidOffset() }
+        let offsetHour = digits(source, at + 1, 2)
+        let offsetMinute = digits(source, at + 4, 2)
+        if offsetHour < 0 || offsetMinute < 0 || offsetHour > 23 || offsetMinute > 59 { return invalidOffset() }
+        offset = offsetHour * 3600 + offsetMinute * 60
+        if source[at] == 45 { offset = -offset }
+        at += 6
+    } else {
+        return invalidOffset()
+    }
+    if at != source.length { return invalidOffset() }
+    let seconds = daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second - offset
+    return errors.success(Reading { seconds: seconds; microseconds: seconds * 1000000 + fraction;
+        fractionDigits: fractionDigits })
+}
+
+function invalidReadingFields(): errors.ValueResult<Reading> {
+    return errors.failure(Reading { seconds: 0; microseconds: 0; fractionDigits: 0 },
+        errors.make(errors.invalidDataCode(), 0, "an ISO 8601 date field is out of range"))
+}
+function invalidFraction(): errors.ValueResult<Reading> {
+    return errors.failure(Reading { seconds: 0; microseconds: 0; fractionDigits: 0 },
+        errors.make(errors.invalidDataCode(), 0, "an ISO 8601 fraction needs at least one digit"))
+}
+function invalidOffset(): errors.ValueResult<Reading> {
+    return errors.failure(Reading { seconds: 0; microseconds: 0; fractionDigits: 0 },
+        errors.make(errors.invalidDataCode(), 0, "an ISO 8601 date must end with Z or a signed offset of whole minutes"))
+}
+
+/// Read an ISO 8601 date as a Unix time in seconds.
+/// The accepted spellings are `YYYY-MM-DDTHH:MM:SS` followed by `Z`, `z` or a
+/// signed `+hh:mm`/`-hh:mm` offset; `T` may also be `t` or a space, and an
+/// optional fraction of up to nine digits is allowed. The offset is applied, so
+/// the result is the UTC instant. A fraction is dropped: use
+/// `parseIso8601Microseconds` when it matters. Bad input is an invalid-data
+/// error, never a plausible-looking time.
+///
+/// ```minyar
+/// match api.parseIso8601("1994-11-06T08:49:37Z") {
+///     Ok(seconds) { print(seconds) }
+///     Err(problem) { print("invalid") }
+/// }
+/// match api.parseIso8601("1994-11-06T09:49:37+01:00") {
+///     Ok(seconds) { print(api.formatIso8601(seconds)) }
+///     Err(problem) { print("invalid") }
+/// }
+/// match api.parseIso8601("1994-11-06T08:49:37") {
+///     Ok(seconds) { print("accepted") }
+///     Err(problem) { print("invalid") }
+/// }
+/// ```
+/// ```output
+/// 784111777
+/// 1994-11-06T08:49:37Z
+/// invalid
+/// ```
+public function parseIso8601(source: Text): Result<Integer, errors.Error> {
+    let reading = readDate(Bytes(source))
+    if !errors.ok(reading) { return Err(errors.error(reading)) }
+    return Ok(errors.value(reading).seconds)
+}
+
+/// Read an ISO 8601 date as a Unix time in microseconds, keeping up to six
+/// fraction digits (more digits are dropped). Everything else follows
+/// `parseIso8601`.
+public function parseIso8601Microseconds(source: Text): Result<Integer, errors.Error> {
+    let reading = readDate(Bytes(source))
+    if !errors.ok(reading) { return Err(errors.error(reading)) }
+    return Ok(errors.value(reading).microseconds)
+}

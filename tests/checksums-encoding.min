@@ -1,0 +1,113 @@
+use "checksum" as checksum
+use "digest" as digest
+use "encoding" as encoding
+use "errors" as errors
+use "text" as text
+use "../tools/testing.min" as test
+
+// SYS-6: CRC-32, CRC-64/NVME, MD5 and Base64 against the published check values
+// of the CRC catalogue, RFC 1321 and RFC 4648, plus chaining and rejection.
+
+function refused(result: Result<Bytes, errors.Error>): Boolean {
+    match result {
+        Ok(accepted) { return false }
+        Err(problem) { return errors.code(problem) == errors.invalidDataCode() }
+    }
+}
+
+function decoded(result: Result<Bytes, errors.Error>, what: Text): Bytes {
+    match result {
+        Ok(accepted) { return accepted }
+        Err(problem) { fail(what + ": " + errors.describe(problem)) }
+    }
+}
+
+function same(actual: Bytes, expected: Bytes): Boolean {
+    if actual.length != expected.length { return false }
+    for index in 0..actual.length { if actual[index] != expected[index] { return false } }
+    return true
+}
+
+// ------------------------------------------------------------------- CRC-32
+
+let check = Bytes("123456789")
+test.check(checksum.crc32(0, check, 0, check.length) == 0xCBF43926, "CRC-32 check value of 123456789")
+test.check(checksum.crc32(0, Bytes(""), 0, 0) == 0, "CRC-32 of empty input is zero")
+test.check(checksum.crc32(0, Bytes("abc"), 0, 3) == 0x352441C2, "CRC-32 of abc")
+test.check(checksum.crc32Hex(check) == "cbf43926", "CRC-32 of 123456789 in hex")
+test.check(checksum.crc32Digest(check).length == 4, "the CRC-32 digest is four bytes")
+let first = checksum.crc32(0, check, 0, 4)
+test.check(checksum.crc32(first, check, 4, 5) == 0xCBF43926, "CRC-32 chains across ranges")
+test.check(checksum.crc32(0, check, 0, check.length) != checksum.crc32c(0, check, 0, check.length),
+    "CRC-32 and CRC-32C are different polynomials")
+
+// -------------------------------------------------------------- CRC-64/NVME
+
+test.check(checksum.crc64Hex(check) == "ae8b14860a799888", "CRC-64/NVME check value of 123456789")
+test.check(checksum.crc64Hex(Bytes("")) == "0000000000000000", "CRC-64/NVME of empty input is zero")
+test.check(checksum.crc64Hex(Bytes("The quick brown fox jumps over the lazy dog")) == "d76c54054954c143",
+    "CRC-64/NVME of the pangram")
+test.check(checksum.crc64(check).length == 8, "the CRC-64 digest is eight bytes")
+test.check(checksum.crc64Hex(check) == checksum.crc64Hex(Bytes("123456789")), "the digest is deterministic")
+
+// ------------------------------------------------------------------ MD5
+
+test.check(digest.md5Hex(Bytes("")) == "d41d8cd98f00b204e9800998ecf8427e", "RFC 1321 empty digest")
+test.check(digest.md5Hex(Bytes("a")) == "0cc175b9c0f1b6a831c399e269772661", "RFC 1321 a digest")
+test.check(digest.md5Hex(Bytes("abc")) == "900150983cd24fb0d6963f7d28e17f72", "RFC 1321 abc digest")
+test.check(digest.md5Hex(Bytes("message digest")) == "f96b697d7cb7938d525a2f31aaf161d0", "RFC 1321 message digest")
+test.check(digest.md5Hex(Bytes("abcdefghijklmnopqrstuvwxyz")) == "c3fcd3d76192e4007dfb496cca67e13b",
+    "RFC 1321 alphabet digest")
+test.check(digest.md5Hex(Bytes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")) ==
+    "d174ab98d277d9f5a5611c2c9f419d9f", "RFC 1321 alphanumeric digest")
+test.check(digest.md5Hex(Bytes("12345678901234567890123456789012345678901234567890123456789012345678901234567890")) ==
+    "57edf4a22be3c955ac49da2e2107b67a", "RFC 1321 digits digest")
+test.check(digest.md5(Bytes("abc")).length == 16, "the MD5 digest is sixteen bytes")
+// Lengths around the 56-byte length field, a whole block and two blocks use
+// every padding branch.
+let boundaryLengths: List<Integer> = [55, 56, 63, 64, 119, 120]
+let boundaryDigests: List<Text> = ["ef1772b6dff9a122358552954ad0df65", "3b0c8ac703f828b04c6c197006d17218",
+    "b06521f39153d618550606be297466d5", "014842d480b571495a4a0363793f7367",
+    "8a7bd0732ed6a28ce75f6dabc90e1613", "5f61c0ccad4cac44c75ff505e1f1e537"]
+for position in 0..boundaryLengths.length {
+    let data = Bytes(boundaryLengths[position])
+    for index in 0..data.length { data[index] = 97 }
+    test.check(digest.md5Hex(data) == boundaryDigests[position], "MD5 of " + Text(data.length) + " bytes of a")
+}
+
+// ---------------------------------------------------------------- Base64
+
+let rfc4648: List<List<Text>> = [["", ""], ["f", "Zg=="], ["fo", "Zm8="], ["foo", "Zm9v"], ["foob", "Zm9vYg=="],
+    ["fooba", "Zm9vYmE="], ["foobar", "Zm9vYmFy"]]
+for vector in rfc4648 {
+    test.check(encoding.base64Encode(Bytes(vector[0])) == vector[1], "RFC 4648 encodes " + vector[0])
+    test.check(same(decoded(encoding.base64Decode(vector[1]), "decoding " + vector[0]), Bytes(vector[0])),
+        "RFC 4648 decodes " + vector[1])
+}
+let high = Bytes(2)
+high[0] = 0xfb
+high[1] = 0xff
+test.check(encoding.base64Encode(high) == "+/8=", "the standard alphabet uses + and /")
+test.check(encoding.base64UrlEncode(high) == "-_8", "the URL-safe alphabet is unpadded and uses - and _")
+test.check(same(decoded(encoding.base64UrlDecode("-_8"), "decoding the URL-safe form"), high),
+    "URL-safe decoding restores the bytes")
+test.check(refused(encoding.base64UrlDecode("+/8=")), "URL-safe base64 rejects standard alphabet characters")
+for length in 0..19 {
+    let data = Bytes(length)
+    for index in 0..length { data[index] = (index * 37 + 11) & 255 }
+    test.check(same(decoded(encoding.base64Decode(encoding.base64Encode(data)), "round trip " + Text(length)), data),
+        "standard base64 round trips " + Text(length) + " bytes")
+    test.check(same(decoded(encoding.base64UrlDecode(encoding.base64UrlEncode(data)), "round trip " + Text(length)), data),
+        "URL-safe base64 round trips " + Text(length) + " bytes")
+}
+
+// Padding, alphabet and trailing-bit mistakes are invalid data.
+for rejected in ["Zg", "Zg=", "Zg===", "Z=g=", "Z g==", "Zg== ", "Zm9v!", "Zm9v\n"] {
+    test.check(refused(encoding.base64Decode(rejected)), "standard base64 rejects '" + rejected + "'")
+}
+test.check(refused(encoding.base64UrlDecode("Zm9v+/8=")), "URL-safe base64 rejects standard alphabet characters")
+test.check(refused(encoding.base64UrlDecode("Z")), "URL-safe base64 rejects a one-character group")
+test.check(refused(encoding.base64Decode("Zh==")), "standard base64 rejects non-zero trailing bits")
+test.check(decoded(encoding.base64Decode(""), "empty").length == 0, "empty input decodes to empty Bytes")
+
+print("CRC-32, CRC-64/NVME, MD5 and Base64 vectors passed")

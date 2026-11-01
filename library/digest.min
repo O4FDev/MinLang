@@ -1,0 +1,130 @@
+use "text" as text
+
+// Message digests that interoperate with older protocols.
+//
+// md5 is RFC 1321 MD5. It is legacy interoperability: S3 object ETags, some CDN
+// and mail formats, and checksums in data already on disk. MD5 collisions are
+// cheap to produce, so a new design uses `sha256` or `crypto` instead. The
+// implementation is Minyar's own fixed-shape arithmetic; no C library or
+// OpenSSL provider is involved, so a program that only needs MD5 links nothing
+// extra.
+
+// The rotating left shift of a 32-bit word.
+function rotateLeft(value: Integer, count: Integer): Integer {
+    return ((value << count) | (value >> (32 - count))) & 0xFFFFFFFF
+}
+
+// RFC 1321's sine-derived additive constants, floor(2^32 * abs(sin(i + 1))).
+function constants(): List<Integer> {
+    return [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
+    ]
+}
+
+// The 64 rotating-shift amounts, round by round, computed once per digest.
+function shiftTable(): List<Integer> {
+    let table: List<Integer> = []
+    let amounts: List<Integer> = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21]
+    for round in 0..4 {
+        for step in 0..16 { table.add(amounts[round * 4 + step % 4]) }
+    }
+    return table
+}
+
+// One 64-byte block folded into the four-word state, in place.
+function block(state: List<Integer>, input: Bytes, at: Integer, table: List<Integer>, rotations: List<Integer>) {
+    let words: List<Integer> = []
+    for index in 0..16 {
+        let base = at + index * 4
+        words.add(input[base] | (input[base + 1] << 8) | (input[base + 2] << 16) | (input[base + 3] << 24))
+    }
+    let a = state[0]
+    let b = state[1]
+    let c = state[2]
+    let d = state[3]
+    for round in 0..4 {
+        for step in 0..16 {
+            let mixed = 0
+            let pick = 0
+            if round == 0 {
+                mixed = (b & c) | ((~b & 0xFFFFFFFF) & d)
+                pick = step
+            } else if round == 1 {
+                mixed = (d & b) | ((~d & 0xFFFFFFFF) & c)
+                pick = (5 * step + 1) % 16
+            } else if round == 2 {
+                mixed = b ^ c ^ d
+                pick = (3 * step + 5) % 16
+            } else {
+                mixed = c ^ (b | (~d & 0xFFFFFFFF))
+                pick = (7 * step) % 16
+            }
+            let rotated = rotateLeft((a + mixed + table[round * 16 + step] + words[pick]) & 0xFFFFFFFF,
+                rotations[round * 16 + step])
+            a = d
+            d = c
+            c = b
+            b = (b + rotated) & 0xFFFFFFFF
+        }
+    }
+    state[0] = (state[0] + a) & 0xFFFFFFFF
+    state[1] = (state[1] + b) & 0xFFFFFFFF
+    state[2] = (state[2] + c) & 0xFFFFFFFF
+    state[3] = (state[3] + d) & 0xFFFFFFFF
+}
+
+/// Return the 16-byte MD5 message digest of `data` (RFC 1321).
+/// The bytes are the digest in the order every protocol prints it, so
+/// `text.hex` of each byte in turn spells the familiar 32 hexadecimal digits.
+///
+/// ```minyar
+/// print(api.md5Hex(Bytes("")))
+/// print(api.md5Hex(Bytes("abc")))
+/// print(api.md5(Bytes("abc")).length)
+/// ```
+/// ```output
+/// d41d8cd98f00b204e9800998ecf8427e
+/// 900150983cd24fb0d6963f7d28e17f72
+/// 16
+/// ```
+public function md5(data: Bytes): Bytes {
+    let state: List<Integer> = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476]
+    let table = constants()
+    let rotations = shiftTable()
+    let whole = data.length / 64
+    for index in 0..whole { block(state, data, index * 64, table, rotations) }
+    // Pad with 0x80, zero bytes and the message length in bits, little-endian.
+    let rest = data.length - whole * 64
+    let tail = Bytes(128)
+    for index in 0..rest { tail[index] = data[whole * 64 + index] }
+    tail[rest] = 0x80
+    let total = 64
+    if rest + 9 > 64 { total = 128 }
+    let bits = data.length * 8
+    for index in 0..8 { tail[total - 8 + index] = (bits >> (index * 8)) & 255 }
+    block(state, tail, 0, table, rotations)
+    if total == 128 { block(state, tail, 64, table, rotations) }
+    let digest = Bytes(16)
+    for index in 0..4 {
+        for byte in 0..4 { digest[index * 4 + byte] = (state[index] >> (byte * 8)) & 255 }
+    }
+    return digest
+}
+
+/// Return `md5`'s digest of `data` as 32 lowercase hexadecimal digits.
+public function md5Hex(data: Bytes): Text {
+    let digits = Bytes("0123456789abcdef")
+    let spelled = Bytes()
+    for byte in md5(data) {
+        spelled.add(digits[byte >> 4])
+        spelled.add(digits[byte & 15])
+    }
+    return text.decodeOrStop(spelled)
+}
