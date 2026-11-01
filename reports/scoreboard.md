@@ -186,3 +186,46 @@ builds, **Parallel checks passed** (GATE-FINAL-EXIT 0). `python3 benchmarks/live
 **0 errors**, 5 patches under load, versions monotonic per connection, every request counted exactly once (SOAK-FINAL-EXIT 0).
 Disk guard: minimum free 12 GB during the run (abort line 6 GB); gate tree deleted afterwards, box B back to 21 GB free.
 Logs: ~/Projects/minyar-goal-20261030/logs/gate-final-993756afe.log, soak-final.log.
+
+## Phase 5 release-candidate verification — final goal tip 7d4576591 (2026-11-01 ~14:20 UTC)
+Hidden suite (box B, `sudo -u judge /home/judge/minyar/score.sh`, cachegrind Ir; all 27 outputs identical):
+
+| program | ratio vs fastest | vs Rust |
+|---|---|---|
+| h01 | 7.256 | 4.889 |
+| h02 | 5.119 | 3.838 |
+| h03 | 3.635 | 1.763 |
+| h04 | 4.346 | 4.346 |
+| h05 | 5.439 | 3.968 |
+| h06 | 5.265 | 4.992 |
+| h07 | 2.656 | 2.656 |
+| h08 | 10.823 | 7.956 |
+| h09 | 4.126 | 3.396 |
+| h10 | 4.127 | 0.939 |
+| h11 | 4.099 | 2.730 |
+| h12 | 8.993 | 1.183 |
+| h13 | 5.061 | 3.334 |
+| h14 | 3.593 | 3.166 |
+| h15 | 4.831 | 3.936 |
+| h16 | 6.580 | 2.865 |
+| h17 | 4.438 | 3.830 |
+| h18 | 1.394 | 1.394 |
+| h19 | 1.216 | 1.216 |
+| h20 | 2.350 | 2.195 |
+| b01 | serial 1.701 / parallel 1.453 | serial 1.484 / parallel 1.453 |
+| b02 | serial 7.092 / parallel 1.825 | serial 4.889 / parallel 1.825 |
+| b03 | serial 4.863 / parallel 2.450 | serial 3.440 / parallel 2.450 |
+| b04 | serial 4.820 / parallel 3.368 | serial 4.428 / parallel 3.368 |
+| b05 | serial 3.969 / parallel 4.702 | serial 2.163 / parallel 4.702 |
+| b06 | serial 1.360 / parallel 0.997 | serial 1.201 / parallel 0.997 |
+| b07 | serial 1.708 / parallel 2.272 | serial 1.222 / parallel 2.272 |
+
+**geomean 4.213 (vs Rust 2.825), max 10.823, 18 programs over 2×; b serial 3.076, b parallel 2.179 (single run; parallel is wall time).**
+Start of run 2 (86f8a0405): 4.826 / 3.236. Baseline 3832f4373: 7.453.
+
+Visible + both-modes, same box (box B, one harness = the final tip's, `--tree` for each tree, cachegrind Ir):
+- geomean vs fastest: baseline 3832f4373 **5.32** → run-2 start a9edf1232 **2.51** → final **2.25**.
+- final vs a9edf1232: 22 compare programs, none slower (best logstats −54.7%, service −46.8%, treewalk −24.8%); bothmodes 6 × (1, 4 threads): worst forkjoin@4 +0.013%, best textindex −4.8% at 1 and 4 threads, mapreduce@4 −0.87%.
+- final vs baseline: every program faster (treewalk −90.3%, exprparse −83.9%, httpparse −70.9%; least: par-mandel −23.2%); bothmodes −11% to −24% at 1 and 4 threads.
+Box-B single-box full gate + soak on 993756afe GREEN (above); 7d4576591 adds only the fast-gate tooling (no compiler/runtime/library change).
+Raw tables: ~/Projects/minyar-goal-20261030/logs/phase5-ab-results/, logs/score-final-7d4576591-boxB.log.
