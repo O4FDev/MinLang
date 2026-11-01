@@ -189,10 +189,11 @@ MINYAR_HOT void rc_bounded_enqueue(RcObject *object) {
     rc_bounded_enqueue_in(&rc_objects, &rc_pending_count, object);
 }
 
-RC_QUEUE_INLINE unsigned rc_drop_in(RcBoundedObjects *q, size_t *pending, void *value) {
-    if (!value) return 0;
-    RcObject *object = (RcObject *)value - 1;
-    size_t ownership = object->ownership;
+/* The drop path for a caller that already loaded the header: the retirement
+ * loop tests each child's header before deciding to take it, and passing that
+ * load on keeps the test and the drop on one load instead of two. */
+RC_QUEUE_INLINE unsigned rc_drop_loaded_in(RcBoundedObjects *q, size_t *pending, RcObject *object,
+                                           size_t ownership) {
     /* Most releases leave another owner: decrement before any kind test. */
     if (ownership >= 16) {
         object->ownership = ownership - 8;
@@ -209,8 +210,7 @@ RC_QUEUE_INLINE unsigned rc_drop_in(RcBoundedObjects *q, size_t *pending, void *
         return 1;
     }
     if (ownership < 8) return 0; /* Immortal literal or cache. */
-    object->ownership = ownership - 8;
-    unsigned kind = object->ownership & 7;
+    unsigned kind = (unsigned)(ownership & 7);
 #if MINYAR_THREADED
     if (kind == 0) {
         rc_bounded_finish_object(object, kind);
@@ -258,8 +258,18 @@ RC_QUEUE_INLINE unsigned rc_drop_in(RcBoundedObjects *q, size_t *pending, void *
         rc_bounded_finish_object(object, kind);
         return 1;
     }
+    /* Only the paths that queue a task still need the zero count in the
+     * header; the frees above replace the header's owner count with its kind
+     * by overwriting or dropping the object. */
+    object->ownership = kind;
     rc_bounded_enqueue_in(q, pending, object);
     return 0;
+}
+
+RC_QUEUE_INLINE unsigned rc_drop_in(RcBoundedObjects *q, size_t *pending, void *value) {
+    if (!value) return 0;
+    RcObject *object = (RcObject *)value - 1;
+    return rc_drop_loaded_in(q, pending, object, object->ownership);
 }
 
 MINYAR_HOT unsigned rc_drop(void *value) {
@@ -289,21 +299,86 @@ static void rc_bounded_retire_temporaries(RcFrame *frame) {
 #define RC_BOUNDED_INLINE static inline
 #endif
 
-/* A uniquely owned small aggregate among the current unit's owners is marked
- * dead and taken onto the unit's stack instead of joining the queue. */
-RC_BOUNDED_INLINE int rc_take_small_child(void *child, RcObject **stack, size_t *top, size_t taken) {
-    if (!child) return 0;
+/* One child of an aggregate the current unit is retiring: a uniquely owned
+ * small aggregate is marked dead and taken onto the unit's stack, anything else
+ * follows the ordinary drop path. The kind test and the single-owner test are
+ * one subtraction: a unique references List (kind 3) or record (kind 4) is
+ * exactly one of the two values the subtraction maps into range, so children
+ * of any other kind or with another owner leave after a single compare. */
+/* The next owning slot of a dead record at or after `index`, searching at most
+ * one unit's window of RC_RECORD_UNIT_FIELDS slots; the result is `index` when
+ * any slot in the window owns a reference. A record keeps one map byte per
+ * slot, so a full window is one word: eight bytes test at once instead of one
+ * byte at a time. */
+_Static_assert(RC_RECORD_UNIT_FIELDS <= 8, "a unit's record window must fit one word");
+RC_BOUNDED_INLINE size_t rc_record_next_owner(const unsigned char *map, size_t index, size_t end) {
+    size_t remain = end - index;
+    if (remain > RC_RECORD_UNIT_FIELDS) remain = RC_RECORD_UNIT_FIELDS;
+    if (remain >= 8) {
+        uint64_t word;
+#ifdef __GNUC__
+        __builtin_memcpy(&word, map + index, sizeof(word));
+#else
+        word = 0;
+        for (size_t offset = 0; offset < 8; offset++) word |= (uint64_t)map[index + offset] << (offset * 8);
+#endif
+        word &= UINT64_C(0x0101010101010101);
+#ifdef __GNUC__
+        if (word) return index + (size_t)(__builtin_ctzll(word) >> 3);
+#else
+        for (size_t offset = 0; offset < 8; offset++) if (word & ((uint64_t)1 << (offset * 8))) return index + offset;
+#endif
+        return index + 8;
+    }
+    size_t limit = index + remain;
+    while (index < limit && !(map[index] & 1)) index++;
+    return index;
+}
+
+RC_BOUNDED_INLINE void rc_visit_child_in(RcBoundedObjects *q, size_t *pending, void *child,
+                                         RcObject **stack, size_t *top, size_t taken) {
+    if (!child) return;
     RcObject *object = (RcObject *)child - 1;
     size_t ownership = object->ownership;
-    if (ownership == (8 | RC_RECORD)) {
-        if ((size_t)((MinyarRecord *)(object + 1))->length > RC_SMALL_RECORD_SLOTS) return 0;
-    } else if (ownership == (8 | RC_REFERENCES)) {
-        if ((size_t)((MinyarList *)(object + 1))->length > RC_SMALL_LIST_SLOTS) return 0;
-    } else return 0;
-    if (*top + taken >= RC_SMALL_RECORD_UNIT_OBJECTS) return 0;
-    object->ownership = (size_t)(ownership & 7);
-    stack[(*top)++] = object;
-    return 1;
+    if ((size_t)(ownership - (8 + RC_REFERENCES)) <= 1) {
+        int record = (ownership & 4) != 0;
+        /* A record's length is its payload's first word, a List's the second;
+         * both kinds keep it inside the payload, so the select needs no test. */
+        const long long *payload = (const long long *)(object + 1) + (record ? 0 : 1);
+        size_t limit = record ? RC_SMALL_RECORD_SLOTS : RC_SMALL_LIST_SLOTS;
+        if ((size_t)*payload <= limit && *top + taken < RC_SMALL_RECORD_UNIT_OBJECTS) {
+            object->ownership = ownership & 7;
+            stack[(*top)++] = object;
+            return;
+        }
+    }
+    rc_drop_loaded_in(q, pending, object, ownership);
+}
+
+/* Finishing a small aggregate the retirement unit holds: the kind is known to
+ * be a references List or a record, so only the List's separate values buffer
+ * and the allocation itself remain. Same accounting and free as
+ * rc_bounded_finish_object, without its kind dispatch. */
+RC_BOUNDED_INLINE void rc_bounded_finish_small(RcObject *object, unsigned kind) {
+    if (kind == RC_REFERENCES) {
+        MinyarList *list = (MinyarList *)(object + 1);
+        rc_free_data(list->values);
+        RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(*list));
+    } else {
+        RC_ACCOUNT(rc_bytes -= sizeof(*object) + sizeof(MinyarRecord)
+                   + (size_t)((MinyarRecord *)(object + 1))->length * (sizeof(long long) + 1));
+    }
+#if defined(MINYAR_RC_TESTING) && defined(MINYAR_RC_OBJECT_RELEASE_OBSERVER)
+    MINYAR_RC_OBJECT_RELEASE_OBSERVER(object);
+#endif
+#if defined(MINYAR_SYSTEM_HEAP) && !defined(MINYAR_RC_TESTING)
+    /* The inline free of the common case: a unit retires objects on pages that
+     * still hold live ones, so the page bookkeeping stays out of line. */
+    rc_heap_deallocate_fast(object);
+#else
+    RC_DEALLOCATE(object);
+#endif
+    RC_ACCOUNT(rc_object_count--);
 }
 
 /* Retire one small record and, while the unit's object allowance lasts, the
@@ -326,11 +401,8 @@ static void rc_bounded_retire_small_in(RcBoundedObjects *q, size_t *pending, RcO
         if (kind == RC_REFERENCES) {
             MinyarList *list = (MinyarList *)(current + 1);
             size_t end = (size_t)list->length;
-            for (size_t index = 0; index < end; index++) {
-                void *child = (void *)(uintptr_t)list->values[index];
-                if (rc_take_small_child(child, stack, &top, finished)) continue;
-                rc_drop_in(q, pending, child);
-            }
+            for (size_t index = 0; index < end; index++)
+                rc_visit_child_in(q, pending, (void *)(uintptr_t)list->values[index], stack, &top, finished);
             continue;
         }
         MinyarRecord *record = (MinyarRecord *)(current + 1);
@@ -338,16 +410,16 @@ static void rc_bounded_retire_small_in(RcBoundedObjects *q, size_t *pending, RcO
         unsigned char *map = (unsigned char *)(record->values + end);
         for (size_t index = 0; index < end; index++) {
             if (!(map[index] & 1)) continue;
-            void *child = (void *)(uintptr_t)record->values[index];
-            if (rc_take_small_child(child, stack, &top, finished)) continue;
-            rc_drop_in(q, pending, child);
+            rc_visit_child_in(q, pending, (void *)(uintptr_t)record->values[index], stack, &top, finished);
         }
     }
     /* Newest first: a unit retires a small subtree in reverse allocation order,
-     * like the unary chains the recent queue already follows. */
+     * like the unary chains the recent queue already follows. Both kinds this
+     * unit can hold are known here, so the freed payload and the allocation go
+     * without the general kind dispatch. */
     while (finished) {
         RcObject *current = finish[--finished];
-        rc_bounded_finish_object(current, current->ownership & 7);
+        rc_bounded_finish_small(current, current->ownership & 7);
     }
 }
 
@@ -373,9 +445,7 @@ RC_BOUNDED_INLINE void rc_bounded_old_object_unit_in(RcBoundedObjects *q, size_t
                 q->active = NULL;
                 return;
             }
-            size_t index = q->cursor;
-            size_t limit = end - index > RC_RECORD_UNIT_FIELDS ? index + RC_RECORD_UNIT_FIELDS : end;
-            while (index < limit && !(map[index] & 1)) index++;
+            size_t index = rc_record_next_owner(map, q->cursor, end);
             q->cursor = index;
             if (index < end && (map[index] & 1)) {
                 q->cursor = index + 1;
@@ -424,8 +494,7 @@ RC_BOUNDED_INLINE void rc_bounded_recent_object_unit_in(RcBoundedObjects *q, siz
                 --*pending;
                 return;
             }
-            size_t limit = end - cursor > RC_RECORD_UNIT_FIELDS ? cursor + RC_RECORD_UNIT_FIELDS : end;
-            while (cursor < limit && !(map[cursor] & 1)) cursor++;
+            cursor = rc_record_next_owner(map, cursor, end);
             if (cursor < end && (map[cursor] & 1)) {
                 void *child = (void *)(uintptr_t)record->values[cursor];
                 rc_record_save_cursor(object, cursor + 1);
@@ -572,9 +641,7 @@ static size_t rc_bounded_schedule(size_t budget) {
                 size_t end = q->cursor + count;
                 while (q->cursor < end) {
                     q->recent_turn ^= 1;
-                    size_t index = q->cursor;
-                    size_t limit = end - index > RC_RECORD_UNIT_FIELDS ? index + RC_RECORD_UNIT_FIELDS : end;
-                    while (index < limit && !(map[index] & 1)) index++;
+                    size_t index = rc_record_next_owner(map, q->cursor, end);
                     q->cursor = index;
                     if (index < end && (map[index] & 1)) {
                         q->cursor = index + 1;

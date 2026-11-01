@@ -104,6 +104,22 @@ static MINYAR_COLD RcSystemPage *rc_system_new_page(unsigned index) {
     rc_system_link(page);
     return page;
 }
+/* The smallest class whose stride holds `bytes` behind a slot header, which is
+ * the number of times 64 doubles after subtracting the header: one
+ * leading-zero count instead of a loop whose trip count varies by size. */
+static inline unsigned rc_system_size_class(size_t bytes) {
+#ifdef __GNUC__
+    /* Most allocations fit the first class, so that case costs one compare;
+     * the leading-zero count serves every larger size without a loop. */
+    if (__builtin_expect(bytes <= 64u - sizeof(RcSystemSlot), 1)) return 0;
+    return 64u - (unsigned)__builtin_clzll((unsigned long long)(bytes + sizeof(RcSystemSlot) - 1)) - 6;
+#else
+    unsigned index = 0;
+    size_t stride = 64;
+    while (bytes > stride - sizeof(RcSystemSlot)) { stride <<= 1; index++; }
+    return index;
+#endif
+}
 MINYAR_HOT void *rc_system_allocate(size_t bytes) {
     if (bytes > 1024u - sizeof(RcSystemSlot)) {
         if (bytes > SIZE_MAX - sizeof(RcSystemSlot)) out_of_memory();
@@ -113,9 +129,7 @@ MINYAR_HOT void *rc_system_allocate(size_t bytes) {
         slot->value.bytes = bytes;
         return slot + 1;
     }
-    unsigned index = 0;
-    size_t stride = 64;
-    while (bytes > stride - sizeof(RcSystemSlot)) { stride <<= 1; index++; }
+    unsigned index = rc_system_size_class(bytes);
     RcSystemPage *page = rc_system_available[index];
     if (!page) page = rc_system_new_page(index);
     /* A page leaves the available list when it has neither a free slot nor
