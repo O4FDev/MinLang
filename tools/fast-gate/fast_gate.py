@@ -356,7 +356,8 @@ def gate_tree(index, tree, checks, args, ips_ready):
     coverage = f"{len(reference & labels)} of the {len(reference)} reference checks + {len(labels - reference)} new" + \
         (f"; {len(missing)} reference checks not in this plan: {' '.join(missing[:8])}{' …' if len(missing) > 8 else ''}" if missing else "")
     print(f"FAST GATE {verdict}: {tree}: {count} checks in the plan (each shard's check-in-parallel: {counts}; {coverage}), {len(results)} run on {ctx.shards} shards, "
-          f"{len(failed)} failed, {len(problems)} problems; wall {elapsed:.0f} s; results {ctx.out}/merged.tsv", flush=True)
+          f"{len(failed)} failed, {len(problems)} problems; wall {elapsed:.0f} s ({time.monotonic() - started:.0f} s since the command "
+          f"started); results {ctx.out}/merged.tsv", flush=True)
     return verdict == "PASSED"
 
 
