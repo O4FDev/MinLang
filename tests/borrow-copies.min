@@ -134,6 +134,17 @@ let source = #"""
         return item.size + left
     }
 
+    record Label { text: Text }
+    function relabel(label: Label): Integer {
+        label.text = "y" + Text(7)
+        return 1
+    }
+    function measure(text: Text, extra: Integer): Integer { return text.length + extra }
+    function deferredTemporary(label: Label): Integer {
+        let total = measure(label.text, relabel(label))
+        return total + label.text.length
+    }
+
     let item = Item { name: "ab" + "c"; size: 2 }
     let shapes = [Shape.Dot(3), Shape.Box(item)]
     let total = 0
@@ -145,8 +156,10 @@ let source = #"""
     let bag = Bag { items: [item, Item { name: "q" + "r"; size: 7 }]; label: "b" + "" }
     print(guardedRead(bag, 0))
     print(guardedRelease(bag))
+    let label = Label { text: "x" + Text(1) }
+    print(deferredTemporary(label))
     """#
-let expected = "10\n2\n2\n9\n4\n3\n"
+let expected = "10\n2\n2\n9\n4\n3\n5\n"
 
 test.require(fixtures.compile(frontend, source), "compile borrow copy IR")
 let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
@@ -162,6 +175,12 @@ test.check(counts(ir, "innerSource") > 0, "innerSource: a copy from an inner blo
 // can release the holder: the module end decides once every callee is compiled.
 test.check(counts(ir, "guardedRead") == 0, "guardedRead: release-free calls leave the binding borrowed")
 test.check(counts(ir, "guardedRelease") > 0, "guardedRelease: a callee that removes a List slot keeps the owner")
+// A statement temporary whose count the module end settles inside a function
+// that owns nothing else: the fill must never land in a function without the
+// frame its borrow or slot needs, and here it stays a retain the statement end
+// releases.
+let deferred = body(ir, "deferredTemporary")
+test.check(test.contains(deferred, "call void @minyar_rc_retain(ptr ") && test.contains(deferred, "call void @minyar_rc_release(ptr ") && !test.contains(deferred, "@minyar_rc_enter(") && !test.contains(deferred, "@minyar_rc_borrow(") && !test.contains(deferred, "@minyar_rc_local("), "deferredTemporary: a deferred statement borrow in a function that owns nothing else is a retain and a release without a frame")
 fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
 test.removeTree(compiler.directory)
 print("Borrow copies: passed")
