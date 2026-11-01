@@ -187,8 +187,13 @@ check-stack-overflow-sanitize: build/minyarc-sanitize build/minyar-runtime-sanit
 
 # Cross-platform per-commit gate. Heavier memory-profile and performance
 # matrices remain in the Linux evidence runner and the full `make check` gate.
-check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow build/compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/compiler-behavior
+# The core compiler-behavior profile is a check of its own so the parallel runner can start it with the others
+# instead of after every check below check-portable.
+.PHONY: check-portable-core
+check-portable-core: build/compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/compiler-behavior
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
+
+check-portable: check-smoke check-regressions check-diagnostics check-conformance check-runtime-unit check-modules check-fuzz check-stack-overflow check-portable-core
 
 check-mutation: build/stage0 build/minyarc build/minyar-runtime.o build/tooling/tests/list-access build/tooling/tests/checked-arithmetic build/tooling/tools/clang-driver build/tooling/tests/mutation
 	$(LIMITED) ./build/tooling/tests/mutation
