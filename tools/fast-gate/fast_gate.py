@@ -465,7 +465,9 @@ def main():
     finally:
         cleanup()
     if not args.single:
-        print(f"FAST GATE RUN {run_id}: {len(specs)} trees, all passed: {passed}; total wall {time.monotonic() - started:.0f} s")
+        print(f"FAST GATE RUN {run_id}: {len(specs)} trees, all passed: {passed}; total wall {time.monotonic() - started:.0f} s", flush=True)
+        # Every tree whose commit has a recorded single-box gate (recorded.tsv) is compared with it check for check.
+        subprocess.run([sys.executable, os.path.join(HERE, "agree.py"), args.out])
     return 0 if passed else 1
 
 
