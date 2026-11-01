@@ -1019,25 +1019,45 @@ def file_digest(path):
         return None
 
 
+GOAL_FAILURE = re.compile(r"^prerequisite (.+): FAILED ", re.M)
+
+
+def failed_goals(text):
+    """Targets the parallel builder reported as failed goals (a successful rebuild that leaves bytes untouched
+    is not a failure, even though Make keeps calling it stale)."""
+    return set(GOAL_FAILURE.findall(text))
+
+
 def changed_outputs(root, targets, jobs, database):
     """Build targets through the check runner's parallel shared-prerequisite builder; return those whose content changed.
 
-    A target that fails to build counts as changed, so its checks run and report the failure."""
+    A target that fails to build counts as changed, so its checks run and report the failure. Make keeps
+    calling a target stale after a successful build whose recipe leaves the file untouched (an awk-only
+    rewrite of identical bytes), so staleness is not a failure signal; the builder's own per-goal result is."""
     before = {target: file_digest(root / target) for target in targets}
     rules = STATE / "cutoff.mk"
     rules.write_text(".PHONY: dev-check-build\ndev-check-build: " + " ".join(targets) + "\n\t@true\n")
     environment = clean_environment()
     environment["MAKEFILES"] = str(rules)
-    subprocess.run(["make", "--no-print-directory", "check-in-parallel", "CHECKS=dev-check-build", f"CHECK_JOBS={jobs}"],
-                   cwd=root, env=environment, stdout=subprocess.DEVNULL)
-    # Anything Make still calls stale was not built (a failed or skipped build): count it as changed.
-    left, _ = stale_outputs(root, targets, database)
-    result = []
+    log = STATE / "cutoff-build.log"
+    with open(log, "w") as output:
+        process = subprocess.run(["make", "--no-print-directory", "check-in-parallel", "CHECKS=dev-check-build",
+                                  f"CHECK_JOBS={jobs}"], cwd=root, env=environment, stdout=output,
+                                 stderr=subprocess.STDOUT)
+    # `prerequisite <target>: FAILED` is the builder's per-goal verdict. The builder may itself fail without
+    # naming a goal; then every target is suspect, so select them all.
+    failed = failed_goals(log.read_text(errors="replace"))
+    if process.returncode != 0 and not failed:
+        say("cut-off build failed without naming a target; treating every stale output as changed")
+        return sorted(targets), sorted(targets)
+    result, broken = [], set()
     for target in targets:
         after = file_digest(root / target)
-        if after is None or after != before[target] or target in left:
+        if after is None or after != before[target] or target in failed:
             result.append(target)
-    return sorted(result), sorted(set(targets) & left)
+            if target in failed or after is None:
+                broken.add(target)
+    return sorted(result), sorted(broken)
 
 
 def select(index, database, checks, changed, added, removed, stale):
@@ -1322,9 +1342,10 @@ def command_run(arguments):
     stale_build = sorted(path for path in stale if path.startswith("build/"))
     compiler = sorted(path for path in changed if path.startswith(("compiler/", "bootstrap/")))
     rebuilt, build_failed = 0, []
-    if stale_build and not arguments.plan and not arguments.no_cutoff:
+    if stale_build and not arguments.no_cutoff:
         # Make's graph is coarse (for example every object depends on every .mk file). Build the stale
-        # outputs now (the checks need them anyway) and keep only those whose bytes changed.
+        # outputs now (the checks need them anyway, and a plan needs them to report a true selection) and
+        # keep only those whose bytes changed.
         build_started = time.time()
         rebuilt = len(stale_build)
         stale_build, build_failed = changed_outputs(root, stale_build, arguments.jobs, database)

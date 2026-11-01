@@ -11,7 +11,7 @@ GREEN: 4 affected check(s) passed in 41 s. Run the full gate (make check-in-para
 RED: 1 of 9 failed: check-suite-catalogue
 ```
 
-`--plan` prints the selection without running it. `--only PATH...` limits the
+`--plan` prints the selection without running the selected checks; it still builds stale outputs for the content cut-off unless `--no-cutoff` is given. `--only PATH...` limits the
 claim to some changed paths or directories; the verdict then names how many
 other changed paths it did not cover. `--jobs N` (default 4) is passed to the
 check runner. The command exits 0 for green, 1 for red, 2 when it cannot
@@ -51,7 +51,9 @@ Selection comes from recorded dependencies, not from a list of areas:
    Make's graph is coarse (every object lists every makefile), so `run` then
    builds the stale outputs through the check runner's parallel builder and
    keeps only those whose bytes changed (builds are deterministic); an output
-   left stale or unbuilt counts as changed. `--no-cutoff` skips this.
+   left unbuilt, or one whose build failed, counts as changed. A successful
+   build that leaves a target's bytes untouched is not a change even though
+   Make still calls it stale. `--no-cutoff` skips this.
 4. A check is selected when it read a changed source or a changed output, listed
    a directory that gained or lost a file, or its Make rules (with all
    prerequisites) or the Makefile variables they use changed. File targets are

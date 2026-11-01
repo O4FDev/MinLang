@@ -296,7 +296,15 @@ with tempfile.TemporaryDirectory(prefix="dev-check-test ") as temporary:
     (tree / "t").mkdir()
     timestamps(tree / "t")
 
+def builder_failures():
+    """A stale target that a successful build leaves untouched is not a change; a failed goal is."""
+    log = "prerequisite build/a: passed wall_ms=3 status=0\nprerequisite build/b: FAILED wall_ms=3 status=2\n"
+    expect(dev.failed_goals(log) == {"build/b"}, f"only failed builder goals count: {dev.failed_goals(log)}")
+    expect(dev.failed_goals("Parallel checks passed\n") == set(), "a clean builder log has no failures")
+
+
 shards()
+builder_failures()
 for failure in failures:
     print("FAIL:", failure)
 print("dev-check selector tests:", "failed" if failures else "passed")
