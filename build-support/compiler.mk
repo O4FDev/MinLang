@@ -104,8 +104,9 @@ build/minyarc-sanitize: build/compiler-stage2-sanitize.ll build/minyar-compiler-
 build/compiler-stage2.ll: build/compiler.min build/compiler-stage1 $(COMPILER_LIBRARY_SOURCES)
 	$(LIMITED) ./build/compiler-stage1 $< $@ --library library
 
-build/minyarc: build/compiler-stage2.ll build/minyar-compiler-runtime.ll
-	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
+# tools/compiler-link.sh runs the same link with the compiler IR split into four modules linked in parallel.
+build/minyarc: build/compiler-stage2.ll build/minyar-compiler-runtime.ll tools/compiler-link.sh
+	$(LIMITED) sh tools/compiler-link.sh "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 build/compiler-stage3.ll: build/compiler.min build/minyarc $(COMPILER_LIBRARY_SOURCES)
 	$(LIMITED) ./build/minyarc $< $@ --library library

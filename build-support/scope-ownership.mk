@@ -35,8 +35,8 @@ check-scope-ownership-sanitize: $(SCOPE_LAUNCHER_ARTIFACTS) build/minyarc-saniti
 build/scope-compiler-stage2.ll: build/compiler.min build/minyarc
 	$(LIMITED) ./build/minyarc $< $@ --library library --scope-owners
 
-build/scope-compiler: build/scope-compiler-stage2.ll build/minyar-compiler-runtime.ll
-	$(LIMITED) "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
+build/scope-compiler: build/scope-compiler-stage2.ll build/minyar-compiler-runtime.ll tools/compiler-link.sh
+	$(LIMITED) sh tools/compiler-link.sh "$(LLVM_CC)" $(LLVM_FLAGS) $(COMPILER_LTO_FLAGS) $(filter %.ll %.o,$^) $(LDLIBS) -o $@
 
 build/scope-compiler-stage3.ll: build/compiler.min build/scope-compiler
 	$(LIMITED) ./build/scope-compiler $< $@ --library library --scope-owners
