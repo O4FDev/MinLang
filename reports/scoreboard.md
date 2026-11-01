@@ -234,3 +234,11 @@ Real-world suite on the release candidate (box B, `benchmarks/realworld/run.py -
 `sync-projects.sh`, adoption patches applied): all 6 build and run. Ir vs the recorded baseline: neo-db 0.96x, minyar-query 0.94x, minyar-js
 0.94x, minyar-terminal 1.00x, minyar-sandbox 0.99x, minyar-sim 0.97x. Wall and build-time columns are single samples against a baseline
 recorded on another box (box M), so they are not comparable; neo-db needed zlib1g-dev installed on box B first (environment, not Minyar).
+
+**neo-db, measured** (box B quiet, 2026-11-01 ~15:20 UTC; `run.py --tree <final 7d4576591> --against <goal baseline 3832f4373> --only neo-db
+--repeat 5`, builds and wall samples interleaved, neo-db pinned at e521f7512): workload Ir 143.9M vs 371.8M = **0.39× (−61%)**, workload
+wall median 30.8 ms vs 63.3 ms = **0.49× (2.06× faster)**; the earlier 1.45× wall was a single noisy sample. **Compile time is slower**:
+the neo-db binary builds in 309.3 s vs 287.6 s (**1.08×**), and its two bench programs compile in 266.4 s vs 170.1 s (**1.57×**) and
+247.7 s vs 179.1 s (**1.38×**) (one build each). Not yet profiled; likely the compile-time analyses added this run (Text loop
+versioning, range-guarded loop versioning, borrow inference and return moves) — a compile-time lane should measure per-pass time on
+neo-db before more analyses land.

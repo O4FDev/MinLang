@@ -8,6 +8,9 @@ Verified on the release candidate: box-B single-box gate 345/345 + live-patching
 exactly-once); hidden all 27 identical; same-box visible + both-modes: no program slower than a9edf1232 or the baseline
 (scoreboard.md, Phase 5). Work parked by the OpenRouter key limit: reports/resume-parked-lanes.md.
 
+**For NeoDB specifically:** its real-world workload runs **2.06× faster** (wall, median of 5) and executes **61% fewer instructions**
+than with the goal's starting compiler; but compiling it is slower (binary 1.08×, its bench programs 1.38–1.57×) — see scoreboard.md.
+
 ## Decisions for Luke
 1. **Merge into `v2`** — approved ("into v2 :)"): fast-forward of `v2` to the release candidate after this report's gate
    (recorded below when done). **Push** `v2` to origin: still yours to decide.
