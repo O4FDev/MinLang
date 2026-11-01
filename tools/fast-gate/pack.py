@@ -97,7 +97,9 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
                     changed = True
         effective[check["label"]] = need
 
-    order = sorted(checks, key=lambda check: (-cost(check), check["label"]))
+    # Aggregates with a recipe of their own go first, so the cost of each child placed beside one includes the chain it
+    # makes (see chain_end): the recipe waits for its children on the same shard.
+    order = sorted(checks, key=lambda check: (not (check["children"] and check.get("recipe")), -cost(check), check["label"]))
     # A shard's runner starts no check before all its shared builds are done, so a shard finishes at about
     # (shared-build phase) + (check phase): each the larger of its longest item and its total over the jobs, and the
     # check phase at least the waiting its checks do behind the shard's one launcher lock.
@@ -110,15 +112,23 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
     def heavy(name):
         return goal_ms.get(name, DEFAULT_GOAL_MS) >= DEFER_MS
 
+    def chain_end(index, parent, extra=None):
+        # An own recipe starts once its children on the same shard are done; they run first (their critical path holds
+        # it), so it ends about when they would on their own plus its own length.
+        children = [by_label[c] for c in by_label[parent]["children"] if c in assigned[index]] + ([extra] if extra else [])
+        if not children:
+            return 0
+        return max(sum(cost(c) for c in children) / jobs, max(length(c) for c in children)) + length(by_label[parent])
+
     def tail_with(index, check):
-        # The longest own recipe that, with this check placed, would run after other checks of the same shard.
+        # The latest end of an own recipe's chain on this shard with this check placed.
         value = tail[index]
         label = check["label"]
-        if check["children"] and check.get("recipe") and any(child in assigned[index] for child in check["children"]):
-            value = max(value, length(check))
+        if check["children"] and check.get("recipe"):
+            value = max(value, chain_end(index, label))
         for parent in own_parents.get(label, []):
             if parent in assigned[index]:
-                value = max(value, length(by_label[parent]))
+                value = max(value, chain_end(index, parent, check))
         return value
 
     def finish(index, extra_goals, check_cost, check_length=0, check_wait=0, check_heavy=0, waits=False, check_tail=None):
@@ -129,9 +139,9 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
         gm = max([goal_max[index]] + light)
         dmax = max(deferred_max[index], check_heavy)
         ends = max(waiter_end[index], dmax + check_length if waits else 0)
-        after = tail[index] if check_tail is None else check_tail
-        checks_phase = max((load[index] + check_cost + sum(ms for ms in extra_goals if ms >= DEFER_MS)) / jobs + after,
-                           longest[index], check_length, locked[index] + check_wait, ends)
+        chains = tail[index] if check_tail is None else check_tail
+        checks_phase = max((load[index] + check_cost + sum(ms for ms in extra_goals if ms >= DEFER_MS)) / jobs,
+                           longest[index], check_length, locked[index] + check_wait, ends, chains)
         return max(gm, gs / jobs) + checks_phase
 
     for check in order:
@@ -223,11 +233,18 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
     # cpu ms); a fresh tree has no history and would start them last, leaving one long check running alone at the end.
     # The estimate is the check's critical path: its own length plus its slowest shared build, so a long build that only
     # a quick check needs (build/scope-compiler-stage3.ll for check-scope-fixed-point) still starts first.
-    # A check that waits for a deferred heavy build gets no boost for it: it would only sleep in a runner slot.
+    # A check that waits for a deferred heavy build gets no boost for it: it would only sleep in a runner slot. A child
+    # of an own recipe on the same shard carries that recipe's path too, so the shard runs it before unrelated checks.
+    shard_of = {label: index for index in range(shards) for label in assigned[index]}
+
+    def path(label):
+        after = [path(parent) for parent in own_parents.get(label, []) if shard_of.get(parent) == shard_of.get(label)]
+        return length(by_label[label]) + max(after or [0])
+
     durations = {}
     for check in checks:
         slowest = max([goal_ms.get(name, 0) for name in check["goals"] if name not in prebuilt and not heavy(name)] or [0])
-        durations[check["label"]] = [length(check) + slowest, cost(check)]
+        durations[check["label"]] = [path(check["label"]) + slowest, cost(check)]
     return {"shards": shards, "jobs": jobs, "checks": len(all_checks), "goals": len(goals), "assignment": result,
             "durations": durations}
 
