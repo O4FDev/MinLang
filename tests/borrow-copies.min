@@ -120,6 +120,20 @@ let source = #"""
         return kept.size
     }
 
+    record Bag { items: List<Item>; label: Text }
+    function readOnly(item: Item): Integer { return item.size }
+    function shrink(items: List<Item>): Integer { items.pop(); return items.length }
+    function guardedRead(bag: Bag, index: Integer): Integer {
+        let items = bag.items
+        let item = bag.items[index]
+        return readOnly(item) + items.length
+    }
+    function guardedRelease(bag: Bag): Integer {
+        let item = bag.items[0]
+        let left = shrink(bag.items)
+        return item.size + left
+    }
+
     let item = Item { name: "ab" + "c"; size: 2 }
     let shapes = [Shape.Dot(3), Shape.Box(item)]
     let total = 0
@@ -128,8 +142,11 @@ let source = #"""
     print(parameterCopy(item))
     print(captureCopy(item))
     print(innerSource(item, Item { name: "x" + "y"; size: 9 }))
+    let bag = Bag { items: [item, Item { name: "q" + "r"; size: 7 }]; label: "b" + "" }
+    print(guardedRead(bag, 0))
+    print(guardedRelease(bag))
     """#
-let expected = "10\n2\n2\n9\n"
+let expected = "10\n2\n2\n9\n4\n3\n"
 
 test.require(fixtures.compile(frontend, source), "compile borrow copy IR")
 let ir = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
@@ -141,6 +158,10 @@ test.check(counts(ir, "parameterCopy") == 0, "parameterCopy: a copy of a readonl
 test.check(ownershipCount(symbolBody(ir, "@.minyar.closure.captureCopy.1(")) == 0, "captureCopy: a closure copies its capture without a count")
 // The source is declared in the loop body, so the target could outlive it.
 test.check(counts(ir, "innerSource") > 0, "innerSource: a copy from an inner block keeps its count")
+// A guarded field or element binding takes an owner only when a call after it
+// can release the holder: the module end decides once every callee is compiled.
+test.check(counts(ir, "guardedRead") == 0, "guardedRead: release-free calls leave the binding borrowed")
+test.check(counts(ir, "guardedRelease") > 0, "guardedRelease: a callee that removes a List slot keeps the owner")
 fixtures.executes(frontend, source, expected, ["-O0", "-O2"], 0, "", true)
 test.removeTree(compiler.directory)
 print("Borrow copies: passed")

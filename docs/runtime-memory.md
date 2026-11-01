@@ -286,9 +286,21 @@ both endpoints of traced ownership operations use the physical payload type.
   A block's `let name = local[index]` binding (the root local not reassigned in
   the block) borrows its element like a parameter. A hidden guard owner is
   reserved at the binding and filled at the end of the block only if later code
-  made a user call or a releasing runtime call; otherwise the guard and its
-  clears are removed. Calls to `parallel` functions count as neither: they use
-  only scalars and never call the runtime.
+  made a releasing runtime call; when only user calls follow, every callee is
+  compiled first and the owner is filled unless all of them are release-free
+  (they only read, allocate, fill records they created, or call such functions).
+  Otherwise the guard and its clears are removed. Calls to `parallel` functions
+  count as neither: they use only scalars and never call the runtime. A
+  statement temporary whose count protects a field or element read across a
+  user call settles by the same rule.
+  A copy of one stable local, `let copy = name` or `copy = name`, takes no
+  count: a readonly parameter or capture is kept by its caller for the whole
+  call, and a match payload or walked element its arm or body never reassigns is
+  kept by the match input or walked List. A value read through a stable field
+  path from such a binding is a stable root too, including a cycle-capable
+  value, because the binding holds a count the collector never frees. A copy
+  from a binding declared in an inner block keeps its count: the target could
+  outlive the source.
 - `minyar_rc_local` retains a new local value before releasing the previous
   value, making aliases and self-assignment safe. Synchronous calls borrow
   parameters protected by caller or ancestor owners; incoming parameter ownership

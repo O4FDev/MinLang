@@ -809,7 +809,10 @@ if fixtures.selected("ScopeOwnership", "test_plain_borrows_share_local_and_retur
         "print(tracedAlias(node).length)"
     ]), "1\n", environment, ordinary, cycle)
     let tracedBody = body(traced, "tracedAlias")
-    test.check(test.contains(tracedBody, "%rc.scope.cells = alloca [1 x ptr]"), "traced projection must transfer its shaded count into the local cell")
+    // A traced field read on a stable path from a counted anchor needs no cell:
+    // the caller keeps the anchor, so the value stays alive; the return takes
+    // the caller's shaded count like any borrowed return.
+    test.check(!test.contains(tracedBody, "%rc.scope.cells") && test.contains(tracedBody, "call void @minyar_rc_retain_traced("), "traced projection on a stable path needs no cell")
     test.check(test.contains(tracedBody, "call void @minyar_rc_retain_traced("), "traced projection must keep its retain barrier")
     let progress = executes(compiler, program([
         "record Box { text: Text }",
@@ -1163,7 +1166,10 @@ if fixtures.selected("ScopeOwnership", "test_temporary_cells_reuse_only_disjoint
     test.check(test.contains(sequential, "%rc.scope.cells = alloca [1 x ptr]"), "two disjoint statement results must reuse one temporary cell")
     test.check(sequential.split("call void @minyar_rc_scope_release_v1(").length == 3, "both sequential result drops must remain after coloring")
     test.check(sequential.split("call void @minyar_rc_scope_poll_v1()").length == 3, "both sequential statement polls must remain after coloring")
-    test.check(body(llvm, "graphReads").split("call void @minyar_rc_retain_traced(").length == 3, "traced local acquisition must reuse its protecting barrier")
+    // Both reads are stable field paths from a counted anchor (the parameter),
+    // and observeGraph releases nothing, so the traced list needs no count.
+    let reads = body(llvm, "graphReads")
+    test.check(!test.contains(reads, "@minyar_rc_retain") && !test.contains(reads, "@minyar_rc_local") && !test.contains(reads, "@minyar_rc_borrow"), "stable traced field reads take no count")
 
     executes(compiler, program([
         "record Job { text: Text; mode: Integer }",
@@ -1392,7 +1398,10 @@ if fixtures.selected("ScopeOwnership", "test_projected_borrows_publish_one_lasti
     for name in ["appendText", "growSelf", "publishBranch"] { test.check(body(llvm, name).split("call void @minyar_list_add_take(").length == 2, "reference List publisher must take its protecting count in " + name) }
     test.check(body(llvm, "publishBranch").split("call void @minyar_rc_scope_leave_empty_v1()").length == 3, "both publisher exits must leave their empty scopes")
     test.check(test.contains(body(llvm, "delayed"), "call void @minyar_rc_retain("), "mutating later RHS evaluation must preserve the earlier argument owner")
-    test.check(test.contains(body(llvm, "publishTraced"), "call void @minyar_rc_retain_traced(") && test.contains(body(llvm, "publishTraced"), "call void @minyar_list_add_take_traced("), "traced projection must transfer its shaded count to the publisher")
+    // A traced field read on a stable path takes no protecting count, so the
+    // publisher retains its own (add_traced) instead of taking a handed-over one.
+    let publishTraced = body(llvm, "publishTraced")
+    test.check(!test.contains(publishTraced, "call void @minyar_rc_retain_traced(") && test.contains(publishTraced, "call void @minyar_list_add_traced("), "traced projection borrows and the publisher counts it once")
     test.check(test.contains(body(llvm, "scalarControl"), "@.minyar.list.set.scalar.checked("), "scalar destinations must keep their scalar frontend path")
 
     // Exact symbol/position/SSA controls; generic List C calls here represent
