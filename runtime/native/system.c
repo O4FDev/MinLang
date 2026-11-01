@@ -163,8 +163,14 @@ static void system_on_signal(int sig) {
     errno = saved;
 }
 
-/* The notification socket, created once. It is non-blocking and close-on-exec, and it outlives every subscription. */
-static int system_signal_socket(void) {
+static void system_signal_release(void) {
+    atomic_store(&system_signal_writer, -1);
+    system_signal_pair[0] = system_signal_pair[1] = -1;
+}
+
+/* The notification socket, created once and shared by every subscription. It is non-blocking and close-on-exec. */
+static int system_signal_socket(bool *created) {
+    *created = false;
     if (system_signal_pair[0] >= 0) return system_signal_pair[0];
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -errno;
@@ -179,38 +185,88 @@ static int system_signal_socket(void) {
     system_signal_pair[0] = sv[0];
     system_signal_pair[1] = sv[1];
     atomic_store(&system_signal_writer, sv[1]);
+    *created = true;
     return sv[0];
 }
 
-/* Install one selector's handler with its signal blocked, so it cannot run before the writer is published. */
-static int system_subscribe_signal(int selector) {
-    int number = system_signal_number(selector);
-    if (!number) return EINVAL;
-    if (system_signal_subscribed[selector]) return 0;
-    sigset_t blocked, previous;
+/* Undo a subscription that failed part way. A handler installed by the failed call goes back; a socket created by it
+ * is closed only once no handler is still inside its write (a signal may have arrived on another thread while this
+ * one was masked), because the descriptor could be reused by an allocation afterwards. */
+static void system_signal_rollback(bool created, int *numbers, struct sigaction *previous, size_t installed) {
+    while (installed) {
+        installed -= 1;
+        sigaction(numbers[installed], &previous[installed], NULL);
+    }
+    if (!created) return;
+    /* Invalidate first, then let a handler that is already inside its non-blocking write finish before the endpoints
+     * are closed and freed for reuse. */
+    int reader = system_signal_pair[0], writer = system_signal_pair[1];
+    system_signal_release();
+    while (atomic_load(&system_signal_readers)) sched_yield();
+    close(reader);
+    close(writer);
+}
+
+/* Install one call's selectors as one transaction: afterwards either every new handler is in place, or the process
+ * looks exactly as it did before the call. Handlers are installed with their signals blocked, so none can run before
+ * the writer is published. */
+static long long system_signal_subscribe(const long long *selectors, size_t count, bool ignore_pipe) {
+    system_error = 0;
+    int numbers[SYSTEM_SIGNAL_SELECTORS];
+    size_t pending = 0;
+    sigset_t blocked;
     sigemptyset(&blocked);
-    sigaddset(&blocked, number);
-    if (sigprocmask(SIG_BLOCK, &blocked, &previous) != 0) return errno;
-    struct sigaction action;
+    for (size_t at = 0; at < count; at++) {
+        int selector = (int)selectors[at];
+        int number = system_signal_number(selector);
+        if (!number) return system_failure(EINVAL);
+        if (system_signal_subscribed[selector]) continue;
+        numbers[pending] = number;
+        sigaddset(&blocked, number);
+        pending += 1;
+    }
+    bool created = false;
+    int descriptor = system_signal_socket(&created);
+    if (descriptor < 0) return system_failure(-descriptor);
+    if (!pending) return descriptor;
+    sigset_t previous_mask;
+    if (sigprocmask(SIG_BLOCK, &blocked, &previous_mask) != 0) {
+        int error = errno;
+        system_signal_rollback(created, numbers, NULL, 0);
+        return system_failure(error);
+    }
+    struct sigaction previous[SYSTEM_SIGNAL_SELECTORS], action;
+    size_t installed = 0;
+    int error = 0;
+    for (size_t at = 0; at < pending && !error; at++)
+        if (sigaction(numbers[at], NULL, &previous[at]) != 0) error = errno;
     memset(&action, 0, sizeof(action));
     action.sa_handler = system_on_signal;
     action.sa_flags = SA_RESTART;
     sigemptyset(&action.sa_mask);
-    int error = sigaction(number, &action, NULL) == 0 ? 0 : errno;
-    if (!error) system_signal_subscribed[selector] = 1;
-    if (sigprocmask(SIG_SETMASK, &previous, NULL) != 0 && !error) error = errno;
-    return error;
-}
-
-/* Validate every selector before installing any, so a rejected call installs nothing. */
-static long long system_signal_subscribe(const long long *selectors, size_t count) {
-    system_error = 0;
-    int descriptor = system_signal_socket();
-    if (descriptor < 0) return system_failure(-descriptor);
-    for (size_t at = 0; at < count; at++) {
-        int error = system_subscribe_signal((int)selectors[at]);
-        if (error) return system_failure(error);
+    for (size_t at = 0; at < pending && !error; at++) {
+        if (sigaction(numbers[at], &action, NULL) != 0) error = errno;
+        else installed += 1;
     }
+    /* SIGPIPE belongs to the same transaction: a server that cannot ignore it must not look half subscribed. */
+    struct sigaction previous_pipe;
+    bool pipe_installed = false;
+    if (!error && ignore_pipe) {
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = SIG_IGN;
+        if (sigaction(SIGPIPE, NULL, &previous_pipe) != 0) error = errno;
+        else if (sigaction(SIGPIPE, &action, NULL) != 0) error = errno;
+        else pipe_installed = true;
+    }
+    if (!error && sigprocmask(SIG_SETMASK, &previous_mask, NULL) != 0) error = errno;
+    if (error) {
+        if (pipe_installed) sigaction(SIGPIPE, &previous_pipe, NULL);
+        system_signal_rollback(created, numbers, previous, installed);
+        sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+        return system_failure(error);
+    }
+    for (size_t at = 0; at < installed; at++)
+        system_signal_subscribed[system_signal_selector(numbers[at])] = 1;
     return descriptor;
 }
 
@@ -226,17 +282,13 @@ long long minyar_system_signalSocketNative(const MinyarBytes *signals) {
             return system_failure(EINVAL);
         selectors[at] = (long long)value;
     }
-    return system_signal_subscribe(selectors, count);
+    return system_signal_subscribe(selectors, count, false);
 }
 
 /* SIGTERM/SIGINT as readiness, ignoring SIGPIPE (idempotent; returns the shared notification socket). */
 long long minyar_system_shutdownSignalSocket(void) {
     static const long long signals[] = {7, 2};
-    long long descriptor = system_signal_subscribe(signals, 2);
-    if (descriptor < 0) return descriptor;
-    long long pipe_status = minyar_system_ignoreBrokenPipes();
-    if (pipe_status) return pipe_status;
-    return descriptor;
+    return system_signal_subscribe(signals, 2, true);
 }
 
 /* The next delivered signal's selector (1..7), 0 when none is pending, or -errno. */

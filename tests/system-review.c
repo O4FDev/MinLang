@@ -26,8 +26,8 @@ static pthread_cond_t pause_condition=PTHREAD_COND_INITIALIZER;
 static _Atomic int active_write;
 static int writer_fd=-1;
 static bool release_write;
-static void system_on_shutdown(int);
-static void *paused_handler(void *p) { (void)p;system_on_shutdown(SIGTERM);return NULL; }
+static void system_on_signal(int);
+static void *paused_handler(void *p) { (void)p;system_on_signal(SIGTERM);return NULL; }
 static int policy_index(int signal) { return signal == SIGTERM ? 0 : signal == SIGINT ? 1 : 2; }
 static int intercepted_action(int signal, const struct sigaction *action, struct sigaction *old) {
     int i = policy_index(signal); assert(signal == SIGTERM || signal == SIGINT || signal == SIGPIPE);
@@ -121,7 +121,7 @@ static void setup(const char *kind, int failure) {
         assert(fcntl(system_signal_pair[i],F_GETFD)&FD_CLOEXEC);
         assert(fcntl(system_signal_pair[i],F_GETFL)&O_NONBLOCK);
     }
-    assert(policies[0].sa_handler==system_on_shutdown && policies[1].sa_handler==system_on_shutdown);
+    assert(policies[0].sa_handler==system_on_signal && policies[1].sa_handler==system_on_signal);
     assert(policies[2].sa_handler==SIG_IGN);
     close(system_signal_pair[0]);close(system_signal_pair[1]);assert(descriptors()==before);
 }
@@ -139,9 +139,9 @@ static void saturated(void) {
     unsigned char byte=SIGINT;
     while(write(system_signal_pair[1],&byte,1)==1){}
     assert(errno==EAGAIN||errno==EWOULDBLOCK);
-    errno=ENOSPC;system_on_shutdown(SIGTERM);assert(errno==ENOSPC);
+    errno=ENOSPC;system_on_signal(SIGTERM);assert(errno==ENOSPC);
     assert(minyar_system_drainShutdownSignals()==SIGINT);
-    system_on_shutdown(SIGTERM);assert(minyar_system_drainShutdownSignals()==SIGTERM);
+    system_on_signal(SIGTERM);assert(minyar_system_drainShutdownSignals()==SIGTERM);
     close(system_signal_pair[0]);close(system_signal_pair[1]);
 }
 int main(int argc,char **argv) {
