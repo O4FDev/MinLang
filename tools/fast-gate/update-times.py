@@ -114,7 +114,11 @@ def main():
                         rows = [found[(tree, p)] for p in pieces]
                         samples.setdefault(label, []).append((sum(r[0] for r in rows), sum(r[1] for r in rows), rows[0][2]))
     for target, rows in samples.items():
-        checks[target] = [str(int(statistics.median(row[0] for row in rows))), str(int(statistics.median(row[1] for row in rows))), rows[-1][2]]
+        passed = rows[-1][2]
+        # The table's own row counts as one more earlier run.
+        if target in checks:
+            rows = rows + [(int(checks[target][0]), int(checks[target][1]), checks[target][2])]
+        checks[target] = [str(int(statistics.median(row[0] for row in rows))), str(int(statistics.median(row[1] for row in rows))), passed]
     with open(os.path.join(HERE, "times.tsv"), "w") as out:
         out.write("target\twall_ms\tcpu_ms\tpassed\n")
         for target, (wall, cpu, passed) in sorted(checks.items(), key=lambda item: -int(item[1][0])):

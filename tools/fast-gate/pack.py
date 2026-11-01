@@ -18,6 +18,7 @@ import re
 import sys
 
 DEFAULT_CHECK_MS = 20000
+UNMEASURED_FIRST_MS = 600000  # runner priority of a check with no time of its own: start it first, it may be long
 DEFAULT_GOAL_MS = 2000
 DEFER_MS = 20000  # shared builds at least this slow are built beside the runner instead of before every check
 ROUNDS = 12  # greedy passes; each later one handicaps the shards the one before left above the mean
@@ -53,13 +54,15 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None, extra=None):
     prebuilt = set(plan.get("prebuilt", []))
     checks = plan["checks"]
     # A check split into pieces keeps its old name as their aggregate: until the pieces have times of their own, they
-    # share the old check's time (less any of its children that have their own) and the aggregate costs nothing.
+    # share the old check's time (less any of its children that have their own) and the aggregate costs nothing. A new
+    # check under an aggregate whose known children already account for its time (check-portable) gets no share.
     check_ms, wall_ms = dict(check_ms), dict(wall_ms)
+    measured = set(check_ms)
     for check in checks:
         label, children = check["label"], check["children"]
         unknown = [child for child in children if child not in check_ms]
-        if label in check_ms and unknown:
-            known_cpu = sum(check_ms[child] for child in children if child in check_ms)
+        known_cpu = sum(check_ms[child] for child in children if child in check_ms)
+        if label in check_ms and unknown and check_ms[label] > known_cpu:
             known_wall = sum(wall_ms.get(child, check_ms[child]) for child in children if child in check_ms)
             for child in unknown:
                 check_ms[child] = max(1000, (check_ms[label] - known_cpu) // len(unknown))
@@ -291,11 +294,13 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None, extra=None):
     # cpu ms); a fresh tree has no history and would start them last, leaving one long check running alone at the end.
     # The estimate is the check's critical path: its own length plus its slowest shared build, so a long build that only
     # a quick check needs (build/scope-compiler-stage3.ll for check-scope-fixed-point) still starts first.
-    # A check that waits for a deferred heavy build gets no boost for it: it would only sleep in a runner slot.
+    # A check that waits for a deferred heavy build gets no boost for it: it would only sleep in a runner slot. A check
+    # with no time of its own starts first: a long new check must not be found out at the end of its shard.
     durations = {}
     for check in checks:
         slowest = max([goal_ms.get(name, 0) for name in check["goals"] if name not in prebuilt and not heavy(name)] or [0])
-        durations[check["label"]] = [length(check) + slowest, cost(check)]
+        first = UNMEASURED_FIRST_MS if check["label"] not in measured and not check["children"] else 0
+        durations[check["label"]] = [max(length(check) + slowest, first), cost(check)]
     return {"shards": count, "regular": shards, "jobs": jobs, "extra": extra, "checks": len(all_checks), "goals": len(goals),
             "assignment": result, "durations": durations}
 
