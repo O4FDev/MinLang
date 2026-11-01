@@ -31,6 +31,41 @@ static inline long long text_byte_find(const unsigned char *bytes, long long sta
     const unsigned char *hit = memchr(bytes + start, wanted, (size_t)(length - start));
     return hit ? hit - bytes : length;
 }
+/* text_byte_find for a caller that walks a whole Text: the eight-byte search
+ * stays where the last piece ended instead of restarting at each piece, so a
+ * line of a few fields costs one word test per field and never a library
+ * call. *cursor is the byte to search from and is left just past the byte
+ * returned; the answer is `length` when no byte is left. */
+static inline long long text_byte_scan(const unsigned char *bytes, long long length,
+                                       unsigned char wanted, long long *cursor) {
+    long long at = *cursor;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    uint64_t spread = 0x0101010101010101ULL * wanted;
+    while (length - at >= 8) {
+        uint64_t word;
+        memcpy(&word, bytes + at, sizeof(word));
+        word ^= spread;
+        uint64_t found = (word - 0x0101010101010101ULL) & ~word & 0x8080808080808080ULL;
+        if (found) {
+            long long hit = at + (__builtin_ctzll(found) >> 3);
+            *cursor = hit < length ? hit + 1 : length;
+            return hit;
+        }
+        at += 8;
+    }
+#endif
+    /* At most seven bytes are left: testing them one at a time is cheaper
+       than the call into the C library that text_byte_find would make. */
+    while (at < length) {
+        if (bytes[at] == wanted) {
+            *cursor = at + 1;
+            return at;
+        }
+        at++;
+    }
+    *cursor = length;
+    return length;
+}
 /* KMP avoids quadratic scans of repeated prefixes. One table is reused for
  * all split matches; one-byte separators take the allocation-free path, and
  * needles of up to TEXT_SEARCH_SMALL bytes use the caller's stack table.
@@ -38,16 +73,12 @@ static inline long long text_byte_find(const unsigned char *bytes, long long sta
  * are found by their first byte and compared in place, at most that many
  * byte comparisons per text byte, so the search stays linear. */
 enum { TEXT_SEARCH_SMALL = 32, TEXT_SEARCH_SHORT = 16 };
-static long long *text_search_table(const MinyarText *needle, long long available,
-                                    long long small[TEXT_SEARCH_SMALL]) {
+/* The table for a long needle. Nearly every search has a short needle, so
+ * text_search_table decides that inline and only this build stays out of
+ * line. */
+static MINYAR_COLD long long *text_search_table_build(const MinyarText *needle,
+                                                      long long small[TEXT_SEARCH_SMALL]) {
     long long length = needle->byte_length;
-    if (length <= TEXT_SEARCH_SHORT || length > available) return NULL;
-#if defined(__linux__) && defined(MINYAR_COMPILER_ARENA)
-    /* text_search_next searches these with the C library's memmem, which
-     * needs no table; building one for every search of an IR line was the
-     * larger half of a self-compile's Text search time. */
-    return NULL;
-#endif
     if ((unsigned long long)length > SIZE_MAX / sizeof(long long))
         minyar_stop("the Text search pattern is too large.");
     long long *table = small;
@@ -70,7 +101,20 @@ static long long *text_search_table(const MinyarText *needle, long long availabl
     }
     return table;
 }
-static void text_search_free(long long *table, const long long *small) {
+static inline long long *text_search_table(const MinyarText *needle, long long available,
+                                           long long small[TEXT_SEARCH_SMALL]) {
+    long long length = needle->byte_length;
+    if (length <= TEXT_SEARCH_SHORT || length > available) return NULL;
+#if defined(__linux__) && defined(MINYAR_COMPILER_ARENA)
+    /* text_search_next searches these with the C library's memmem, which
+     * needs no table; building one for every search of an IR line was the
+     * larger half of a self-compile's Text search time. */
+    return NULL;
+#else
+    return text_search_table_build(needle, small);
+#endif
+}
+static inline void text_search_free(long long *table, const long long *small) {
     if (!table || table == small)
         return;
 #ifndef MINYAR_COMPILER_ARENA
@@ -181,10 +225,9 @@ MinyarList *minyar_text_split(MinyarText *text, MinyarText *separator) {
             long long count = 0, scan = start;
             _Bool finished = 0;
             while (count < SPLIT_BATCH) {
-                long long end = text_byte_find(bytes, scan, length, wanted);
+                long long end = text_byte_scan(bytes, length, wanted, &scan);
                 ends[count++] = end;
                 if (end >= length) { finished = 1; break; }
-                scan = end + 1;
             }
             list_reserve(parts, parts->length + count);
             for (long long piece = 0; piece < count; piece++) {
@@ -480,8 +523,9 @@ static void text_split_range(MinyarText *text, MinyarText *separator, long long 
         list_position_stop(index, piece);
     }
     if (separator->byte_length == 1) {
+        long long scan = 0;
         for (;;) {
-            long long at = text_byte_find(bytes, from, length, separator->bytes[0]);
+            long long at = text_byte_scan(bytes, length, separator->bytes[0], &scan);
             if (piece == index) { *start = from; *end = at; return; }
             if (at >= length) break;
             from = at + 1;
@@ -517,11 +561,11 @@ long long minyar_text_split_count(MinyarText *text, MinyarText *separator) {
     if (separator->byte_length == 1) {
         const unsigned char *bytes = text->bytes;
         long long length = text->byte_length;
+        long long cursor = 0;
         for (;;) {
-            long long at = text_byte_find(bytes, from, length, separator->bytes[0]);
+            long long at = text_byte_scan(bytes, length, separator->bytes[0], &cursor);
             if (at >= length) return pieces;
             pieces++;
-            from = at + 1;
         }
     }
     long long small[TEXT_SEARCH_SMALL];
@@ -618,6 +662,22 @@ static MinyarText *text_index_piece(MinyarText *index, long long start, long lon
 #endif
 }
 /* text.split(separator), as the piece ranges. One pass over the receiver. */
+/* One more piece of room in the range buffer; the stack buffer serves the
+ * first pieces, and every later size doubles. */
+static long long *split_ranges_grow(long long *ranges, const long long *small, long long count,
+                                    long long *capacity) {
+    long long grown_capacity = *capacity * 2;
+    long long *grown = data_allocate((size_t)(2 * grown_capacity) * sizeof(long long),
+                                     sizeof(long long));
+    memcpy(grown, ranges, (size_t)(2 * count) * sizeof(long long));
+#ifndef MINYAR_COMPILER_ARENA
+    if (ranges != small) rc_free_data(ranges);
+#else
+    (void)small;
+#endif
+    *capacity = grown_capacity;
+    return grown;
+}
 MinyarText *minyar_text_split_index(MinyarText *text, MinyarText *separator) {
     ensure_text_index(text);
     ensure_text_index(separator);
@@ -626,43 +686,45 @@ MinyarText *minyar_text_split_index(MinyarText *text, MinyarText *separator) {
     long long capacity = 32, count = 0;
     const unsigned char *bytes = text->bytes;
     long long length = text->byte_length, from = 0;
-    _Bool more = 1;
-    long long small_table[TEXT_SEARCH_SMALL];
-    long long *table = NULL;
-    if (separator->byte_length > 1) table = text_search_table(separator, length, small_table);
-    while (more) {
-        long long end;
-        if (!separator->byte_length) {
-            if (from >= length) break;
+    long long separator_length = separator->byte_length;
+    if (separator_length == 1) {
+        /* The usual separator: one byte, so the cursor that text_byte_scan
+         * keeps makes the whole receiver one pass of eight-byte tests. */
+        unsigned char wanted = separator->bytes[0];
+        long long scan = 0;
+        for (;;) {
+            long long end = text_byte_scan(bytes, length, wanted, &scan);
+            if (count == capacity) ranges = split_ranges_grow(ranges, small, count, &capacity);
+            ranges[2 * count] = from;
+            ranges[2 * count + 1] = end;
+            count++;
+            if (end >= length) break;
+            from = end + 1;
+        }
+    } else if (!separator_length) {
+        while (from < length) {
             unsigned char lead = bytes[from];
-            end = from + (lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4);
-        } else if (separator->byte_length == 1) {
-            end = text_byte_find(bytes, from, length, separator->bytes[0]);
-        } else {
-            long long match = text_search_next(text, separator, from, table);
-            if (match < 0) end = length; else end = match;
-        }
-        if (count == capacity) {
-            long long grown_capacity = capacity * 2;
-            long long *grown = data_allocate((size_t)(2 * grown_capacity) * sizeof(long long),
-                                            sizeof(long long));
-            memcpy(grown, ranges, (size_t)(2 * count) * sizeof(long long));
-#ifndef MINYAR_COMPILER_ARENA
-            if (ranges != small) rc_free_data(ranges);
-#endif
-            ranges = grown;
-            capacity = grown_capacity;
-        }
-        ranges[2 * count] = from;
-        ranges[2 * count + 1] = end;
-        count++;
-        if (!separator->byte_length) {
+            long long end = from + (lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4);
+            if (count == capacity) ranges = split_ranges_grow(ranges, small, count, &capacity);
+            ranges[2 * count] = from;
+            ranges[2 * count + 1] = end;
+            count++;
             from = end;
-        } else if (end >= length) {
-            more = 0;
-        } else {
-            from = end + separator->byte_length;
         }
+    } else {
+        long long small_table[TEXT_SEARCH_SMALL];
+        long long *table = text_search_table(separator, length, small_table);
+        for (;;) {
+            long long match = text_search_next(text, separator, from, table);
+            long long end = match < 0 ? length : match;
+            if (count == capacity) ranges = split_ranges_grow(ranges, small, count, &capacity);
+            ranges[2 * count] = from;
+            ranges[2 * count + 1] = end;
+            count++;
+            if (match < 0) break;
+            from = match + separator_length;
+        }
+        if (table) text_search_free(table, small_table);
     }
     MinyarText *index = new_text(bytes, count, !text->character_offsets ? 1 : 0);
     index->character_offsets = NULL;
@@ -678,7 +740,6 @@ MinyarText *minyar_text_split_index(MinyarText *text, MinyarText *separator) {
 #ifndef MINYAR_COMPILER_ARENA
     if (ranges != small) rc_free_data(ranges);
 #endif
-    if (table) text_search_free(table, small_table);
     return index;
 }
 long long minyar_text_split_index_count(MinyarText *index) {
@@ -978,20 +1039,23 @@ MinyarText *minyar_text_ascii_uppercased(MinyarText *text) { return text_ascii_c
 /* joinText(parts, separator): one exactly sized copy. */
 MinyarText *minyar_join_texts_with(const MinyarList *parts, MinyarText *separator) {
     long long length = 0, offset = 0;
-    _Bool ascii = separator->character_length == separator->byte_length;
-    for (long long index = 0; index < parts->length; index++) {
+    long long count = parts->length, separator_length = separator->byte_length;
+    _Bool ascii = separator->character_length == separator_length;
+    for (long long index = 0; index < count; index++) {
         const MinyarText *part = (const MinyarText *)(intptr_t)parts->values[index];
         length = text_checked_sum(length, part->byte_length);
-        if (index) length = text_checked_sum(length, separator->byte_length);
         if (part->character_length != part->byte_length) ascii = 0;
     }
+    /* Every separator but the one after the last part goes between them. */
+    if (count > 1 && separator_length) length = text_checked_sum(length, text_checked_product(count - 1, separator_length));
     unsigned char *out;
     MinyarText *text = text_build(length, ascii, &out);
-    for (long long index = 0; index < parts->length; index++) {
+    const unsigned char *separator_bytes = separator->bytes;
+    for (long long index = 0; index < count; index++) {
         const MinyarText *part = (const MinyarText *)(intptr_t)parts->values[index];
         if (index) {
-            copy_bytes(out + offset, separator->bytes, (size_t)separator->byte_length);
-            offset += separator->byte_length;
+            copy_bytes(out + offset, separator_bytes, (size_t)separator_length);
+            offset += separator_length;
         }
         copy_bytes(out + offset, part->bytes, (size_t)part->byte_length);
         offset += part->byte_length;
