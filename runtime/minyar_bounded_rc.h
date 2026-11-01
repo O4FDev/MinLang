@@ -210,7 +210,12 @@ RC_QUEUE_INLINE unsigned rc_drop_loaded_in(RcBoundedObjects *q, size_t *pending,
         return 1;
     }
     if (ownership < 8) return 0; /* Immortal literal or cache. */
-    unsigned kind = (unsigned)(ownership & 7);
+    /* Store the count and read the kind back through the header. LTO inlines
+     * this body at every user drop site, and a kind tested from the register
+     * instead of the stored header splits the shared tail into extra copies
+     * there (textops' main grew 134 instructions, 0.2% of its Ir). */
+    object->ownership = ownership - 8;
+    unsigned kind = (unsigned)(object->ownership & 7);
 #if MINYAR_THREADED
     if (kind == 0) {
         rc_bounded_finish_object(object, kind);
@@ -258,10 +263,6 @@ RC_QUEUE_INLINE unsigned rc_drop_loaded_in(RcBoundedObjects *q, size_t *pending,
         rc_bounded_finish_object(object, kind);
         return 1;
     }
-    /* Only the paths that queue a task still need the zero count in the
-     * header; the frees above replace the header's owner count with its kind
-     * by overwriting or dropping the object. */
-    object->ownership = kind;
     rc_bounded_enqueue_in(q, pending, object);
     return 0;
 }
