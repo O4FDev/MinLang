@@ -3,6 +3,8 @@
 use "httpserver" as http
 use "connect" as connect
 use "rpc" as rpc
+use "deflate" as deflate
+use "errors" as errors
 
 public function fromHttp(request: http.Request): connect.Request {
     let headers: List<rpc.Header> = []
@@ -23,4 +25,21 @@ public function serve(server: http.Server, service: connect.Server, request: htt
     if http.respond(server, request, toHttp(fallback)) { return true }
     http.abandon(server, request)
     return false
+}
+
+/// gzip Content-Encoding for connect.Options.compressors and Client.compressors.
+public function gzip(): connect.Compressor {
+    return connect.Compressor { name: "gzip"; compress: gzipCompress; decompress: gzipDecompress }
+}
+function gzipCompress(data: Bytes): Result<Bytes, errors.Error> {
+    // Stored blocks bound the worst case: five bytes per 16 KiB plus the gzip frame.
+    let result = deflate.compress(data, deflate.GZIP, 6, data.length + data.length / 16 + 64)
+    if !deflate.ok(result) { return Err(errors.make(errors.invalidDataCode(), deflate.status(result), "gzip compression failed")) }
+    return Ok(deflate.data(result))
+}
+function gzipDecompress(data: Bytes, limit: Integer): Result<Bytes, errors.Error> {
+    let result = deflate.decompress(data, deflate.GZIP, limit)
+    if deflate.status(result) == deflate.LIMIT { return Err(errors.make(errors.overflowCode(), deflate.LIMIT, "gzip data expands past " + Text(limit) + " bytes")) }
+    if !deflate.ok(result) { return Err(errors.make(errors.invalidDataCode(), deflate.status(result), "invalid gzip data")) }
+    return Ok(deflate.data(result))
 }

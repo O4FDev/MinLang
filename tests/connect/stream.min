@@ -1,0 +1,185 @@
+// Server streaming and deferred unary calls through Server.open and
+// Exchange.step: envelopes, end-of-stream errors and trailers, held streams,
+// backpressure, deadlines, cancellation, compression and in-flight keys.
+use "connect" as connect
+use "rpc" as rpc
+use "errors" as errors
+use "text" as utf8
+
+global clockNow: List<Integer> = [0]
+function clock(): Integer { return clockNow[0] }
+function header(name: Text, value: Text): rpc.Header { return rpc.Header { name: name; value: value } }
+function reversed(data: Bytes): Bytes {
+    let out = Bytes()
+    for index in 0..data.length { out.add(data[data.length - 1 - index]) }
+    return out
+}
+// Envelopes as "flags:text" pieces, so the output stays readable.
+function envelopes(body: Bytes): Text {
+    let parts: List<Text> = []
+    let at = 0
+    while at + 5 <= body.length {
+        let length = (body[at + 1] << 24) | (body[at + 2] << 16) | (body[at + 3] << 8) | body[at + 4]
+        let data = body.slice(at + 5, min(body.length, at + 5 + length))
+        if (body[at] & 1) == 1 { data = reversed(data) }
+        parts.add(Text(body[at]) + ":" + utf8.decodeOrStop(data))
+        at += 5 + length
+    }
+    if at != body.length { parts.add("<" + Text(body.length - at) + " stray bytes>") }
+    return joinText(parts, " | ")
+}
+function headers(response: connect.Response): Text {
+    let line = ""
+    for field in response.headers { line = line + " [" + field.name + ": " + field.value + "]" }
+    return line
+}
+function show(label: Text, response: connect.Response) {
+    let body = ""
+    if rpc.headerValue(response.headers, "content-type").startsWith("application/connect+") { body = envelopes(response.body) }
+    else { body = utf8.decodeOrStop(response.body) }
+    print(label + " " + Text(response.status) + headers(response) + " " + body)
+}
+function steps(label: Text, exchange: connect.Exchange) {
+    let line = label
+    while true {
+        match exchange.step() {
+            Waiting {
+                print(line + " / waiting")
+                return
+            }
+            Respond(response) {
+                print(line + " / respond " + Text(response.status) + headers(response) + " " + utf8.decodeOrStop(response.body))
+                return
+            }
+            Start(head) { line = line + " / start " + Text(head.status) + headers(head) }
+            Write(piece) { line = line + " / write " + envelopes(piece) }
+            End(piece) {
+                print(line + " / end " + envelopes(piece))
+                return
+            }
+        }
+    }
+}
+function streamRequest(target: Text, message: Text, extra: List<rpc.Header>): connect.Request {
+    let request = connect.Request { method: "POST"; target: target; headers: [header("content-type", "application/connect+json")]
+        body: connect.envelope(0, Bytes(message)) }
+    for field in extra { request.headers.add(field) }
+    return request
+}
+function opened(server: connect.Server, request: connect.Request): connect.Exchange {
+    match server.open(request) {
+        Started(exchange) { return exchange }
+        Complete(response) {
+            show("unexpectedly complete", response)
+            fail("expected a started call")
+        }
+    }
+}
+
+let kept: List<rpc.Responder> = []
+let services = rpc.services()
+services.addServerStream("/t.v1.S/Count", function(call: rpc.Call, data: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+    let count = data.length
+    call.responseHeaders.add(header("x-count", Text(count)))
+    for index in 0..count { responder.send(Bytes("{\"n\":" + Text(index) + "}")) }
+    call.responseTrailers.add(header("x-total", Text(count)))
+    call.responseTrailers.add(header("x-total", "again"))
+    if utf8.decodeOrStop(data) == "bad" { return Err(rpc.failure(rpc.FAILED_PRECONDITION, "stopped after " + Text(count)).withDetail("t.v1.Why", Bytes("w"))) }
+    return Ok()
+})
+services.addServerStream("/t.v1.S/Watch", function(call: rpc.Call, data: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+    responder.hold()
+    kept.add(responder)
+    return Ok()
+})
+services.addDeferred("/t.v1.S/Later", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+    if utf8.decodeOrStop(data) == "now" {
+        responder.send(Bytes("at once"))
+        return Ok()
+    }
+    responder.hold()
+    kept.add(responder)
+    return Ok()
+})
+let options = connect.defaults(clock)
+options.maxStreamBufferBytes = 40
+options.compressMinBytes = 1
+options.compressors.add(connect.Compressor { name: "reverse"
+    compress: function(data: Bytes): Result<Bytes, errors.Error> { return Ok(reversed(data)) }
+    decompress: function(data: Bytes, limit: Integer): Result<Bytes, errors.Error> { return Ok(reversed(data)) } })
+options.cors.allowedOrigins.add("https://app.example")
+let server = connect.server(services, options)
+
+// A stream that finishes inside its handler is one complete response.
+show("count", server.handle(streamRequest("/t.v1.S/Count", "abc", [])))
+show("count-error", server.handle(streamRequest("/t.v1.S/Count", "bad", [])))
+show("count-empty", server.handle(streamRequest("/t.v1.S/Count", "", [header("origin", "https://app.example")])))
+
+// Request envelopes and stream-level failures end in an error message with status 200.
+show("no-envelope", server.handle(connect.Request { method: "POST"; target: "/t.v1.S/Count"; headers: [header("content-type", "application/connect+json")]; body: Bytes("ab") }))
+let two = connect.envelope(0, Bytes("a"))
+two.addBytes(connect.envelope(0, Bytes("b")))
+show("two-messages", server.handle(connect.Request { method: "POST"; target: "/t.v1.S/Count"; headers: [header("content-type", "application/connect+json")]; body: two }))
+show("compressed-flag", server.handle(connect.Request { method: "POST"; target: "/t.v1.S/Count"; headers: [header("content-type", "application/connect+json")]; body: connect.envelope(1, Bytes("ab")) }))
+show("unknown-encoding", server.handle(streamRequest("/t.v1.S/Count", "ab", [header("connect-content-encoding", "gzip")])))
+show("bad-timeout", server.handle(streamRequest("/t.v1.S/Count", "ab", [header("connect-timeout-ms", "x")])))
+show("unary-type", server.handle(connect.Request { method: "POST"; target: "/t.v1.S/Count"; headers: [header("content-type", "application/json")]; body: Bytes("{}") }))
+show("get", server.handle(connect.Request { method: "GET"; target: "/t.v1.S/Count?encoding=json"; headers: []; body: Bytes() }))
+
+// Compression both ways: flag 1 messages under connect-content-encoding.
+show("compressed", server.handle(connect.Request { method: "POST"; target: "/t.v1.S/Count"
+    headers: [header("content-type", "application/connect+json"), header("connect-content-encoding", "reverse"), header("connect-accept-encoding", "gzip, reverse")]
+    body: connect.envelope(1, Bytes("dc")) }))
+
+// A held stream: messages flow as the transport steps the exchange.
+let watch = opened(server, streamRequest("/t.v1.S/Watch", "w", [header("connect-timeout-ms", "100")]))
+steps("held", watch)
+let responder = kept[0]
+print("send " + Text(responder.send(Bytes("{\"tick\":1}"))))
+steps("first", watch)
+// The buffer holds 40 bytes; later sends wait until the transport drains it.
+let accepted = 0
+let refused = 0
+for index in 0..5 { if responder.send(Bytes("{\"tick\":" + Text(index + 2) + "}")) { accepted += 1 } else { refused += 1 } }
+print("accepted " + Text(accepted) + " refused " + Text(refused) + " active " + Text(responder.active()))
+steps("drain", watch)
+print("send after drain " + Text(responder.send(Bytes("{\"tick\":9}"))))
+print("deadline " + Text(watch.deadline()))
+clockNow[0] = 100
+steps("deadline", watch)
+print("send after deadline " + Text(responder.send(Bytes("{}"))) + " active " + Text(responder.active()) + " finished " + Text(watch.finished()))
+steps("after", watch)
+
+// A held stream the client abandons.
+let gone = opened(server, streamRequest("/t.v1.S/Watch", "w", []))
+gone.cancel()
+print("canceled send " + Text(kept[1].send(Bytes("{}"))) + " active " + Text(kept[1].active()))
+steps("canceled", gone)
+show("held-by-handle", server.handle(streamRequest("/t.v1.S/Watch", "w", [])))
+
+// Deferred unary answers: at once, later, with an error, and past the deadline.
+show("deferred-now", server.handle(connect.Request { method: "POST"; target: "/t.v1.S/Later"; headers: [header("content-type", "application/json")]; body: Bytes("now") }))
+let later = opened(server, connect.Request { method: "POST"; target: "/t.v1.S/Later"
+    headers: [header("content-type", "application/json"), header("idempotency-key", "k"), header("origin", "https://app.example")]; body: Bytes("x") })
+steps("later", later)
+show("retry-while-running", server.handle(connect.Request { method: "POST"; target: "/t.v1.S/Later"
+    headers: [header("content-type", "application/json"), header("idempotency-key", "k")]; body: Bytes("x") }))
+let answer = kept[kept.length - 1]
+print("answer " + Text(answer.send(Bytes("{\"done\":true}"))))
+answer.finish(None)
+steps("answered", later)
+show("retry-after", server.handle(connect.Request { method: "POST"; target: "/t.v1.S/Later"
+    headers: [header("content-type", "application/json"), header("idempotency-key", "k")]; body: Bytes("x") }))
+let failing = opened(server, connect.Request { method: "POST"; target: "/t.v1.S/Later"; headers: [header("content-type", "application/json")]; body: Bytes("x") })
+kept[kept.length - 1].finish(Some(rpc.failure(rpc.NOT_FOUND, "gone")))
+steps("failed", failing)
+let slow = opened(server, connect.Request { method: "POST"; target: "/t.v1.S/Later"; headers: [header("content-type", "application/json"), header("connect-timeout-ms", "5")]; body: Bytes("x") })
+clockNow[0] = 105
+steps("slow", slow)
+let twice = opened(server, connect.Request { method: "POST"; target: "/t.v1.S/Later"; headers: [header("content-type", "application/json")]; body: Bytes("x") })
+print("twice " + Text(kept[kept.length - 1].send(Bytes("{}"))) + " " + Text(kept[kept.length - 1].send(Bytes("{}"))))
+steps("twice", twice)
+let silent = opened(server, connect.Request { method: "POST"; target: "/t.v1.S/Later"; headers: [header("content-type", "application/json")]; body: Bytes("x") })
+kept[kept.length - 1].finish(None)
+steps("silent", silent)
+print("executed " + Text(server.executed()) + " replayed " + Text(server.replayed()))

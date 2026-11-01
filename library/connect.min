@@ -1,5 +1,6 @@
 // Connect protocol (connectrpc.com) server and client over the rpc handler API.
-// No sockets: Server.handle turns one HTTP request into one HTTP response, and
+// No sockets: Server.handle turns one HTTP request into one HTTP response
+// (Server.open and Exchange.step for answers that come later), and
 // Client.unary sends through a caller-supplied transport, so the same code runs
 // behind httpserver (library/connecthttp.min) and inside simulation tests.
 // Unary calls use application/proto or application/json bodies over POST, or
@@ -15,7 +16,8 @@ public record Request { method: Text; target: Text; headers: List<rpc.Header>; b
 public record Response { status: Integer; headers: List<rpc.Header>; body: Bytes }
 
 /// A Content-Encoding the server or client accepts, such as gzip.
-/// `decompress` must refuse output longer than its limit.
+/// `decompress` must refuse output longer than its limit with an
+/// errors.overflowCode() error, which a server reports as RESOURCE_EXHAUSTED.
 public record Compressor {
     name: Text
     compress: (Bytes) -> Result<Bytes, errors.Error>
@@ -51,10 +53,13 @@ public record Options {
     // Completed unary results kept for retried calls with an Idempotency-Key.
     idempotencyEntries: Integer
     idempotencyMilliseconds: Integer
+    // Response bytes an open stream may queue before Responder.send says wait.
+    maxStreamBufferBytes: Integer
 }
 public function defaults(clock: () -> Integer): Options {
     return Options { clock: clock; maxRequestBytes: 4194304; maxResponseBytes: 16777216; requireProtocolVersion: false;
-        cors: noCors(); compressors: []; compressMinBytes: 1024; idempotencyEntries: 4096; idempotencyMilliseconds: 86400000 }
+        cors: noCors(); compressors: []; compressMinBytes: 1024; idempotencyEntries: 4096; idempotencyMilliseconds: 86400000;
+        maxStreamBufferBytes: 1048576 }
 }
 
 record Replay { key: Text; fingerprint: Integer; stored: Integer; response: Response }
@@ -64,12 +69,16 @@ public record Server {
     private replays: List<Replay>
     private replayNext: Integer
     private replayIndex: Map<Text, Integer>
+    // Keys of deferred calls still running; a retry meanwhile is ABORTED.
+    private running: Set<Text>
     private executed: Integer
     private replayed: Integer
 }
 public function server(services: rpc.Services, options: Options): Server {
     let index: Map<Text, Integer> = Map()
-    return Server { services: services; options: options; replays: []; replayNext: 0; replayIndex: index; executed: 0; replayed: 0 }
+    let running: Set<Text> = Set()
+    return Server { services: services; options: options; replays: []; replayNext: 0; replayIndex: index; running: running;
+        executed: 0; replayed: 0 }
 }
 // Handler runs started, and responses served again for a retried key.
 public function Server.executed(): Integer { return self.executed }
@@ -369,15 +378,97 @@ function Server.encodings(): Text {
     return joinText(names, ",")
 }
 
-/// Serves one unary HTTP request, including CORS preflight.
+/// Serves one request whose answer is ready when its handler returns:
+/// unary calls, CORS preflight, and deferred or streaming calls that finish
+/// inside their handler. Use `open` to serve calls that finish later.
 public function Server.handle(request: Request): Response {
+    match self.open(request) {
+        Complete(response) { return response }
+        Started(exchange) {
+            let head = Response { status: 0; headers: []; body: Bytes() }
+            while true {
+                match exchange.step() {
+                    Respond(response) { return response }
+                    Start(started) { head = started }
+                    Write(piece) { head.body.addBytes(piece) }
+                    End(piece) {
+                        head.body.addBytes(piece)
+                        return head
+                    }
+                    Waiting {
+                        exchange.cancel()
+                        return self.withCors(exchange.origin, failed(rpc.UNIMPLEMENTED, "this call finishes later; serve it with Server.open"))
+                    }
+                }
+            }
+        }
+    }
+    return failed(rpc.INTERNAL, "unreachable")
+}
+
+/// The outcome of opening a call.
+public choice Opened {
+    Complete(response: Response)
+    // The handler returned without finishing; step the Exchange as the
+    // transport polls, until it responds or ends.
+    Started(exchange: Exchange)
+}
+
+/// What a transport sends next for an open call.
+public choice Step {
+    // Nothing yet: step again after the next poll or the call's deadline.
+    Waiting
+    // A complete unary answer; the call is over.
+    Respond(response: Response)
+    // A stream begins: send this status and these headers, then the pieces.
+    Start(head: Response)
+    Write(piece: Bytes)
+    // The last bytes of the stream; the call is over.
+    End(piece: Bytes)
+}
+
+/// A deferred unary call or a server stream that outlives its handler.
+public record Exchange {
+    private server: Server
+    private call: rpc.Call
+    private responder: rpc.Responder
+    private streaming: Boolean
+    private requestHeaders: List<rpc.Header>
+    private compressor: Maybe<Compressor>
+    private queue: Bytes
+    private headSent: Boolean
+    private message: Maybe<Bytes>
+    private outcome: Maybe<Maybe<rpc.Error>>
+    private done: Boolean
+    private origin: Text
+    private replayKey: Text
+    private replayFingerprint: Integer
+    private started: Integer
+}
+// The call's deadline on the server clock, or -1; step it then at the latest.
+public function Exchange.deadline(): Integer { return self.call.deadline }
+public function Exchange.finished(): Boolean { return self.done }
+// The client went away: the handler's later sends fail and nothing is stored.
+public function Exchange.cancel() {
+    if self.done { return }
+    self.done = true
+    rpc.cancel(self.responder)
+    if self.replayKey != "" { self.server.running.remove(self.replayKey) }
+}
+
+/// Starts one call. Most callers use `handle`; transports that can wait use
+/// this and step a Started exchange as they poll.
+public function Server.open(request: Request): Opened {
     let headers = lowerHeaders(request.headers)
     let normalized = Request { method: request.method.asciiUppercased(); target: request.target; headers: headers; body: request.body }
     let origin = rpc.headerValue(headers, "origin")
     if normalized.method == "OPTIONS" && rpc.headerValue(headers, "access-control-request-method") != "" {
-        return self.preflight(origin)
+        return Complete(self.preflight(origin))
     }
-    return self.withCors(origin, self.dispatch(normalized))
+    return match self.dispatch(normalized, origin) {
+        Complete(response) { Complete(self.withCors(origin, response)) }
+        Started(exchange) { Started(exchange) }
+    }
 }
 
 record Parsed { codec: Text; body: Bytes; compression: Text; get: Boolean; problem: Maybe<Response> }
@@ -455,7 +546,62 @@ function Server.parse(request: Request, method: rpc.Method, path: Text, raw: Tex
     return Parsed { codec: codec; body: request.body; compression: rpc.headerValue(headers, encodingHeader).asciiLowercased(); get: false; problem: None }
 }
 
-function Server.dispatch(request: Request): Response {
+// One Connect envelope: flags, a big-endian length, then the bytes.
+public function envelope(flags: Integer, data: Bytes): Bytes {
+    let out = Bytes()
+    out.add(flags)
+    out.add((data.length >> 24) & 255)
+    out.add((data.length >> 16) & 255)
+    out.add((data.length >> 8) & 255)
+    out.add(data.length & 255)
+    out.addBytes(data)
+    return out
+}
+// The end-of-stream message: an optional error and the trailers.
+public function endStreamJson(error: Maybe<rpc.Error>, trailers: List<rpc.Header>): Bytes {
+    let out = Bytes("{")
+    match error {
+        Some(problem) {
+            out.addBytes(Bytes("\"error\":"))
+            out.addBytes(errorJson(problem))
+        }
+        None {}
+    }
+    if trailers.length > 0 {
+        match error { Some(_) { out.add(44) } None {} }
+        out.addBytes(Bytes("\"metadata\":{"))
+        let names: List<Text> = []
+        for field in trailers {
+            let name = field.name.asciiLowercased()
+            let seen = false
+            for other in names { if other == name { seen = true } }
+            if !seen { names.add(name) }
+        }
+        for index in 0..names.length {
+            if index > 0 { out.add(44) }
+            quoted(names[index], out)
+            out.addBytes(Bytes(":["))
+            let first = true
+            for field in trailers {
+                if field.name.asciiLowercased() != names[index] { continue }
+                if !first { out.add(44) }
+                first = false
+                quoted(field.value, out)
+            }
+            out.add(93)
+        }
+        out.add(125)
+    }
+    out.add(125)
+    return out
+}
+// A stream that fails before its handler runs: status 200 and an end message.
+function streamFailure(codec: Text, error: rpc.Error): Response {
+    return Response { status: 200; headers: [rpc.Header { name: "content-type"; value: "application/connect+" + codec }]
+        body: envelope(2, endStreamJson(Some(error), [])) }
+}
+
+function Server.dispatch(request: Request, origin: Text): Opened {
     let question = request.target.find("?")
     let path = request.target
     let raw = ""
@@ -464,78 +610,246 @@ function Server.dispatch(request: Request): Response {
         raw = request.target.slice(question + 1, request.target.length)
     }
     let found = self.services.lookup(path)
-    if found.isNone() { return failed(rpc.UNIMPLEMENTED, "no procedure " + path) }
+    if found.isNone() {
+        let missing = failed(rpc.UNIMPLEMENTED, "no procedure " + path)
+        return Complete(Response { status: 404; headers: missing.headers; body: missing.body })
+    }
     let method = found.unwrap()
     let streaming = method.kind() == rpc.SERVER_STREAM
     let allowGet = method.idempotency == rpc.NO_SIDE_EFFECTS && !streaming
     if request.method != "POST" && !(request.method == "GET" && allowGet) {
         let allow = "POST"
         if allowGet { allow = "GET, POST" }
-        return Response { status: 405; headers: [rpc.Header { name: "allow"; value: allow }]; body: Bytes() }
+        return Complete(Response { status: 405; headers: [rpc.Header { name: "allow"; value: allow }]; body: Bytes() })
     }
     let parsed = self.parse(request, method, path, raw, streaming)
-    match parsed.problem { Some(response) { return response } None {} }
-    if parsed.body.length > self.options.maxRequestBytes {
-        return failed(rpc.RESOURCE_EXHAUSTED, "request is larger than " + Text(self.options.maxRequestBytes) + " bytes")
+    match parsed.problem {
+        Some(response) {
+            if streaming && response.status != 415 {
+                return Complete(streamFailure(parsed.codec, parseErrorJson(response.body).unwrapOr(rpc.failure(rpc.INVALID_ARGUMENT, "bad request"))))
+            }
+            return Complete(response)
+        }
+        None {}
     }
+    let opened = self.prepare(request, method, path, parsed, origin)
+    if streaming {
+        match opened {
+            Complete(response) {
+                if response.status == 200 { return opened }
+                return Complete(streamFailure(parsed.codec, parseErrorJson(response.body).unwrapOr(rpc.failure(rpc.INTERNAL, "failed"))))
+            }
+            Started(_) { return opened }
+        }
+    }
+    return opened
+}
+
+function Server.prepare(request: Request, method: rpc.Method, path: Text, parsed: Parsed, origin: Text): Opened {
+    let streaming = method.kind() == rpc.SERVER_STREAM
+    let limit = self.options.maxRequestBytes
     let body = parsed.body
-    if parsed.compression != "" && parsed.compression != "identity" {
+    let compressed = parsed.compression != "" && parsed.compression != "identity"
+    if streaming {
+        // One enveloped message; flag 1 marks it compressed.
+        if body.length == 0 { return Complete(failed(rpc.UNIMPLEMENTED, "a server stream needs exactly one request message")) }
+        if body.length < 5 { return Complete(failed(rpc.INVALID_ARGUMENT, "incomplete request envelope")) }
+        let flags = body[0]
+        let length = (body[1] << 24) | (body[2] << 16) | (body[3] << 8) | body[4]
+        if length > limit { return Complete(failed(rpc.RESOURCE_EXHAUSTED, "request is larger than " + Text(limit) + " bytes")) }
+        if body.length < 5 + length { return Complete(failed(rpc.INVALID_ARGUMENT, "incomplete request message")) }
+        if body.length > 5 + length { return Complete(failed(rpc.UNIMPLEMENTED, "a server stream needs exactly one request message")) }
+        if (flags & 254) != 0 { return Complete(failed(rpc.INVALID_ARGUMENT, "unexpected envelope flags")) }
+        if (flags & 1) == 1 && !compressed { return Complete(failed(rpc.INTERNAL, "compressed message without connect-content-encoding")) }
+        compressed = compressed && (flags & 1) == 1
+        body = body.slice(5, body.length)
+    } else if body.length > limit {
+        return Complete(failed(rpc.RESOURCE_EXHAUSTED, "request is larger than " + Text(limit) + " bytes"))
+    }
+    if parsed.compression != "" && parsed.compression != "identity" && self.compressor(parsed.compression).isNone() {
+        return Complete(failed(rpc.UNIMPLEMENTED, "unknown compression " + parsed.compression + "; supported: " + self.encodings()))
+    }
+    if compressed {
         match self.compressor(parsed.compression) {
             Some(compressor) {
-                match compressor.decompress(body, self.options.maxRequestBytes) {
+                match compressor.decompress(body, limit) {
                     Ok(expanded) { body = expanded }
-                    Err(problem) { return failed(rpc.INVALID_ARGUMENT, "cannot decompress request: " + problem.message()) }
+                    Err(problem) {
+                        let code = rpc.INVALID_ARGUMENT
+                        if errors.code(problem) == errors.overflowCode() { code = rpc.RESOURCE_EXHAUSTED }
+                        return Complete(failed(code, "cannot decompress request: " + problem.message()))
+                    }
                 }
             }
-            None { return failed(rpc.UNIMPLEMENTED, "unknown compression " + parsed.compression + "; supported: " + self.encodings()) }
+            None {}
         }
     }
     let timeout = timeoutMilliseconds(rpc.headerValue(request.headers, "connect-timeout-ms"))
-    if timeout == -2 { return failed(rpc.INVALID_ARGUMENT, "malformed connect-timeout-ms") }
+    if timeout == -2 { return Complete(failed(rpc.INVALID_ARGUMENT, "malformed connect-timeout-ms")) }
     let started = self.options.clock()
     let deadline = -1
     if timeout >= 0 { deadline = started + timeout }
-    if streaming { return failed(rpc.UNIMPLEMENTED, "server streaming is not served yet") }
 
-    // A retried call with the same Idempotency-Key gets the stored result.
+    // A retried unary call with the same Idempotency-Key gets the stored result.
     let key = rpc.headerValue(request.headers, "idempotency-key")
     let replayKey = ""
     let replayFingerprint = 0
-    if key != "" {
-        if key.byteLength > 255 { return failed(rpc.INVALID_ARGUMENT, "idempotency-key is longer than 255 bytes") }
+    if key != "" && !streaming {
+        if key.byteLength > 255 { return Complete(failed(rpc.INVALID_ARGUMENT, "idempotency-key is longer than 255 bytes")) }
         let scope = fingerprint(FNV_OFFSET, Bytes(rpc.headerValue(request.headers, "authorization")))
         replayKey = path + "\n" + Text(scope) + "\n" + key
         replayFingerprint = fingerprint(fingerprint(FNV_OFFSET, Bytes(parsed.codec)), body)
+        if self.running.contains(replayKey) { return Complete(failed(rpc.ABORTED, "a call with this idempotency-key is still running")) }
         match self.stored(replayKey, started) {
             Some(entry) {
                 if entry.fingerprint != replayFingerprint {
-                    return failed(rpc.INVALID_ARGUMENT, "idempotency-key was used with a different request")
+                    return Complete(failed(rpc.INVALID_ARGUMENT, "idempotency-key was used with a different request"))
                 }
                 self.replayed += 1
                 let copy = Response { status: entry.response.status; headers: []; body: entry.response.body }
                 for field in entry.response.headers { copy.headers.add(field) }
                 copy.headers.add(rpc.Header { name: "idempotent-replayed"; value: "true" })
-                return copy
+                return Complete(copy)
             }
             None {}
         }
     }
 
     let call = rpc.call(path, "connect", parsed.codec, request.headers, deadline, self.options.clock)
-    let result: Result<Bytes, rpc.Error> = Err(rpc.failure(rpc.INTERNAL, "no result"))
     self.executed += 1
     match method.handler {
-        Unary(handler) { result = handler(call, body) }
-        Deferred(_) { result = Err(rpc.failure(rpc.UNIMPLEMENTED, "deferred handlers are not served yet")) }
-        ServerStream(_) {}
+        Unary(handler) {
+            let response = self.unaryResponse(call, handler(call, body), request.headers)
+            // A retry gets what the handler did, even when this attempt ran out of time.
+            if replayKey != "" && response.status != 503 { self.store(replayKey, replayFingerprint, response, started) }
+            if call.expired() { return Complete(self.unaryResponse(call, Err(rpc.failure(rpc.DEADLINE_EXCEEDED, "the deadline passed")), request.headers)) }
+            return Complete(response)
+        }
+        Deferred(handler) {
+            let exchange = self.exchange(call, false, request.headers, "", origin, replayKey, replayFingerprint, started)
+            if replayKey != "" { self.running.add(replayKey) }
+            exchange.run(handler(call, body, exchange.responder))
+            return Started(exchange)
+        }
+        ServerStream(handler) {
+            let exchange = self.exchange(call, true, request.headers, rpc.headerValue(request.headers, "connect-accept-encoding"), origin, "", 0, started)
+            exchange.run(handler(call, body, exchange.responder))
+            return Started(exchange)
+        }
     }
-    if call.expired() { result = Err(rpc.failure(rpc.DEADLINE_EXCEEDED, "the deadline passed")) }
-    let response = self.unaryResponse(call, result, request)
-    if replayKey != "" && response.status != 503 { self.store(replayKey, replayFingerprint, response, started) }
-    return response
 }
 
-function Server.unaryResponse(call: rpc.Call, result: Result<Bytes, rpc.Error>, request: Request): Response {
+function Server.exchange(call: rpc.Call, streaming: Boolean, headers: List<rpc.Header>, accepted: Text, origin: Text,
+        replayKey: Text, replayFingerprint: Integer, started: Integer): Exchange {
+    let compressor: Maybe<Compressor> = None
+    for piece in accepted.split(",") {
+        let name = trimmed(piece).asciiLowercased()
+        if compressor.isNone() && name != "" { compressor = self.compressor(name) }
+    }
+    let exchange = Exchange { server: self; call: call; responder: rpc.responder(function(data: Bytes): Boolean { return false }, function(error: Maybe<rpc.Error>) {})
+        streaming: streaming; requestHeaders: headers; compressor: compressor; queue: Bytes(); headSent: false; message: None
+        outcome: None; done: false; origin: origin; replayKey: replayKey; replayFingerprint: replayFingerprint; started: started }
+    exchange.responder = rpc.responder(function(data: Bytes): Boolean { return exchange.deliver(data) },
+        function(error: Maybe<rpc.Error>) { exchange.end(error) })
+    return exchange
+}
+function Exchange.deliver(data: Bytes): Boolean {
+    if self.done || self.outcome.isSome() { return false }
+    if !self.streaming {
+        if self.message.isSome() {
+            self.outcome = Some(Some(rpc.failure(rpc.INTERNAL, "a unary handler sent more than one message")))
+            rpc.cancel(self.responder)
+            return false
+        }
+        self.message = Some(data)
+        return true
+    }
+    if self.queue.length >= self.server.options.maxStreamBufferBytes { return false }
+    if data.length > self.server.options.maxResponseBytes {
+        self.outcome = Some(Some(rpc.failure(rpc.RESOURCE_EXHAUSTED, "message is larger than " + Text(self.server.options.maxResponseBytes) + " bytes")))
+        rpc.cancel(self.responder)
+        return false
+    }
+    match self.compressor {
+        Some(compressor) {
+            if data.length >= self.server.options.compressMinBytes {
+                match compressor.compress(data) {
+                    Ok(packed) {
+                        self.queue.addBytes(envelope(1, packed))
+                        return true
+                    }
+                    Err(_) {}
+                }
+            }
+        }
+        None {}
+    }
+    self.queue.addBytes(envelope(0, data))
+    return true
+}
+function Exchange.end(error: Maybe<rpc.Error>) {
+    if self.outcome.isNone() { self.outcome = Some(error) }
+}
+// Applies the handler's return: Err finishes the call; Ok finishes it unless held.
+function Exchange.run(result: Result<Nothing, rpc.Error>) {
+    match result {
+        Ok() { if !rpc.held(self.responder) { self.responder.finish(None) } }
+        Err(problem) { self.responder.finish(Some(problem)) }
+    }
+}
+
+/// The next thing to send. Call it after polling until it returns Waiting,
+/// and again by the call's deadline.
+public function Exchange.step(): Step {
+    if self.done { return Waiting }
+    if self.outcome.isNone() && self.call.expired() {
+        self.outcome = Some(Some(rpc.failure(rpc.DEADLINE_EXCEEDED, "the deadline passed")))
+        rpc.cancel(self.responder)
+    }
+    if !self.streaming {
+        match self.outcome {
+            Some(error) {
+                self.done = true
+                let result: Result<Bytes, rpc.Error> = Err(rpc.failure(rpc.INTERNAL, "the handler finished without a message"))
+                match error {
+                    Some(problem) { result = Err(problem) }
+                    None { match self.message { Some(data) { result = Ok(data) } None {} } }
+                }
+                let response = self.server.unaryResponse(self.call, result, self.requestHeaders)
+                if self.replayKey != "" {
+                    self.server.running.remove(self.replayKey)
+                    if response.status != 503 { self.server.store(self.replayKey, self.replayFingerprint, response, self.started) }
+                }
+                return Respond(self.server.withCors(self.origin, response))
+            }
+            None { return Waiting }
+        }
+    }
+    if !self.headSent {
+        if self.queue.length == 0 && self.outcome.isNone() { return Waiting }
+        self.headSent = true
+        let headers: List<rpc.Header> = [rpc.Header { name: "content-type"; value: "application/connect+" + self.call.codec }]
+        match self.compressor { Some(compressor) { headers.add(rpc.Header { name: "connect-content-encoding"; value: compressor.name }) } None {} }
+        for field in self.call.responseHeaders { headers.add(rpc.Header { name: field.name.asciiLowercased(); value: field.value }) }
+        return Start(self.server.withCors(self.origin, Response { status: 200; headers: headers; body: Bytes() }))
+    }
+    match self.outcome {
+        Some(error) {
+            self.done = true
+            let piece = self.queue
+            self.queue = Bytes()
+            piece.addBytes(envelope(2, endStreamJson(error, self.call.responseTrailers)))
+            return End(piece)
+        }
+        None {}
+    }
+    if self.queue.length == 0 { return Waiting }
+    let piece = self.queue
+    self.queue = Bytes()
+    return Write(piece)
+}
+
+function Server.unaryResponse(call: rpc.Call, result: Result<Bytes, rpc.Error>, requestHeaders: List<rpc.Header>): Response {
     match result {
         Ok(message) {
             if message.length > self.options.maxResponseBytes {
@@ -545,7 +859,7 @@ function Server.unaryResponse(call: rpc.Call, result: Result<Bytes, rpc.Error>, 
             let headers: List<rpc.Header> = [rpc.Header { name: "content-type"; value: "application/" + call.codec }]
             let body = message
             if message.length >= self.options.compressMinBytes {
-                for name in tokens(request.headers, "accept-encoding") {
+                for name in tokens(requestHeaders, "accept-encoding") {
                     match self.compressor(name) {
                         Some(compressor) {
                             match compressor.compress(message) {
@@ -627,13 +941,16 @@ function Server.preflight(origin: Text): Response {
     headers.add(rpc.Header { name: "access-control-max-age"; value: Text(self.options.cors.maxAgeSeconds) })
     return Response { status: 204; headers: headers; body: Bytes() }
 }
+// A copy with CORS headers, so a stored replay never keeps one caller's origin.
 function Server.withCors(origin: Text, response: Response): Response {
     if !self.originAllowed(origin) { return response }
-    self.allowOrigin(origin, response.headers)
+    let headers: List<rpc.Header> = []
+    for field in response.headers { headers.add(field) }
+    self.allowOrigin(origin, headers)
     let exposed = EXPOSED_HEADERS
     for name in self.options.cors.exposedHeaders { exposed = exposed + ", " + name.asciiLowercased() }
-    response.headers.add(rpc.Header { name: "access-control-expose-headers"; value: exposed })
-    return response
+    headers.add(rpc.Header { name: "access-control-expose-headers"; value: exposed })
+    return Response { status: response.status; headers: headers; body: response.body }
 }
 
 // ---- Client
@@ -648,7 +965,11 @@ public record Client {
     transport: (Request) -> Result<Response, rpc.Error>
     // Tries per call for UNAVAILABLE failures, including lost responses.
     attempts: Integer
+    // Accepted response encodings; `sendCompression` names one for requests
+    // of at least `compressMinBytes`.
     compressors: List<Compressor>
+    sendCompression: Text
+    compressMinBytes: Integer
     maxResponseBytes: Integer
     private keyPrefix: Text
     private serial: Integer
@@ -657,7 +978,7 @@ public record Client {
 /// across clients: give each process random text, such as 16 random bytes in hex.
 public function client(baseUrl: Text, codec: Text, transport: (Request) -> Result<Response, rpc.Error>, keyPrefix: Text): Client {
     return Client { baseUrl: baseUrl; codec: codec; headers: []; transport: transport; attempts: 3; compressors: [];
-        maxResponseBytes: 16777216; keyPrefix: keyPrefix; serial: 0 }
+        sendCompression: ""; compressMinBytes: 1024; maxResponseBytes: 16777216; keyPrefix: keyPrefix; serial: 0 }
 }
 public record CallOptions {
     headers: List<rpc.Header>
@@ -686,15 +1007,32 @@ public function Client.request(procedure: Text, message: Bytes, options: CallOpt
     let names: List<Text> = []
     for item in self.compressors { names.add(item.name) }
     if names.length > 0 { headers.add(rpc.Header { name: "accept-encoding"; value: joinText(names, ", ") }) }
+    let body = message
+    let encoding = ""
+    if self.sendCompression != "" && message.length >= self.compressMinBytes {
+        for compressor in self.compressors {
+            if compressor.name == self.sendCompression {
+                match compressor.compress(message) {
+                    Ok(packed) {
+                        body = packed
+                        encoding = compressor.name
+                    }
+                    Err(_) {}
+                }
+            }
+        }
+    }
     if options.get {
         let target = self.baseUrl + procedure + "?connect=v1&encoding=" + self.codec
-        if self.codec == "json" { target = target + "&message=" + escapeQuery(message) }
-        else { target = target + "&base64=1&message=" + base64(message, true) }
+        if encoding != "" { target = target + "&compression=" + encoding }
+        if self.codec == "json" && encoding == "" { target = target + "&message=" + escapeQuery(body) }
+        else { target = target + "&base64=1&message=" + base64(body, true) }
         return Request { method: "GET"; target: target; headers: headers; body: Bytes() }
     }
     headers.add(rpc.Header { name: "content-type"; value: "application/" + self.codec })
     headers.add(rpc.Header { name: "connect-protocol-version"; value: "1" })
-    return Request { method: "POST"; target: self.baseUrl + procedure; headers: headers; body: message }
+    if encoding != "" { headers.add(rpc.Header { name: "content-encoding"; value: encoding }) }
+    return Request { method: "POST"; target: self.baseUrl + procedure; headers: headers; body: body }
 }
 
 function trailersOf(headers: List<rpc.Header>): List<rpc.Header> {
