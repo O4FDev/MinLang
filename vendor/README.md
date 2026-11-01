@@ -31,3 +31,12 @@ Upstream: <https://github.com/nothings/stb>
   The optional `unicode` native provider supplies grapheme segmentation, NFC
   normalization and full default case folding. Ordinary Text operations do
   not link this provider. Its native-object cache includes every vendored byte.
+
+- `protobuf/` contains unmodified `.proto` sources from Protocol Buffers 36.2,
+  from <https://github.com/protocolbuffers/protobuf/releases/tag/v36.2>
+  (`protobuf-36.2.tar.gz`, SHA256
+  `3d9642a662d10e68ebae5e53f14dcce5105684212d5078f8e0d47d1ab3ae6b64`).
+  `protobuf/LICENSE` carries its BSD-3-Clause license. protoc-gen-minyar
+  regenerates its own bindings from `descriptor.proto` and
+  `compiler/plugin.proto`; `make check-protoc-gen-minyar` checks that doing so
+  changes nothing.
