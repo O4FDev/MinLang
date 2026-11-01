@@ -22,7 +22,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 KEY = os.path.expanduser("~/.ssh/brief_crawl_do")
 SSH = ["ssh", "-i", KEY, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-       "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8"]
+       "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=8",
+       # One multiplexed connection per box: the dozen ssh/rsync steps per box would each pay a handshake otherwise.
+       "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/fg-%C", "-o", "ControlPersist=120"]
 BASE = "/home/agent/base"
 FG = "/home/agent/fg"
 TREE = "/home/agent/swarm/gate"
