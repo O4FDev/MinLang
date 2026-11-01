@@ -1,5 +1,35 @@
 # Why Minyar is still slower: profile-backed causes for every visible benchmark over 1.1x (2026-10-30)
 
+## STATUS 2026-11-01 04:00 UTC — every visible program over 1.1x, at goal tip f939afb71 (box K, cachegrind Ir)
+Geomean 2.32 vs fastest (was 5.32 at the 3832f4373 baseline and 2.52 at the start of run 2); 1.87 vs Rust. Dominant
+remaining cost per program from the run-2 visible profile (reports/next-phase.md "Visible programs"); the cause catalogue and
+per-program sections below still hold, with the ratios superseded by this table.
+
+| program | ratio 2026-10-30 | ratio now | vs Rust | dominant remaining cost (profile) | fix in flight / owner |
+|---|---|---|---|---|---|
+| json | 12.17 | 6.38 | 3.79 | reclamation 23% + allocation 17% + Text 17% (parseValue, small-aggregate retirement) | esc (inline slots), res2 (eager retirement), txt3 |
+| exprparse | 17.16 | 4.74 | 3.73 | user 64% (Parser.peek/unary: Result and record traffic), RC 16% | brw (borrow inference, next: move-into-call ≈7%), cg |
+| grid | 5.36 | 4.86 | 3.59 | user 96%: 5-point stencil, checked adds block vectorisation | cg (pragma unroll −25% READY path; range-guarded unchecked loop version) |
+| inventory | 6.22 | 4.58 | 4.58 | user 67% + List 12% (merge sort) + RC 10% | esc/fbip (List storage), cg (sort) |
+| config | 7.58 | 3.94 | 2.61 | user 40% + Text 35% + Map 8% | txt3 (join/search/slice), map (landed: −2.7%) |
+| httpparse | 5.47 | 3.62 | 3.62 | Text 35% + RC 19% + allocation 12% | txt3, res2 |
+| tokenizer | 5.69 | 3.46 | 3.20 | user 64% (tokenize) + allocation 14% + Text 14% | cg, txt3 |
+| textops | 5.54 | 3.28 | 1.94 | Text 42% (text_search_next 14%) + RC 17% | txt3 (search), res2 |
+| bytecode | 2.88 | 2.88 | 1.11 | user 100%: interpreter dispatch loop | cg |
+| logstats | 5.84 | 2.67 | 1.47 | Text 45% (split/slice) — positional split landed (−47%) | txt3 |
+| wordfreq | 3.94 | 2.11 | 1.79 | user 49% + split_next 24% | txt3, map (landed −3%) |
+| sortrows | 4.11 | 1.92 | 1.48 | List sort 96% (record merge sort) | cg (sort kernels) |
+| intmap | 2.98 | 1.85 | 1.85 | user 86% (inlined Map probes) | map (landed −5.7%) |
+| orders | 2.20 | 1.84 | 1.69 | user 79% + sort 11% | cg |
+| par-forkjoin | 1.99 | 1.81 | 1.81 | user 100% (serial fib + combine) | cg |
+| treewalk | 4.59 | 1.77 | 1.52 | user 88% + allocation 12% | brw (−24.7% in candidate r2n), esc/fbip |
+| sorttext | 2.48 | 1.54 | 1.54 | List sort 60% + Text compare 16% | txt3, cg |
+| service | 4.07 | 1.43 | 0.92 | Text 36% + RC 28% (split landed −45%) | txt3, res2 |
+| nbody | 1.63 | 1.30 | 1.28 | user 100% Float math; FMA contraction would give 1.11 (trade-off for Luke) | cg (FMA held for Luke) |
+| par-mandel | 1.21 | 1.20 | 1.19 | user 100% parallel escape loop | cg |
+| matrix | 1.12 | 1.10 | 1.07 | user 98% multiply-add | cg |
+| par-reduce | 0.84 | 0.83 | 0.83 | faster than every peer | — |
+
 Lane `perfgaps`, branch `goal/2026-10-30-perfgaps` = goal/integrate-ownership `2d1d5d632` (goal base + codegen +
 systems + ownership + stdlib + parallel lanes). Analysis only: no compiler, runtime or library change.
 
