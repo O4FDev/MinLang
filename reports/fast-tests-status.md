@@ -32,12 +32,20 @@ projects it: max(box ready 64 s, cache box done) + the slowest shard (pull → d
 - Product change on this branch: `tools/compiler-link.sh` links minyarc and scope-compiler as 4 ThinLTO modules in
   parallel (identical stage3 output; cold compiler build 49 → 29 s on 4 vCPU).
 
+### Since 03:00
+- Rehearsal on the new machinery (8-shard plan in waves + the cache-box shard): batch 9 (10 reds incl.
+  check-last-use-sinks) and int13 (5 reds incl. check-statement-nesting out of memory) **agree check for check**.
+- **A fully green single-box gate recorded**: 5af3d8643, one s-8vcpu shard box, the loop's gate-queue.sh recipe
+  (CHECK_JOBS=7): 441 checks, GATE-EXIT 0, 26 min. Added to recorded.tsv as tip-5af3d8643 (the earlier recorded
+  gates are all red on check-determinism-runtime, fixed after them).
+- Rebase rehearsal: goal/fast-tests onto goal/2026-10-30 f939afb71 applies cleanly (67 commits); its fast gate is
+  green, 442 checks, projected 281 s (new goal-branch checks had no times yet; refreshed in e226fc1b6).
+
 ### Next
-- Rehearsal (running): batch 9 and int13 on the new machinery, 8-shard plan in waves.
 - Capacity is still 3 free droplets (account limit 10) until the run-2 boxes go at Sun 1 Nov 21:45 UTC, or until
   Luke raises the limit. Then: freeze, `time tools/fast-gate.sh TIP` on 8 shards (the verdict prints the time since the
   command started), the recorded trees on the same code, `agree.py`, and the rollout.
-- Guard spend today: $2.62 of $10 at 02:41.
+- Guard spend today: about $4 of $10 at 05:00; the proof and the merge gate need about $2–3.
 
 ## 2026-10-31 22:35 UTC
 
