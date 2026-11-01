@@ -17,7 +17,9 @@ checks) in ≤ 300 s wall with the same pass/fail as a single-box gate. Command:
 | batch 9 (box H, text record) | 2c2dd076b | 339 = 339 | + last-use-sinks, choice, choice-set-niche, ownership-name-proofs, quic-*, record-reconstruction-reuse, structured-tasks | 820 s |
 | int12 (box K), c8 uncapped | 4b03b4fab | 340 = 340 | + statement-nesting, memory-regressions, peer-regressions(-python…) | — |
 | one-c4 (box O) | 526b2f18f | 340 = 340 | + empty-map-traversal, scalar-record-reuse, public-release | — |
-7 of 7 recorded commits agree check for check. Still to come in batch 2: one-c2 (green) and the integrated tip.
+| one-c2 (box N) | 565a2528e | 340 = 340 | determinism-runtime, portable | 806 s |
+8 of 8 recorded commits agree check for check. The integrated tip (ft-725b49172: all splits, stage1 -O0, rebased on
+the determinism fix) is **green: 440 checks (all 340 reference checks + 100 pieces), 0 failed**, 854 s on 2 shards.
 
 ### Plan to the proof (capacity: 3 droplets until the run-2 boxes go, Sun 1 Nov 21:45 UTC)
 1. Freeze the code; snapshot the tip.
