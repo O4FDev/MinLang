@@ -69,6 +69,9 @@ def main():
             try:
                 assignment = json.load(open(os.path.join(shard, "assignment.json")))
                 index = int(os.path.basename(shard).split("-")[1])
+                # The cache box's own shard runs on another CPU model; its times would skew the shards' table.
+                if index >= assignment.get("regular", len(assignment["assignment"])):
+                    continue
                 mine = set(assignment["assignment"][index]["checks"])
                 table = [line.rstrip("\n").split("\t") for line in open(os.path.join(shard, "times.tsv"))][1:]
             except (OSError, ValueError, KeyError, IndexError):

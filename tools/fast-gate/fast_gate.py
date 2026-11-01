@@ -167,7 +167,8 @@ def prepare_cache(cache, tree, files, args, run_id, timeline):
     sync_tree(cache["public"], tree, files, f"{root}/tree")
     timeline["synced"] = time.monotonic() - started
     upload_tools(cache["public"], f"{root}/fg", args)
-    ssh(cache["public"], f"FAST_GATE_CC={args.cc_cache} setsid nohup bash {root}/fg/cache-run.sh {run_id} {args.shards} {args.jobs} > {root}/run.log 2>&1 < /dev/null &")
+    ssh(cache["public"], f"FAST_GATE_CC={args.cc_cache} setsid nohup bash {root}/fg/cache-run.sh {run_id} {args.shards} {args.jobs} "
+                         f"{args.cache_shard} > {root}/run.log 2>&1 < /dev/null &")
     timeline["launched"] = time.monotonic() - started
 
 
@@ -182,11 +183,11 @@ def prepare_shard(ip, tree, files, index, args, timeline):
     timeline["synced"] = time.monotonic() - started
 
 
-def run_shard(ip, index, args, timeline):
+def run_shard(ip, index, args, timeline, jobs=None):
     """Start shard-run.sh detached on the shard, wait for it with reconnecting ssh sessions, then fetch its out/.
     A shard that cannot be reached for 5 minutes (deleted, dead) is given up: its checks are reported as missing."""
     env = f"FAST_GATE_CC={args.cc_cache} " + (f"FAST_GATE_CACHE={args.cache['private']} FAST_GATE_RUN={args.run_id} " if args.cache else "")
-    launch = f"{env}setsid nohup bash {FG}/shard-run.sh {TREE} {index} {args.shards} {args.jobs} > {FG}/run.log 2>&1 < /dev/null & echo launched"
+    launch = f"{env}setsid nohup bash {FG}/shard-run.sh {TREE} {index} {args.shards} {jobs or args.jobs} > {FG}/run.log 2>&1 < /dev/null & echo launched"
     wait = f"until grep -q SHARD-DONE {FG}/out/status 2>/dev/null; do sleep 1; done"
     for attempt in range(60):
         result = ssh(ip, launch, check=False, timeout=60)
@@ -306,12 +307,24 @@ def gate_tree(index, tree, checks, args, ips_ready):
     if ctx.cache:
         cache_thread = threading.Thread(target=prepare_cache, args=(ctx.cache, tree, files, ctx, ctx.run_id, cache_timeline))
         cache_thread.start()
-    timelines = [dict() for _ in range(ctx.shards)]
+    # With --cache-shard the cache box runs one more, slower shard of the plan (index SHARDS) in its own copy of the
+    # tree once it has built and planned; the tree it serves to the shards is never touched.
+    extra = ctx.shards if ctx.cache and ctx.cache_shard else None
+    total = ctx.shards + (extra is not None)
+    timelines = [dict() for _ in range(total)]
     # Each box takes the next shard of the plan when it is free: with --boxes below --shards the same plan runs in
     # waves (every shard's own timeline is still measured), otherwise every box runs one shard.
-    queue, queue_lock, shard_dirs = list(range(ctx.shards)), threading.Lock(), [None] * ctx.shards
-    pool = concurrent.futures.ThreadPoolExecutor(max_workers=ctx.boxes)
+    queue, queue_lock, shard_dirs = list(range(ctx.shards)), threading.Lock(), [None] * total
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=ctx.boxes + 1)
     futures = []
+    if extra is not None:
+
+        def cache_work():
+            timelines[extra]["active"] = time.monotonic() - t0
+            prepare_shard(ctx.cache["public"], tree, files, extra, ctx, timelines[extra])
+            shard_dirs[extra] = run_shard(ctx.cache["public"], extra, ctx, timelines[extra], jobs=int(ctx.cache_shard.split("@")[0]))
+
+        futures.append(pool.submit(cache_work))
     for box, ip in ips_ready():
 
         def work(ip=ip):
@@ -355,7 +368,8 @@ def gate_tree(index, tree, checks, args, ips_ready):
     missing = sorted(reference - labels)
     coverage = f"{len(reference & labels)} of the {len(reference)} reference checks + {len(labels - reference)} new" + \
         (f"; {len(missing)} reference checks not in this plan: {' '.join(missing[:8])}{' …' if len(missing) > 8 else ''}" if missing else "")
-    print(f"FAST GATE {verdict}: {tree}: {count} checks in the plan (each shard's check-in-parallel: {counts}; {coverage}), {len(results)} run on {ctx.shards} shards, "
+    boxes = f"{ctx.shards} shards" + (" + the cache box" if extra is not None else "")
+    print(f"FAST GATE {verdict}: {tree}: {count} checks in the plan (each shard's check-in-parallel: {counts}; {coverage}), {len(results)} run on {boxes}, "
           f"{len(failed)} failed, {len(problems)} problems; wall {elapsed:.0f} s ({time.monotonic() - started:.0f} s since the command "
           f"started); results {ctx.out}/merged.tsv", flush=True)
     return verdict == "PASSED"
@@ -377,6 +391,8 @@ def main():
     parser.add_argument("--checks", default=open(os.path.join(HERE, "checks.txt")).read().strip(),
                         help="the gate's CHECKS (default: tools/fast-gate/checks.txt, the single-box gate's list)")
     parser.add_argument("--cache", default="auto", help="the shard-cache box: auto (the droplet named shard-cache, if any), none, or NAME")
+    parser.add_argument("--cache-shard", default="4@0.7", help="SLOTS@SPEED: the cache box also runs one shard of the plan, "
+                        "SLOTS checks at once at SPEED times a shard core (pack.py EXTRA); empty for none")
     parser.add_argument("--keep", action="store_true", help="leave the shards running (debugging only)")
     parser.add_argument("--hosts", default="", help="comma-separated existing boxes to use as shards instead of creating droplets (debugging only; never deleted)")
     parser.add_argument("--cc-cache", default="off", choices=["off", "log", "cache", "verify"],
