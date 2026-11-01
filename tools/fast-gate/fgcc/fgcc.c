@@ -284,7 +284,8 @@ static analysis analyse(int argc, char **argv, const char *cwd) {
     for (int i = 1; i < argc; i++) sha_str(&key, "arg", i == a.output_index ? ext(argv[i]) : argv[i]);
     extern char **environ;
     static const char *env_exact[] = {"CPATH", "LIBRARY_PATH", "COMPILER_PATH", "SOURCE_DATE_EPOCH", "LD_RUN_PATH", "LD_LIBRARY_PATH",
-        "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "ZERO_AR_DATE", "LLVM_PROFILE_FILE", "RC_DEBUG_OPTIONS", NULL};
+        "SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "ZERO_AR_DATE", "LLVM_PROFILE_FILE", "RC_DEBUG_OPTIONS", "PATH", "LANG", "LC_ALL",
+        "LC_CTYPE", NULL};
     static const char *env_prefix[] = {"C_INCLUDE", "CPLUS_INCLUDE", "OBJC_INCLUDE", "CCC_", "CLANG_", "LLVM_", "ASAN_", "UBSAN_", "LSAN_", NULL};
     for (char **e = environ; *e; e++) {
         char name[256];
@@ -414,6 +415,10 @@ static void log_record(int argc, char **argv, const char *cwd, const analysis *a
 int main(int argc, char **argv) {
     read_config();
     if (!strcmp(mode, "off") || !*dir) passthrough(argv);
+    // As tools/clang-cache.min: checks that measure budgets, performance or timing always compile for real.
+    const char *label = getenv("MINYAR_CHECK_LABEL"), *disable = getenv("MINYAR_DISABLE_COMPILER_CACHE");
+    if ((disable && !strcmp(disable, "1")) || (label && (strstr(label, "budget") || strstr(label, "performance") ||
+        strstr(label, "timing") || strstr(label, "measurement")))) passthrough(argv);
     double start = now();
     char cwd[4096];
     if (!getcwd(cwd, sizeof cwd)) passthrough(argv);
