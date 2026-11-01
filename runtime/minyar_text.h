@@ -710,7 +710,7 @@ MinyarText *minyar_text_split_index(MinyarText *text, MinyarText *separator) {
     long long separator_length = separator->byte_length;
     if (separator_length == 1) {
         /* The usual separator: one byte, so the cursor that text_byte_scan
-         * keeps makes the whole receiver one pass of eight-byte tests. */
+         * keeps makes the whole receiver one pass of sixteen-byte tests. */
         unsigned char wanted = separator->bytes[0];
         long long scan = 0;
         for (;;) {
