@@ -62,8 +62,11 @@ application must also bound its own collections and response construction.
 
 ## HTTPS on the same listener
 
-`listenTLS(host, port, limits, identity, privateKey)` returns the same Server
-with the same poll/respond API and limits; only the bytes on the socket differ.
+Import `httpstls` and call `listenTLS(host, port, limits, identity, privateKey)`.
+It returns the same `httpserver.Server` with the same poll/respond API and
+limits; only the bytes on the socket differ. Keeping TLS in its own module
+means a plain `http.listen` program never imports, links or starts the
+TLS/crypto natives.
 `identity` is a List of DER certificates (leaf first) and `privateKey` is a
 PKCS#8 DER key. Each accepted connection runs a TLS 1.3 session
 (`tlsserver`, ALPN "http/1.1", no client authentication), so request and
@@ -74,11 +77,12 @@ authenticated close_notify when the response closes them.
 
 ```minyar
 use "httpserver" as http
+use "httpstls" as httpstls
 use "errors" as errors
 use "io" as io
 
 let identity: List<Bytes> = [io.readBytesFile("leaf.der")]
-let server = http.listenTLS("127.0.0.1", 8443, http.defaults(), identity, io.readBytesFile("leaf.pk8"))
+let server = httpstls.listenTLS("127.0.0.1", 8443, http.defaults(), identity, io.readBytesFile("leaf.pk8"))
 if !http.ok(server) { fail(errors.message(http.serverError(server))) }
 while true {
     let batch = http.poll(server, -1)
@@ -89,7 +93,7 @@ while true {
 }
 ```
 
-An invalid identity or key is reported by `listenTLS` before any connection is
+An invalid identity or key is reported by `httpstls.listenTLS` before any connection is
 accepted: check `ok(server)` as for plain HTTP. Server name selection (SNI),
 client certificates and HTTP/2 remain application or separate-module concerns.
 

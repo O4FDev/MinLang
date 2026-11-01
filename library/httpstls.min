@@ -1,0 +1,59 @@
+// TLS 1.3 termination for the bounded HTTP server in `httpserver`.
+//
+// `httpserver` itself imports no TLS module, so a plain `http.listen` program
+// never compiles, links or starts the TLS/crypto natives. Import this module
+// (and call `listenTLS`) only when serving HTTPS:
+//
+//     use "httpstls" as httpserver_tls
+//     let server = httpserver_tls.listenTLS(host, port, http.defaults(), chain, key)
+use "httpserver" as http
+use "net" as net
+use "random" as secureRandom
+use "tlsserver" as tlsserver
+
+// Socket bytes are fed straight from the wire buffer into the session; the
+// authenticated plaintext is what the HTTP core parses. The buffer lives in
+// this closure, so a plain connection carries no TLS bytes field at all.
+record Wire { data: Bytes }
+
+function transport(session: tlsserver.Session): http.TlsOps {
+    let wire = Wire { data: Bytes() }
+    return http.TlsOps {
+        state: function(): Integer { return session.state },
+        takeIncoming: function(): Bytes { return tlsserver.takeIncoming(session) },
+        takeOutgoing: function(): Bytes { return tlsserver.takeOutgoing(session) },
+        send: function(data: Bytes) { tlsserver.send(session, data) },
+        endInput: function() { tlsserver.endInput(session) },
+        close: function() { tlsserver.close(session) },
+        feed: function(socket: Integer, limit: Integer): Integer {
+            wire.data.clear()
+            let count = net.readInto(socket, wire.data, limit)
+            if count < 0 { return count }
+            if wire.data.length > 0 {
+                tlsserver.receive(session, wire.data)
+                wire.data = Bytes()
+            }
+            return count
+        }
+    }
+}
+
+// The same Server API and limits as `http.listen`; only the socket bytes differ.
+// Each accepted connection runs its own tlsserver session (protocol "http/1.1",
+// no client authentication). A configuration error is reported once, before
+// accepting, exactly as `http.listen` reports an invalid configuration.
+public function listenTLS(host: Text, port: Integer, limits: http.Limits, identity: List<Bytes>, privateKey: Bytes): http.Server {
+    let factory = http.TlsFactory {
+        validate: function(): Text {
+            let probe = tlsserver.server(secureRandom.bytes(64), "http/1.1", identity, privateKey, [], false)
+            if probe.state == tlsserver.FAILED { return "invalid TLS server identity or private key" }
+            return ""
+        },
+        open: function(): Maybe<http.TlsOps> {
+            let session = tlsserver.server(secureRandom.bytes(64), "http/1.1", identity, privateKey, [], false)
+            if session.state == tlsserver.FAILED { return None }
+            return Some(transport(session))
+        }
+    }
+    return http.listenWith(host, port, limits, factory)
+}
