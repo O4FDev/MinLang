@@ -1,0 +1,1025 @@
+use "protobuf-descriptor" as descriptor
+use "./google/protobuf/compiler/plugin.min" as plugin
+// protoc-gen-minyar's code generator: one Minyar module per .proto file, with
+// records for messages, choices for enums and oneofs, and their encodings.
+
+// Field kinds are google.protobuf.FieldDescriptorProto.Type numbers.
+constant DOUBLE = 1
+constant FLOAT = 2
+constant INT64 = 3
+constant UINT64 = 4
+constant INT32 = 5
+constant FIXED64 = 6
+constant FIXED32 = 7
+constant BOOL = 8
+constant STRING = 9
+constant GROUP = 10
+constant MESSAGE = 11
+constant BYTES = 12
+constant UINT32 = 13
+constant ENUM = 14
+constant SFIXED32 = 15
+constant SFIXED64 = 16
+constant SINT32 = 17
+constant SINT64 = 18
+
+// CodeGeneratorResponse.Feature: FEATURE_PROTO3_OPTIONAL.
+constant SUPPORTED_FEATURES = 1
+
+// The well-known types are bundled with the standard library as flat
+// packages: google/protobuf/timestamp.proto is `use "protobuf-timestamp"`.
+global BUNDLED: List<Text> = ["any", "api", "descriptor", "duration", "empty", "field_mask", "source_context", "struct", "timestamp", "type", "wrappers"]
+
+// Type names that would hide a built-in type.
+global RESERVED_TYPES: List<Text> = ["Integer", "Float", "Boolean", "Text", "Bytes", "Character", "Nothing", "List", "Map", "Set", "Maybe", "Result", "Self", "Some", "None", "Ok", "Err", "Iterable", "Iterator", "Equatable", "Ordered", "Hashable"]
+
+/// One message or enum, anywhere in the request.
+record TypeInfo {
+    // The full proto name without a leading dot, such as `pkg.Outer.Inner`.
+    fullName: Text
+    file: Text
+    // The Minyar type name inside its own module, such as `Outer_Inner`.
+    local: Text
+    isEnum: Boolean
+    proto3: Boolean
+    message: descriptor.DescriptorProto
+    enumeration: descriptor.EnumDescriptorProto
+    // Minyar case names for enums, parallel to enumeration.value; aliases get "".
+    cases: List<Text>
+}
+
+/// Everything the generator knows about one field of a message.
+record Field {
+    name: Text
+    protoName: Text
+    jsonName: Text
+    number: Integer
+    kind: Integer
+    repeated: Boolean
+    packed: Boolean
+    // Explicit presence: the field is a Maybe.
+    presence: Boolean
+    // The full name of a message or enum type, or "".
+    typeName: Text
+    defaultValue: Text
+    hasDefault: Boolean
+    // Index into the message's oneofs, or -1.
+    oneof: Integer
+    // The oneof choice's case name for a oneof member.
+    caseName: Text
+    // A map field's key and value, as fields 1 and 2 of its entry.
+    entry: List<Field>
+    // A map whose values could reach its own message is a List of entry records.
+    entryList: Boolean
+    entryType: Text
+}
+
+record Oneof {
+    name: Text
+    protoName: Text
+    typeName: Text
+    fields: List<Field>
+}
+
+record Message {
+    info: TypeInfo
+    fields: List<Field>
+    oneofs: List<Oneof>
+}
+
+record Generator {
+    types: List<TypeInfo>
+    index: Map<Text, Integer>
+    files: Map<Text, Integer>
+    request: plugin.CodeGeneratorRequest
+}
+
+record Module {
+    generator: Generator
+    file: descriptor.FileDescriptorProto
+    lines: List<Text>
+    // Imported proto files and their aliases, in first-use order.
+    imports: List<Text>
+    aliases: List<Text>
+    usesJson: Boolean
+    // Local type names, so oneof choices avoid them.
+    names: Set<Text>
+}
+
+// ----- Names -----
+
+function isUpper(c: Character): Boolean { return c >= 'A' && c <= 'Z' }
+function isLower(c: Character): Boolean { return c >= 'a' && c <= 'z' }
+function isDigit(c: Character): Boolean { return c >= '0' && c <= '9' }
+function upperOf(c: Character): Character {
+    if isLower(c) { return Character(Integer(c) - 32) }
+    return c
+}
+function lowerOf(c: Character): Character {
+    if isUpper(c) { return Character(Integer(c) + 32) }
+    return c
+}
+
+/// protoc's lowerCamelCase: underscores are removed and the letter after one
+/// is capitalized.
+function camel(name: Text): Text {
+    let parts: List<Text> = []
+    let upperNext = false
+    for c in name {
+        if c == '_' {
+            upperNext = true
+        } else if upperNext {
+            parts.add(Text(upperOf(c)))
+            upperNext = false
+        } else {
+            parts.add(Text(c))
+        }
+    }
+    return joinText(parts)
+}
+
+function capitalized(name: Text): Text {
+    if name.length == 0 { return name }
+    return Text(upperOf(name[0])) + name.slice(1, name.length)
+}
+
+function decapitalized(name: Text): Text {
+    if name.length == 0 { return name }
+    return Text(lowerOf(name[0])) + name.slice(1, name.length)
+}
+
+function identifierOnly(name: Text): Text {
+    let parts: List<Text> = []
+    for c in name {
+        if isUpper(c) || isLower(c) || isDigit(c) || c == '_' { parts.add(Text(c)) } else { parts.add("_") }
+    }
+    return joinText(parts)
+}
+
+function typeName(name: Text): Text {
+    let result = capitalized(identifierOnly(name))
+    if result.length == 0 || !isUpper(result[0]) { result = "M" + result }
+    for reserved in RESERVED_TYPES { if result == reserved { return result + "_" } }
+    return result
+}
+
+function fieldName(protoName: Text): Text {
+    let result = decapitalized(camel(identifierOnly(protoName)))
+    if result.length == 0 || isDigit(result[0]) { result = "field" + result }
+    return result
+}
+
+function caseName(name: Text): Text {
+    let result = capitalized(identifierOnly(name))
+    if result.length == 0 || !isUpper(result[0]) { result = "V" + result }
+    if result == "Some" || result == "None" || result == "Ok" || result == "Err" || result == "Unrecognized" { result = result + "_" }
+    return result
+}
+
+function unique(name: Text, taken: Set<Text>): Text {
+    let result = name
+    let counter = 2
+    while taken.contains(result) {
+        result = name + "_" + Text(counter)
+        counter += 1
+    }
+    taken.add(result)
+    return result
+}
+
+function quoted(value: Text): Text {
+    let parts: List<Text> = ["\""]
+    for c in value {
+        if c == '"' { parts.add("\\\"") }
+        else if c == '\\' { parts.add("\\\\") }
+        else if c == '\n' { parts.add("\\n") }
+        else if c == '\r' { parts.add("\\r") }
+        else if c == '\t' { parts.add("\\t") }
+        else if Integer(c) < 32 { parts.add("\" + Text(Character(" + Text(Integer(c)) + ")) + \"") }
+        else { parts.add(Text(c)) }
+    }
+    parts.add("\"")
+    return joinText(parts)
+}
+
+function withoutDot(name: Text): Text {
+    if name.length > 0 && name[0] == '.' { return name.slice(1, name.length) }
+    return name
+}
+
+// ----- Indexing the request -----
+
+function newGenerator(request: plugin.CodeGeneratorRequest): Generator {
+    let generator = Generator { types: []; index: Map(); files: Map(); request: request }
+    for position in 0..request.protoFile.length {
+        let file = request.protoFile[position]
+        generator.files[file.name()] = position
+        let prefix = file.package()
+        let proto3 = file.syntax() == "proto3"
+        let taken: Set<Text> = Set()
+        for message in file.messageType { indexMessage(generator, file.name(), prefix, "", message, proto3, taken) }
+        for enumeration in file.enumType { indexEnum(generator, file.name(), prefix, "", enumeration, proto3, taken) }
+    }
+    return generator
+}
+
+function joinedName(prefix: Text, name: Text): Text {
+    if prefix == "" { return name }
+    return prefix + "." + name
+}
+
+function joinedLocal(outer: Text, name: Text): Text {
+    if outer == "" { return typeName(name) }
+    return outer + "_" + typeName(name)
+}
+
+function indexMessage(generator: Generator, file: Text, scope: Text, outer: Text, message: descriptor.DescriptorProto, proto3: Boolean, taken: Set<Text>) {
+    let fullName = joinedName(scope, message.name())
+    let local = unique(joinedLocal(outer, message.name()), taken)
+    generator.index[fullName] = generator.types.length
+    generator.types.add(TypeInfo { fullName: fullName; file: file; local: local; isEnum: false; proto3: proto3; message: message; enumeration: descriptor.newEnumDescriptorProto(); cases: [] })
+    for nested in message.nestedType { indexMessage(generator, file, fullName, local, nested, proto3, taken) }
+    for enumeration in message.enumType { indexEnum(generator, file, fullName, local, enumeration, proto3, taken) }
+}
+
+function indexEnum(generator: Generator, file: Text, scope: Text, outer: Text, enumeration: descriptor.EnumDescriptorProto, proto3: Boolean, taken: Set<Text>) {
+    let fullName = joinedName(scope, enumeration.name())
+    let local = unique(joinedLocal(outer, enumeration.name()), taken)
+    let cases: List<Text> = []
+    let seen: Set<Integer> = Set()
+    let caseNames: Set<Text> = Set()
+    for value in enumeration.value {
+        if seen.contains(value.number()) {
+            cases.add("")
+        } else {
+            seen.add(value.number())
+            cases.add(unique(caseName(value.name()), caseNames))
+        }
+    }
+    generator.index[fullName] = generator.types.length
+    generator.types.add(TypeInfo { fullName: fullName; file: file; local: local; isEnum: true; proto3: proto3; message: descriptor.newDescriptorProto(); enumeration: enumeration; cases: cases })
+}
+
+function Generator.type(fullName: Text): TypeInfo {
+    let name = withoutDot(fullName)
+    if !self.index.has(name) { fail("protoc-gen-minyar: unknown type " + name) }
+    return self.types[self.index[name]]
+}
+
+function isMapEntry(info: TypeInfo): Boolean {
+    if info.isEnum { return false }
+    if info.message.options is Some(options) { return options.mapEntry() }
+    return false
+}
+
+/// Whether a value of `from` can contain a value of `target`, through message
+/// fields, lists and maps.
+function reaches(generator: Generator, from: Text, target: Text, visited: Set<Text>): Boolean {
+    if from == target { return true }
+    if visited.contains(from) { return false }
+    visited.add(from)
+    let info = generator.type(from)
+    if info.isEnum { return false }
+    for field in info.message.field {
+        if field.type().number() == MESSAGE || field.type().number() == GROUP {
+            if reaches(generator, withoutDot(field.typeName()), target, visited) { return true }
+        }
+    }
+    return false
+}
+
+// ----- Fields -----
+
+function fieldOf(generator: Generator, owner: TypeInfo, proto: descriptor.FieldDescriptorProto, taken: Set<Text>): Field {
+    let kind = proto.type().number()
+    let repeated = proto.label().number() == 3
+    let name = fieldName(proto.name())
+    if name == "unknownFields" { name = name + "_" }
+    let presence = false
+    if !repeated {
+        if kind == MESSAGE || kind == GROUP { presence = true }
+        else if !owner.proto3 { presence = true }
+        else if proto.proto3Optional() { presence = true }
+        if presence && kind != MESSAGE && kind != GROUP && (name == "encode" || name == "toJson") { name = name + "_" }
+    }
+    let packed = false
+    if repeated && kind != STRING && kind != BYTES && kind != MESSAGE && kind != GROUP {
+        packed = owner.proto3
+        if proto.options is Some(options) {
+            if options.packed is Some(value) { packed = value }
+        }
+    }
+    let oneof = -1
+    if proto.oneofIndex is Some(position) {
+        if !proto.proto3Optional() {
+            oneof = position
+            presence = false
+        }
+    }
+    let jsonName = proto.jsonName()
+    if jsonName == "" { jsonName = camel(proto.name()) }
+    let field = Field {
+        name: unique(name, taken)
+        protoName: proto.name()
+        jsonName: jsonName
+        number: proto.number()
+        kind: kind
+        repeated: repeated
+        packed: packed
+        presence: presence
+        typeName: withoutDot(proto.typeName())
+        defaultValue: proto.defaultValue()
+        hasDefault: proto.defaultValue.isSome()
+        oneof: oneof
+        caseName: ""
+        entry: []
+        entryList: false
+        entryType: ""
+    }
+    if kind == MESSAGE && repeated {
+        let entry = generator.type(field.typeName)
+        if isMapEntry(entry) {
+            let entryTaken: Set<Text> = Set()
+            for part in entry.message.field { field.entry.add(fieldOf(generator, entry, part, entryTaken)) }
+            if field.entry[0].number != 1 { field.entry = [field.entry[1], field.entry[0]] }
+            field.entry[0].presence = false
+            field.entry[1].presence = false
+            let value = field.entry[1]
+            if value.kind == MESSAGE && reaches(generator, value.typeName, owner.fullName, Set()) {
+                field.entryList = true
+                field.entryType = entry.local
+            }
+        }
+    }
+    return field
+}
+
+function messageOf(generator: Generator, info: TypeInfo, taken: Set<Text>): Message {
+    let message = Message { info: info; fields: []; oneofs: [] }
+    let fieldNames: Set<Text> = Set()
+    fieldNames.add("unknownFields")
+    for proto in info.message.field { message.fields.add(fieldOf(generator, info, proto, fieldNames)) }
+    for position in 0..info.message.oneofDecl.length {
+        let declaration = info.message.oneofDecl[position]
+        let oneof = Oneof { name: ""; protoName: declaration.name(); typeName: ""; fields: [] }
+        let caseNames: Set<Text> = Set()
+        for field in message.fields {
+            if field.oneof == position {
+                field.caseName = unique(caseName(camel(field.protoName)), caseNames)
+                oneof.fields.add(field)
+            }
+        }
+        if oneof.fields.length > 0 {
+            oneof.name = unique(fieldName(declaration.name()), fieldNames)
+            let candidate = info.local + "_" + typeName(camel(declaration.name()))
+            if taken.contains(candidate) { candidate = candidate + "Oneof" }
+            oneof.typeName = unique(candidate, taken)
+        }
+        message.oneofs.add(oneof)
+    }
+    return message
+}
+
+// ----- Output -----
+
+function Module.line(indent: Integer, text: Text) {
+    if text == "" { self.lines.add("\n"); return }
+    self.lines.add("    ".repeat(indent) + text + "\n")
+}
+
+function relativePath(from: Text, to: Text): Text {
+    let fromParts = from.split("/")
+    let toParts = to.split("/")
+    let common = 0
+    while common < fromParts.length - 1 && common < toParts.length - 1 && fromParts[common] == toParts[common] { common += 1 }
+    let parts: List<Text> = []
+    for index in common..(fromParts.length - 1) { parts.add("..") }
+    if parts.length == 0 { parts.add(".") }
+    for index in common..toParts.length { parts.add(toParts[index]) }
+    return joinText(parts, "/")
+}
+
+function withoutProto(path: Text): Text {
+    if path.length > 6 && path.slice(path.length - 6, path.length) == ".proto" { return path.slice(0, path.length - 6) }
+    return path
+}
+
+function bundledName(path: Text): Text {
+    let prefix = "google/protobuf/"
+    if path.length <= prefix.length || path.slice(0, prefix.length) != prefix { return "" }
+    let base = withoutProto(path.slice(prefix.length, path.length))
+    for name in BUNDLED { if name == base { return "protobuf-" + name } }
+    return ""
+}
+
+function importPath(from: Text, to: Text): Text {
+    let bundled = bundledName(to)
+    if bundled != "" { return bundled }
+    return relativePath(from, withoutProto(to) + ".min")
+}
+
+/// The alias that qualifies names from another file's module, or "" for this one.
+function Module.qualifier(file: Text): Text {
+    if file == self.file.name() { return "" }
+    for position in 0..self.imports.length {
+        if self.imports[position] == file { return self.aliases[position] + "." }
+    }
+    let alias = identifierOnly(withoutProto(file))
+    self.imports.add(file)
+    self.aliases.add(alias)
+    return alias + "."
+}
+
+/// A type or function name from the module that declares `fullName`.
+function Module.name(fullName: Text, prefix: Text): Text {
+    let info = self.generator.type(fullName)
+    let local = info.local
+    if prefix != "" { local = prefix + local }
+    return self.qualifier(info.file) + local
+}
+
+function Module.typeOf(fullName: Text): Text { return self.name(fullName, "") }
+
+function Module.scalarType(field: Field): Text {
+    let kind = field.kind
+    if kind == DOUBLE || kind == FLOAT { return "Float" }
+    if kind == BOOL { return "Boolean" }
+    if kind == STRING { return "Text" }
+    if kind == BYTES { return "Bytes" }
+    if kind == MESSAGE || kind == GROUP || kind == ENUM { return self.typeOf(field.typeName) }
+    return "Integer"
+}
+
+function Module.fieldType(field: Field): Text {
+    if field.entry.length == 2 {
+        if field.entryList { return "List<" + field.entryType + ">" }
+        return "Map<" + self.scalarType(field.entry[0]) + ", " + self.scalarType(field.entry[1]) + ">"
+    }
+    let single = self.scalarType(field)
+    if field.repeated { return "List<" + single + ">" }
+    if field.presence { return "Maybe<" + single + ">" }
+    return single
+}
+
+function enumCase(info: TypeInfo, number: Integer): Text {
+    for position in 0..info.enumeration.value.length {
+        if info.enumeration.value[position].number() == number && info.cases[position] != "" { return info.cases[position] }
+    }
+    return ""
+}
+
+function enumCaseNamed(info: TypeInfo, name: Text): Text {
+    for position in 0..info.enumeration.value.length {
+        if info.enumeration.value[position].name() == name {
+            return enumCase(info, info.enumeration.value[position].number())
+        }
+    }
+    return ""
+}
+
+function floatLiteral(text: Text): Text {
+    if text == "inf" { return "(1.0 / 0.0)" }
+    if text == "-inf" { return "(-1.0 / 0.0)" }
+    if text == "nan" { return "(0.0 / 0.0)" }
+    let mantissa = text
+    let exponent = ""
+    let marker = text.find("e")
+    if marker < 0 { marker = text.find("E") }
+    if marker >= 0 {
+        mantissa = text.slice(0, marker)
+        exponent = "e" + text.slice(marker + 1, text.length)
+    }
+    if !mantissa.contains(".") { mantissa = mantissa + ".0" }
+    if mantissa.length > 0 && mantissa[0] == '.' { mantissa = "0" + mantissa }
+    if mantissa.length > 1 && mantissa[0] == '-' && mantissa[1] == '.' { mantissa = "-0" + mantissa.slice(1, mantissa.length) }
+    if mantissa[mantissa.length - 1] == '.' { mantissa = mantissa + "0" }
+    return mantissa + exponent
+}
+
+/// Integer literal for a decimal default, wrapping uint64 values above 2^63-1.
+function integerLiteral(text: Text): Text {
+    if text.length > 0 && text[0] == '-' { return text }
+    let value = 0
+    for c in text { value = wrappingAdd(wrappingMultiply(value, 10), Integer(c) - 48) }
+    return Text(value)
+}
+
+/// The value a field has when absent: its proto2 default, or the zero value.
+function Module.defaultValue(field: Field): Text {
+    let kind = field.kind
+    if kind == ENUM {
+        let info = self.generator.type(field.typeName)
+        let name = enumCase(info, 0)
+        if !info.proto3 && info.enumeration.value.length > 0 { name = info.cases[0] }
+        if field.hasDefault { name = enumCaseNamed(info, field.defaultValue) }
+        if name == "" { return self.typeOf(field.typeName) + ".Unrecognized(0)" }
+        return self.typeOf(field.typeName) + "." + name
+    }
+    if field.hasDefault {
+        if kind == DOUBLE || kind == FLOAT { return floatLiteral(field.defaultValue) }
+        if kind == BOOL { return field.defaultValue }
+        if kind == STRING { return quoted(field.defaultValue) }
+        if kind == BYTES { return "Bytes(" + quoted(field.defaultValue) + ")" }
+        return integerLiteral(field.defaultValue)
+    }
+    if kind == DOUBLE || kind == FLOAT { return "0.0" }
+    if kind == BOOL { return "false" }
+    if kind == STRING { return "\"\"" }
+    if kind == BYTES { return "Bytes()" }
+    if kind == MESSAGE || kind == GROUP { return self.name(field.typeName, "new") + "()" }
+    return "0"
+}
+
+function Module.initialValue(field: Field): Text {
+    if field.entry.length == 2 {
+        if field.entryList { return "[]" }
+        return "Map()"
+    }
+    if field.repeated { return "[]" }
+    if field.presence { return "None" }
+    return self.defaultValue(field)
+}
+
+// ----- Binary encoding -----
+
+function wireType(kind: Integer): Integer {
+    if kind == DOUBLE || kind == FIXED64 || kind == SFIXED64 { return 1 }
+    if kind == FLOAT || kind == FIXED32 || kind == SFIXED32 { return 5 }
+    if kind == STRING || kind == BYTES || kind == MESSAGE { return 2 }
+    if kind == GROUP { return 3 }
+    return 0
+}
+
+function tagOf(number: Integer, wire: Integer): Text { return Text((number << 3) | wire) }
+
+/// Statements appending one value (without its key) to `out`.
+function Module.writeValue(indent: Integer, field: Field, out: Text, value: Text) {
+    let kind = field.kind
+    if kind == DOUBLE { self.line(indent, "protobuf.writeDouble(" + out + ", " + value + ")") }
+    else if kind == FLOAT { self.line(indent, "protobuf.writeFloat(" + out + ", " + value + ")") }
+    else if kind == FIXED64 || kind == SFIXED64 { self.line(indent, "protobuf.writeFixed64(" + out + ", " + value + ")") }
+    else if kind == FIXED32 || kind == SFIXED32 { self.line(indent, "protobuf.writeFixed32(" + out + ", " + value + ")") }
+    else if kind == BOOL { self.line(indent, "protobuf.writeBoolean(" + out + ", " + value + ")") }
+    else if kind == STRING { self.line(indent, "protobuf.writeText(" + out + ", " + value + ")") }
+    else if kind == BYTES { self.line(indent, "protobuf.writeDelimited(" + out + ", " + value + ")") }
+    else if kind == SINT32 || kind == SINT64 { self.line(indent, "protobuf.writeSigned(" + out + ", " + value + ")") }
+    else if kind == ENUM { self.line(indent, "protobuf.writeVarint(" + out + ", " + value + ".number())") }
+    else if kind == MESSAGE {
+        self.line(indent, "let inner = Bytes()")
+        self.line(indent, self.name(field.typeName, "write") + "(inner, " + value + ")")
+        self.line(indent, "protobuf.writeDelimited(" + out + ", inner)")
+    } else if kind == GROUP {
+        self.line(indent, self.name(field.typeName, "write") + "(" + out + ", " + value + ")")
+        self.line(indent, "protobuf.writeVarint(" + out + ", " + tagOf(field.number, 4) + ")")
+    } else { self.line(indent, "protobuf.writeVarint(" + out + ", " + value + ")") }
+}
+
+/// Statements appending one field (key and value) to `out`.
+function Module.writeKeyed(indent: Integer, field: Field, out: Text, value: Text) {
+    self.line(indent, "protobuf.writeVarint(" + out + ", " + tagOf(field.number, wireType(field.kind)) + ")")
+    self.writeValue(indent, field, out, value)
+}
+
+/// The condition under which an implicit-presence value is encoded.
+function Module.notDefault(field: Field, value: Text): Text {
+    let kind = field.kind
+    if kind == DOUBLE || kind == FLOAT { return value + " != 0.0 || 1.0 / " + value + " < 0.0" }
+    if kind == BOOL { return value }
+    if kind == STRING || kind == BYTES { return value + ".length > 0" }
+    if kind == ENUM { return value + ".number() != 0" }
+    return value + " != 0"
+}
+
+function Module.writeField(field: Field) {
+    let access = "message." + field.name
+    if field.entry.length == 2 {
+        let key = field.entry[0]
+        let value = field.entry[1]
+        if field.entryList {
+            self.line(1, "for entry in " + access + " {")
+            self.line(2, "let pair = Bytes()")
+            self.writeKeyed(2, key, "pair", "entry.key")
+            self.writeKeyed(2, value, "pair", "entry.value")
+        } else {
+            self.line(1, "for key in " + access + " {")
+            self.line(2, "let pair = Bytes()")
+            self.writeKeyed(2, key, "pair", "key")
+            self.writeKeyed(2, value, "pair", access + "[key]")
+        }
+        self.line(2, "protobuf.writeVarint(out, " + tagOf(field.number, 2) + ")")
+        self.line(2, "protobuf.writeDelimited(out, pair)")
+        self.line(1, "}")
+    } else if field.packed {
+        self.line(1, "if " + access + ".length > 0 {")
+        self.line(2, "let packed = Bytes()")
+        self.line(2, "for value in " + access + " {")
+        self.writeValue(3, field, "packed", "value")
+        self.line(2, "}")
+        self.line(2, "protobuf.writeVarint(out, " + tagOf(field.number, 2) + ")")
+        self.line(2, "protobuf.writeDelimited(out, packed)")
+        self.line(1, "}")
+    } else if field.repeated {
+        self.line(1, "for value in " + access + " {")
+        self.writeKeyed(2, field, "out", "value")
+        self.line(1, "}")
+    } else if field.presence {
+        self.line(1, "if " + access + " is Some(value) {")
+        self.writeKeyed(2, field, "out", "value")
+        self.line(1, "}")
+    } else {
+        self.line(1, "if " + self.notDefault(field, access) + " {")
+        self.writeKeyed(2, field, "out", access)
+        self.line(1, "}")
+    }
+}
+
+function Module.writeOneof(oneof: Oneof) {
+    self.line(1, "if message." + oneof.name + " is Some(choice) {")
+    self.line(2, "match choice {")
+    for field in oneof.fields {
+        self.line(3, field.caseName + "(value) {")
+        self.writeKeyed(4, field, "out", "value")
+        self.line(3, "}")
+    }
+    self.line(2, "}")
+    self.line(1, "}")
+}
+
+/// Fields in number order; a oneof is written where its first member falls.
+function encodingOrder(message: Message): List<Field> {
+    let ordered = message.fields.sortedBy(function(a: Field, b: Field): Integer {
+        if a.number < b.number { return -1 }
+        if a.number > b.number { return 1 }
+        return 0
+    })
+    return ordered
+}
+
+// ----- Binary decoding -----
+
+/// An expression reading one value of a scalar or enum field.
+function Module.readExpression(field: Field): Text {
+    let kind = field.kind
+    if kind == DOUBLE { return "reader.readDouble()" }
+    if kind == FLOAT { return "reader.readFloat()" }
+    if kind == INT64 || kind == UINT64 { return "reader.readVarint()" }
+    if kind == INT32 { return "reader.readInt32()" }
+    if kind == FIXED64 || kind == SFIXED64 { return "reader.readFixed64()" }
+    if kind == FIXED32 { return "reader.readFixed32()" }
+    if kind == SFIXED32 { return "reader.readSfixed32()" }
+    if kind == BOOL { return "reader.readBoolean()" }
+    if kind == STRING { return "reader.readText()" }
+    if kind == BYTES { return "reader.readBytes()" }
+    if kind == UINT32 { return "reader.readUint32()" }
+    if kind == SINT32 { return "reader.readSint32()" }
+    if kind == SINT64 { return "reader.readSint64()" }
+    if kind == ENUM { return self.name(field.typeName, "enum") + "(reader.readInt32())" }
+    fail("protoc-gen-minyar: no scalar reader for kind " + Text(kind))
+}
+
+function Module.closedEnum(field: Field): Boolean {
+    return field.kind == ENUM && !self.generator.type(field.typeName).proto3
+}
+
+/// Statements reading one scalar or enum value and passing it to `store`, a
+/// statement prefix completed by the value and ")". Closed enums keep
+/// unrecognized numbers as unknown fields.
+function Module.readStore(indent: Integer, field: Field, store: Text, close: Text) {
+    if self.closedEnum(field) {
+        self.line(indent, "let number = reader.readInt32()")
+        self.line(indent, "let value = " + self.name(field.typeName, "enum") + "(number)")
+        self.line(indent, "if value is Unrecognized(_) {")
+        self.line(indent + 1, "protobuf.keepVarint(message.unknownFields, " + Text(field.number) + ", number)")
+        self.line(indent, "} else {")
+        self.line(indent + 1, store + "value" + close)
+        self.line(indent, "}")
+    } else {
+        self.line(indent, store + self.readExpression(field) + close)
+    }
+}
+
+/// Statements reading a nested message into a fresh `created`.
+function Module.readMessage(indent: Integer, field: Field, existing: Text, store: Text) {
+    if field.kind == GROUP {
+        self.line(indent, "let created = " + self.name(field.typeName, "new") + "()")
+        if existing != "" { self.line(indent, "if " + existing + " is Some(previous) { created = previous }") }
+        self.line(indent, "let group = reader.startGroup(tag)")
+        self.line(indent, self.name(field.typeName, "read") + "(reader, created)")
+        self.line(indent, "reader.endGroup(group)")
+        self.line(indent, store)
+        return
+    }
+    self.line(indent, "let outer = reader.enter()")
+    self.line(indent, "if outer >= 0 {")
+    self.line(indent + 1, "let created = " + self.name(field.typeName, "new") + "()")
+    if existing != "" { self.line(indent + 1, "if " + existing + " is Some(previous) { created = previous }") }
+    self.line(indent + 1, self.name(field.typeName, "read") + "(reader, created)")
+    self.line(indent + 1, store)
+    self.line(indent + 1, "reader.leave(outer)")
+    self.line(indent, "}")
+}
+
+function Module.readMapEntry(field: Field) {
+    let key = field.entry[0]
+    let value = field.entry[1]
+    self.line(3, tagOf(field.number, 2) + " {")
+    self.line(4, "let outer = reader.enter()")
+    self.line(4, "if outer >= 0 {")
+    self.line(5, "let key = " + self.defaultValue(key))
+    self.line(5, "let value = " + self.defaultValue(value))
+    self.line(5, "while reader.more() {")
+    self.line(6, "let tag = reader.readTag()")
+    self.line(6, "match tag {")
+    self.line(7, tagOf(1, wireType(key.kind)) + " { key = " + self.readExpression(key) + " }")
+    if value.kind == MESSAGE {
+        self.line(7, tagOf(2, 2) + " {")
+        self.line(8, "let inner = reader.enter()")
+        self.line(8, "if inner >= 0 {")
+        self.line(9, self.name(value.typeName, "read") + "(reader, value)")
+        self.line(9, "reader.leave(inner)")
+        self.line(8, "}")
+        self.line(7, "}")
+    } else {
+        self.line(7, tagOf(2, wireType(value.kind)) + " { value = " + self.readExpression(value) + " }")
+    }
+    self.line(7, "_ { reader.skip(tag) }")
+    self.line(6, "}")
+    self.line(5, "}")
+    self.line(5, "reader.leave(outer)")
+    if field.entryList {
+        self.line(5, "message." + field.name + ".add(" + field.entryType + " { key: key; value: value })")
+    } else {
+        self.line(5, "message." + field.name + "[key] = value")
+    }
+    self.line(4, "}")
+    self.line(3, "}")
+}
+
+function Module.readField(field: Field, message: Message) {
+    let access = "message." + field.name
+    if field.entry.length == 2 {
+        self.readMapEntry(field)
+        return
+    }
+    let wire = wireType(field.kind)
+    if field.oneof >= 0 {
+        let oneof = message.oneofs[field.oneof]
+        let make = "Some(" + oneof.typeName + "." + field.caseName + "("
+        self.line(3, tagOf(field.number, wire) + " {")
+        if field.kind == MESSAGE || field.kind == GROUP {
+            self.line(4, "let current: Maybe<" + self.scalarType(field) + "> = None")
+            self.line(4, "if message." + oneof.name + " is Some(" + field.caseName + "(previous)) { current = Some(previous) }")
+            self.readMessage(4, field, "current", "message." + oneof.name + " = " + make + "created))")
+        } else {
+            self.readStore(4, field, "message." + oneof.name + " = " + make, "))")
+        }
+        self.line(3, "}")
+        return
+    }
+    if field.repeated {
+        if field.kind == MESSAGE || field.kind == GROUP {
+            self.line(3, tagOf(field.number, wire) + " {")
+            self.readMessage(4, field, "", access + ".add(created)")
+            self.line(3, "}")
+            return
+        }
+        self.line(3, tagOf(field.number, wire) + " {")
+        self.readStore(4, field, access + ".add(", ")")
+        self.line(3, "}")
+        if wire != 2 {
+            self.line(3, tagOf(field.number, 2) + " {")
+            self.line(4, "let outer = reader.enter()")
+            self.line(4, "while reader.more() {")
+            self.readStore(5, field, access + ".add(", ")")
+            self.line(4, "}")
+            self.line(4, "reader.leave(outer)")
+            self.line(3, "}")
+        }
+        return
+    }
+    self.line(3, tagOf(field.number, wire) + " {")
+    if field.kind == MESSAGE || field.kind == GROUP {
+        self.readMessage(4, field, access, access + " = Some(created)")
+    } else if field.presence {
+        self.readStore(4, field, access + " = Some(", ")")
+    } else {
+        self.readStore(4, field, access + " = ", "")
+    }
+    self.line(3, "}")
+}
+
+function Module.dedupeEntries(field: Field) {
+    let access = "message." + field.name
+    self.line(1, "if " + access + ".length > 1 {")
+    self.line(2, "let last: Map<" + self.scalarType(field.entry[0]) + ", Integer> = Map()")
+    self.line(2, "for position in 0.." + access + ".length { last[" + access + "[position].key] = position }")
+    self.line(2, "if last.length < " + access + ".length {")
+    self.line(3, "let kept: List<" + field.entryType + "> = []")
+    self.line(3, "for position in 0.." + access + ".length {")
+    self.line(4, "if last[" + access + "[position].key] == position { kept.add(" + access + "[position]) }")
+    self.line(3, "}")
+    self.line(3, access + " = kept")
+    self.line(2, "}")
+    self.line(1, "}")
+}
+
+// ----- Declarations -----
+
+function Module.enumeration(info: TypeInfo) {
+    let name = info.local
+    self.line(0, "/// `" + info.fullName + "`")
+    self.line(0, "public choice " + name + " {")
+    for position in 0..info.cases.length {
+        if info.cases[position] != "" { self.line(1, info.cases[position]) }
+    }
+    self.line(1, "Unrecognized(value: Integer)")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "public function " + name + ".number(): Integer {")
+    self.line(1, "match self {")
+    for position in 0..info.cases.length {
+        if info.cases[position] != "" { self.line(2, info.cases[position] + " { return " + Text(info.enumeration.value[position].number()) + " }") }
+    }
+    self.line(2, "Unrecognized(value) { return value }")
+    self.line(1, "}")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "public function enum" + name + "(number: Integer): " + name + " {")
+    self.line(1, "match number {")
+    for position in 0..info.cases.length {
+        if info.cases[position] != "" { self.line(2, Text(info.enumeration.value[position].number()) + " { return " + name + "." + info.cases[position] + " }") }
+    }
+    self.line(2, "_ { return " + name + ".Unrecognized(number) }")
+    self.line(1, "}")
+    self.line(0, "}")
+    self.line(0, "")
+}
+
+function Module.record(message: Message) {
+    let name = message.info.local
+    for field in message.fields {
+        if field.entryList {
+            self.line(0, "/// An entry of `" + message.info.fullName + "." + field.protoName + "`.")
+            self.line(0, "public record " + field.entryType + " {")
+            self.line(1, "key: " + self.scalarType(field.entry[0]))
+            self.line(1, "value: " + self.scalarType(field.entry[1]))
+            self.line(0, "}")
+            self.line(0, "")
+        }
+    }
+    for oneof in message.oneofs {
+        if oneof.fields.length == 0 { continue }
+        self.line(0, "/// The `" + oneof.protoName + "` oneof of `" + message.info.fullName + "`.")
+        self.line(0, "public choice " + oneof.typeName + " {")
+        for field in oneof.fields { self.line(1, field.caseName + "(value: " + self.scalarType(field) + ")") }
+        self.line(0, "}")
+        self.line(0, "")
+    }
+    self.line(0, "/// `" + message.info.fullName + "`")
+    self.line(0, "public record " + name + " {")
+    let oneofsDone: Set<Integer> = Set()
+    for field in message.fields {
+        if field.oneof >= 0 {
+            if !oneofsDone.contains(field.oneof) {
+                oneofsDone.add(field.oneof)
+                let oneof = message.oneofs[field.oneof]
+                self.line(1, oneof.name + ": Maybe<" + oneof.typeName + ">")
+            }
+        } else {
+            self.line(1, field.name + ": " + self.fieldType(field))
+        }
+    }
+    self.line(1, "unknownFields: Bytes")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "public function new" + name + "(): " + name + " {")
+    self.line(1, "return " + name + " {")
+    let initialized: Set<Integer> = Set()
+    for field in message.fields {
+        if field.oneof >= 0 {
+            if !initialized.contains(field.oneof) {
+                initialized.add(field.oneof)
+                self.line(2, message.oneofs[field.oneof].name + ": None")
+            }
+        } else {
+            self.line(2, field.name + ": " + self.initialValue(field))
+        }
+    }
+    self.line(2, "unknownFields: Bytes()")
+    self.line(1, "}")
+    self.line(0, "}")
+    self.line(0, "")
+    for field in message.fields {
+        if field.presence && field.oneof < 0 && field.kind != MESSAGE && field.kind != GROUP {
+            self.line(0, "public function " + name + "." + field.name + "(): " + self.scalarType(field) + " {")
+            self.line(1, "if self." + field.name + " is Some(value) { return value }")
+            self.line(1, "return " + self.defaultValue(field))
+            self.line(0, "}")
+            self.line(0, "")
+        }
+    }
+    self.line(0, "public function " + name + ".encode(): Bytes {")
+    self.line(1, "let out = Bytes()")
+    self.line(1, "write" + name + "(out, self)")
+    self.line(1, "return out")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "public function decode" + name + "(data: Bytes): Result<" + name + ", errors.Error> {")
+    self.line(1, "let reader = protobuf.reader(data)")
+    self.line(1, "let message = new" + name + "()")
+    self.line(1, "read" + name + "(reader, message)")
+    self.line(1, "if reader.failed() { return Err(reader.failure()) }")
+    self.line(1, "return Ok(message)")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "public function write" + name + "(out: Bytes, message: " + name + ") {")
+    let written: Set<Integer> = Set()
+    for field in encodingOrder(message) {
+        if field.oneof >= 0 {
+            if !written.contains(field.oneof) {
+                written.add(field.oneof)
+                self.writeOneof(message.oneofs[field.oneof])
+            }
+        } else {
+            self.writeField(field)
+        }
+    }
+    self.line(1, "out.addBytes(message.unknownFields)")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "public function read" + name + "(reader: protobuf.Reader, message: " + name + ") {")
+    self.line(1, "while reader.more() {")
+    self.line(2, "let tag = reader.readTag()")
+    if message.fields.length > 0 {
+        self.line(2, "match tag {")
+        for field in message.fields { self.readField(field, message) }
+        self.line(3, "_ { reader.keep(tag, message.unknownFields) }")
+        self.line(2, "}")
+    } else {
+        self.line(2, "reader.keep(tag, message.unknownFields)")
+    }
+    self.line(1, "}")
+    for field in message.fields {
+        if field.entryList { self.dedupeEntries(field) }
+    }
+    self.line(0, "}")
+    self.line(0, "")
+}
+
+function Module.declarations(info: TypeInfo, taken: Set<Text>) {
+    if info.isEnum {
+        self.enumeration(info)
+        return
+    }
+    if isMapEntry(info) { return }
+    self.record(messageOf(self.generator, info, taken))
+}
+
+function outputName(path: Text): Text { return withoutProto(path) + ".min" }
+
+function Generator.file(position: Integer): plugin.CodeGeneratorResponse_File {
+    let file = self.request.protoFile[position]
+    let module = Module { generator: self; file: file; lines: []; imports: []; aliases: []; usesJson: false; names: Set() }
+    let taken: Set<Text> = Set()
+    for info in self.types { if info.file == file.name() { taken.add(info.local) } }
+    for info in self.types {
+        if info.file == file.name() { module.declarations(info, taken) }
+    }
+    let header: List<Text> = []
+    header.add("// Code generated by protoc-gen-minyar. DO NOT EDIT.\n")
+    header.add("// source: " + file.name() + "\n")
+    header.add("use \"errors\" as errors\n")
+    header.add("use \"protobuf\" as protobuf\n")
+    let order: List<Integer> = []
+    for position in 0..module.imports.length { order.add(position) }
+    let sorted = order.sortedBy(function(a: Integer, b: Integer): Integer {
+        if module.aliases[a] < module.aliases[b] { return -1 }
+        if module.aliases[a] > module.aliases[b] { return 1 }
+        return 0
+    })
+    for index in sorted {
+        header.add("use " + quoted(importPath(file.name(), module.imports[index])) + " as " + module.aliases[index] + "\n")
+    }
+    header.add("\n")
+    let lines = module.lines
+    while lines.length > 0 && lines[lines.length - 1] == "\n" { lines.pop() }
+    let output = plugin.newCodeGeneratorResponse_File()
+    output.name = Some(outputName(file.name()))
+    output.content = Some(joinText(header) + joinText(lines))
+    return output
+}
+
+/// Generate one module for each file the request names.
+public function generate(request: plugin.CodeGeneratorRequest): plugin.CodeGeneratorResponse {
+    let response = plugin.newCodeGeneratorResponse()
+    response.supportedFeatures = Some(SUPPORTED_FEATURES)
+    let generator = newGenerator(request)
+    for name in request.fileToGenerate {
+        if !generator.files.has(name) {
+            response.error = Some("protoc-gen-minyar: " + name + " is not among the request's files")
+            return response
+        }
+        response.file.add(generator.file(generator.files[name]))
+    }
+    return response
+}

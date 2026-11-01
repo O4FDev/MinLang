@@ -1,0 +1,173 @@
+use "io" as io
+use "process" as process
+use "./everything.min" as everything
+use "./legacy.min" as legacy
+use "./sample/shared.min" as shared
+// Generated-code driver for tests/protoc-gen-minyar-test.min, which copies it
+// beside the plugin's output for tests/protobuf/*.proto.
+//
+//   roundtrip decode TYPE IN OUT  decode IN as TYPE and encode it to OUT
+//   roundtrip build OUT           encode a message built in Minyar to OUT
+//   roundtrip check               check field values and API behaviour
+
+function stop(message: Text) {
+    print("FAIL " + message)
+    exit(1)
+}
+
+function expect(condition: Boolean, message: Text) { if !condition { stop(message) } }
+
+function reencode(kind: Text, data: Bytes): Bytes {
+    if kind == "sample.Everything" {
+        match everything.decodeEverything(data) {
+            Ok(message) { return message.encode() }
+            Err(problem) { stop(problem.message()) }
+        }
+    }
+    if kind == "legacy.Legacy" {
+        match legacy.decodeLegacy(data) {
+            Ok(message) { return message.encode() }
+            Err(problem) { stop(problem.message()) }
+        }
+    }
+    stop("unknown type " + kind)
+    return Bytes()
+}
+
+function built(): everything.Everything {
+    let message = everything.newEverything()
+    message.int32Value = -5
+    message.int64Value = -9223372036854775807 - 1
+    message.uint32Value = 4294967295
+    message.uint64Value = -1
+    message.sint32Value = -2147483648
+    message.sint64Value = 9223372036854775807
+    message.fixed32Value = 4000000000
+    message.fixed64Value = -2
+    message.sfixed32Value = -3
+    message.sfixed64Value = -4
+    message.floatValue = 1.5
+    message.doubleValue = -0.0
+    message.boolValue = true
+    message.stringValue = "héllo"
+    message.bytesValue = Bytes("raw")
+    message.color = shared.Color.Green
+    let point = shared.newPoint()
+    point.x = 3
+    message.point = Some(point)
+    message.optionalInt32 = Some(0)
+    message.mood = everything.Everything_Mood.CALM
+    message.packedInt32 = [1, -1, 300]
+    message.packedSint64 = [-2, 2]
+    message.packedColor = [shared.Color.RED, shared.Color.Unrecognized(9)]
+    message.unpackedInt64 = [7, 8]
+    message.strings = ["a", ""]
+    message.points = [point, shared.newPoint()]
+    message.counts["one"] = 1
+    message.names[-1] = "minus"
+    message.flags[true] = point
+    message.colors[2] = shared.Color.NEGATIVE
+    let child = everything.newEverything()
+    child.int32Value = 9
+    message.children.add(everything.Everything_ChildrenEntry { key: "kid"; value: child })
+    message.choice = Some(everything.Everything_Choice.ChoiceText("picked"))
+    message.type = 1
+    message.match = 2
+    message.unknownFields_ = 3
+    message.leading = 4
+    return message
+}
+
+function check() {
+    // Defaults and presence.
+    let empty = everything.newEverything()
+    expect(empty.encode().length == 0, "an empty proto3 message encodes nothing")
+    expect(empty.optionalInt32.isNone() && empty.point.isNone() && empty.choice.isNone(), "presence starts empty")
+    let old = legacy.newLegacy()
+    expect(old.count() == -7 && old.ratio() == 1.5 && old.enabled() && old.size().number() == 2, "proto2 defaults")
+    expect(old.tiny() < -1.0e300 && old.label() == "say \"hi\"\n" && old.big() == -1, "proto2 special defaults")
+    expect(old.count.isNone(), "proto2 fields start absent")
+    // A decoded message keeps every value.
+    match everything.decodeEverything(built().encode()) {
+        Ok(decoded) {
+            expect(decoded.int64Value == -9223372036854775807 - 1 && decoded.uint64Value == -1 && decoded.sint32Value == -2147483648, "integer extremes")
+            expect(decoded.uint32Value == 4294967295 && decoded.fixed32Value == 4000000000 && decoded.sfixed32Value == -3, "32-bit values")
+            expect(decoded.doubleValue == 0.0 && 1.0 / decoded.doubleValue < 0.0, "negative zero is encoded")
+            expect(decoded.stringValue == "héllo" && decoded.color.number() == 2, "text and enums")
+            expect(decoded.packedColor[1].number() == 9, "open enums keep unrecognized numbers")
+            expect(decoded.optionalInt32 == Some(0), "explicit presence keeps a zero")
+            expect(decoded.names[-1] == "minus" && decoded.counts["one"] == 1, "maps")
+            expect(decoded.children.length == 1 && decoded.children[0].value.int32Value == 9, "recursive map values")
+            match decoded.choice {
+                Some(ChoiceText(value)) { expect(value == "picked", "oneof value") }
+                _ { stop("oneof case") }
+            }
+            match decoded.point {
+                Some(point) { expect(point.x == 3, "nested message") }
+                None { stop("nested message missing") }
+            }
+        }
+        Err(problem) { stop(problem.message()) }
+    }
+    // Merging: a repeated singular message merges, and a later map key wins.
+    let first = everything.newEverything()
+    let a = shared.newPoint()
+    a.x = 1
+    first.point = Some(a)
+    first.children.add(everything.Everything_ChildrenEntry { key: "k"; value: everything.newEverything() })
+    let second = everything.newEverything()
+    let b = shared.newPoint()
+    b.y = 2
+    second.point = Some(b)
+    let later = everything.newEverything()
+    later.int32Value = 5
+    second.children.add(everything.Everything_ChildrenEntry { key: "k"; value: later })
+    let joined = first.encode()
+    joined.addBytes(second.encode())
+    match everything.decodeEverything(joined) {
+        Ok(merged) {
+            match merged.point {
+                Some(point) { expect(point.x == 1 && point.y == 2, "singular messages merge") }
+                None { stop("merged message missing") }
+            }
+            expect(merged.children.length == 1 && merged.children[0].value.int32Value == 5, "the last map entry wins")
+        }
+        Err(problem) { stop(problem.message()) }
+    }
+    // Closed enums keep unknown numbers as unknown fields.
+    let unknownSize = Bytes()
+    unknownSize.add(56)
+    unknownSize.add(9)
+    match legacy.decodeLegacy(unknownSize) {
+        Ok(decoded) {
+            expect(decoded.size.isNone() && decoded.unknownFields.length == 2, "closed enum unknown value")
+            expect(decoded.encode().length == 2, "unknown fields are written back")
+        }
+        Err(problem) { stop(problem.message()) }
+    }
+    // Malformed input is an error, not a stop.
+    let truncated = built().encode()
+    truncated.resize(truncated.length - 1)
+    expect(everything.decodeEverything(truncated).isErr(), "truncated input")
+    let badUtf8 = Bytes()
+    badUtf8.add(114)
+    badUtf8.add(1)
+    badUtf8.add(255)
+    expect(everything.decodeEverything(badUtf8).isErr(), "invalid UTF-8 in a string")
+    let badGroup = Bytes()
+    badGroup.add(91)
+    expect(legacy.decodeLegacy(badGroup).isErr(), "unterminated group")
+    print("ok")
+}
+
+let mode = process.argument(0)
+if mode == "decode" {
+    let data = io.readBytesFile(process.argument(2))
+    io.writeBytesFile(process.argument(3), reencode(process.argument(1), data))
+} else if mode == "build" {
+    io.writeBytesFile(process.argument(1), built().encode())
+} else if mode == "check" {
+    check()
+} else {
+    stop("unknown mode " + mode)
+}

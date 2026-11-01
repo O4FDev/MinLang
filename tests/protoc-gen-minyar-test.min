@@ -1,0 +1,58 @@
+use "../tools/testing.min" as test
+use "io" as io
+use "system" as system
+// protoc-gen-minyar under protoc: generate tests/protobuf/*.proto, compile the
+// generated modules with tests/protobuf/roundtrip.min at -O0 and -O2, and check
+// that the generated codecs agree with protoc's own encoder and decoder.
+
+constant PLUGIN = "build/tooling/tools/protoc-gen-minyar/main"
+
+function sh(script: Text, log: Text, seconds: Integer): test.Result {
+    return test.run(["/bin/sh", "-c", script], system.environment(), "", log, seconds)
+}
+
+function quoted(path: Text): Text { return "'" + path + "'" }
+
+let scratch = test.scratch()
+let generated = scratch + "/generated"
+let clang = test.setting("MINYAR_TEST_CLANG", "clang")
+test.require(test.run(["mkdir", "-p", generated], system.environment(), "", scratch + "/mkdir", 10), "scratch")
+let protoc = "protoc --plugin=protoc-gen-minyar=" + quoted(PLUGIN) + " -Itests/protobuf "
+test.require(sh(protoc + "--minyar_out=" + quoted(generated) + " everything.proto legacy.proto sample/shared.proto", scratch + "/generate", 60), "protoc-gen-minyar")
+for name in ["everything.min", "legacy.min", "sample/shared.min"] {
+    test.check(io.fileExists(generated + "/" + name), "generated " + name)
+}
+io.writeTextFile(generated + "/roundtrip.min", io.readTextFile("tests/protobuf/roundtrip.min"))
+test.require(test.run(["./build/minyarc-modules", generated + "/roundtrip.min", scratch + "/roundtrip.ll", "--library", "library"], system.environment(), "", scratch + "/compile", 120), "compile generated code")
+
+for level in ["-O0", "-O2"] {
+    let program = scratch + "/roundtrip" + level
+    test.require(test.run([clang, level, "-Wno-override-module", scratch + "/roundtrip.ll", "build/testing/cycle-runtime.o", "-lm", "-o", program], system.environment(), "", program + ".link", 240), "link " + level)
+    let checked = test.run([program, "check"], system.environment(), "", program + ".check", 30)
+    test.require(checked, "generated-code checks " + level)
+    test.check(checked.output == "ok\n", "generated-code checks " + level + ": " + checked.output)
+
+    // Messages built in Minyar decode with protoc to the expected text.
+    test.require(test.run([program, "build", scratch + "/built.bin"], system.environment(), "", program + ".build", 30), "build " + level)
+    let decoded = sh(protoc + "--decode=sample.Everything everything.proto < " + quoted(scratch + "/built.bin"), program + ".decode", 30)
+    test.require(decoded, "protoc decodes Minyar output " + level)
+    test.check(decoded.output == io.readTextFile("tests/protobuf/built.txtpb"), "protoc reads the built message " + level + "\n" + decoded.output)
+
+    // protoc's encodings survive a Minyar decode and encode: compare canonical
+    // (deterministic) re-encodings of both, so map order does not matter.
+    for fixture in [["sample.Everything", "everything"], ["legacy.Legacy", "legacy"]] {
+        let kind = fixture[0]
+        let file = fixture[1]
+        let original = scratch + "/" + file + level + ".bin"
+        test.require(sh(protoc + "--encode=" + kind + " " + file + ".proto < tests/protobuf/" + file + ".txtpb > " + quoted(original), original + ".encode", 30), "protoc encodes " + file)
+        test.require(test.run([program, "decode", kind, original, original + ".minyar"], system.environment(), "", original + ".run", 30), "Minyar re-encodes " + file + " " + level)
+        let canonical = "protoc --decode=" + kind + " -Itests/protobuf " + file + ".proto < \"$1\" | protoc --encode=" + kind + " --deterministic_output -Itests/protobuf " + file + ".proto | od -An -tx1"
+        let expected = test.run(["/bin/sh", "-c", canonical, "canonical", original], system.environment(), "", original + ".expected", 30)
+        let actual = test.run(["/bin/sh", "-c", canonical, "canonical", original + ".minyar"], system.environment(), "", original + ".actual", 30)
+        test.require(expected, "canonical protoc encoding of " + file)
+        test.require(actual, "canonical Minyar encoding of " + file)
+        test.check(expected.output == actual.output, file + " round trip differs at " + level + "\nprotoc:\n" + expected.output + "Minyar:\n" + actual.output)
+    }
+}
+test.removeScratch(scratch)
+print("protoc-gen-minyar: ok")

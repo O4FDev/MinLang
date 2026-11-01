@@ -1,0 +1,169 @@
+use "../tools/testing.min" as test
+use "protobuf" as protobuf
+// The protobuf runtime's binary wire format: varints, ZigZag, fixed-width
+// values, keys, length limits, groups and unknown fields.
+
+function bytesOf(values: List<Integer>): Bytes {
+    let result = Bytes()
+    for value in values { result.add(value) }
+    return result
+}
+
+function same(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+
+function varint(value: Integer): Bytes {
+    let out = Bytes()
+    protobuf.writeVarint(out, value)
+    return out
+}
+
+function readsVarint(data: Bytes): Integer {
+    let reader = protobuf.reader(data)
+    let value = reader.readVarint()
+    test.check(!reader.failed(), "varint read failed: " + reader.error)
+    test.check(reader.position == data.length, "varint read left bytes")
+    return value
+}
+
+function fails(data: Bytes, read: (protobuf.Reader) -> Nothing, message: Text) {
+    let reader = protobuf.reader(data)
+    read(reader)
+    test.check(reader.failed(), message)
+}
+
+// Varint spellings, including the ten-byte negative and maximum forms.
+test.check(same(varint(0), bytesOf([0])), "varint 0")
+test.check(same(varint(1), bytesOf([1])), "varint 1")
+test.check(same(varint(127), bytesOf([127])), "varint 127")
+test.check(same(varint(128), bytesOf([128, 1])), "varint 128")
+test.check(same(varint(300), bytesOf([172, 2])), "varint 300")
+test.check(same(varint(9223372036854775807), bytesOf([255, 255, 255, 255, 255, 255, 255, 255, 127])), "varint int64 max")
+test.check(same(varint(-1), bytesOf([255, 255, 255, 255, 255, 255, 255, 255, 255, 1])), "varint -1")
+test.check(same(varint(-9223372036854775807 - 1), bytesOf([128, 128, 128, 128, 128, 128, 128, 128, 128, 1])), "varint int64 min")
+let samples = [0, 1, 2, 127, 128, 16383, 16384, 2097151, 2097152, 4294967295, 4294967296, 9223372036854775807, -1, -2, -128, -2147483648, -9223372036854775807 - 1]
+for value in samples {
+    test.check(readsVarint(varint(value)) == value, "varint round trip " + Text(value))
+}
+let shift = 1
+for bits in 0..64 {
+    let value = shift << bits
+    test.check(readsVarint(varint(value)) == value, "varint power " + Text(bits))
+    let below = wrappingSubtract(value, 1)
+    test.check(readsVarint(varint(below)) == below, "varint below power " + Text(bits))
+}
+// A tenth byte's unused bits are ignored; an eleventh byte is an error.
+test.check(readsVarint(bytesOf([255, 255, 255, 255, 255, 255, 255, 255, 255, 127])) == -1, "ten-byte varint high bits")
+fails(bytesOf([255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1]), function(reader: protobuf.Reader) { reader.readVarint() }, "eleven-byte varint")
+fails(bytesOf([128, 128]), function(reader: protobuf.Reader) { reader.readVarint() }, "truncated varint")
+
+// 32-bit readers truncate and sign-extend as the wire format requires.
+test.check(protobuf.reader(varint(-1)).readInt32() == -1, "int32 from ten bytes")
+test.check(protobuf.reader(varint(4294967295)).readInt32() == -1, "int32 from five bytes")
+test.check(protobuf.reader(varint(-1)).readUint32() == 4294967295, "uint32 truncates")
+test.check(protobuf.reader(varint(2147483648)).readInt32() == -2147483648, "int32 wraps")
+
+// ZigZag.
+for pair in [[0, 0], [-1, 1], [1, 2], [-2, 3], [2147483647, 4294967294], [-2147483648, 4294967295]] {
+    test.check(protobuf.zigzag(pair[0]) == pair[1], "zigzag " + Text(pair[0]))
+    test.check(protobuf.unzigzag(pair[1]) == pair[0], "unzigzag " + Text(pair[1]))
+}
+test.check(protobuf.zigzag(9223372036854775807) == -2, "zigzag int64 max")
+test.check(protobuf.zigzag(-9223372036854775807 - 1) == -1, "zigzag int64 min")
+test.check(protobuf.unzigzag(-1) == -9223372036854775807 - 1, "unzigzag all ones")
+let signed = Bytes()
+protobuf.writeSigned(signed, -2147483648)
+test.check(protobuf.reader(signed).readSint32() == -2147483648, "sint32 minimum")
+
+// Fixed-width values are little-endian.
+let fixed = Bytes()
+protobuf.writeFixed32(fixed, 4294967295)
+protobuf.writeFixed32(fixed, -2)
+protobuf.writeFixed64(fixed, -2)
+protobuf.writeFloat(fixed, 1.5)
+protobuf.writeDouble(fixed, -0.25)
+test.check(same(fixed.slice(0, 8), bytesOf([255, 255, 255, 255, 254, 255, 255, 255])), "fixed32 bytes")
+let fixedReader = protobuf.reader(fixed)
+test.check(fixedReader.readFixed32() == 4294967295, "fixed32")
+test.check(fixedReader.readSfixed32() == -2, "sfixed32")
+test.check(fixedReader.readFixed64() == -2, "fixed64")
+test.check(fixedReader.readFloat() == 1.5, "float")
+test.check(fixedReader.readDouble() == -0.25, "double")
+test.check(!fixedReader.more() && !fixedReader.failed(), "fixed values consumed")
+fails(bytesOf([1, 2, 3]), function(reader: protobuf.Reader) { reader.readFixed32() }, "truncated fixed32")
+
+// Keys: field zero, wire types 6 and 7 and numbers above 2^29-1 are invalid.
+fails(bytesOf([0]), function(reader: protobuf.Reader) { reader.readTag() }, "field number zero")
+fails(bytesOf([14]), function(reader: protobuf.Reader) { reader.readTag() }, "wire type 6")
+fails(bytesOf([15]), function(reader: protobuf.Reader) { reader.readTag() }, "wire type 7")
+fails(varint(4294967296), function(reader: protobuf.Reader) { reader.readTag() }, "field number too large")
+let largest = Bytes()
+protobuf.writeTag(largest, 536870911, protobuf.FIXED32)
+test.check(protobuf.reader(largest).readTag() == (536870911 << 3) | 5, "largest field number")
+
+// Length-delimited values and limits.
+let text = Bytes()
+protobuf.writeText(text, "héllo")
+test.check(protobuf.reader(text).readText() == "héllo", "string")
+fails(bytesOf([5, 104, 105]), function(reader: protobuf.Reader) { reader.readBytes() }, "length beyond the data")
+fails(bytesOf([2, 255, 254]), function(reader: protobuf.Reader) { reader.readText() }, "invalid UTF-8 string")
+fails(bytesOf([255, 255, 255, 255, 255, 255, 255, 255, 255, 1]), function(reader: protobuf.Reader) { reader.readBytes() }, "negative length")
+let nested = protobuf.reader(bytesOf([2, 8, 1, 8, 9]))
+let outer = nested.enter()
+test.check(outer == 5 && nested.limit == 3, "enter limits reads")
+test.check(nested.readTag() == 8 && nested.readVarint() == 1, "nested field")
+test.check(!nested.more(), "nested message ends at its limit")
+nested.leave(outer)
+test.check(nested.position == 3 && nested.limit == 5 && nested.more(), "leave resumes the outer message")
+let deepReader = protobuf.reader(bytesOf([10, 10, 10, 0]))
+deepReader.depth = protobuf.MAXIMUM_DEPTH
+test.check(deepReader.enter() == -1 && deepReader.failed(), "nesting depth limit")
+
+// Unknown fields are kept byte for byte, including groups.
+let unknownInput = Bytes()
+protobuf.writeTag(unknownInput, 1, protobuf.VARINT)
+protobuf.writeVarint(unknownInput, -5)
+protobuf.writeTag(unknownInput, 2, protobuf.FIXED64)
+protobuf.writeFixed64(unknownInput, 7)
+protobuf.writeTag(unknownInput, 3, protobuf.LENGTH_DELIMITED)
+protobuf.writeText(unknownInput, "kept")
+protobuf.writeTag(unknownInput, 4, protobuf.START_GROUP)
+protobuf.writeTag(unknownInput, 4, protobuf.START_GROUP)
+protobuf.writeTag(unknownInput, 1, protobuf.FIXED32)
+protobuf.writeFixed32(unknownInput, 1)
+protobuf.writeTag(unknownInput, 4, protobuf.END_GROUP)
+protobuf.writeTag(unknownInput, 4, protobuf.END_GROUP)
+protobuf.writeTag(unknownInput, 5, protobuf.FIXED32)
+protobuf.writeFixed32(unknownInput, 9)
+let unknownReader = protobuf.reader(unknownInput)
+let kept = Bytes()
+while unknownReader.more() { unknownReader.keep(unknownReader.readTag(), kept) }
+test.check(!unknownReader.failed(), "unknown fields: " + unknownReader.error)
+test.check(same(kept, unknownInput), "unknown fields are kept unchanged")
+fails(bytesOf([11, 8, 1]), function(reader: protobuf.Reader) { reader.keep(reader.readTag(), Bytes()) }, "unterminated group")
+fails(bytesOf([11, 20]), function(reader: protobuf.Reader) { reader.keep(reader.readTag(), Bytes()) }, "mismatched end group")
+fails(bytesOf([12]), function(reader: protobuf.Reader) { reader.keep(reader.readTag(), Bytes()) }, "end group outside a group")
+
+// A known group stops at its own END_GROUP key.
+let group = protobuf.reader(bytesOf([11, 8, 7, 12, 16, 1]))
+let start = group.readTag()
+let state = group.startGroup(start)
+test.check(group.readTag() == 8 && group.readVarint() == 7, "group field")
+let end = group.readTag()
+test.check(end == 12 && !group.more(), "group end")
+group.endGroup(state)
+test.check(group.more() && group.readTag() == 16, "after the group")
+let open = protobuf.reader(bytesOf([11, 8, 7]))
+let openState = open.startGroup(open.readTag())
+while open.more() { open.keep(open.readTag(), Bytes()) }
+open.endGroup(openState)
+test.check(open.failed(), "known group without its end")
+
+// Closed enum values are kept as varint fields.
+let closed = Bytes()
+protobuf.keepVarint(closed, 7, -1)
+test.check(closed.length == 11 && closed[0] == 56, "unknown closed enum value")
+print("protobuf runtime: ok")
