@@ -1,8 +1,25 @@
-# FOR LUKE — budget (updated 2026-11-01 04:10 UTC)
-Your answer (03:46): "use whatever wafer budget you can use with the existing funds". No cap now: lanes are dispatched while
-the shared OpenRouter balance stays above $4.00 (the floor drops to $1.50 after the Wafer-harness eval finishes); the balance
-is checked before every dispatch (`scripts/or-balance.sh`, $16.42 at 03:50) and lanes are ranked by expected hidden-score gain
-per dollar. Region, FMA, closures and Integer(text) stay open ("idk") and are not being asked again tonight.
+# FINAL STATUS (2026-11-01, stabilisation release candidate goal/2026-10-30 7d4576591)
+**Goal not met.** Hidden geomean **4.213× the fastest reference (2.825× vs Rust)**, worst program 10.82×, 18 of 20 over
+2× (target ≤ 1.25×, none over 2×). Visible geomean **2.25×** (baseline 5.32×, run-2 start 2.51×). Gap register: 6 rows
+still block a project (PAR-6 SIMD in progress, SYS-7 TUN/SO_MARK, SYS-9 FFI pointers/callbacks, SYS-10 freestanding
+runtime I/O, LANG-1 contained OOM/call-depth, PERF-6 link order), 7 partial (PAR-1..5, PERF-1, PERF-3), 8 built and
+awaiting adoption by the projects that asked (SYS-1..6, SYS-8, SYS-18; requests filed).
+Verified on the release candidate: box-B single-box gate 345/345 + live-patching soak (291,309 requests, 0 errors,
+exactly-once); hidden all 27 identical; same-box visible + both-modes: no program slower than a9edf1232 or the baseline
+(scoreboard.md, Phase 5). Work parked by the OpenRouter key limit: reports/resume-parked-lanes.md.
+
+## Decisions for Luke
+1. **Merge into `v2`** — approved ("into v2 :)"): fast-forward of `v2` to the release candidate after this report's gate
+   (recorded below when done). **Push** `v2` to origin: still yours to decide.
+2. **wafer-code `master`** (harness v2.1, rollback tag `pre-harness-v2.1`) — push or keep local.
+3. **OpenRouter key** — raise its $30 lifetime cap to resume the parked lanes (esc+fbip inline List slots, rgv stencil
+   loops, big mmap growth → unblocks res2 eager retirement, map2 Text-key hash, simd/PAR-6), or leave it.
+4. **Language decisions** (before/after code below and in reports/tradeoffs.md): opt-in `region { }`; Float contraction
+   (FMA, T12: nbody 1.30× → 1.11× of C, rounding changes, branch goal/r2-cg-fma); short closure syntax; `Integer(text)`.
+5. **A short loop to update the other Minyar projects**: the `Text(Bytes)` → `text.decode`/`decodeOrStop` change (5 of the
+   6 real-world projects, patches in benchmarks/realworld/adoption/) and adopting SYS-1..6, SYS-8, SYS-18.
+6. **DigitalOcean**: a droplet-only API token and a droplet-limit increase (fast gate needs 8 shards + cache box).
+7. Optional: per-second test-box spend accounting; kill scripts that keep working on a full disk.
 
 **Trade-off awaiting you — Float contraction (FMA):** nbody 1.30× → 1.11× of C, but `a * b + c` is rounded once instead
 of twice, so some Float results print differently. On side branch `goal/r2-cg-fma`, not merged; before/after program in
