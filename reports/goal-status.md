@@ -1,8 +1,8 @@
-# FOR LUKE (2026-11-01 00:00 UTC) — run-2 Wafer budget binds before Sunday 21:00
-$6.2 of the $15 run-2 Wafer budget is spent after 3.5 h (about $1.8/h with 10–11 lanes; one third of it is prompt-cache
-misses after idle waits, now being cut by ending agent sessions on waits and resuming at `medium` effort). At this rate
-the budget reaches $13 (where I stop re-dispatching, keeping $2 for fixes) around 04:00–06:00 UTC, 15+ hours before the
-21:00 stop. Raise it? Until you answer, lanes are paced, not stopped.
+# FOR LUKE — budget (updated 2026-11-01 04:10 UTC)
+Your answer (03:46): "use whatever wafer budget you can use with the existing funds". No cap now: lanes are dispatched while
+the shared OpenRouter balance stays above $4.00 (the floor drops to $1.50 after the Wafer-harness eval finishes); the balance
+is checked before every dispatch (`scripts/or-balance.sh`, $16.42 at 03:50) and lanes are ranked by expected hidden-score gain
+per dollar. Region, FMA, closures and Integer(text) stay open ("idk") and are not being asked again tonight.
 
 **Trade-off awaiting you — Float contraction (FMA):** nbody 1.30× → 1.11× of C, but `a * b + c` is rounded once instead
 of twice, so some Float results print differently. On side branch `goal/r2-cg-fma`, not merged; before/after program in
