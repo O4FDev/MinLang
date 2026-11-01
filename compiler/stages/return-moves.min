@@ -1,19 +1,14 @@
-// Last-use moves over the scope-owner (Perceus) shape.
+// Last-use return moves over the scope-owner (Perceus) shape.
 //
-// Two shapes appear once the result ABI and the scope cells are lowered, and
-// both move a count with work that could move it with none:
+// `return Ok(left)` in a `.r` function retains the payload for the caller and
+// then drops the scope cell that already held that one count: two operations
+// move a count that could move in none. The payload register is the cell's
+// value itself, so when the cell provably holds the value's only count there,
+// the return hands the cell's count to the caller instead
+// (`minyar_rc_scope_move_v1` with an empty cell retains nothing) and the
+// cleanup drop of that cell releases nothing.
 //
-// 1. `return Ok(left)` in a `.r` function retains the payload for the caller
-//    and then drops the scope cell that already held that one count. The
-//    payload register is the cell's value itself, so when the cell provably
-//    holds the value's only count at that point, the return hands the cell's
-//    count to the caller instead (`minyar_rc_scope_move_v1` with an empty cell
-//    retains nothing) and the cleanup drop is removed.
-// 2. Any owner transfer out of a cell (`scope_move_v1`, or a null store) leaves
-//    the cell empty, so a later cleanup that loads the cell, nulls it again and
-//    drops the load can only drop null: all three lines are dead work.
-//
-// The proof for (1) is local and syntactic, which is what keeps it sound:
+// The proof is local and syntactic, which is what keeps it sound:
 //  - the value was stored into a scope cell exactly once in the whole body;
 //  - walking back from the retain along the only path that reaches it (every
 //    block on it has exactly one branch into it, so no other entry exists)
@@ -265,59 +260,6 @@ function returnMoveCell(lines: List<Text>, ret: Integer): Boolean {
     return true
 }
 
-// The scope cell this line empties, or "": a move out of the cell, or a store
-// of null into it.
-function returnMoveEmptiedCell(line: Text): Text {
-    let movePrefix = "  call void @minyar_rc_scope_move_v1(ptr "
-    if line.startsWith(movePrefix) {
-        let comma = line.find(", ptr ")
-        if comma < 0 { return "" }
-        return line.slice(movePrefix.length, comma)
-    }
-    let nullStore = "  store ptr null, ptr "
-    if line.startsWith(nullStore) { return line.slice(nullStore.length, line.length) }
-    return ""
-}
-
-// A cleanup that loads a cell already emptied on this path, nulls it again and
-// drops the load can only drop null: all three lines are dead work and go.
-function returnMoveDeadCells(lines: List<Text>): Boolean {
-    let changed = false
-    let index = 0
-    while index < lines.length {
-        let cell = returnMoveEmptiedCell(lines[index])
-        if cell != "" && cell.find("%rc.scope.slot.") == 0 {
-            let load = ""
-            let loadIndex = -1
-            let nullStore = -1
-            let dropIndex = -1
-            let position = index + 1
-            while position < lines.length {
-                let line = lines[position]
-                if line.endsWith(":") || line.startsWith("  br ") || line.startsWith("  switch ") || line.startsWith("  ret ") || line.startsWith("  invoke ") { position = lines.length } else if loadIndex >= 0 && dropIndex < 0 && line == "  call void @minyar_rc_scope_drop_v1(ptr " + load + ")" {
-                    dropIndex = position
-                    position = lines.length
-                } else if line.find(cell) < 0 { position = position + 1 } else if loadIndex < 0 && line.startsWith("  %rc.scope.drop.") && line.endsWith(" = load ptr, ptr " + cell) {
-                    load = line.slice(2, line.find(" = load ptr, ptr "))
-                    loadIndex = position
-                    position = position + 1
-                } else if loadIndex >= 0 && nullStore < 0 && line == "  store ptr null, ptr " + cell {
-                    nullStore = position
-                    position = position + 1
-                } else { position = lines.length }
-            }
-            if loadIndex >= 0 && dropIndex >= 0 && returnMoveTokenUses(lines, load) == 2 {
-                lines[loadIndex] = ""
-                lines[dropIndex] = ""
-                if nullStore >= 0 { lines[nullStore] = "" }
-                changed = true
-            }
-        }
-        index = index + 1
-    }
-    return changed
-}
-
 function returnMoveBody(lines: List<Text>): Boolean {
     let changed = false
     let index = 0
@@ -327,7 +269,6 @@ function returnMoveBody(lines: List<Text>): Boolean {
         }
         index = index + 1
     }
-    if returnMoveDeadCells(lines) { changed = true }
     return changed
 }
 
