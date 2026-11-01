@@ -1,0 +1,808 @@
+// Connect protocol (connectrpc.com) server and client over the rpc handler API.
+// No sockets: Server.handle turns one HTTP request into one HTTP response, and
+// Client.unary sends through a caller-supplied transport, so the same code runs
+// behind httpserver (library/connecthttp.min) and inside simulation tests.
+// Unary calls use application/proto or application/json bodies over POST, or
+// GET for NO_SIDE_EFFECTS methods. Errors are Connect JSON with details.
+use "rpc" as rpc
+use "errors" as errors
+use "json" as json
+use "text" as utf8
+
+/// An HTTP request as a transport received it. `target` is the path with
+/// any query; header names are lowercase.
+public record Request { method: Text; target: Text; headers: List<rpc.Header>; body: Bytes }
+public record Response { status: Integer; headers: List<rpc.Header>; body: Bytes }
+
+/// A Content-Encoding the server or client accepts, such as gzip.
+/// `decompress` must refuse output longer than its limit.
+public record Compressor {
+    name: Text
+    compress: (Bytes) -> Result<Bytes, errors.Error>
+    decompress: (Bytes, Integer) -> Result<Bytes, errors.Error>
+}
+
+/// Cross-origin access for browser clients such as connect-web. Origins are
+/// exact ("https://app.example") or "*". Add application headers, such as
+/// "authorization", to `allowedHeaders` and readable response headers to
+/// `exposedHeaders`.
+public record Cors {
+    allowedOrigins: List<Text>
+    allowedHeaders: List<Text>
+    exposedHeaders: List<Text>
+    allowCredentials: Boolean
+    maxAgeSeconds: Integer
+}
+public function noCors(): Cors {
+    return Cors { allowedOrigins: []; allowedHeaders: []; exposedHeaders: []; allowCredentials: false; maxAgeSeconds: 7200 }
+}
+
+public record Options {
+    // Milliseconds on any monotonic clock; deadlines and the replay cache use it.
+    clock: () -> Integer
+    maxRequestBytes: Integer
+    maxResponseBytes: Integer
+    // Reject requests without Connect-Protocol-Version: 1 (or connect=v1 on GET).
+    requireProtocolVersion: Boolean
+    cors: Cors
+    compressors: List<Compressor>
+    // Responses at least this long are compressed when the client accepts it.
+    compressMinBytes: Integer
+    // Completed unary results kept for retried calls with an Idempotency-Key.
+    idempotencyEntries: Integer
+    idempotencyMilliseconds: Integer
+}
+public function defaults(clock: () -> Integer): Options {
+    return Options { clock: clock; maxRequestBytes: 4194304; maxResponseBytes: 16777216; requireProtocolVersion: false;
+        cors: noCors(); compressors: []; compressMinBytes: 1024; idempotencyEntries: 4096; idempotencyMilliseconds: 86400000 }
+}
+
+record Replay { key: Text; fingerprint: Integer; stored: Integer; response: Response }
+public record Server {
+    private services: rpc.Services
+    private options: Options
+    private replays: List<Replay>
+    private replayNext: Integer
+    private replayIndex: Map<Text, Integer>
+    private executed: Integer
+    private replayed: Integer
+}
+public function server(services: rpc.Services, options: Options): Server {
+    let index: Map<Text, Integer> = Map()
+    return Server { services: services; options: options; replays: []; replayNext: 0; replayIndex: index; executed: 0; replayed: 0 }
+}
+// Handler runs started, and responses served again for a retried key.
+public function Server.executed(): Integer { return self.executed }
+public function Server.replayed(): Integer { return self.replayed }
+
+// ---- Connect error and status mapping
+
+public function httpStatus(code: Integer): Integer {
+    if code == rpc.CANCELED { return 499 }
+    if code == rpc.INVALID_ARGUMENT || code == rpc.FAILED_PRECONDITION || code == rpc.OUT_OF_RANGE { return 400 }
+    if code == rpc.DEADLINE_EXCEEDED { return 504 }
+    if code == rpc.NOT_FOUND { return 404 }
+    if code == rpc.ALREADY_EXISTS || code == rpc.ABORTED { return 409 }
+    if code == rpc.PERMISSION_DENIED { return 403 }
+    if code == rpc.RESOURCE_EXHAUSTED { return 429 }
+    if code == rpc.UNIMPLEMENTED { return 501 }
+    if code == rpc.UNAVAILABLE { return 503 }
+    if code == rpc.UNAUTHENTICATED { return 401 }
+    return 500
+}
+// The code a client infers from an HTTP status without a Connect error body.
+public function codeForStatus(status: Integer): Integer {
+    if status == 400 { return rpc.INTERNAL }
+    if status == 401 { return rpc.UNAUTHENTICATED }
+    if status == 403 { return rpc.PERMISSION_DENIED }
+    if status == 404 { return rpc.UNIMPLEMENTED }
+    if status == 429 || status == 502 || status == 503 || status == 504 { return rpc.UNAVAILABLE }
+    return rpc.UNKNOWN
+}
+
+constant HEX = "0123456789abcdef"
+function quoted(value: Text, out: Bytes) {
+    out.add(34)
+    for byte in Bytes(value) {
+        if byte == 34 || byte == 92 { out.add(92); out.add(byte) }
+        else if byte == 10 { out.addBytes(Bytes("\\n")) }
+        else if byte == 13 { out.addBytes(Bytes("\\r")) }
+        else if byte == 9 { out.addBytes(Bytes("\\t")) }
+        else if byte < 32 || byte == 127 {
+            out.addBytes(Bytes("\\u00"))
+            out.add(Bytes(HEX)[byte >> 4])
+            out.add(Bytes(HEX)[byte & 15])
+        } else { out.add(byte) }
+    }
+    out.add(34)
+}
+/// The Connect JSON body for an error.
+public function errorJson(error: rpc.Error): Bytes {
+    let out = Bytes("{\"code\":")
+    quoted(rpc.codeName(error.code), out)
+    if error.message != "" {
+        out.addBytes(Bytes(",\"message\":"))
+        quoted(error.message, out)
+    }
+    if error.details.length > 0 {
+        out.addBytes(Bytes(",\"details\":["))
+        for index in 0..error.details.length {
+            if index > 0 { out.add(44) }
+            out.addBytes(Bytes("{\"type\":"))
+            quoted(error.details[index].type, out)
+            out.addBytes(Bytes(",\"value\":\""))
+            out.addBytes(Bytes(base64(error.details[index].value, false).replace("=", "")))
+            out.addBytes(Bytes("\"}"))
+        }
+        out.add(93)
+    }
+    out.add(125)
+    return out
+}
+// Reads a Connect JSON error body, or None when it is not one.
+public function parseErrorJson(body: Bytes): Maybe<rpc.Error> {
+    match json.decodeBytes(body, body.length + 1) {
+        Ok(value) {
+            if value.kind != json.OBJECT { return None }
+            let code = rpc.codeFromName(textMember(value, "code"))
+            if code < 0 { return None }
+            let error = rpc.failure(code, textMember(value, "message"))
+            if value.hasMember("details") {
+                let details = value.member("details")
+                if details.kind == json.ARRAY {
+                    for item in details.items {
+                        if item.kind != json.OBJECT { continue }
+                        match unbase64(textMember(item, "value")) {
+                            Some(data) { error.details.add(rpc.Detail { type: textMember(item, "type"); value: data }) }
+                            None {}
+                        }
+                    }
+                }
+            }
+            return Some(error)
+        }
+        Err(_) { return None }
+    }
+}
+function textMember(value: json.Value, name: Text): Text {
+    if !value.hasMember(name) { return "" }
+    let member = value.member(name)
+    if member.kind != json.STRING { return "" }
+    return member.text
+}
+
+// ---- Base64 (standard and URL alphabets; decoding accepts both, padded or not)
+
+constant STANDARD = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+constant URL = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+public function base64(data: Bytes, url: Boolean): Text {
+    let alphabet = Bytes(STANDARD)
+    if url { alphabet = Bytes(URL) }
+    let out = Bytes()
+    let at = 0
+    while at + 3 <= data.length {
+        let word = (data[at] << 16) | (data[at + 1] << 8) | data[at + 2]
+        out.add(alphabet[(word >> 18) & 63]); out.add(alphabet[(word >> 12) & 63])
+        out.add(alphabet[(word >> 6) & 63]); out.add(alphabet[word & 63])
+        at += 3
+    }
+    let left = data.length - at
+    if left == 1 {
+        let word = data[at] << 16
+        out.add(alphabet[(word >> 18) & 63]); out.add(alphabet[(word >> 12) & 63])
+        if !url { out.addBytes(Bytes("==")) }
+    } else if left == 2 {
+        let word = (data[at] << 16) | (data[at + 1] << 8)
+        out.add(alphabet[(word >> 18) & 63]); out.add(alphabet[(word >> 12) & 63]); out.add(alphabet[(word >> 6) & 63])
+        if !url { out.add(61) }
+    }
+    return utf8.decodeOrStop(out)
+}
+function sextet(byte: Integer): Integer {
+    if byte >= 65 && byte <= 90 { return byte - 65 }
+    if byte >= 97 && byte <= 122 { return byte - 71 }
+    if byte >= 48 && byte <= 57 { return byte + 4 }
+    if byte == 43 || byte == 45 { return 62 }
+    if byte == 47 || byte == 95 { return 63 }
+    return -1
+}
+public function unbase64(encoded: Text): Maybe<Bytes> {
+    let input = Bytes(encoded)
+    let length = input.length
+    while length > 0 && input[length - 1] == 61 { length -= 1 }
+    if input.length - length > 2 || length % 4 == 1 { return None }
+    let out = Bytes()
+    let word = 0
+    let bits = 0
+    for index in 0..length {
+        let value = sextet(input[index])
+        if value < 0 { return None }
+        word = ((word << 6) | value) & 16777215
+        bits += 6
+        if bits >= 8 {
+            bits -= 8
+            out.add((word >> bits) & 255)
+        }
+    }
+    return Some(out)
+}
+
+// ---- Small text helpers
+
+function lowerHeaders(headers: List<rpc.Header>): List<rpc.Header> {
+    let lowered: List<rpc.Header> = []
+    for field in headers { lowered.add(rpc.Header { name: field.name.asciiLowercased(); value: field.value }) }
+    return lowered
+}
+function trimmed(value: Text): Text {
+    let start = 0
+    let end = value.length
+    while start < end && (value[start] == ' ' || value[start] == '\t') { start += 1 }
+    while end > start && (value[end - 1] == ' ' || value[end - 1] == '\t') { end -= 1 }
+    return value.slice(start, end)
+}
+// Comma-separated tokens from every value of a header, lowercase and trimmed.
+function tokens(headers: List<rpc.Header>, name: Text): List<Text> {
+    let found: List<Text> = []
+    for value in rpc.headerValues(headers, name) {
+        for piece in value.split(",") {
+            let token = trimmed(piece).asciiLowercased()
+            if token != "" { found.add(token) }
+        }
+    }
+    return found
+}
+function hexValue(byte: Integer): Integer {
+    if byte >= 48 && byte <= 57 { return byte - 48 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    if byte >= 65 && byte <= 70 { return byte - 55 }
+    return -1
+}
+// Percent-decoding for query values; "+" is a space. None for a bad escape.
+function unescape(value: Text): Maybe<Bytes> {
+    let input = Bytes(value)
+    let out = Bytes()
+    let at = 0
+    while at < input.length {
+        let byte = input[at]
+        if byte == 37 {
+            if at + 2 >= input.length { return None }
+            let high = hexValue(input[at + 1])
+            let low = hexValue(input[at + 2])
+            if high < 0 || low < 0 { return None }
+            out.add(high * 16 + low)
+            at += 3
+        } else {
+            if byte == 43 { out.add(32) } else { out.add(byte) }
+            at += 1
+        }
+    }
+    return Some(out)
+}
+function escapeQuery(data: Bytes): Text {
+    let out = Bytes()
+    for byte in data {
+        let plain = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) ||
+            byte == 45 || byte == 46 || byte == 95 || byte == 126
+        if plain { out.add(byte) } else {
+            out.add(37)
+            out.add(Bytes("0123456789ABCDEF")[byte >> 4])
+            out.add(Bytes("0123456789ABCDEF")[byte & 15])
+        }
+    }
+    return utf8.decodeOrStop(out)
+}
+record Query { names: List<Text>; values: List<Bytes>; bad: Boolean }
+function query(raw: Text): Query {
+    let result = Query { names: []; values: []; bad: false }
+    if raw == "" { return result }
+    for pair in raw.split("&") {
+        if pair == "" { continue }
+        let equals = pair.find("=")
+        let name = pair
+        let value = ""
+        if equals >= 0 {
+            name = pair.slice(0, equals)
+            value = pair.slice(equals + 1, pair.length)
+        }
+        match unescape(name) {
+            Some(decodedName) {
+                match unescape(value) {
+                    Some(decodedValue) {
+                        match utf8.decode(decodedName) {
+                            Ok(text) { result.names.add(text); result.values.add(decodedValue) }
+                            Err(_) { result.bad = true }
+                        }
+                    }
+                    None { result.bad = true }
+                }
+            }
+            None { result.bad = true }
+        }
+    }
+    return result
+}
+function Query.get(name: Text): Maybe<Bytes> {
+    for index in 0..self.names.length { if self.names[index] == name { return Some(self.values[index]) } }
+    return None
+}
+function Query.text(name: Text): Text {
+    match self.get(name) {
+        Some(value) {
+            return match utf8.decode(value) {
+                Ok(text) { text }
+                Err(_) { "" }
+            }
+        }
+        None { return "" }
+    }
+}
+// 64-bit FNV-1a, for request fingerprints and key scopes.
+function fingerprint(seed: Integer, data: Bytes): Integer {
+    let hash = seed
+    for byte in data { hash = wrappingMultiply(hash ^ byte, 1099511628211) }
+    return hash
+}
+constant FNV_OFFSET = -3750763034362895579
+
+// ---- Server
+
+function plain(status: Integer, message: Text): Response {
+    return Response { status: status; headers: [rpc.Header { name: "content-type"; value: "text/plain; charset=utf-8" }]; body: Bytes(message) }
+}
+// An error response; metadata is the call's headers and trailer-prefixed trailers.
+function errorResponse(error: rpc.Error, headers: List<rpc.Header>, trailers: List<rpc.Header>): Response {
+    let out: List<rpc.Header> = [rpc.Header { name: "content-type"; value: "application/json" }]
+    for field in headers { out.add(field) }
+    for field in trailers { out.add(rpc.Header { name: "trailer-" + field.name; value: field.value }) }
+    return Response { status: httpStatus(error.code); headers: out; body: errorJson(error) }
+}
+function failed(code: Integer, message: Text): Response { return errorResponse(rpc.failure(code, message), [], []) }
+
+function Server.compressor(name: Text): Maybe<Compressor> {
+    for item in self.options.compressors { if item.name == name { return Some(item) } }
+    return None
+}
+function Server.encodings(): Text {
+    let names: List<Text> = []
+    for item in self.options.compressors { names.add(item.name) }
+    return joinText(names, ",")
+}
+
+/// Serves one unary HTTP request, including CORS preflight.
+public function Server.handle(request: Request): Response {
+    let headers = lowerHeaders(request.headers)
+    let normalized = Request { method: request.method.asciiUppercased(); target: request.target; headers: headers; body: request.body }
+    let origin = rpc.headerValue(headers, "origin")
+    if normalized.method == "OPTIONS" && rpc.headerValue(headers, "access-control-request-method") != "" {
+        return self.preflight(origin)
+    }
+    return self.withCors(origin, self.dispatch(normalized))
+}
+
+record Parsed { codec: Text; body: Bytes; compression: Text; get: Boolean; problem: Maybe<Response> }
+function problem(response: Response): Parsed {
+    return Parsed { codec: ""; body: Bytes(); compression: ""; get: false; problem: Some(response) }
+}
+function codecFromContentType(contentType: Text, streaming: Boolean): Text {
+    let semicolon = contentType.find(";")
+    let base = contentType
+    let parameters = ""
+    if semicolon >= 0 {
+        base = contentType.slice(0, semicolon)
+        parameters = contentType.slice(semicolon + 1, contentType.length)
+    }
+    base = trimmed(base).asciiLowercased()
+    let prefix = "application/"
+    if streaming { prefix = "application/connect+" }
+    if !base.startsWith(prefix) { return "" }
+    let codec = base.slice(prefix.length, base.length)
+    if codec != "proto" && codec != "json" { return "" }
+    for parameter in parameters.split(";") {
+        let item = trimmed(parameter).asciiLowercased()
+        if item == "" { continue }
+        if item.startsWith("charset=") {
+            let charset = item.slice(8, item.length)
+            if codec != "json" || (charset != "utf-8" && charset != "\"utf-8\"") { return "" }
+        }
+    }
+    return codec
+}
+function unsupportedMedia(streaming: Boolean): Response {
+    let accepted = "application/json, application/proto"
+    if streaming { accepted = "application/connect+json, application/connect+proto" }
+    return Response { status: 415; headers: [rpc.Header { name: "accept-post"; value: accepted }]; body: Bytes() }
+}
+// Parses a connect-timeout-ms value: 1 to 10 digits. -2 when malformed.
+function timeoutMilliseconds(value: Text): Integer {
+    if value == "" { return -1 }
+    if value.length > 10 { return -2 }
+    let total = 0
+    for character in value {
+        if character < '0' || character > '9' { return -2 }
+        total = total * 10 + Integer(character) - 48
+    }
+    return total
+}
+
+function Server.parse(request: Request, method: rpc.Method, path: Text, raw: Text, streaming: Boolean): Parsed {
+    let headers = request.headers
+    if request.method == "GET" {
+        let params = query(raw)
+        if params.bad { return problem(failed(rpc.INVALID_ARGUMENT, "malformed query")) }
+        let connect = params.text("connect")
+        if connect != "" && connect != "v1" { return problem(failed(rpc.INVALID_ARGUMENT, "connect must be v1")) }
+        if connect == "" && self.options.requireProtocolVersion { return problem(failed(rpc.INVALID_ARGUMENT, "missing connect=v1 query parameter")) }
+        let codec = params.text("encoding")
+        if codec != "proto" && codec != "json" { return problem(unsupportedMedia(false)) }
+        let message = Bytes()
+        match params.get("message") { Some(value) { message = value } None {} }
+        if params.text("base64") == "1" {
+            match unbase64(utf8.decodeOrStop(message)) {
+                Some(decoded) { message = decoded }
+                None { return problem(failed(rpc.INVALID_ARGUMENT, "message is not base64")) }
+            }
+        }
+        return Parsed { codec: codec; body: message; compression: params.text("compression").asciiLowercased(); get: true; problem: None }
+    }
+    let codec = codecFromContentType(rpc.headerValue(headers, "content-type"), streaming)
+    if codec == "" { return problem(unsupportedMedia(streaming)) }
+    let version = rpc.headerValue(headers, "connect-protocol-version")
+    if version != "" && version != "1" { return problem(failed(rpc.INVALID_ARGUMENT, "connect-protocol-version must be 1")) }
+    if version == "" && self.options.requireProtocolVersion { return problem(failed(rpc.INVALID_ARGUMENT, "missing connect-protocol-version header")) }
+    let encodingHeader = "content-encoding"
+    if streaming { encodingHeader = "connect-content-encoding" }
+    return Parsed { codec: codec; body: request.body; compression: rpc.headerValue(headers, encodingHeader).asciiLowercased(); get: false; problem: None }
+}
+
+function Server.dispatch(request: Request): Response {
+    let question = request.target.find("?")
+    let path = request.target
+    let raw = ""
+    if question >= 0 {
+        path = request.target.slice(0, question)
+        raw = request.target.slice(question + 1, request.target.length)
+    }
+    let found = self.services.lookup(path)
+    if found.isNone() { return failed(rpc.UNIMPLEMENTED, "no procedure " + path) }
+    let method = found.unwrap()
+    let streaming = method.kind() == rpc.SERVER_STREAM
+    let allowGet = method.idempotency == rpc.NO_SIDE_EFFECTS && !streaming
+    if request.method != "POST" && !(request.method == "GET" && allowGet) {
+        let allow = "POST"
+        if allowGet { allow = "GET, POST" }
+        return Response { status: 405; headers: [rpc.Header { name: "allow"; value: allow }]; body: Bytes() }
+    }
+    let parsed = self.parse(request, method, path, raw, streaming)
+    match parsed.problem { Some(response) { return response } None {} }
+    if parsed.body.length > self.options.maxRequestBytes {
+        return failed(rpc.RESOURCE_EXHAUSTED, "request is larger than " + Text(self.options.maxRequestBytes) + " bytes")
+    }
+    let body = parsed.body
+    if parsed.compression != "" && parsed.compression != "identity" {
+        match self.compressor(parsed.compression) {
+            Some(compressor) {
+                match compressor.decompress(body, self.options.maxRequestBytes) {
+                    Ok(expanded) { body = expanded }
+                    Err(problem) { return failed(rpc.INVALID_ARGUMENT, "cannot decompress request: " + problem.message()) }
+                }
+            }
+            None { return failed(rpc.UNIMPLEMENTED, "unknown compression " + parsed.compression + "; supported: " + self.encodings()) }
+        }
+    }
+    let timeout = timeoutMilliseconds(rpc.headerValue(request.headers, "connect-timeout-ms"))
+    if timeout == -2 { return failed(rpc.INVALID_ARGUMENT, "malformed connect-timeout-ms") }
+    let started = self.options.clock()
+    let deadline = -1
+    if timeout >= 0 { deadline = started + timeout }
+    if streaming { return failed(rpc.UNIMPLEMENTED, "server streaming is not served yet") }
+
+    // A retried call with the same Idempotency-Key gets the stored result.
+    let key = rpc.headerValue(request.headers, "idempotency-key")
+    let replayKey = ""
+    let replayFingerprint = 0
+    if key != "" {
+        if key.byteLength > 255 { return failed(rpc.INVALID_ARGUMENT, "idempotency-key is longer than 255 bytes") }
+        let scope = fingerprint(FNV_OFFSET, Bytes(rpc.headerValue(request.headers, "authorization")))
+        replayKey = path + "\n" + Text(scope) + "\n" + key
+        replayFingerprint = fingerprint(fingerprint(FNV_OFFSET, Bytes(parsed.codec)), body)
+        match self.stored(replayKey, started) {
+            Some(entry) {
+                if entry.fingerprint != replayFingerprint {
+                    return failed(rpc.INVALID_ARGUMENT, "idempotency-key was used with a different request")
+                }
+                self.replayed += 1
+                let copy = Response { status: entry.response.status; headers: []; body: entry.response.body }
+                for field in entry.response.headers { copy.headers.add(field) }
+                copy.headers.add(rpc.Header { name: "idempotent-replayed"; value: "true" })
+                return copy
+            }
+            None {}
+        }
+    }
+
+    let call = rpc.call(path, "connect", parsed.codec, request.headers, deadline, self.options.clock)
+    let result: Result<Bytes, rpc.Error> = Err(rpc.failure(rpc.INTERNAL, "no result"))
+    self.executed += 1
+    match method.handler {
+        Unary(handler) { result = handler(call, body) }
+        Deferred(_) { result = Err(rpc.failure(rpc.UNIMPLEMENTED, "deferred handlers are not served yet")) }
+        ServerStream(_) {}
+    }
+    if call.expired() { result = Err(rpc.failure(rpc.DEADLINE_EXCEEDED, "the deadline passed")) }
+    let response = self.unaryResponse(call, result, request)
+    if replayKey != "" && response.status != 503 { self.store(replayKey, replayFingerprint, response, started) }
+    return response
+}
+
+function Server.unaryResponse(call: rpc.Call, result: Result<Bytes, rpc.Error>, request: Request): Response {
+    match result {
+        Ok(message) {
+            if message.length > self.options.maxResponseBytes {
+                return errorResponse(rpc.failure(rpc.RESOURCE_EXHAUSTED, "response is larger than " + Text(self.options.maxResponseBytes) + " bytes"),
+                    call.responseHeaders, call.responseTrailers)
+            }
+            let headers: List<rpc.Header> = [rpc.Header { name: "content-type"; value: "application/" + call.codec }]
+            let body = message
+            if message.length >= self.options.compressMinBytes {
+                for name in tokens(request.headers, "accept-encoding") {
+                    match self.compressor(name) {
+                        Some(compressor) {
+                            match compressor.compress(message) {
+                                Ok(packed) {
+                                    body = packed
+                                    headers.add(rpc.Header { name: "content-encoding"; value: compressor.name })
+                                }
+                                Err(_) {}
+                            }
+                            break
+                        }
+                        None {}
+                    }
+                }
+            }
+            for field in call.responseHeaders { headers.add(rpc.Header { name: field.name.asciiLowercased(); value: field.value }) }
+            for field in call.responseTrailers { headers.add(rpc.Header { name: "trailer-" + field.name.asciiLowercased(); value: field.value }) }
+            return Response { status: 200; headers: headers; body: body }
+        }
+        Err(error) { return errorResponse(error, lowerHeaders(call.responseHeaders), lowerHeaders(call.responseTrailers)) }
+    }
+}
+
+// ---- Idempotency replay cache: a bounded ring of completed unary results.
+
+function Server.stored(key: Text, now: Integer): Maybe<Replay> {
+    if !self.replayIndex.has(key) { return None }
+    let entry = self.replays[self.replayIndex[key]]
+    if now - entry.stored >= self.options.idempotencyMilliseconds {
+        self.replayIndex.remove(key)
+        return None
+    }
+    return Some(entry)
+}
+function Server.store(key: Text, fingerprint: Integer, response: Response, now: Integer) {
+    if self.options.idempotencyEntries <= 0 { return }
+    let entry = Replay { key: key; fingerprint: fingerprint; stored: now; response: response }
+    if self.replays.length < self.options.idempotencyEntries {
+        self.replayIndex[key] = self.replays.length
+        self.replays.add(entry)
+        return
+    }
+    let slot = self.replayNext
+    let old = self.replays[slot].key
+    if self.replayIndex.has(old) && self.replayIndex[old] == slot { self.replayIndex.remove(old) }
+    self.replays[slot] = entry
+    self.replayIndex[key] = slot
+    self.replayNext = (slot + 1) % self.options.idempotencyEntries
+}
+
+// ---- CORS
+
+constant ALLOWED_HEADERS = "content-type, connect-protocol-version, connect-timeout-ms, connect-accept-encoding, connect-content-encoding, grpc-timeout, x-grpc-web, x-user-agent, idempotency-key"
+constant EXPOSED_HEADERS = "grpc-status, grpc-message, grpc-status-details-bin, idempotent-replayed"
+function Server.originAllowed(origin: Text): Boolean {
+    if origin == "" { return false }
+    for allowed in self.options.cors.allowedOrigins { if allowed == "*" || allowed == origin { return true } }
+    return false
+}
+function Server.allowOrigin(origin: Text, headers: List<rpc.Header>) {
+    let cors = self.options.cors
+    let wildcard = false
+    for allowed in cors.allowedOrigins { if allowed == "*" { wildcard = true } }
+    if wildcard && !cors.allowCredentials { headers.add(rpc.Header { name: "access-control-allow-origin"; value: "*" }) }
+    else {
+        headers.add(rpc.Header { name: "access-control-allow-origin"; value: origin })
+        headers.add(rpc.Header { name: "vary"; value: "Origin" })
+    }
+    if cors.allowCredentials { headers.add(rpc.Header { name: "access-control-allow-credentials"; value: "true" }) }
+}
+function Server.preflight(origin: Text): Response {
+    let headers: List<rpc.Header> = []
+    if !self.originAllowed(origin) { return Response { status: 403; headers: headers; body: Bytes() } }
+    self.allowOrigin(origin, headers)
+    let allowed = ALLOWED_HEADERS
+    for name in self.options.cors.allowedHeaders { allowed = allowed + ", " + name.asciiLowercased() }
+    headers.add(rpc.Header { name: "access-control-allow-methods"; value: "GET, POST" })
+    headers.add(rpc.Header { name: "access-control-allow-headers"; value: allowed })
+    headers.add(rpc.Header { name: "access-control-max-age"; value: Text(self.options.cors.maxAgeSeconds) })
+    return Response { status: 204; headers: headers; body: Bytes() }
+}
+function Server.withCors(origin: Text, response: Response): Response {
+    if !self.originAllowed(origin) { return response }
+    self.allowOrigin(origin, response.headers)
+    let exposed = EXPOSED_HEADERS
+    for name in self.options.cors.exposedHeaders { exposed = exposed + ", " + name.asciiLowercased() }
+    response.headers.add(rpc.Header { name: "access-control-expose-headers"; value: exposed })
+    return response
+}
+
+// ---- Client
+
+/// Sends one HTTP request and returns its response; Err for a transport
+/// failure, such as a reset connection or a lost response (UNAVAILABLE).
+public record Client {
+    // Prefix for procedure paths, such as "https://api.example" or "".
+    baseUrl: Text
+    codec: Text
+    headers: List<rpc.Header>
+    transport: (Request) -> Result<Response, rpc.Error>
+    // Tries per call for UNAVAILABLE failures, including lost responses.
+    attempts: Integer
+    compressors: List<Compressor>
+    maxResponseBytes: Integer
+    private keyPrefix: Text
+    private serial: Integer
+}
+/// A client for "proto" or "json". `keyPrefix` makes Idempotency-Keys unique
+/// across clients: give each process random text, such as 16 random bytes in hex.
+public function client(baseUrl: Text, codec: Text, transport: (Request) -> Result<Response, rpc.Error>, keyPrefix: Text): Client {
+    return Client { baseUrl: baseUrl; codec: codec; headers: []; transport: transport; attempts: 3; compressors: [];
+        maxResponseBytes: 16777216; keyPrefix: keyPrefix; serial: 0 }
+}
+public record CallOptions {
+    headers: List<rpc.Header>
+    // -1 for no deadline.
+    timeoutMilliseconds: Integer
+    // Send GET with the message in the query (NO_SIDE_EFFECTS methods only).
+    get: Boolean
+    // Retry this call on UNAVAILABLE with an Idempotency-Key, even if the
+    // method has side effects. NO_SIDE_EFFECTS and IDEMPOTENT calls retry anyway.
+    idempotency: Integer
+    // A caller-chosen key; empty asks the client to make one per call.
+    idempotencyKey: Text
+}
+public function callOptions(): CallOptions {
+    return CallOptions { headers: []; timeoutMilliseconds: -1; get: false; idempotency: rpc.IDEMPOTENCY_UNKNOWN; idempotencyKey: "" }
+}
+public record Reply { message: Bytes; headers: List<rpc.Header>; trailers: List<rpc.Header> }
+public record Failure { error: rpc.Error; headers: List<rpc.Header>; trailers: List<rpc.Header> }
+
+public function Client.request(procedure: Text, message: Bytes, options: CallOptions, key: Text): Request {
+    let headers: List<rpc.Header> = []
+    for field in self.headers { headers.add(rpc.Header { name: field.name.asciiLowercased(); value: field.value }) }
+    for field in options.headers { headers.add(rpc.Header { name: field.name.asciiLowercased(); value: field.value }) }
+    if options.timeoutMilliseconds >= 0 { headers.add(rpc.Header { name: "connect-timeout-ms"; value: Text(options.timeoutMilliseconds) }) }
+    if key != "" { headers.add(rpc.Header { name: "idempotency-key"; value: key }) }
+    let names: List<Text> = []
+    for item in self.compressors { names.add(item.name) }
+    if names.length > 0 { headers.add(rpc.Header { name: "accept-encoding"; value: joinText(names, ", ") }) }
+    if options.get {
+        let target = self.baseUrl + procedure + "?connect=v1&encoding=" + self.codec
+        if self.codec == "json" { target = target + "&message=" + escapeQuery(message) }
+        else { target = target + "&base64=1&message=" + base64(message, true) }
+        return Request { method: "GET"; target: target; headers: headers; body: Bytes() }
+    }
+    headers.add(rpc.Header { name: "content-type"; value: "application/" + self.codec })
+    headers.add(rpc.Header { name: "connect-protocol-version"; value: "1" })
+    return Request { method: "POST"; target: self.baseUrl + procedure; headers: headers; body: message }
+}
+
+function trailersOf(headers: List<rpc.Header>): List<rpc.Header> {
+    let trailers: List<rpc.Header> = []
+    for field in headers {
+        if field.name.startsWith("trailer-") { trailers.add(rpc.Header { name: field.name.slice(8, field.name.length); value: field.value }) }
+    }
+    return trailers
+}
+function headersOf(headers: List<rpc.Header>): List<rpc.Header> {
+    let plainHeaders: List<rpc.Header> = []
+    for field in headers { if !field.name.startsWith("trailer-") { plainHeaders.add(field) } }
+    return plainHeaders
+}
+
+/// Reads one Connect unary HTTP response.
+public function Client.reply(response: Response): Result<Reply, Failure> {
+    let headers = lowerHeaders(response.headers)
+    let metadata = headersOf(headers)
+    let trailers = trailersOf(headers)
+    let body = response.body
+    let encoding = rpc.headerValue(headers, "content-encoding").asciiLowercased()
+    if encoding != "" && encoding != "identity" {
+        let found = false
+        for compressor in self.compressors {
+            if compressor.name == encoding {
+                found = true
+                match compressor.decompress(body, self.maxResponseBytes) {
+                    Ok(expanded) { body = expanded }
+                    Err(problem) {
+                        return Err(Failure { error: rpc.failure(rpc.INTERNAL, "cannot decompress response: " + problem.message()); headers: metadata; trailers: trailers })
+                    }
+                }
+            }
+        }
+        if !found { return Err(Failure { error: rpc.failure(rpc.INTERNAL, "unknown response compression " + encoding); headers: metadata; trailers: trailers }) }
+    }
+    if response.status != 200 {
+        let error = rpc.failure(codeForStatus(response.status), "HTTP status " + Text(response.status))
+        if codecFromContentType(rpc.headerValue(headers, "content-type"), false) == "json" {
+            match parseErrorJson(body) { Some(parsed) { error = parsed } None {} }
+        }
+        return Err(Failure { error: error; headers: metadata; trailers: trailers })
+    }
+    let codec = codecFromContentType(rpc.headerValue(headers, "content-type"), false)
+    if codec != self.codec {
+        return Err(Failure { error: rpc.failure(rpc.INTERNAL, "unexpected response content-type " + rpc.headerValue(headers, "content-type")); headers: metadata; trailers: trailers })
+    }
+    if body.length > self.maxResponseBytes {
+        return Err(Failure { error: rpc.failure(rpc.RESOURCE_EXHAUSTED, "response is larger than " + Text(self.maxResponseBytes) + " bytes"); headers: metadata; trailers: trailers })
+    }
+    return Ok(Reply { message: body; headers: metadata; trailers: trailers })
+}
+
+/// One unary call. UNAVAILABLE failures, including a response lost in
+/// transit, are retried up to `attempts` times for calls that may be
+/// repeated; the same Idempotency-Key lets the server answer a retry without
+/// running the handler again.
+public function Client.unary(procedure: Text, message: Bytes, options: CallOptions): Result<Reply, Failure> {
+    let retryable = options.idempotency != rpc.IDEMPOTENCY_UNKNOWN || options.get
+    let key = options.idempotencyKey
+    if key == "" && options.idempotency != rpc.NO_SIDE_EFFECTS && !options.get && self.keyPrefix != "" {
+        self.serial += 1
+        key = self.keyPrefix + "-" + Text(self.serial)
+        retryable = true
+    }
+    let request = self.request(procedure, message, options, key)
+    let attempt = 0
+    while true {
+        attempt += 1
+        let failure = Failure { error: rpc.failure(rpc.UNKNOWN, ""); headers: []; trailers: [] }
+        match self.transport(request) {
+            Ok(response) {
+                match self.reply(response) {
+                    Ok(reply) { return Ok(reply) }
+                    Err(problem) { failure = problem }
+                }
+            }
+            Err(error) { failure = Failure { error: error; headers: []; trailers: [] } }
+        }
+        if failure.error.code != rpc.UNAVAILABLE || !retryable || attempt >= self.attempts { return Err(failure) }
+    }
+    return Err(Failure { error: rpc.failure(rpc.UNKNOWN, "unreachable"); headers: []; trailers: [] })
+}
+
+/// A typed unary call for generated client code.
+public function call<Request, Reply>(client: Client, procedure: Text, request: Request, requestCodecs: List<rpc.Codec<Request>>,
+        replyCodecs: List<rpc.Codec<Reply>>, options: CallOptions): Result<Reply, Failure> {
+    let encoded: Bytes = Bytes()
+    let found = false
+    for codec in requestCodecs {
+        if codec.name == client.codec {
+            found = true
+            match codec.encode(request) {
+                Ok(data) { encoded = data }
+                Err(problem) { return Err(Failure { error: rpc.failure(rpc.INTERNAL, "cannot encode request: " + problem.message); headers: []; trailers: [] }) }
+            }
+        }
+    }
+    if !found { return Err(Failure { error: rpc.failure(rpc.INTERNAL, "no " + client.codec + " codec for this request"); headers: []; trailers: [] }) }
+    let reply = try client.unary(procedure, encoded, options)
+    for codec in replyCodecs {
+        if codec.name == client.codec {
+            return match codec.decode(reply.message) {
+                Ok(message) { Ok(message) }
+                Err(problem) { Err(Failure { error: rpc.failure(rpc.INTERNAL, "cannot decode reply: " + problem.message); headers: reply.headers; trailers: reply.trailers }) }
+            }
+        }
+    }
+    return Err(Failure { error: rpc.failure(rpc.INTERNAL, "no " + client.codec + " codec for this reply"); headers: reply.headers; trailers: reply.trailers })
+}

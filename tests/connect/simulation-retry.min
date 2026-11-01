@@ -1,0 +1,134 @@
+// A Connect client and server talk through the simulation module's network.
+// The first response is lost; the client retries with the same
+// Idempotency-Key and the server answers from its replay cache, so the
+// handler runs once. The universe is deterministic: the compiler proves that
+// nothing it reaches, the Connect server and client included, touches a host
+// clock, socket or random source.
+use "simulation" as sim
+use "connect" as connect
+use "rpc" as rpc
+use "text" as utf8
+
+constant REQUESTS = 1
+constant RESPONSES = 2
+
+function field(out: Bytes, data: Bytes) {
+    out.addInt32(data.length)
+    out.addBytes(data)
+}
+function encodeHeaders(out: Bytes, headers: List<rpc.Header>) {
+    out.addInt32(headers.length)
+    for header in headers {
+        field(out, Bytes(header.name))
+        field(out, Bytes(header.value))
+    }
+}
+record Reader { data: Bytes; at: Integer }
+function Reader.bytes(): Bytes {
+    let length = self.data.getInt32(self.at)
+    let value = self.data.slice(self.at + 4, self.at + 4 + length)
+    self.at += 4 + length
+    return value
+}
+function Reader.text(): Text { return utf8.decodeOrStop(self.bytes()) }
+function Reader.headers(): List<rpc.Header> {
+    let count = self.data.getInt32(self.at)
+    self.at += 4
+    let headers: List<rpc.Header> = []
+    for index in 0..count { headers.add(rpc.Header { name: self.text(); value: self.text() }) }
+    return headers
+}
+function encodeRequest(request: connect.Request): Bytes {
+    let out = Bytes()
+    field(out, Bytes(request.method))
+    field(out, Bytes(request.target))
+    encodeHeaders(out, request.headers)
+    field(out, request.body)
+    return out
+}
+function decodeRequest(data: Bytes): connect.Request {
+    let reader = Reader { data: data; at: 0 }
+    let method = reader.text()
+    let target = reader.text()
+    let headers = reader.headers()
+    return connect.Request { method: method; target: target; headers: headers; body: reader.bytes() }
+}
+function encodeResponse(response: connect.Response): Bytes {
+    let out = Bytes()
+    out.addInt32(response.status)
+    encodeHeaders(out, response.headers)
+    field(out, response.body)
+    return out
+}
+function decodeResponse(data: Bytes): connect.Response {
+    let reader = Reader { data: data; at: 4 }
+    let headers = reader.headers()
+    return connect.Response { status: data.getInt32(0); headers: headers; body: reader.bytes() }
+}
+
+record Ledger { charges: Integer; balance: Integer }
+record Network { world: sim.World; server: connect.Server; attempts: Integer; lose: List<Integer> }
+
+// One request/response exchange over two simulated links. Attempts listed
+// in `lose` have their response dropped by a partition.
+function Network.exchange(request: connect.Request): Result<connect.Response, rpc.Error> {
+    self.attempts += 1
+    sim.submitPacket(self.world, REQUESTS, encodeRequest(request), 1 + sim.choose(self.world, 20), self.attempts)
+    let arrived = sim.next(self.world)
+    if arrived.result < 0 { return Err(rpc.failure(rpc.UNAVAILABLE, "request lost")) }
+    let response = self.server.handle(decodeRequest(arrived.data))
+    let losing = false
+    for attempt in self.lose { if attempt == self.attempts { losing = true } }
+    sim.partition(self.world, RESPONSES, losing)
+    sim.submitPacket(self.world, RESPONSES, encodeResponse(response), 1 + sim.choose(self.world, 20), self.attempts)
+    let back = sim.next(self.world)
+    sim.partition(self.world, RESPONSES, false)
+    if back.result < 0 { return Err(rpc.failure(rpc.UNAVAILABLE, "response lost")) }
+    return Ok(decodeResponse(back.data))
+}
+
+record Outcome { text: Text; charges: Integer; attempts: Integer; replayed: Integer; at: Integer }
+
+deterministic function universe(seed: Integer, lose: List<Integer>, keyPrefix: Text): Outcome {
+    let world = sim.create(seed)
+    let ledger = Ledger { charges: 0; balance: 100 }
+    let services = rpc.services()
+    services.addUnary("/bank.v1.Ledger/Charge", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+        ledger.charges += 1
+        ledger.balance -= data.length
+        return Ok(Bytes("balance " + Text(ledger.balance)))
+    })
+    let options = connect.defaults(function(): Integer { return sim.now(world) })
+    let server = connect.server(services, options)
+    let network = Network { world: world; server: server; attempts: 0; lose: lose }
+    let client = connect.client("", "proto", function(request: connect.Request): Result<connect.Response, rpc.Error> {
+        return network.exchange(request)
+    }, keyPrefix)
+    let text = ""
+    match client.unary("/bank.v1.Ledger/Charge", Bytes("seven"), connect.callOptions()) {
+        Ok(reply) { text = utf8.decodeOrStop(reply.message) }
+        Err(failure) { text = rpc.codeName(failure.error.code) + ": " + failure.error.message }
+    }
+    return Outcome { text: text; charges: ledger.charges; attempts: network.attempts; replayed: server.replayed(); at: sim.now(world) }
+}
+
+function show(outcome: Outcome) {
+    print(outcome.text + "; handler runs " + Text(outcome.charges) + "; attempts " + Text(outcome.attempts) + "; replayed " + Text(outcome.replayed))
+}
+
+// The first response is lost: the retry is answered from the replay cache.
+show(universe(7, [1], "client-a"))
+// The first two responses are lost; the third attempt still runs nothing new.
+show(universe(11, [1, 2], "client-a"))
+// Every attempt is lost: the call fails after three tries, having charged once.
+show(universe(13, [1, 2, 3], "client-a"))
+// Without keys the client cannot retry a call with side effects safely, so it does not.
+show(universe(7, [1], ""))
+// The same seed and losses replay exactly, across many seeds.
+let same = 0
+for seed in 1..200 {
+    let first = universe(seed, [1], "client-b")
+    let again = universe(seed, [1], "client-b")
+    if first.charges == 1 && first.replayed == 1 && first.at == again.at && first.text == again.text { same += 1 }
+}
+print(same)

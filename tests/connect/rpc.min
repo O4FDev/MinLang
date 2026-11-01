@@ -1,0 +1,108 @@
+// The transport-neutral rpc handler API: codes, registry, typed codecs and
+// the Responder contract that streaming transports rely on.
+use "rpc" as rpc
+use "text" as utf8
+
+let names: List<Text> = []
+for code in 0..17 { names.add(Text(code) + "=" + rpc.codeName(code)) }
+print(joinText(names, " "))
+print(Text(rpc.codeFromName("out_of_range")) + " " + Text(rpc.codeFromName("ok")) + " " + Text(rpc.codeFromName("Unknown")))
+print(rpc.codeName(rpc.failure(99, "bad code").code))
+
+// The registry keeps one method per procedure; the latest registration wins.
+let services = rpc.services()
+services.addUnary("/a.S/One", rpc.IDEMPOTENT, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> { return Ok(Bytes("first")) })
+services.addUnary("/a.S/Two", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> { return Ok(data) })
+services.addUnary("/a.S/One", rpc.NO_SIDE_EFFECTS, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> { return Ok(Bytes("second")) })
+print(joinText(services.procedures(), " ") + " " + Text(services.lookup("/a.S/One").unwrap().idempotency) + " " + Text(services.lookup("/a.S/Three").isNone()))
+
+// Typed handlers decode with the call's codec and rewrap codec failures.
+let numbers = [rpc.Codec<Integer> { name: "proto"
+    decode: function(data: Bytes): Result<Integer, rpc.Error> {
+        if data.length != 1 { return Err(rpc.failure(rpc.INTERNAL, "one byte please")) }
+        return Ok(data[0])
+    }
+    encode: function(value: Integer): Result<Bytes, rpc.Error> {
+        if value > 255 { return Err(rpc.failure(rpc.INTERNAL, "too big")) }
+        let data = Bytes(1)
+        data[0] = value
+        return Ok(data)
+    } }]
+let clock = function(): Integer { return 500 }
+let method = rpc.unary("/a.S/Double", rpc.IDEMPOTENCY_UNKNOWN, numbers, numbers, function(call: rpc.Call, value: Integer): Result<Integer, rpc.Error> {
+    return Ok(value * 2)
+})
+function run(method: rpc.Method, codec: Text, input: Bytes): Text {
+    let call = rpc.call(method.procedure, "connect", codec, [], 600, function(): Integer { return 500 })
+    match method.handler {
+        Unary(body) {
+            return match body(call, input) {
+                Ok(data) { "ok " + Text(data[0]) }
+                Err(problem) { rpc.codeName(problem.code) + " " + problem.message }
+            }
+        }
+        else { return "not unary" }
+    }
+}
+let one = Bytes(1)
+one[0] = 21
+print(run(method, "proto", one))
+one[0] = 200
+print(run(method, "proto", one))
+print(run(method, "proto", Bytes()))
+print(run(method, "json", one))
+
+// Calls: headers, deadline arithmetic.
+let call = rpc.call("/a.S/Two", "grpc", "proto", [rpc.Header { name: "x-a"; value: "1" }, rpc.Header { name: "x-a"; value: "2" }], 600, clock)
+print(call.header("X-A") + " " + joinText(rpc.headerValues(call.requestHeaders, "x-a"), ",") + " " + Text(call.remaining()) + " " + Text(call.expired()))
+let open = rpc.call("/a.S/Two", "grpc", "proto", [], -1, clock)
+print(Text(open.remaining()) + " " + Text(open.expired()))
+let past = rpc.call("/a.S/Two", "grpc", "proto", [], 400, clock)
+print(Text(past.remaining()) + " " + Text(past.expired()))
+
+// Responder: bounded delivery, one finish, cancellation.
+record Sink { messages: List<Text>; room: Integer; ends: List<Text> }
+let sink = Sink { messages: []; room: 2; ends: [] }
+let responder = rpc.responder(function(data: Bytes): Boolean {
+    if sink.room == 0 { return false }
+    sink.room -= 1
+    sink.messages.add(utf8.decodeOrStop(data))
+    return true
+}, function(error: Maybe<rpc.Error>) {
+    match error {
+        Some(problem) { sink.ends.add(rpc.codeName(problem.code)) }
+        None { sink.ends.add("ok") }
+    }
+})
+print(Text(responder.send(Bytes("a"))) + " " + Text(responder.send(Bytes("b"))) + " " + Text(responder.send(Bytes("c"))) + " " + Text(responder.active()))
+sink.room = 1
+print(Text(responder.send(Bytes("c"))) + " " + Text(responder.sentCount()))
+responder.finish(None)
+responder.finish(Some(rpc.failure(rpc.INTERNAL, "twice")))
+print(Text(responder.send(Bytes("d"))) + " " + Text(responder.active()) + " " + Text(rpc.finished(responder)) + " " + joinText(sink.messages, "") + " " + joinText(sink.ends, ","))
+let canceled = rpc.responder(function(data: Bytes): Boolean { return true }, function(error: Maybe<rpc.Error>) { sink.ends.add("late") })
+rpc.cancel(canceled)
+canceled.finish(None)
+print(Text(canceled.send(Bytes("x"))) + " " + Text(canceled.active()) + " " + joinText(sink.ends, ","))
+
+// Typed server streaming: encoding failures finish the call as INTERNAL.
+let stream = rpc.serverStream("/a.S/Count", numbers, numbers, function(call: rpc.Call, limit: Integer, sender: rpc.Sender<Integer>): Result<Nothing, rpc.Error> {
+    for value in [limit, limit * 2, 999, 1] { if !rpc.send(sender, value) { return Ok() } }
+    return Ok()
+})
+let delivered: List<Text> = []
+let ended: List<Text> = []
+let streamed = rpc.responder(function(data: Bytes): Boolean { delivered.add(Text(data[0])); return true }, function(error: Maybe<rpc.Error>) {
+    match error { Some(problem) { ended.add(problem.message) } None { ended.add("ok") } }
+})
+match stream.handler {
+    ServerStream(body) {
+        one[0] = 7
+        match body(rpc.call("/a.S/Count", "connect", "proto", [], -1, clock), one, streamed) {
+            Ok() { print("returned ok " + Text(stream.kind() == rpc.SERVER_STREAM)) }
+            Err(problem) { print(problem.message) }
+        }
+    }
+    else { print("not streaming") }
+}
+print(joinText(delivered, ",") + " " + joinText(ended, ","))

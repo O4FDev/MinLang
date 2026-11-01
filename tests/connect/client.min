@@ -1,0 +1,134 @@
+// connect.Client without sockets: request shapes, reply and error parsing,
+// typed calls through codecs, and the retry policy.
+use "connect" as connect
+use "rpc" as rpc
+use "text" as utf8
+
+function header(name: Text, value: Text): rpc.Header { return rpc.Header { name: name; value: value } }
+function describe(request: connect.Request): Text {
+    let line = request.method + " " + request.target
+    for field in request.headers { line = line + " [" + field.name + ": " + field.value + "]" }
+    return line + " " + Text(request.body.length) + " bytes"
+}
+function outcome(result: Result<connect.Reply, connect.Failure>): Text {
+    match result {
+        Ok(reply) {
+            let line = "ok " + utf8.decodeOrStop(reply.message)
+            for field in reply.headers { line = line + " [" + field.name + ": " + field.value + "]" }
+            for field in reply.trailers { line = line + " {" + field.name + ": " + field.value + "}" }
+            return line
+        }
+        Err(failure) {
+            let line = rpc.codeName(failure.error.code) + " '" + failure.error.message + "'"
+            for detail in failure.error.details { line = line + " (" + detail.type + " " + Text(detail.value.length) + ")" }
+            for field in failure.headers { line = line + " [" + field.name + ": " + field.value + "]" }
+            for field in failure.trailers { line = line + " {" + field.name + ": " + field.value + "}" }
+            return line
+        }
+    }
+}
+
+// Scripted responses, recording what the client sent.
+record Script { responses: List<Result<connect.Response, rpc.Error>>; sent: List<connect.Request> }
+function Script.transport(): (connect.Request) -> Result<connect.Response, rpc.Error> {
+    return function(request: connect.Request): Result<connect.Response, rpc.Error> {
+        self.sent.add(request)
+        if self.responses.length == 0 { return Err(rpc.failure(rpc.UNAVAILABLE, "no more responses")) }
+        return self.responses.removeAt(0)
+    }
+}
+function respond(status: Integer, contentType: Text, body: Text): Result<connect.Response, rpc.Error> {
+    let headers: List<rpc.Header> = []
+    if contentType != "" { headers.add(header("Content-Type", contentType)) }
+    return Ok(connect.Response { status: status; headers: headers; body: Bytes(body) })
+}
+
+let script = Script { responses: []; sent: [] }
+let client = connect.client("https://api.example", "proto", script.transport(), "c1")
+client.headers.add(header("Authorization", "Bearer t"))
+
+// Request shapes.
+let options = connect.callOptions()
+options.timeoutMilliseconds = 250
+options.headers.add(header("X-Trace", "7"))
+print(describe(client.request("/t.v1.S/Echo", Bytes("abc"), options, "key-1")))
+let get = connect.callOptions()
+get.get = true
+print(describe(client.request("/t.v1.S/Lookup", Bytes("a+b/c?"), get, "")))
+let jsonClient = connect.client("", "json", script.transport(), "")
+print(describe(jsonClient.request("/t.v1.S/Lookup", Bytes("{\"q\":\"a b&c\"}"), get, "")))
+
+// Replies: headers, trailer- prefixed trailers, wrong content types.
+let headers = [header("Content-Type", "application/proto"), header("X-One", "1"), header("Trailer-X-Two", "2")]
+print(outcome(client.reply(connect.Response { status: 200; headers: headers; body: Bytes("pong") })))
+print(outcome(client.reply(connect.Response { status: 200; headers: [header("content-type", "application/json")]; body: Bytes("{}") })))
+// Errors: Connect JSON with details (padded or not), and bare HTTP statuses.
+let errorBody = "{\"code\":\"permission_denied\",\"message\":\"no\",\"details\":[{\"type\":\"t.v1.Why\",\"value\":\"AP8\"},{\"type\":\"t.v1.Pad\",\"value\":\"AP8=\"},{\"type\":\"t.v1.Bad\",\"value\":\"%%\"}]}"
+print(outcome(client.reply(connect.Response { status: 403; headers: [header("content-type", "application/json"), header("x-why", "policy"), header("trailer-x-at", "end")]; body: Bytes(errorBody) })))
+print(outcome(client.reply(connect.Response { status: 500; headers: [header("content-type", "application/json")]; body: Bytes("{\"code\":\"made_up\"}") })))
+for status in [400, 401, 403, 404, 408, 429, 502, 503, 504, 500] {
+    print(Text(status) + " " + outcome(client.reply(connect.Response { status: status; headers: [header("content-type", "text/html")]; body: Bytes("<h1>oops</h1>") })))
+}
+
+// Retries: UNAVAILABLE retries with one key until attempts run out; other codes do not.
+script.responses = [Err(rpc.failure(rpc.UNAVAILABLE, "reset")), respond(503, "application/json", "{\"code\":\"unavailable\"}"), respond(200, "application/proto", "third")]
+print(outcome(client.unary("/t.v1.S/Pay", Bytes("p"), connect.callOptions())))
+let keys: List<Text> = []
+for request in script.sent { keys.add(rpc.headerValue(request.headers, "idempotency-key")) }
+print(joinText(keys, " "))
+script.sent = []
+script.responses = [respond(400, "application/json", "{\"code\":\"invalid_argument\",\"message\":\"bad\"}"), respond(200, "application/proto", "never")]
+print(outcome(client.unary("/t.v1.S/Pay", Bytes("p"), connect.callOptions())) + " after " + Text(script.sent.length))
+script.sent = []
+script.responses = [Err(rpc.failure(rpc.UNAVAILABLE, "1")), Err(rpc.failure(rpc.UNAVAILABLE, "2")), Err(rpc.failure(rpc.UNAVAILABLE, "3")), respond(200, "application/proto", "never")]
+print(outcome(client.unary("/t.v1.S/Pay", Bytes("p"), connect.callOptions())) + " after " + Text(script.sent.length))
+// A keyless client retries only calls that may be repeated.
+script.sent = []
+script.responses = [Err(rpc.failure(rpc.UNAVAILABLE, "lost")), respond(200, "json", "never")]
+print(outcome(jsonClient.unary("/t.v1.S/Pay", Bytes("{}"), connect.callOptions())) + " after " + Text(script.sent.length))
+script.sent = []
+script.responses = [Err(rpc.failure(rpc.UNAVAILABLE, "lost")), respond(200, "application/json", "{\"ok\":true}")]
+let safe = connect.callOptions()
+safe.idempotency = rpc.IDEMPOTENT
+print(outcome(jsonClient.unary("/t.v1.S/Put", Bytes("{}"), safe)) + " after " + Text(script.sent.length) + " key '" + rpc.headerValue(script.sent[0].headers, "idempotency-key") + "'")
+
+// Typed calls go through the codecs for the client's codec name.
+let texts = [rpc.Codec<Text> { name: "proto"
+    decode: function(data: Bytes): Result<Text, rpc.Error> {
+        return match utf8.decode(data) {
+            Ok(text) { Ok(text) }
+            Err(_) { Err(rpc.failure(rpc.INVALID_ARGUMENT, "not text")) }
+        }
+    }
+    encode: function(value: Text): Result<Bytes, rpc.Error> { return Ok(Bytes(value.asciiUppercased())) } }]
+script.sent = []
+script.responses = [respond(200, "application/proto", "typed reply")]
+match connect.call(client, "/t.v1.S/Echo", "hello", texts, texts, connect.callOptions()) {
+    Ok(text) { print(text + " for " + utf8.decodeOrStop(script.sent[0].body)) }
+    Err(failure) { print(failure.error.message) }
+}
+let invalid = Bytes(1)
+invalid[0] = 255
+script.responses = [Ok(connect.Response { status: 200; headers: [header("content-type", "application/proto")]; body: invalid })]
+match connect.call(client, "/t.v1.S/Echo", "hello", texts, texts, connect.callOptions()) {
+    Ok(text) { print(text) }
+    Err(failure) { print(rpc.codeName(failure.error.code) + " " + failure.error.message) }
+}
+match connect.call(jsonClient, "/t.v1.S/Echo", "hello", texts, texts, connect.callOptions()) {
+    Ok(text) { print(text) }
+    Err(failure) { print(rpc.codeName(failure.error.code) + " " + failure.error.message) }
+}
+
+// A real server behind the transport: errors round-trip with their details.
+let services = rpc.services()
+services.addUnary("/t.v1.S/Echo", rpc.NO_SIDE_EFFECTS, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+    if data.length == 0 { return Err(rpc.failure(rpc.NOT_FOUND, "empty").withDetail("t.v1.Why", Bytes("why"))) }
+    call.responseTrailers.add(header("x-size", Text(data.length)))
+    return Ok(data)
+})
+let server = connect.server(services, connect.defaults(function(): Integer { return 0 }))
+let direct = connect.client("", "proto", function(request: connect.Request): Result<connect.Response, rpc.Error> { return Ok(server.handle(request)) }, "d")
+print(outcome(direct.unary("/t.v1.S/Echo", Bytes("round trip"), connect.callOptions())))
+print(outcome(direct.unary("/t.v1.S/Echo", Bytes(), connect.callOptions())))
+print(outcome(direct.unary("/t.v1.S/Echo", Bytes("by get"), get)))
+print(outcome(direct.unary("/t.v1.S/Gone", Bytes("x"), connect.callOptions())))

@@ -1,0 +1,169 @@
+// connect.Server request handling without sockets: codecs, GET, errors,
+// limits, deadlines, compression, idempotency and CORS.
+use "connect" as connect
+use "rpc" as rpc
+use "errors" as errors
+use "text" as utf8
+
+global clockNow: List<Integer> = [1000]
+function clock(): Integer { return clockNow[0] }
+function header(name: Text, value: Text): rpc.Header { return rpc.Header { name: name; value: value } }
+function post(target: Text, contentType: Text, body: Text): connect.Request {
+    return connect.Request { method: "POST"; target: target; headers: [header("Content-Type", contentType)]; body: Bytes(body) }
+}
+function show(label: Text, response: connect.Response) {
+    let line = label + " " + Text(response.status)
+    for field in response.headers { line = line + " [" + field.name + ": " + field.value + "]" }
+    match utf8.decode(response.body) {
+        Ok(text) { if text != "" { line = line + " " + text } }
+        Err(_) { line = line + " <" + Text(response.body.length) + " bytes>" }
+    }
+    print(line)
+}
+function reversed(data: Bytes): Bytes {
+    let out = Bytes()
+    for index in 0..data.length { out.add(data[data.length - 1 - index]) }
+    return out
+}
+
+let runs = [0]
+let services = rpc.services()
+services.addUnary("/t.v1.S/Echo", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+    runs[0] += 1
+    call.responseHeaders.add(header("X-Codec", call.codec))
+    call.responseTrailers.add(header("X-Run", Text(runs[0])))
+    return Ok(data)
+})
+services.addUnary("/t.v1.S/Lookup", rpc.NO_SIDE_EFFECTS, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+    let out = Bytes("found ")
+    out.addBytes(data)
+    return Ok(out)
+})
+services.addUnary("/t.v1.S/Fail", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+    call.responseHeaders.add(header("x-why", "testing"))
+    let code = 0
+    for byte in data { code = code * 10 + byte - 48 }
+    let bytes = Bytes(2)
+    bytes[0] = 0
+    bytes[1] = 255
+    return Err(rpc.failure(code, "line\n\"quoted\" \\ tab\t" + Text(Character(1)) + "é").withDetail("t.v1.Why", bytes).withDetail("t.v1.Empty", Bytes()))
+})
+services.addUnary("/t.v1.S/Slow", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+    print("remaining " + Text(call.remaining()) + " deadline " + Text(call.deadline))
+    clockNow[0] += 50
+    return Ok(Bytes("late"))
+})
+services.addServerStream("/t.v1.S/Watch", function(call: rpc.Call, data: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+    return Ok()
+})
+services.addDeferred("/t.v1.S/Later", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+    return Ok()
+})
+let options = connect.defaults(clock)
+options.maxRequestBytes = 64
+options.compressMinBytes = 4
+options.idempotencyEntries = 2
+options.idempotencyMilliseconds = 1000
+options.cors.allowedOrigins.add("https://app.example")
+options.cors.allowedHeaders.add("Authorization")
+options.cors.exposedHeaders.add("X-Run")
+options.compressors.add(connect.Compressor { name: "reverse"
+    compress: function(data: Bytes): Result<Bytes, errors.Error> { return Ok(reversed(data)) }
+    decompress: function(data: Bytes, limit: Integer): Result<Bytes, errors.Error> {
+        if data.length > limit { return Err(errors.make(errors.invalidDataCode(), 0, "too long")) }
+        return Ok(reversed(data))
+    } })
+let server = connect.server(services, options)
+
+// Codecs and content types.
+show("json", server.handle(post("/t.v1.S/Echo", "application/json", "{}")))
+show("charset", server.handle(post("/t.v1.S/Echo", "Application/JSON; Charset=UTF-8", "{}")))
+show("proto", server.handle(post("/t.v1.S/Echo", "application/proto", "pb")))
+show("latin1", server.handle(post("/t.v1.S/Echo", "application/json; charset=latin1", "{}")))
+show("proto-charset", server.handle(post("/t.v1.S/Echo", "application/proto; charset=utf-8", "pb")))
+show("streaming-type", server.handle(post("/t.v1.S/Echo", "application/connect+proto", "pb")))
+show("text", server.handle(post("/t.v1.S/Echo", "text/plain", "x")))
+show("missing", server.handle(post("/t.v1.S/Nothing", "application/proto", "x")))
+show("put", server.handle(connect.Request { method: "PUT"; target: "/t.v1.S/Echo"; headers: []; body: Bytes() }))
+show("stream-unary", server.handle(post("/t.v1.S/Watch", "application/proto", "x")))
+show("stream", server.handle(post("/t.v1.S/Watch", "application/connect+proto", "x")))
+show("deferred", server.handle(post("/t.v1.S/Later", "application/proto", "x")))
+
+// Protocol version.
+let versioned = post("/t.v1.S/Echo", "application/proto", "v")
+versioned.headers.add(header("connect-protocol-version", "2"))
+show("version-2", server.handle(versioned))
+
+// GET for NO_SIDE_EFFECTS methods only.
+show("get-json", server.handle(connect.Request { method: "GET"; target: "/t.v1.S/Lookup?connect=v1&encoding=json&message=%7B%22a%22%3A+1%7D"; headers: []; body: Bytes() }))
+let binary = Bytes(3)
+binary[1] = 255
+binary[2] = 251
+show("get-base64", server.handle(connect.Request { method: "GET"; target: "/t.v1.S/Lookup?encoding=proto&base64=1&message=" + connect.base64(binary, true); headers: []; body: Bytes() }))
+show("get-no-encoding", server.handle(connect.Request { method: "GET"; target: "/t.v1.S/Lookup?message=x"; headers: []; body: Bytes() }))
+show("get-bad-escape", server.handle(connect.Request { method: "GET"; target: "/t.v1.S/Lookup?encoding=json&message=%zz"; headers: []; body: Bytes() }))
+show("get-v2", server.handle(connect.Request { method: "GET"; target: "/t.v1.S/Lookup?connect=v2&encoding=json"; headers: []; body: Bytes() }))
+show("get-side-effects", server.handle(connect.Request { method: "GET"; target: "/t.v1.S/Echo?encoding=json&message=%7B%7D"; headers: []; body: Bytes() }))
+
+// Every code maps to its HTTP status and survives JSON escaping.
+for code in 1..17 { show("fail-" + Text(code), server.handle(post("/t.v1.S/Fail", "application/proto", Text(code)))) }
+
+// Limits.
+show("too-large", server.handle(post("/t.v1.S/Echo", "application/proto", "x".repeat(65))))
+
+// Deadlines: the handler sees the remaining time; finishing late is DEADLINE_EXCEEDED.
+let timed = post("/t.v1.S/Slow", "application/proto", "")
+timed.headers.add(header("Connect-Timeout-Ms", "40"))
+show("deadline", server.handle(timed))
+let roomy = post("/t.v1.S/Slow", "application/proto", "")
+roomy.headers.add(header("connect-timeout-ms", "60"))
+show("in-time", server.handle(roomy))
+for bad in ["-1", "1.5", "12345678901", "soon"] {
+    let malformed = post("/t.v1.S/Echo", "application/proto", "")
+    malformed.headers.add(header("connect-timeout-ms", bad))
+    show("timeout " + bad, server.handle(malformed))
+}
+
+// Compression in both directions, and an unknown encoding.
+let packed = post("/t.v1.S/Echo", "application/proto", "olleh")
+packed.headers.add(header("content-encoding", "reverse"))
+packed.headers.add(header("accept-encoding", "gzip, reverse"))
+show("compressed", server.handle(packed))
+let gzip = post("/t.v1.S/Echo", "application/proto", "x")
+gzip.headers.add(header("content-encoding", "gzip"))
+show("gzip", server.handle(gzip))
+
+// Idempotency keys: a retry replays, a different body is refused, keys are
+// scoped by authorization and expire, and the cache keeps a bounded count.
+function keyed(key: Text, body: Text, authorization: Text): connect.Request {
+    let request = post("/t.v1.S/Echo", "application/proto", body)
+    request.headers.add(header("Idempotency-Key", key))
+    if authorization != "" { request.headers.add(header("authorization", authorization)) }
+    return request
+}
+let before = server.executed()
+show("key-first", server.handle(keyed("a", "one", "")))
+show("key-retry", server.handle(keyed("a", "one", "")))
+show("key-other-body", server.handle(keyed("a", "two", "")))
+show("key-other-user", server.handle(keyed("a", "one", "Bearer someone")))
+print("handler runs " + Text(server.executed() - before) + ", replayed " + Text(server.replayed()))
+clockNow[0] += 1000
+show("key-expired", server.handle(keyed("a", "one", "")))
+show("key-b", server.handle(keyed("b", "x", "")))
+show("key-c", server.handle(keyed("c", "x", "")))
+show("key-a-evicted", server.handle(keyed("a", "one", "")))
+show("key-long", server.handle(keyed("k".repeat(256), "x", "")))
+
+// CORS.
+let preflight = connect.Request { method: "OPTIONS"; target: "/t.v1.S/Echo"
+    headers: [header("Origin", "https://app.example"), header("Access-Control-Request-Method", "POST")]; body: Bytes() }
+show("preflight", server.handle(preflight))
+let foreign = connect.Request { method: "OPTIONS"; target: "/t.v1.S/Echo"
+    headers: [header("origin", "https://evil.example"), header("access-control-request-method", "POST")]; body: Bytes() }
+show("foreign-preflight", server.handle(foreign))
+let browser = post("/t.v1.S/Echo", "application/json", "{}")
+browser.headers.add(header("origin", "https://app.example"))
+show("browser", server.handle(browser))
+let other = post("/t.v1.S/Echo", "application/json", "{}")
+other.headers.add(header("origin", "https://evil.example"))
+show("other-origin", server.handle(other))
