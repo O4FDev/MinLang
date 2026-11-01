@@ -1,0 +1,106 @@
+// library/uint64.min against C uint64_t (tests/uint64-reference.c): format,
+// parse, compare, divide and remainder over structured edges and 1,200,000
+// fuzzed values, plus every boundary near 0, 2^63, 2^64 and each power of two and ten.
+use "uint64" as u64
+use "errors" as errors
+
+function value(seed: Integer): Integer { native "u64ref" }
+function referenceCompare(left: Integer, right: Integer): Integer { native "u64ref" }
+function referenceDivide(left: Integer, right: Integer): Integer { native "u64ref" }
+function referenceRemainder(left: Integer, right: Integer): Integer { native "u64ref" }
+function digit(value: Integer, index: Integer): Integer { native "u64ref" }
+function parseByte(seed: Integer, index: Integer): Integer { native "u64ref" }
+function parseOverflows(seed: Integer): Integer { native "u64ref" }
+function parseValue(seed: Integer): Integer { native "u64ref" }
+
+function hex(value: Integer): Text {
+    let digits = "0123456789abcdef"
+    let result = ""
+    for shift in 0..16 { result = result + Text(digits[(value >> ((15 - shift) * 4)) & 15]) }
+    return result
+}
+function decimal(value: Integer): Bytes {
+    let result = Bytes()
+    let index = 0
+    while true {
+        let byte = digit(value, index)
+        if byte < 0 { return result }
+        result.add(byte)
+        index += 1
+    }
+    return result
+}
+function roundTrip(value: Integer) {
+    let text = u64.format(value)
+    let expected = decimal(value)
+    let actual = Bytes(text)
+    if actual.length != expected.length { fail("format length " + hex(value) + ": " + text) }
+    for index in 0..actual.length { if actual[index] != expected[index] { fail("format " + hex(value) + ": " + text) } }
+    match u64.parse(text) {
+        Ok(parsed) { if parsed != value { fail("round trip " + hex(value) + " read " + hex(parsed)) } }
+        Err(problem) { fail("round trip " + hex(value) + ": " + problem.describe()) }
+    }
+}
+function pair(left: Integer, right: Integer) {
+    let order = u64.compare(left, right)
+    if order != referenceCompare(left, right) { fail("compare " + hex(left) + " " + hex(right)) }
+    if u64.less(left, right) != (order < 0) || u64.lessOrEqual(left, right) != (order <= 0) { fail("less " + hex(left) + " " + hex(right)) }
+    if right != 0 {
+        if u64.divide(left, right) != referenceDivide(left, right) { fail("divide " + hex(left) + " " + hex(right)) }
+        if u64.remainder(left, right) != referenceRemainder(left, right) { fail("remainder " + hex(left) + " " + hex(right)) }
+    }
+}
+function parseCase(seed: Integer) {
+    let source = Bytes()
+    let index = 0
+    while parseByte(seed, index) >= 0 { source.add(parseByte(seed, index)); index += 1 }
+    match u64.parseBytes(source) {
+        Ok(parsed) {
+            if parseOverflows(seed) != 0 { fail("accepted overflow " + Text(index) + " digits") }
+            if parsed != parseValue(seed) { fail("parse " + hex(parsed) + " expected " + hex(parseValue(seed))) }
+        }
+        Err(problem) {
+            if parseOverflows(seed) == 0 { fail("rejected in-range digits: " + problem.describe()) }
+            if errors.code(problem) != errors.overflowCode() { fail("overflow code") }
+        }
+    }
+}
+
+// Structured edges: offsets around 0, 2^63, 2^64, every power of two and every power of ten.
+let edges: List<Integer> = []
+for offset in 0..1025 {
+    edges.add(offset)
+    edges.add(wrappingSubtract(0, offset + 1))
+    edges.add(wrappingAdd(-9223372036854775808, offset))
+    edges.add(wrappingSubtract(-9223372036854775808, offset + 1))
+}
+let power = 1
+for exponent in 0..64 {
+    for offset in -3..4 { edges.add(wrappingAdd(power, offset)) }
+    power = wrappingMultiply(power, 2)
+}
+let ten = 1
+for exponent in 0..20 {
+    for offset in -3..4 { edges.add(wrappingAdd(ten, offset)) }
+    ten = wrappingMultiply(ten, 10)
+}
+for item in edges { roundTrip(item) }
+for left in edges { for at in 0..64 { pair(left, edges[(at * 131 + (left & 1023)) % edges.length]) } }
+for left in 0..64 { for right in 0..64 { pair(edges[left * 37 % edges.length], edges[right * 53 % edges.length]) } }
+let count = 1200000
+for seed in 0..count {
+    let left = value(seed * 2)
+    let right = value(seed * 2 + 1)
+    roundTrip(left)
+    pair(left, right)
+    pair(right, left)
+    parseCase(seed)
+}
+for bad in ["", "-1", "+1", " 1", "1 ", "1_000", "0x10", "18446744073709551616", "99999999999999999999", "184467440737095516150"] {
+    match u64.parse(bad) {
+        Ok(parsed) { fail("accepted invalid unsigned text '" + bad + "'") }
+        Err(problem) {}
+    }
+}
+if u64.format(u64.MAX) != "18446744073709551615" || u64.format(0) != "0" { fail("extreme formats") }
+print("uint64: " + Text(edges.length) + " edge values and " + Text(count * 2) + " fuzzed values match C uint64_t")

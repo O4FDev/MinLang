@@ -1,0 +1,74 @@
+// Unsigned 64-bit values over an Integer's two's-complement bit pattern, for
+// Protobuf uint64/fixed64 and other unsigned wire formats. An Integer holds
+// 0 to 2^63-1 as itself and 2^63 to 2^64-1 as its negative bit pattern.
+// Addition, subtraction and multiplication modulo 2^64 are the core
+// wrappingAdd, wrappingSubtract and wrappingMultiply; equality is ==.
+use "errors" as errors
+use "text" as utf8
+
+/// 2^64-1, the largest unsigned value (the bit pattern of -1).
+public constant MAX = -1
+constant SIGN = -9223372036854775808
+constant LOW = 9223372036854775807
+
+function flip(value: Integer): Integer { return value ^ SIGN }
+
+/// -1, 0 or 1 as `left` is below, equal to or above `right`, both unsigned.
+public function compare(left: Integer, right: Integer): Integer {
+    let a = flip(left)
+    let b = flip(right)
+    if a < b { return -1 }
+    if a > b { return 1 }
+    return 0
+}
+public function less(left: Integer, right: Integer): Boolean { return flip(left) < flip(right) }
+public function lessOrEqual(left: Integer, right: Integer): Boolean { return flip(left) <= flip(right) }
+
+/// The unsigned quotient, rounded toward zero. Division by zero stops the program.
+public function divide(dividend: Integer, divisor: Integer): Integer {
+    if divisor < 0 {
+        // A divisor of 2^63 or more fits into the dividend at most once.
+        if flip(dividend) >= flip(divisor) { return 1 }
+        return 0
+    }
+    if dividend >= 0 { return dividend / divisor }
+    // Halve the dividend so the signed division is exact in range; the
+    // doubled estimate is at most one short of the true quotient.
+    let quotient = wrappingMultiply(((dividend >> 1) & LOW) / divisor, 2)
+    let rest = wrappingSubtract(dividend, wrappingMultiply(quotient, divisor))
+    if flip(rest) >= flip(divisor) { return quotient + 1 }
+    return quotient
+}
+/// The unsigned remainder. Division by zero stops the program.
+public function remainder(dividend: Integer, divisor: Integer): Integer {
+    if divisor == 0 { return dividend % divisor }
+    return wrappingSubtract(dividend, wrappingMultiply(divide(dividend, divisor), divisor))
+}
+
+/// The value as unsigned decimal, "0" to "18446744073709551615".
+public function format(value: Integer): Text {
+    if value >= 0 { return Text(value) }
+    let high = divide(value, 10)
+    return Text(high) + Text(wrappingSubtract(value, wrappingMultiply(high, 10)))
+}
+
+function invalid(message: Text): Result<Integer, errors.Error> {
+    return Err(errors.make(errors.invalidDataCode(), 0, message))
+}
+/// Reads unsigned decimal ASCII digits: no sign, spaces or separators. Leading
+/// zeros are accepted. Values above 2^64-1 fail with overflowCode.
+public function parse(source: Text): Result<Integer, errors.Error> { return parseBytes(Bytes(source)) }
+public function parseBytes(source: Bytes): Result<Integer, errors.Error> {
+    if source.length == 0 { return invalid("expected unsigned decimal digits") }
+    let value = 0
+    for byte in source {
+        if byte < 48 || byte > 57 { return invalid("expected unsigned decimal digits") }
+        let digit = byte - 48
+        // 1844674407370955161 * 10 + 5 is 2^64-1.
+        if value < 0 || value > 1844674407370955161 || value == 1844674407370955161 && digit > 5 {
+            return Err(errors.make(errors.overflowCode(), 0, "integer is outside the unsigned 64-bit range"))
+        }
+        value = wrappingAdd(wrappingMultiply(value, 10), digit)
+    }
+    return Ok(value)
+}
