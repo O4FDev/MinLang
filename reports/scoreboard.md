@@ -229,3 +229,8 @@ Visible + both-modes, same box (box B, one harness = the final tip's, `--tree` f
 - final vs baseline: every program faster (treewalk −90.3%, exprparse −83.9%, httpparse −70.9%; least: par-mandel −23.2%); bothmodes −11% to −24% at 1 and 4 threads.
 Box-B single-box full gate + soak on 993756afe GREEN (above); 7d4576591 adds only the fast-gate tooling (no compiler/runtime/library change).
 Raw tables: ~/Projects/minyar-goal-20261030/logs/phase5-ab-results/, logs/score-final-7d4576591-boxB.log.
+
+Real-world suite on the release candidate (box B, `benchmarks/realworld/run.py --tree 7d4576591 --keep-going --repeat 1`, projects synced with
+`sync-projects.sh`, adoption patches applied): all 6 build and run. Ir vs the recorded baseline: neo-db 0.96x, minyar-query 0.94x, minyar-js
+0.94x, minyar-terminal 1.00x, minyar-sandbox 0.99x, minyar-sim 0.97x. Wall and build-time columns are single samples against a baseline
+recorded on another box (box M), so they are not comparable; neo-db needed zlib1g-dev installed on box B first (environment, not Minyar).
