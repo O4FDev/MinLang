@@ -48,6 +48,14 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
                 check_ms[child] = max(1000, (check_ms[label] - known_cpu) // len(unknown))
                 wall_ms[child] = max(1000, (wall_ms.get(label, check_ms[label]) - known_wall) // len(unknown))
             check_ms[label], wall_ms[label] = 1000, 1000
+    # An aggregate with a recipe of its own (check-portable runs compiler-behavior on the stage3 IR) starts only after its
+    # direct children on the same shard pass; on a shard without them it starts at once.
+    by_label = {check["label"]: check for check in checks}
+    own_parents = {}
+    for check in checks:
+        if check["children"] and check.get("recipe"):
+            for child in check["children"]:
+                own_parents.setdefault(child, []).append(check["label"])
     siblings = {}
     for check in checks:
         if len(check["children"]) > 1:
@@ -95,14 +103,25 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
     # check phase at least the waiting its checks do behind the shard's one launcher lock.
     goal_sum, goal_max = [0] * shards, [0] * shards
     load, longest, locked = [0] * shards, [0] * shards, [0] * shards
-    deferred_max, waiter_end = [0] * shards, [0] * shards
+    deferred_max, waiter_end, tail = [0] * shards, [0] * shards, [0] * shards
     owned = [set() for _ in range(shards)]
     assigned = [set() for _ in range(shards)]
 
     def heavy(name):
         return goal_ms.get(name, DEFAULT_GOAL_MS) >= DEFER_MS
 
-    def finish(index, extra_goals, check_cost, check_length=0, check_wait=0, check_heavy=0, waits=False):
+    def tail_with(index, check):
+        # The longest own recipe that, with this check placed, would run after other checks of the same shard.
+        value = tail[index]
+        label = check["label"]
+        if check["children"] and check.get("recipe") and any(child in assigned[index] for child in check["children"]):
+            value = max(value, length(check))
+        for parent in own_parents.get(label, []):
+            if parent in assigned[index]:
+                value = max(value, length(by_label[parent]))
+        return value
+
+    def finish(index, extra_goals, check_cost, check_length=0, check_wait=0, check_heavy=0, waits=False, check_tail=None):
         # Light shared builds run before any check; heavy ones run beside the checks on one core, and a check that
         # needs one ("waiter") cannot finish before it is built.
         light = [ms for ms in extra_goals if ms < DEFER_MS]
@@ -110,7 +129,8 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
         gm = max([goal_max[index]] + light)
         dmax = max(deferred_max[index], check_heavy)
         ends = max(waiter_end[index], dmax + check_length if waits else 0)
-        checks_phase = max((load[index] + check_cost + sum(ms for ms in extra_goals if ms >= DEFER_MS)) / jobs,
+        after = tail[index] if check_tail is None else check_tail
+        checks_phase = max((load[index] + check_cost + sum(ms for ms in extra_goals if ms >= DEFER_MS)) / jobs + after,
                            longest[index], check_length, locked[index] + check_wait, ends)
         return max(gm, gs / jobs) + checks_phase
 
@@ -119,7 +139,8 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
         for index in range(shards):
             extra = [goal_ms.get(name, DEFAULT_GOAL_MS) for name in effective[check["label"]] if name not in owned[index]]
             needs_heavy = [goal_ms.get(name, DEFAULT_GOAL_MS) for name in effective[check["label"]] if heavy(name)]
-            value = finish(index, extra, cost(check), length(check), waiting(check), max(needs_heavy or [0]), bool(needs_heavy))
+            value = finish(index, extra, cost(check), length(check), waiting(check), max(needs_heavy or [0]), bool(needs_heavy),
+                           tail_with(index, check))
             # Pieces of one split check share their inputs and the launcher lock: keep them on different shards.
             value += 0.5 * length(check) * len(siblings.get(check["label"], set()) & assigned[index])
             if best_value is None or value < best_value:
@@ -136,6 +157,7 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
                     goal_max[best] = max(goal_max[best], goal_ms.get(name, DEFAULT_GOAL_MS))
         if needs_heavy:
             waiter_end[best] = max(waiter_end[best], max(needs_heavy) + length(check))
+        tail[best] = tail_with(best, check)
         load[best] += cost(check)
         longest[best] = max(longest[best], length(check))
         locked[best] += waiting(check)

@@ -3,8 +3,8 @@
 
 Takes, from every shard of the given runs, the checks that shard ran (its times.tsv rows for its assignment) and the
 shared builds it built (gate.log `prerequisite NAME: passed ... cpu_user/system/rss_kib=U S R` lines that took more
-than a few milliseconds), and merges them over the current tables: a measured value replaces the old one, a check
-not measured keeps its old value.
+than a few milliseconds), and merges them over the current tables: a measured check time replaces the old one; a
+shared build keeps the largest time seen (it is cheap when another build already made its prerequisites).
 """
 import glob
 import json
@@ -44,7 +44,10 @@ def main():
             for line in open(os.path.join(shard, "gate.log"), errors="replace"):
                 match = pattern.match(line)
                 if match and int(match.group(2)) > 50:
-                    goals[match.group(1)] = [str(int((float(match.group(3)) + float(match.group(4))) * 1000))]
+                    # A shared build's time depends on which of its prerequisites another build already made, so keep
+                    # the largest seen: the packer must assume it can be the one doing the work.
+                    measured = int((float(match.group(3)) + float(match.group(4))) * 1000)
+                    goals[match.group(1)] = [str(max(measured, int(goals.get(match.group(1), ["0"])[0])))]
     with open(os.path.join(HERE, "times.tsv"), "w") as out:
         out.write("target\twall_ms\tcpu_ms\tpassed\n")
         for target, (wall, cpu, passed) in sorted(checks.items(), key=lambda item: -int(item[1][0])):
