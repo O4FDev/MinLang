@@ -43,7 +43,9 @@ if [[ ! -s $out/assignment.json ]]; then
   python3 "$fg/pack.py" "$out/plan.json" "$fg/times.tsv" "$fg/goal-times.tsv" "$shards" "$jobs" > "$out/assignment.json" || { stamp PACK-FAILED; finish 4; }
 fi
 python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["assignment"][int(sys.argv[2])]
-for key, path in (("skip", sys.argv[3]), ("deferred", sys.argv[4]), ("waiters", sys.argv[5])): open(path, "w").write("".join(x+"\n" for x in a.get(key, [])))' \
+open(sys.argv[3], "w").write("".join(x+"\n" for x in a["skip"]))
+open(sys.argv[4], "w").write("".join(" ".join(g)+"\n" for g in a.get("deferred", [])))
+open(sys.argv[5], "w").write("".join(label+" "+",".join(groups)+"\n" for label, groups in a.get("waiters", {}).items()))' \
   "$out/assignment.json" "$index" "$out/skip.txt" "$out/deferred.txt" "$out/waiters.txt" || finish 4
 stamp "PLANNED $(sha256sum < "$out/plan.json" | cut -c1-16) $(sha256sum < "$out/assignment.json" | cut -c1-16)"
 # Longest first: seed the runner's duration history (it only orders checks by it) with the packing estimates.
@@ -54,17 +56,19 @@ python3 -c 'import json,sys; d=json.load(open(sys.argv[1]))["durations"]; open(s
 # build/bootstrap.lock: their files are shared with no other build on this shard (pack.py closes the set over shared
 # prerequisites), and the launcher's own first-use targets are all built before the runner starts, so a launcher call
 # in a running check never waits a minute for them. The shim holds the checks that need them until it is done.
-rm -f "$out/deferred.exit"
-if [[ -s $out/deferred.txt ]]; then
+rm -f "$out"/deferred-*.exit
+group=0
+while read -r targets; do
   ( deferred_tmp=$(mktemp -d /tmp/minyar-tests-deferred.XXXXXX)
     env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL MINYAR_TEST_JOBS=1 MINYAR_TEST_SHARED_HOST=1 DEBUGINFOD_URLS= TMPDIR="$deferred_tmp" \
-      /usr/bin/make -j1 $(cat "$out/deferred.txt") > "$out/deferred.log" 2>&1
-    echo $? > "$out/deferred.exit.tmp" && mv "$out/deferred.exit.tmp" "$out/deferred.exit"; stamp "DEFERRED-DONE $(cat "$out/deferred.exit")" ) &
-else
-  echo 0 > "$out/deferred.exit"
-fi
+      /usr/bin/make -j1 $targets > "$out/deferred-$group.log" 2>&1
+    status=$?
+    echo $status > "$out/deferred-$group.exit.tmp" && mv "$out/deferred-$group.exit.tmp" "$out/deferred-$group.exit"
+    stamp "DEFERRED-DONE $group $status" ) &
+  group=$((group + 1))
+done < "$out/deferred.txt"
 PATH=$fg/shim:$PATH FAST_GATE_SKIP=$out/skip.txt FAST_GATE_ROOT=$(pwd -P) FAST_GATE_TIMELINE=$out/timeline \
-  FAST_GATE_WAITERS=$out/waiters.txt FAST_GATE_DEFERRED=$out/deferred.exit \
+  FAST_GATE_WAITERS=$out/waiters.txt FAST_GATE_DEFERRED=$out \
   make check-in-parallel CHECKS="$checks" CHECK_JOBS="$jobs" > "$out/gate.log" 2>&1
 status=$?
 stamp "GATE-EXIT $status"

@@ -192,13 +192,29 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
                 if recipe_members(name) & touched:
                     deferred.add(name)
                     changed = True
-        waiters = sorted(label for label in mine if effective[label] & deferred)
+        # Independent deferred chains (no shared prerequisite between them) build in separate makes, in parallel; a
+        # check waits only for the chains it needs.
+        groups = []
+        for name in sorted(deferred, key=lambda n: -goal_ms.get(n, DEFAULT_GOAL_MS)):
+            reach = recipe_members(name) | {name}
+            joined = [g for g in groups if g["reach"] & reach]
+            merged = {"names": {name}, "reach": reach}
+            for g in joined:
+                merged["names"] |= g["names"]
+                merged["reach"] |= g["reach"]
+                groups.remove(g)
+            groups.append(merged)
+        waiters = {}
+        for label in sorted(mine):
+            needs = [str(k) for k, g in enumerate(groups) if effective[label] & g["names"]]
+            if needs:
+                waiters[label] = needs
         skip = [label for label in all_checks if label not in mine] + [name for name in goals if name not in needed or name in deferred]
         result.append({
             "shard": index,
             "checks": sorted(mine),
             "goals": sorted(needed),
-            "deferred": sorted(deferred),
+            "deferred": [sorted(g["names"]) for g in groups],
             "waiters": waiters,
             "estimate_s": round(finish(index, [], 0) / 1000, 1),
             "skip": skip,
@@ -207,9 +223,10 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
     # cpu ms); a fresh tree has no history and would start them last, leaving one long check running alone at the end.
     # The estimate is the check's critical path: its own length plus its slowest shared build, so a long build that only
     # a quick check needs (build/scope-compiler-stage3.ll for check-scope-fixed-point) still starts first.
+    # A check that waits for a deferred heavy build gets no boost for it: it would only sleep in a runner slot.
     durations = {}
     for check in checks:
-        slowest = max([goal_ms.get(name, 0) for name in check["goals"] if name not in prebuilt] or [0])
+        slowest = max([goal_ms.get(name, 0) for name in check["goals"] if name not in prebuilt and not heavy(name)] or [0])
         durations[check["label"]] = [length(check) + slowest, cost(check)]
     return {"shards": shards, "jobs": jobs, "checks": len(all_checks), "goals": len(goals), "assignment": result,
             "durations": durations}
