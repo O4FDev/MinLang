@@ -770,13 +770,20 @@ function loopStepBound(copy: LoopCopy, ranges: LoopRanges, value: Text, slot: Te
     let defined = loopDefinitionLine(copy, value)
     if defined < 0 { return "" }
     let checked = loopCheckedAt(copy, defined)
+    // The name is the checked operation's own result: it sits one line below
+    // the intrinsic, flag and trap call that produce it.
+    let start = defined
+    if checked.operator == "" && defined >= 1 && copy.lines[defined].find(" = extractvalue { i64, i1 } ") >= 0 {
+        checked = loopCheckedAt(copy, defined - 1)
+        start = defined - 1
+    }
     if checked.operator != "" {
         if loopLoadedLocal(copy, checked.left) == slot || loopLoadedLocal(copy, checked.right) == slot { return "" }
         let left = loopStepBound(copy, ranges, checked.left, slot, counter, limit, depth + 1)
         let right = loopStepBound(copy, ranges, checked.right, slot, counter, limit, depth + 1)
         if left == "" || right == "" { return "" }
-        if loopRangeOperation(ranges, defined) < 0 {
-            ranges.ops.add(LoopRangeOp { line: defined, operator: checked.operator, value: checked.value, left: checked.left, right: checked.right })
+        if loopRangeOperation(ranges, start) < 0 {
+            ranges.ops.add(LoopRangeOp { line: start, operator: checked.operator, value: checked.value, left: checked.left, right: checked.right })
         }
         let parts = "." + copy.loop + "." + Text(ranges.bounds.length)
         let sum = "%loop.step.sum" + parts
@@ -943,6 +950,31 @@ function loopRangeGuard(copy: LoopCopy, counter: Text, limit: Text, walk: Boolea
     // A loop with no List element as an added value has nothing the trap costs:
     // LLVM already removes its checks and its counter alone is cheap.
     if ranges.slots.length == 0 || ranges.scans.length == 0 { return loopRangeNone() }
+    // The counter's own `index += 1` is checked too. It cannot overflow in the
+    // copy: the loop runs only while the counter is below a List length, and the
+    // guard already tested the entry counter as not negative.
+    index = 0
+    while index < copy.lines.length {
+        let slot = loopStoredLocal(copy, copy.lines[index])
+        if slot == counter {
+            let at = copy.lines[index].find(", ptr %local.")
+            let stored = copy.lines[index].slice(12, at)
+            let defined = loopDefinitionLine(copy, stored)
+            if defined >= 1 {
+                let operation = loopCheckedAt(copy, defined - 1)
+                if operation.operator == "add" && operation.value == stored {
+                    let step = operation.right
+                    let before = operation.left
+                    if step != "1" && before != "1" { return loopRangeNone() }
+                    if step == "1" { step = operation.left; before = operation.right }
+                    if loopLoadedLocal(copy, before) == counter && loopRangeOperation(ranges, defined - 1) < 0 {
+                        ranges.ops.add(LoopRangeOp { line: defined - 1, operator: "add", value: operation.value, left: operation.left, right: operation.right })
+                    }
+                }
+            }
+        }
+        index = index + 1
+    }
     // One test per accumulator: a loop that adds twice per iteration grows by
     // the sum of both steps, so the tests are combined rather than repeated.
     if !loopRangeCombined(copy, ranges, limit) { return loopRangeNone() }
