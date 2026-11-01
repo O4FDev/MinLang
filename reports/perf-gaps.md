@@ -1,5 +1,35 @@
 # Why Minyar is still slower: profile-backed causes for every visible benchmark over 1.1x (2026-10-30)
 
+## FINAL 2026-11-01 (release candidate 7d4576591, box B same-box run, cachegrind Ir)
+Geomean 2.25 vs fastest (baseline 5.32), 1.81 vs Rust. Programs over 1.1x keep the cause and owner listed in the 04:00 table below;
+what landed since then: borrow inference (treewalk −24.8%), Text runtime scans (logstats −8.7%), cheaper reclamation (httpparse −2.2%,
+exprparse −1.9%, json −1.8%), last-use moves (exprparse −1.8%), guarded List-walk loops (grid −0.9%).
+
+| program | ratio vs fastest | fastest | vs Rust |
+|---|---|---|---|
+| json | 6.25 | c | 3.71 |
+| grid | 4.81 | c | 3.56 |
+| inventory | 4.58 | rust | 4.58 |
+| exprparse | 4.55 | c | 3.58 |
+| config | 3.84 | c | 2.54 |
+| httpparse | 3.50 | rust | 3.50 |
+| tokenizer | 3.42 | c | 3.16 |
+| textops | 3.17 | cpp | 1.87 |
+| bytecode | 2.88 | c | 1.11 |
+| logstats | 2.34 | c | 1.29 |
+| wordfreq | 2.06 | c | 1.74 |
+| sortrows | 1.92 | cpp | 1.48 |
+| intmap | 1.85 | rust | 1.85 |
+| orders | 1.83 | cpp | 1.68 |
+| par-forkjoin | 1.81 | c | 1.81 |
+| sorttext | 1.50 | rust | 1.50 |
+| service | 1.38 | cpp | 0.89 |
+| treewalk | 1.33 | c | 1.14 |
+| nbody | 1.30 | cpp | 1.28 |
+| par-mandel | 1.20 | c | 1.19 |
+| matrix | 1.10 | c | 1.07 |
+| par-reduce | 0.83 | rust | 0.83 |
+
 ## STATUS 2026-11-01 04:00 UTC — every visible program over 1.1x, at goal tip f939afb71 (box K, cachegrind Ir)
 Geomean 2.32 vs fastest (was 5.32 at the 3832f4373 baseline and 2.52 at the start of run 2); 1.87 vs Rust. Dominant
 remaining cost per program from the run-2 visible profile (reports/next-phase.md "Visible programs"); the cause catalogue and
