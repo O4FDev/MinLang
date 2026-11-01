@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 STATE = ROOT / "build" / "dev-check"
 SKIP_TOP = {".git", "build", "target"}
 INDEX_SCHEMA = 2  # extra keys (inspectors, writes) are optional so older tools read newer indexes
-GATE_REMINDER = "Run the full gate (make check-in-parallel CHECKS=check-portable) before merging."
+GATE_REMINDER = "Run the full gate (tools/fast-gate.sh TREE) before merging."
 
 
 def say(*parts):

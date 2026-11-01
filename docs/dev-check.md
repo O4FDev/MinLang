@@ -7,7 +7,7 @@ the stale build outputs, every selected check with the reason it was selected,
 and one verdict line:
 
 ```
-GREEN: 4 affected check(s) passed in 41 s. Run the full gate (make check-in-parallel CHECKS=check-portable) before merging.
+GREEN: 4 affected check(s) passed in 41 s. Run the full gate (tools/fast-gate.sh TREE) before merging.
 RED: 1 of 9 failed: check-suite-catalogue
 ```
 
@@ -23,6 +23,10 @@ programs under cachegrind and prints their Minyar Ir against
 It is feedback, not a landing gate: always run the full gate before merging.
 dev-check is the default pre-gate step for all Minyar work: run it after every
 change, fix what it reports, and only then queue the full gate.
+
+The full gate is `tools/fast-gate.sh TREE` ([fast-gate.md](fast-gate.md)): every
+check of the single-box gate, sharded over on-demand boxes, with the same verdict
+for every check, in under 5 minutes. Several trees can share one call.
 
 ## How a check is selected
 
@@ -205,7 +209,8 @@ time) when the base moves far; until then a moved base only widens selection.
 | compiler function body edit, function index (constant-overflow diagnostic) | 78 | red in 700 s on the one failing check |
 | runtime header function body edit, function index (`minyar_map_get_or`) | 90 | red in 1,022 s on the one failing check |
 
-The full gate takes 22 to 24 minutes on the same box with `CHECK_JOBS=8`.
+The full gate takes 22 to 24 minutes on the same box with `CHECK_JOBS=8`, and
+under 5 minutes with `tools/fast-gate.sh`.
 
 With the function index, most of the remaining selection for a compiler or
 runtime change comes from checks that read the compiler binary, a runtime
