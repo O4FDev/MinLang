@@ -57,7 +57,8 @@ a clean hidden re-score (no program slower than +0.1% Ir) and a clean visible co
 | r2i+r2j merged 1ab0fef98 (httpstls listener; compiler huge pages) | 4.384 | 3.117 | unchanged | SYS-18 closed in Minyar; objstore adopts one line |
 | r2l merged b27b0710b (dev-check narrows: compiler edit ~24/337 checks) | 4.384 | 3.117 | unchanged | |
 | 4-thread re-measure (quiet box B, n=5 medians) | — | parallel: no program slower beyond noise | bothmodes Ir@4 equal or lower | scoreboard.md |
-| in flight | brw (treewalk −25%; RED after rebase: crash hunt), esc+fbip (inline List slots + buffer reuse), res2, cg | | | |
+| run-2 merges 06:20–09:45 (see scoreboard.md) | **4.248 (2.849)** | 3.090 | treewalk −24.7%, logstats −8.7% | brw, signals+PTY, Text runtime, systems stdlib, guarded loops, last-use moves |
+| in flight 09:45 | esc+fbip (inline List slots), big (mmap growth → unblocks res2 eager retirement), sched2, rgv (stencil shapes), map2 (Text-key hash), simd (PAR-6) | | | |
 Gap register: SYS-18 (`http.listenTLS`, blocks minyar-objstore) added and in progress; SYS-19 (projects behind the
 `Text(bytes)` API change) filed to the owning loops.
 

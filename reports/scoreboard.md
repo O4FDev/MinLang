@@ -156,3 +156,19 @@ parallel wall geomean 1.56 → 1.56; mapreduce@4 wall 1.44 → 1.59 with identic
 (noise). Verdict: no program slower in parallel mode beyond noise. Logs: ~/Projects/minyar-goal-20261030/logs/pm-20261101/.
 Note: single score.sh runs swing up to ±50% in the parallel column (wall time, cached references); only medians over
 interleaved rounds may be used to judge a parallel regression.
+
+## Run 2 merges, continued (2026-11-01 06:20 → 09:45 UTC, box B hidden score; each gated GREEN on M/K/J first)
+| goal tip | what landed | hidden h geomean (vs Rust) | worst h | b serial | notes |
+|---|---|---|---|---|---|
+| e2d877b40 | brw borrow inference + crash fix + reassigned-source fix | 4.312 (2.892) | 11.10 | 3.116 | h17 −22.7%, h14 −3.9%; treewalk −24.7% |
+| 31cb7b081 | SYS-1 signal subscriptions, SYS-2 PTY sessions | 4.312 | 11.10 | 3.116 | hidden unchanged |
+| a38e31def | Text runtime scans (one-cursor split, SSE2 separator scan, 4-word UTF-8) | 4.249 (2.850) | 11.02 | 3.090 | h06 −5.4%, h20 −5.1%, h13 −4.3%, h10 −4.1%; logstats −8.7% |
+| fad45086b | SYS-3 file locks, SYS-4 real paths/identity/temp dirs, SYS-5 time, SYS-6 CRC/MD5/Base64, SYS-8 readLine | 4.249 | 11.02 | 3.090 | hidden unchanged |
+| 994f9bc3e | range-guarded versioning of checked List-walk accumulations | 4.249 | 11.02 | 3.090 | hidden unchanged; visible grid −0.87% |
+| 58990cb8d | last-use moves into field stores and returned pairs | 4.248 (2.849) | 11.02 | 3.090 | h04 −0.18%, h05 −0.25%; exprparse −1.8% |
+Held (gate GREEN, one program over +0.1%): res2 eager retirement (b05 +0.18%: glibc mmap-threshold free-order effect,
+lane `big` making large buffers mmap/mremap), sched reclamation (h09 +0.61%: newly inlined runtime code grew user code,
+lane `sched2`), cg literal-range unroll (b04 +0.22%, dropped).
+
+r2y same-box check (box M, 09:40 UTC; parent fad45086b vs 994f9bc3e; cachegrind Ir): compare 22 programs — worst
+inventory +0.016%, grid −0.869%, config −0.020%, the rest 0.000%; bothmodes 6 programs at 1 and 4 threads — all identical.
