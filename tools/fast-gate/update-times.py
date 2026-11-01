@@ -6,7 +6,9 @@ shared builds it built (gate.log `prerequisite NAME: passed ... cpu_user/system/
 than a few milliseconds), and merges them over the current tables: a measured check takes the median of its times in
 the given runs (shard boxes are shared-CPU: one check's time can double from one run to the next), less the time the
 shim held it for deferred shared builds; a shared build keeps the largest time seen (it is cheap when another build
-already made its prerequisites).
+already made its prerequisites). An aggregate without a recipe of its own keeps its old time (pack.py costs it nothing
+where it is one; check-portable's row is its recipe's time in trees where it had one), except a check split into pieces
+(no such aggregate below it), which gets the sum of the checks below it: its time in an older tree, where it is one check.
 """
 import glob
 import json
@@ -65,6 +67,7 @@ def main():
     goals = read(os.path.join(HERE, "goal-times.tsv"), 2)
     pattern = re.compile(r"^prerequisite (\S+): passed wall_ms=(\d+) .*cpu_user/system/rss_kib=([0-9.]+) ([0-9.]+) ")
     for run in sys.argv[1:]:
+        found, plans = {}, {}
         for shard in sorted(glob.glob(os.path.join(run, "**", "shard-*"), recursive=True)):
             try:
                 assignment = json.load(open(os.path.join(shard, "assignment.json")))
@@ -77,9 +80,13 @@ def main():
             except (OSError, ValueError, KeyError, IndexError):
                 continue
             waits = held(shard)
+            tree = os.path.dirname(shard)
+            if tree not in plans and os.path.exists(os.path.join(shard, "plan.json")):
+                plans[tree] = {check["label"]: check for check in json.load(open(os.path.join(shard, "plan.json")))["checks"]}
+            plan = plans.get(tree, {})
             for target, wall, cpu, passed in table:
-                if target in mine:
-                    samples.setdefault(target, []).append((max(1, int(wall) - waits.get(target, 0)), int(cpu), passed))
+                if target in mine and not (plan.get(target, {}).get("children") and not plan[target].get("recipe")):
+                    found[(tree, target)] = (max(1, int(wall) - waits.get(target, 0)), int(cpu), passed)
             for line in open(os.path.join(shard, "gate.log"), errors="replace"):
                 match = pattern.match(line)
                 if match and int(match.group(2)) > 50:
@@ -87,6 +94,25 @@ def main():
                     # the largest seen: the packer must assume it can be the one doing the work.
                     measured = int((float(match.group(3)) + float(match.group(4))) * 1000)
                     goals[match.group(1)] = [str(max(measured, int(goals.get(match.group(1), ["0"])[0])))]
+        for (tree, target), row in found.items():
+            samples.setdefault(target, []).append(row)
+        for tree, plan in plans.items():
+
+            def below(label):
+                found_below = set()
+                for child in plan[label]["children"]:
+                    found_below |= {child} | below(child)
+                return found_below
+
+            def bare(label):
+                return bool(plan[label]["children"]) and not plan[label].get("recipe")
+
+            for label in plan:
+                if bare(label):
+                    pieces = below(label)
+                    if not any(bare(p) for p in pieces) and all((tree, p) in found for p in pieces):
+                        rows = [found[(tree, p)] for p in pieces]
+                        samples.setdefault(label, []).append((sum(r[0] for r in rows), sum(r[1] for r in rows), rows[0][2]))
     for target, rows in samples.items():
         checks[target] = [str(int(statistics.median(row[0] for row in rows))), str(int(statistics.median(row[1] for row in rows))), rows[-1][2]]
     with open(os.path.join(HERE, "times.tsv"), "w") as out:

@@ -26,7 +26,7 @@ ROUNDS = 12  # greedy passes; each later one handicaps the shards the one before
 EXCLUSIVE = {"check-net-udp-offload", "check-net-udp-offload-sanitize", "check-peer-edge-cids", "check-peer-edge-cids-sanitize"}
 # The shard-cache box is another CPU model with half a shard's memory: it takes only short checks with known times, none
 # that measures time or budgets or uses a sanitizer build, and none that waits for a deferred heavy build.
-EXTRA_HEAD_MS = 10000
+EXTRA_HEAD_MS = 15000  # measured: the cache box is done about 16 s before the shards are up
 EXTRA_MAX_MS = 45000
 EXTRA_EXCLUDE = re.compile(r"bench|ablation|budget|perform|timing|measure|sanitize|bakeoff|stress|scaling")
 
@@ -65,6 +65,11 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None, extra=None):
                 check_ms[child] = max(1000, (check_ms[label] - known_cpu) // len(unknown))
                 wall_ms[child] = max(1000, (wall_ms.get(label, check_ms[label]) - known_wall) // len(unknown))
             check_ms[label], wall_ms[label] = 1000, 1000
+    # An aggregate without a recipe of its own only waits for its children (the table keeps the sum of its pieces, its
+    # time in an older tree where it is still one check).
+    for check in checks:
+        if check["children"] and not check.get("recipe"):
+            check_ms[check["label"]], wall_ms[check["label"]] = 1000, 1000
     # An aggregate with a recipe of its own (check-portable runs compiler-behavior on the stage3 IR) starts only after
     # every check below it on the same shard passes (a skipped aggregate in between still waits for its children there).
     by_label = {check["label"]: check for check in checks}
