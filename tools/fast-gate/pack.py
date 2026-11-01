@@ -16,6 +16,10 @@ import sys
 DEFAULT_CHECK_MS = 20000
 DEFAULT_GOAL_MS = 2000
 DEFER_MS = 20000  # shared builds at least this slow are built beside the runner instead of before every check
+ROUNDS = 12  # greedy passes; each later one handicaps the shards the one before left above the mean
+# tools/check-runner.min exclusive(): these start only once no other check is running on the shard, also where the shim
+# finishes them at once, so an aggregate above one (check-portable) starts only once its whole shard has drained.
+EXCLUSIVE = {"check-net-udp-offload", "check-net-udp-offload-sanitize", "check-peer-edge-cids", "check-peer-edge-cids-sanitize"}
 
 
 def read_times(path, column):
@@ -48,14 +52,20 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
                 check_ms[child] = max(1000, (check_ms[label] - known_cpu) // len(unknown))
                 wall_ms[child] = max(1000, (wall_ms.get(label, check_ms[label]) - known_wall) // len(unknown))
             check_ms[label], wall_ms[label] = 1000, 1000
-    # An aggregate with a recipe of its own (check-portable runs compiler-behavior on the stage3 IR) starts only after its
-    # direct children on the same shard pass; on a shard without them it starts at once.
+    # An aggregate with a recipe of its own (check-portable runs compiler-behavior on the stage3 IR) starts only after
+    # every check below it on the same shard passes (a skipped aggregate in between still waits for its children there).
     by_label = {check["label"]: check for check in checks}
-    own_parents = {}
-    for check in checks:
-        if check["children"] and check.get("recipe"):
-            for child in check["children"]:
-                own_parents.setdefault(child, []).append(check["label"])
+    below = {}
+
+    def descendants(label):
+        if label not in below:
+            below[label] = set()
+            for child in by_label[label]["children"]:
+                below[label] |= {child} | descendants(child)
+        return below[label]
+
+    drains = {label for label in by_label if descendants(label) & EXCLUSIVE}
+    holds = {label for label, check in by_label.items() if check["children"] and check.get("recipe")} | (EXCLUSIVE & set(by_label))
     siblings = {}
     for check in checks:
         if len(check["children"]) > 1:
@@ -97,8 +107,8 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
                     changed = True
         effective[check["label"]] = need
 
-    # Aggregates with a recipe of their own go first, so the cost of each child placed beside one includes the chain it
-    # makes (see chain_end): the recipe waits for its children on the same shard.
+    # Aggregates with a recipe of their own go first, so the cost of each check placed beside one includes the wait it
+    # adds to that recipe (chain_end).
     order = sorted(checks, key=lambda check: (not (check["children"] and check.get("recipe")), -cost(check), check["label"]))
     # A shard's runner starts no check before all its shared builds are done, so a shard finishes at about
     # (shared-build phase) + (check phase): each the larger of its longest item and its total over the jobs, and the
@@ -108,27 +118,32 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
     deferred_max, waiter_end, tail = [0] * shards, [0] * shards, [0] * shards
     owned = [set() for _ in range(shards)]
     assigned = [set() for _ in range(shards)]
+    state = [goal_sum, goal_max, load, longest, locked, deferred_max, waiter_end, tail, owned, assigned]
 
     def heavy(name):
         return goal_ms.get(name, DEFAULT_GOAL_MS) >= DEFER_MS
 
-    def chain_end(index, parent, extra=None):
-        # An own recipe starts once its children on the same shard are done; they run first (their critical path holds
-        # it), so it ends about when they would on their own plus its own length.
-        children = [by_label[c] for c in by_label[parent]["children"] if c in assigned[index]] + ([extra] if extra else [])
-        if not children:
+    def chain_end(index, label, extra=None):
+        # When a check that waits for others on its shard ends, with extra placed there too. An exclusive check, or an
+        # aggregate above one, runs after the shard has drained; another own recipe after its descendants here, which the
+        # runner starts first (their priority includes it).
+        own = length(by_label[label])
+        if label in drains or label in EXCLUSIVE:
+            return (load[index] + (cost(extra) if extra else 0)) / jobs + own
+        here = [by_label[c] for c in descendants(label) & assigned[index]]
+        if extra and extra["label"] in descendants(label):
+            here.append(extra)
+        if not here:
             return 0
-        return max(sum(cost(c) for c in children) / jobs, max(length(c) for c in children)) + length(by_label[parent])
+        return max(sum(cost(c) for c in here) / jobs, max(length(c) for c in here)) + own
 
     def tail_with(index, check):
-        # The latest end of an own recipe's chain on this shard with this check placed.
-        value = tail[index]
-        label = check["label"]
-        if check["children"] and check.get("recipe"):
-            value = max(value, chain_end(index, label))
-        for parent in own_parents.get(label, []):
-            if parent in assigned[index]:
-                value = max(value, chain_end(index, parent, check))
+        # The latest such end on this shard with this check placed.
+        value = 0
+        for label in holds & assigned[index]:
+            value = max(value, chain_end(index, label, check))
+        if check["label"] in holds:
+            value = max(value, chain_end(index, check["label"]))
         return value
 
     def finish(index, extra_goals, check_cost, check_length=0, check_wait=0, check_heavy=0, waits=False, check_tail=None):
@@ -144,13 +159,13 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
                            longest[index], check_length, locked[index] + check_wait, ends, chains)
         return max(gm, gs / jobs) + checks_phase
 
-    for check in order:
+    def place(check, handicap):
         best, best_value = 0, None
         for index in range(shards):
             extra = [goal_ms.get(name, DEFAULT_GOAL_MS) for name in effective[check["label"]] if name not in owned[index]]
             needs_heavy = [goal_ms.get(name, DEFAULT_GOAL_MS) for name in effective[check["label"]] if heavy(name)]
             value = finish(index, extra, cost(check), length(check), waiting(check), max(needs_heavy or [0]), bool(needs_heavy),
-                           tail_with(index, check))
+                           tail_with(index, check)) + handicap[index]
             # Pieces of one split check share their inputs and the launcher lock: keep them on different shards.
             value += 0.5 * length(check) * len(siblings.get(check["label"], set()) & assigned[index])
             if best_value is None or value < best_value:
@@ -172,6 +187,22 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
         longest[best] = max(longest[best], length(check))
         locked[best] += waiting(check)
         assigned[best].add(check["label"])
+
+    # Greedy longest-first cannot take back an early placement, so a shard can end well above the rest (the one with
+    # check-portable, which waits for its whole shard). Later passes handicap such shards; the best pass is kept.
+    handicap, kept = [0.0] * shards, None
+    for _ in range(ROUNDS):
+        for item in state:
+            item[:] = [set() if isinstance(item[0], set) else 0 for _ in range(shards)]
+        for check in order:
+            place(check, handicap)
+        estimates = [finish(index, [], 0) for index in range(shards)]
+        if kept is None or max(estimates) < kept[0]:
+            kept = (max(estimates), [[set(x) if isinstance(x, set) else x for x in item] for item in state])
+        mean = sum(estimates) / shards
+        handicap = [h + (e - mean) / 2 for h, e in zip(handicap, estimates)]
+    for item, saved in zip(state, kept[1]):
+        item[:] = saved
 
     result = []
     all_checks = [check["label"] for check in checks]
@@ -233,18 +264,11 @@ def pack(plan, check_ms, goal_ms, shards, jobs, wall_ms=None):
     # cpu ms); a fresh tree has no history and would start them last, leaving one long check running alone at the end.
     # The estimate is the check's critical path: its own length plus its slowest shared build, so a long build that only
     # a quick check needs (build/scope-compiler-stage3.ll for check-scope-fixed-point) still starts first.
-    # A check that waits for a deferred heavy build gets no boost for it: it would only sleep in a runner slot. A child
-    # of an own recipe on the same shard carries that recipe's path too, so the shard runs it before unrelated checks.
-    shard_of = {label: index for index in range(shards) for label in assigned[index]}
-
-    def path(label):
-        after = [path(parent) for parent in own_parents.get(label, []) if shard_of.get(parent) == shard_of.get(label)]
-        return length(by_label[label]) + max(after or [0])
-
+    # A check that waits for a deferred heavy build gets no boost for it: it would only sleep in a runner slot.
     durations = {}
     for check in checks:
         slowest = max([goal_ms.get(name, 0) for name in check["goals"] if name not in prebuilt and not heavy(name)] or [0])
-        durations[check["label"]] = [path(check["label"]) + slowest, cost(check)]
+        durations[check["label"]] = [length(check) + slowest, cost(check)]
     return {"shards": shards, "jobs": jobs, "checks": len(all_checks), "goals": len(goals), "assignment": result,
             "durations": durations}
 
