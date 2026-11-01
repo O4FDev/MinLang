@@ -172,3 +172,10 @@ lane `sched2`), cg literal-range unroll (b04 +0.22%, dropped).
 
 r2y same-box check (box M, 09:40 UTC; parent fad45086b vs 994f9bc3e; cachegrind Ir): compare 22 programs — worst
 inventory +0.016%, grid −0.869%, config −0.020%, the rest 0.000%; bothmodes 6 programs at 1 and 4 threads — all identical.
+
+Same-box parent-vs-candidate checks (box L, 2026-11-01 ~10:40 UTC, cachegrind Ir; rule from 09:58: every merge gets this):
+- r2z 58990cb8d vs parent 994f9bc3e — compare 22: exprparse −1.835%, config −0.078%, json −0.022%, rest 0.000%; bothmodes
+  6 × (1, 4 threads): all identical.
+- r3b 1fa396a48 vs parent 58990cb8d — compare 22: httpparse −2.152%, exprparse −1.922%, json −1.751%, nothing slower;
+  bothmodes: mapreduce −0.863% @1 / −0.862% @4, server −0.363% @1, nothing slower.
+- r3b hidden (box B): geomean 4.248 → 4.213, every program equal or faster.
