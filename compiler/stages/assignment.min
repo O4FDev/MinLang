@@ -1191,7 +1191,21 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
     // bound is a List length (a List walk or `0..list.length`): nothing in the
     // loop can change that length. A scalar store may, as far as LLVM knows,
     // and an unrelated bound proves nothing, so only those loops are versioned.
-    if pure && output[stepPiece] == "" && ((collection < 0 && !lengthBound) || context.valueBorrows.scalarStores != storesBefore) {
+    let baseVersion = (collection < 0 && !lengthBound) || context.valueBorrows.scalarStores != storesBefore
+    // A checked accumulation traps on every iteration, which no analysis can
+    // remove: such a loop is versioned for its growth test alone, and only when
+    // that test covers the accumulation.
+    let accumulates = false
+    let reads = false
+    if pure && !baseVersion {
+        let scanned = entryPiece + 3
+        while scanned < stepPiece {
+            if output[scanned].find(".with.overflow.i64(") >= 0 { accumulates = true }
+            if output[scanned].find("@.minyar.list.get.") >= 0 { reads = true }
+            scanned = scanned + 1
+        }
+    }
+    if pure && output[stepPiece] == "" && (baseVersion || (accumulates && reads)) {
         let condition: List<Text> = ["for.condition." + Text(loopLabel) + ":\n"]
         let piece = entryPiece + 3
         while piece < testPiece {
@@ -1205,7 +1219,13 @@ function compileForParts(context: CompilerContext, localNames: List<Text>, local
             piece = piece + 1
         }
         condition.add("  br label %for.condition." + Text(loopLabel) + "\n")
-        let ignored = versionCheckedLoop(output, entryPiece, joinText(condition), loopLabel, counter, variable, position, bound)
+        let region = joinText(condition)
+        // The growth test only pays on a List walk, where the vectorized copy
+        // costs a few instructions per element.
+        let walk = lengthBound || collection >= 0
+        if baseVersion || loopRangeCandidate(region, loopLabel, counter, variable, position, bound, walk, "for.checked." + Text(loopLabel)) {
+            let ignored = versionCheckedLoop(output, entryPiece, region, loopLabel, counter, variable, position, bound, walk, false, "")
+        }
     }
     // A counted ASCII Text reads its bytes at the character position: test
     // that once per loop entry and run a copy that loads bytes. Only a

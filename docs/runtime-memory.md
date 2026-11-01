@@ -643,6 +643,24 @@ loop runs a copy whose accesses at the position are plain loads and stores from
 buffers read once, which LLVM can vectorize. A loop whose position goes out of
 range therefore always runs checked and fails at the same access with the same
 message (`make check-list-access`).
+A versioned loop that walks a List and accumulates with checked `+`, `-` or `*`
+carries a second test, because LLVM removes its bounds checks but not one
+overflow test per addition. Every store of a checked result into a local is one
+iteration's accumulation; its added value must be bounded before the loop: a
+literal, the loop position, a length the loop already read, an element read at
+the loop position, or a product or sum of those. Each List an added value reads
+at the position is scanned once, over exactly the positions the loop visits,
+ORing the magnitude of every element, which bounds all of them and which LLVM
+vectorizes. One test then compares the accumulator's magnitude at entry plus
+the number of iterations times the summed steps with the signed range, using
+`udiv` so no bound computation can overflow itself. A loop that passes runs a
+copy whose additions are plain instructions; every other loop runs the checked
+copy, so an overflow still fails at the same addition with the same message and
+the same partial writes (`make check-checked-arithmetic`). The test is skipped
+when the loop stores into a List, branches back into the middle of the block,
+advances its counter more than once, holds a checked operation that is not a
+covered accumulation, multiplies by a factor not proved zero, or has no bound
+it can prove.
 
 Compiler-arena builds retain storage until process exit and compile away ownership
 hooks. Their short-slice cache can evict an entry without invalidating aliases

@@ -35,6 +35,7 @@ record LoopCopy {
     blocks: Integer
     position: Text
     variable: Text
+    indexLocal: Text
     lists: List<Text>
     values: List<Text>
     lengths: List<Text>
@@ -46,6 +47,8 @@ record LoopCopy {
     windowCode: List<Text>
     windowNames: List<Text>
     windowHoisted: List<Text>
+    scanLists: List<Text>
+    scanBounds: List<Text>
     fields: Boolean
     texts: List<Text>
     textLengths: List<Text>
@@ -266,10 +269,33 @@ function loopInvariant(copy: LoopCopy, value: Text, slot: Boolean): Text {
 // stores only the position into it.
 function loopAtPosition(copy: LoopCopy, value: Text): Boolean {
     if value == copy.position { return true }
-    if copy.variable == "" { return false }
     let defined = loopDefinitionLine(copy, value)
     if defined < 0 { return false }
-    return copy.loaded[defined] == copy.variable && copy.lines[defined].find(" = load i64, ") >= 0
+    if copy.lines[defined].find(" = load i64, ") < 0 { return false }
+    if copy.variable != "" && copy.loaded[defined] == copy.variable { return true }
+    // A counter the region advances is the position only before that store:
+    // after it, a load reads the next position.
+    if copy.indexLocal == "" || copy.loaded[defined] != copy.indexLocal { return false }
+    let index = 0
+    while index < defined {
+        if copy.lines[index].startsWith("  store i64 ") && copy.lines[index].endsWith(", ptr " + copy.indexLocal) { return false }
+        index = index + 1
+    }
+    return true
+}
+
+// The number in `%local.N`, for a local the loop counts in.
+function loopLocalNumber(local: Text): Integer {
+    if local.length < 8 || !local.startsWith("%local.") { return -1 }
+    let number = 0
+    let index = 7
+    while index < local.length {
+        let digit = Integer(local[index]) - 48
+        if digit < 0 || digit > 9 { return -1 }
+        number = number * 10 + digit
+        index = index + 1
+    }
+    return number
 }
 
 function loopTruncated(values: List<Text>, length: Integer): List<Text> {
@@ -521,12 +547,427 @@ function loopRename(copy: LoopCopy, line: Text): Text {
     return joinText(pieces)
 }
 
+// --- Range-guarded accumulation -----------------------------------------
+//
+// A versioned loop that accumulates with checked `+ - *` re-tests overflow on
+// every addition, which stops LLVM from widening or vectorizing it. When each
+// iteration adds a value the test can bound beforehand (a List element at the
+// loop position, a literal, the loop position, or a product or sum of those),
+// one test before the loop covers every addition: the largest step times the
+// number of iterations, added to the accumulator's magnitude at entry, must
+// stay below 2^63. A scan of each List the steps read supplies its elements'
+// magnitude in one pass: the OR of their absolute values bounds every element
+// by a subset of its bits, and LLVM vectorizes that pass. A loop that passes
+// runs a copy whose additions are plain `add i64`; every other loop runs the
+// checked copy, which traps at the same addition with the same message and the
+// same partial writes.
+
+// One checked operation of the region the plain copy computes without a test.
+record LoopRangeOp {
+    line: Integer
+    operator: Text
+    value: Text
+    left: Text
+    right: Text
+}
+
+// Every checked operation the guard covers, with one growth test per
+// accumulator and one scan per List a step reads.
+record LoopRanges {
+    ok: Boolean
+    ops: List<LoopRangeOp>
+    slots: List<Text>
+    deltas: List<Text>
+    bounds: List<Text>
+    scans: List<Text>
+    tests: List<Text>
+    fallback: Text
+}
+
+// The result for a loop the guard does not cover: nothing changes.
+function loopRangeNone(): LoopRanges {
+    return LoopRanges { ok: false, ops: [], slots: [], deltas: [], bounds: [], scans: [], tests: [], fallback: "" }
+}
+
+// The signed operation a line starts, "" for any other line.
+// A loop shorter than this pays more for the guard than it saves: the guard
+// costs a fixed ~20 instructions and each iteration saves ~9.
+function loopRangeMinimum(): Integer {
+    return 8
+}
+
+function loopCheckedOperator(line: Text): Text {
+    if line.find(" = call { i64, i1 } @llvm.sadd.with.overflow.i64(") >= 0 { return "add" }
+    if line.find(" = call { i64, i1 } @llvm.ssub.with.overflow.i64(") >= 0 { return "sub" }
+    if line.find(" = call { i64, i1 } @llvm.smul.with.overflow.i64(") >= 0 { return "mul" }
+    return ""
+}
+
+function loopCheckedCallee(operator: Text): Text {
+    if operator == "sub" { return "@llvm.ssub.with.overflow.i64" }
+    if operator == "mul" { return "@llvm.smul.with.overflow.i64" }
+    return "@llvm.sadd.with.overflow.i64"
+}
+
+// The name an `extractvalue` of a checked result defines, "" for another line.
+function loopCheckedPart(line: Text, part: Text): Text {
+    let mark = " = extractvalue { i64, i1 } "
+    let at = line.find(mark)
+    if at < 0 || !line.endsWith(", " + part) { return "" }
+    return line.slice(2, at)
+}
+
+// The whole checked operation a line starts; `operator` empty for any other
+// shape, which the plain copy cannot take over.
+function loopCheckedAt(copy: LoopCopy, line: Integer): LoopRangeOp {
+    let none = LoopRangeOp { line: line, operator: "", value: "", left: "", right: "" }
+    let operator = loopCheckedOperator(copy.lines[line])
+    if operator == "" || line + 3 >= copy.lines.length { return none }
+    let value = loopCheckedPart(copy.lines[line + 1], "0")
+    let flag = loopCheckedPart(copy.lines[line + 2], "1")
+    if value == "" || flag == "" { return none }
+    if copy.lines[line + 3].find("@.minyar.integer.overflow.checked(i1 " + flag + ")") < 0 { return none }
+    // The flag may only be read by that call: every other use needs the test.
+    let uses = 0
+    let at = 0
+    while at < copy.lines.length {
+        if copy.lines[at].find(flag) >= 0 { uses = uses + 1 }
+        at = at + 1
+    }
+    if uses != 2 { return none }
+    let arguments = loopCallArguments(copy.lines[line], loopCheckedCallee(operator))
+    if arguments.length != 2 { return none }
+    return LoopRangeOp { line: line, operator: operator, value: value, left: arguments[0], right: arguments[1] }
+}
+
+// The `%local.N` an i64 load of `value` reads, "" otherwise.
+function loopLoadedLocal(copy: LoopCopy, value: Text): Text {
+    let defined = loopDefinitionLine(copy, value)
+    if defined < 0 { return "" }
+    let line = copy.lines[defined]
+    if !line.startsWith("  " + value + " = load i64, ptr %local.") { return "" }
+    let local = line.slice(line.find("%local."), line.length)
+    if local.length < 8 { return "" }
+    let index = 7
+    while index < local.length {
+        if !(local[index] >= '0' && local[index] <= '9') { return "" }
+        index = index + 1
+    }
+    return local
+}
+
+// The value a region store writes into `local` before `line`, "" unless
+// exactly one store names that local.
+function loopStoredValue(copy: LoopCopy, local: Text, before: Integer): Text {
+    let found = ""
+    let count = 0
+    let index = 0
+    while index < copy.lines.length {
+        if loopStoredLocal(copy, copy.lines[index]) == local {
+            if index < before && count == 0 {
+                found = copy.lines[index].slice(12, copy.lines[index].find(", ptr %local."))
+                count = 1
+            } else {
+                count = 2
+            }
+        }
+        index = index + 1
+    }
+    if count != 1 { return "" }
+    return found
+}
+
+// The `%local.N` a region store writes, "" for a line that stores nothing.
+function loopStoredLocal(copy: LoopCopy, line: Text): Text {
+    if !line.startsWith("  store i64 %") { return "" }
+    let at = line.find(", ptr %local.")
+    if at < 0 { return "" }
+    let local = line.slice(at + 6, line.length)
+    if local.length < 8 { return "" }
+    let index = 7
+    while index < local.length {
+        if !(local[index] >= '0' && local[index] <= '9') { return "" }
+        index = index + 1
+    }
+    return local
+}
+
+// The index of the covered operation a line starts, -1 when none does.
+function loopRangeOperation(ranges: LoopRanges, line: Integer): Integer {
+    let index = 0
+    while index < ranges.ops.length {
+        if ranges.ops[index].line == line { return index }
+        index = index + 1
+    }
+    return -1
+}
+
+// Whether a covered operation already computes this line.
+function loopRangeCovered(ranges: LoopRanges, line: Integer): Boolean {
+    let index = 0
+    while index < ranges.ops.length {
+        let start = ranges.ops[index].line
+        if line >= start && line <= start + 3 { return true }
+        index = index + 1
+    }
+    return false
+}
+
+// Whether the plain copy simply omits this line: the checked operation's own
+// intrinsic, its flag and its overflow call.
+function loopRangeOmitted(ranges: LoopRanges, line: Integer): Boolean {
+    let index = 0
+    while index < ranges.ops.length {
+        let start = ranges.ops[index].line
+        if line == start || line == start + 2 || line == start + 3 { return true }
+        index = index + 1
+    }
+    return false
+}
+
+// A scan of one List inside the guard, once per List: one pass over the
+// positions the loop visits that ORs the elements' absolute values. A loop
+// that visits a few positions of a long List pays for a few loads, not for
+// the List. Returns the name of the bound.
+function loopScan(copy: LoopCopy, ranges: LoopRanges, list: Text, counter: Text, limit: Text): Text {
+    let known = 0
+    while known < copy.scanLists.length {
+        if copy.scanLists[known] == list { return copy.scanBounds[known] }
+        known = known + 1
+    }
+    let tag = "." + copy.loop + "." + Text(copy.scanLists.length)
+    let name = "loop.scan" + tag
+    let ref = "%" + name
+    let values = ref + ".values"
+    let length = ref + ".length"
+    let cursor = ref + ".at"
+    let haystack = ref + ".or"
+    let value = ref + ".value"
+    let start = ref + ".start"
+    let stop = ref + ".stop"
+    // The loop visits [max(first, 0), min(limit, length)) at the position, so
+    // the scan covers exactly those elements.
+    // The trip test comes first: a short loop pays for nothing but it.
+    ranges.scans.add("  " + ref + ".counter = load i64, ptr " + counter + "\n  " + ref + ".below = icmp slt i64 " + ref + ".counter, 0\n  " + start + " = select i1 " + ref + ".below, i64 0, i64 " + ref + ".counter\n  " + ref + ".trip = sub i64 " + limit + ", " + start + "\n  " + ref + ".short = icmp slt i64 " + ref + ".trip, " + Text(loopRangeMinimum()) + "\n  br i1 " + ref + ".short, label %" + ranges.fallback + ", label %" + name + ".entry\n\n" + name + ".entry:\n  " + values + " = call ptr @.minyar.list.values(ptr " + list + ")\n  " + length + " = call i64 @.minyar.list.length(ptr " + list + ")\n  " + ref + ".capped = icmp slt i64 " + limit + ", " + length + "\n  " + stop + " = select i1 " + ref + ".capped, i64 " + limit + ", i64 " + length + "\n  br label %" + name + ".head\n\n" + name + ".head:\n  " + cursor + " = phi i64 [ " + start + ", %" + name + ".entry ], [ " + cursor + ".next, %" + name + ".body ]\n  " + haystack + " = phi i64 [ 0, %" + name + ".entry ], [ " + haystack + ".next, %" + name + ".body ]\n  " + ref + ".more = icmp slt i64 " + cursor + ", " + stop + "\n  br i1 " + ref + ".more, label %" + name + ".body, label %" + name + ".done\n\n" + name + ".body:\n  " + ref + ".slot = getelementptr inbounds i64, ptr " + values + ", i64 " + cursor + "\n  " + value + " = load i64, ptr " + ref + ".slot\n  " + ref + ".negative = icmp slt i64 " + value + ", 0\n  " + ref + ".opposite = sub i64 0, " + value + "\n  " + ref + ".magnitude = select i1 " + ref + ".negative, i64 " + ref + ".opposite, i64 " + value + "\n  " + haystack + ".next = or i64 " + haystack + ", " + ref + ".magnitude\n  " + cursor + ".next = add i64 " + cursor + ", 1\n  br label %" + name + ".head\n\n" + name + ".done:\n")
+    copy.scanLists.add(list)
+    copy.scanBounds.add(haystack)
+    return haystack
+}
+
+// The magnitude bound of one step value, or "" when the guard cannot bound it:
+// a literal, the loop position, a List element at the loop position, a product
+// or a sum of those, or a value the test already hoisted. Every checked
+// operation on the way becomes one the plain copy computes.
+function loopStepBound(copy: LoopCopy, ranges: LoopRanges, value: Text, slot: Text, counter: Text, limit: Text, depth: Integer): Text {
+    if depth > 5 { return "" }
+    if loopAtPosition(copy, value) { return "%loop.first." + copy.loop }
+    if loopLiteral(value) {
+        if !value.startsWith("-") { return value }
+        let magnitude = value.slice(1, value.length)
+        if magnitude == "9223372036854775808" { return "" }
+        return magnitude
+    }
+    let defined = loopDefinitionLine(copy, value)
+    if defined < 0 { return "" }
+    let checked = loopCheckedAt(copy, defined)
+    if checked.operator != "" {
+        if loopLoadedLocal(copy, checked.left) == slot || loopLoadedLocal(copy, checked.right) == slot { return "" }
+        let left = loopStepBound(copy, ranges, checked.left, slot, counter, limit, depth + 1)
+        let right = loopStepBound(copy, ranges, checked.right, slot, counter, limit, depth + 1)
+        if left == "" || right == "" { return "" }
+        if loopRangeOperation(ranges, defined) < 0 {
+            ranges.ops.add(LoopRangeOp { line: defined, operator: checked.operator, value: checked.value, left: checked.left, right: checked.right })
+        }
+        let parts = "." + copy.loop + "." + Text(ranges.bounds.length)
+        let sum = "%loop.step.sum" + parts
+        let bound = "%loop.step.bound" + parts
+        if checked.operator == "mul" {
+            ranges.bounds.add("  " + sum + " = icmp eq i64 " + right + ", 0\n  " + sum + ".safe = select i1 " + sum + ", i64 1, i64 " + right + "\n  " + sum + ".div = udiv i64 9223372036854775807, " + sum + ".safe\n  " + sum + ".fits = icmp ule i64 " + left + ", " + sum + ".div\n  " + sum + ".prod = mul i64 " + left + ", " + sum + ".safe\n  " + bound + " = select i1 " + sum + ".fits, i64 " + sum + ".prod, i64 -1\n")
+        } else {
+            ranges.bounds.add("  " + sum + " = add i64 " + left + ", " + right + "\n  " + sum + ".carry = icmp ult i64 " + sum + ", " + left + "\n  " + bound + " = select i1 " + sum + ".carry, i64 -1, i64 " + sum + "\n")
+        }
+        return bound
+    }
+    // A load of a local the iteration just stored reads that value.
+    if copy.lines[defined].startsWith("  " + value + " = load i64, ptr %local.") {
+        let local = loopLoadedLocal(copy, value)
+        if local == "" || local == slot { return "" }
+        let source = loopStoredValue(copy, local, defined)
+        if source != "" { return loopStepBound(copy, ranges, source, slot, counter, limit, depth + 1) }
+    }
+    // A List element at the loop position: the scan of that List bounds it.
+    let callee = ""
+    if copy.lines[defined].startsWith("  " + value + " = call i64 @.minyar.list.get.") { callee = loopAccessCallee(copy.lines[defined], "@.minyar.list.get.") }
+    if callee != "" {
+        let arguments = loopCallArguments(copy.lines[defined], callee)
+        if arguments.length < 2 { return "" }
+        if loopWindowOffset(copy, loopAccessIndex(arguments, false)) != "0" { return "" }
+        let list = loopInvariant(copy, arguments[0], false)
+        if list == "" { return "" }
+        return loopScan(copy, ranges, list, counter, limit)
+    }
+    // Any other value the test can read before the loop bounds every use.
+    return loopInvariant(copy, value, false)
+}
+
+// One growth test: the largest step, times the number of iterations, must keep
+// every value the accumulator takes inside the signed range.
+function loopRangeTest(copy: LoopCopy, ranges: LoopRanges, slot: Text, delta: Text, limit: Text) {
+    let index = Text(ranges.tests.length)
+    let tag = "." + copy.loop + "." + index
+    let name = "loop.grow" + tag
+    let ref = "%" + name
+    let trip = ref + ".trip"
+    let account = ref + ".acc"
+    let magnitude = ref + ".mag"
+    let room = ref + ".room"
+    let safe = ref + ".safe"
+    ranges.tests.add("  " + trip + " = sub i64 " + limit + ", %loop.first." + copy.loop + "\n  " + account + " = load i64, ptr " + slot + "\n  " + ref + ".negative = icmp slt i64 " + account + ", 0\n  " + ref + ".opposite = sub i64 0, " + account + "\n  " + magnitude + " = select i1 " + ref + ".negative, i64 " + ref + ".opposite, i64 " + account + "\n  " + room + " = sub i64 9223372036854775807, " + magnitude + "\n  " + ref + ".zero = icmp eq i64 " + delta + ", 0\n  " + safe + " = select i1 " + ref + ".zero, i64 1, i64 " + delta + "\n  " + ref + ".quot = udiv i64 " + room + ", " + safe + "\n  " + ref + ".allowed = select i1 " + ref + ".zero, i64 -1, i64 " + ref + ".quot\n  " + ref + " = icmp ule i64 " + trip + ", " + ref + ".allowed\n")
+}
+
+// One growth test per accumulator, with its steps summed. A saturated sum makes
+// the test fail, which is what an unbounded step means.
+function loopRangeCombined(copy: LoopCopy, ranges: LoopRanges, limit: Text): Boolean {
+    let slots: List<Text> = []
+    let deltas: List<Text> = []
+    let index = 0
+    while index < ranges.slots.length {
+        let slot = ranges.slots[index]
+        let at = loopNamed(slots, slot)
+        if at < 0 {
+            slots.add(slot)
+            deltas.add(ranges.deltas[index])
+        } else {
+            let name = "%loop.step.total." + copy.loop + "." + Text(at) + "." + Text(index)
+            let left = deltas[at]
+            let right = ranges.deltas[index]
+            ranges.bounds.add("  " + name + " = add i64 " + left + ", " + right + "\n  " + name + ".carry = icmp ult i64 " + name + ", " + left + "\n  " + name + ".bound = select i1 " + name + ".carry, i64 -1, i64 " + name + "\n")
+            deltas[at] = name + ".bound"
+        }
+        index = index + 1
+    }
+    ranges.slots = slots
+    ranges.deltas = deltas
+    let tests: List<Text> = []
+    ranges.tests = tests
+    index = 0
+    while index < slots.length {
+        loopRangeTest(copy, ranges, slots[index], deltas[index], limit)
+        index = index + 1
+    }
+    return true
+}
+
+// The accumulations of a call-free region: which checked operation each store
+// closes, and how fast its value may grow. `ok` false when the region is
+// anything else, which leaves the checked copy in place.
+function loopRangeGuard(copy: LoopCopy, counter: Text, limit: Text, walk: Boolean, fallback: Text): LoopRanges {
+    let ranges = loopRangeNone()
+    ranges.fallback = fallback
+    // A List walk is the case worth a test: it reads every element once, so the
+    // vectorized copy is a few instructions per element and the scan is one.
+    if !walk { return ranges }
+    // An element read at the loop position is hoisted only when the loop
+    // writes no List: a written List may hold other values later.
+    let index = 0
+    while index < copy.lines.length {
+        if copy.lines[index].find(".minyar.list.set.scalar.") >= 0 { return ranges }
+        index = index + 1
+    }
+    // The region must be one block sequence: a branch back into it other than
+    // the last line would run an accumulation more than once per iteration.
+    index = 0
+    while index < copy.lines.length - 1 {
+        let line = copy.lines[index]
+        if line.startsWith("  br ") {
+            let targets = line.split("label %")
+            let step = 1
+            while step < targets.length {
+                let target = targets[step]
+                let end = 0
+                while end < target.length && loopNameCharacter(target[end]) { end = end + 1 }
+                let back = loopDefinitionLine(copy, "%" + target.slice(0, end))
+                if back >= 0 && back < index { return loopRangeNone() }
+                step = step + 1
+            }
+        }
+        index = index + 1
+    }
+    // The counter must advance exactly once per iteration, or the positions the
+    // loop visits are not the ones the scan reads.
+    let advances = 0
+    index = 0
+    while index < copy.lines.length {
+        if copy.lines[index].startsWith("  store ") && copy.lines[index].endsWith(", ptr " + counter) { advances = advances + 1 }
+        index = index + 1
+    }
+    if advances != 1 { return loopRangeNone() }
+    // Every store of a checked result is one iteration's accumulation of the
+    // local it writes.
+    index = 0
+    while index < copy.lines.length {
+        let slot = loopStoredLocal(copy, copy.lines[index])
+        if slot != "" {
+            let at = copy.lines[index].find(", ptr %local.")
+            let stored = copy.lines[index].slice(12, at)
+            let defined = loopDefinitionLine(copy, stored)
+            if defined >= 1 {
+                let operation = loopCheckedAt(copy, defined - 1)
+                if operation.operator != "" && operation.value == stored {
+                    let before = operation.left
+                    let step = operation.right
+                    if loopLoadedLocal(copy, before) != slot {
+                        before = operation.right
+                        step = operation.left
+                    }
+                    if loopLoadedLocal(copy, before) == slot {
+                        let delta = loopStepBound(copy, ranges, step, slot, counter, limit, 0)
+                        if operation.operator == "mul" {
+                            // A factor bounded by zero is always zero; any other
+                            // factor either grows the value or can negate its
+                            // smallest one, which overflows on its own.
+                            if delta != "0" { return loopRangeNone() }
+                        }
+                        if delta == "" { return loopRangeNone() }
+                        if loopRangeOperation(ranges, defined - 1) < 0 {
+                            ranges.ops.add(LoopRangeOp { line: defined - 1, operator: operation.operator, value: operation.value, left: operation.left, right: operation.right })
+                        }
+                        ranges.slots.add(slot)
+                        ranges.deltas.add(delta)
+                    }
+                }
+            }
+        }
+        index = index + 1
+    }
+    // A loop with no List element as an added value has nothing the trap costs:
+    // LLVM already removes its checks and its counter alone is cheap.
+    if ranges.slots.length == 0 || ranges.scans.length == 0 { return loopRangeNone() }
+    // One test per accumulator: a loop that adds twice per iteration grows by
+    // the sum of both steps, so the tests are combined rather than repeated.
+    if !loopRangeCombined(copy, ranges, limit) { return loopRangeNone() }
+    // Every checked operation of the region must be covered, or the plain copy
+    // would drop a test.
+    index = 0
+    while index < copy.lines.length {
+        let line = copy.lines[index]
+        if line.find(" = extractvalue { i64, i1 } ") >= 0 || line.startsWith("  call void @.minyar.integer.overflow.checked(") {
+            if !loopRangeCovered(ranges, index) { return loopRangeNone() }
+        }
+        index = index + 1
+    }
+    ranges.ok = true
+    return ranges
+}
+
 // Version the loop compiled into output after versionPureLoop. `region` is
 // its condition block through its step block; it ends by branching back to
 // the condition. Returns false, changing nothing, when no access qualifies.
-function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Text, loopLabel: Integer, counter: Integer, variable: Integer, position: Text, bound: Text): Boolean {
+// The classified copy of a loop region, with the loop variable aliased to the
+// position when the region stores nothing else into it.
+function loopRegionCopy(region: Text, loopLabel: Integer, variable: Integer, position: Text): LoopCopy {
     let loop = Text(loopLabel)
-    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".fast" + loop, loop: loop, blocks: 0, position: position, variable: "", lists: [], values: [], lengths: [], valueLoads: [], positionLists: [], windowLengths: [], windowLists: [], windowOffsets: [], windowCode: [], windowNames: [], windowHoisted: [], fields: false, texts: [], textLengths: [], textBytes: [] }
+    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".fast" + loop, loop: loop, blocks: 0, position: position, variable: "", indexLocal: "", lists: [], values: [], lengths: [], valueLoads: [], positionLists: [], windowLengths: [], windowLists: [], windowOffsets: [], windowCode: [], windowNames: [], windowHoisted: [], scanLists: [], scanBounds: [], fields: false, texts: [], textLengths: [], textBytes: [] }
     loopClassify(copy)
     // The loop variable is an alias of the position only if the region stores
     // nothing else into it.
@@ -543,8 +984,51 @@ function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Tex
         index = index + 1
     }
     if variable >= 0 && stores == 1 && positionStores == 1 { copy.variable = variableSlot }
+    return copy
+}
+
+// Whether the region is an accumulation the range guard can cover, which is
+// the only reason to version a loop whose checks LLVM already removes.
+function loopRangeCandidate(region: Text, loopLabel: Integer, counter: Integer, variable: Integer, position: Text, bound: Text, walk: Boolean, fallback: Text): Boolean {
+    let copy = loopRegionCopy(region, loopLabel, variable, position)
     let limit = loopInvariant(copy, bound, false)
     if limit == "" { return false }
+    return loopRangeGuard(copy, "%local." + Text(counter), limit, walk, fallback).ok
+}
+
+function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Text, loopLabel: Integer, counter: Integer, variable: Integer, position: Text, bound: Text, walk: Boolean, whileLoop: Boolean, indexLocal: Text): Boolean {
+    let loop = Text(loopLabel)
+    // The copy's own condition label is where a guard that cannot pay sends the
+    // loop: the checked copy, which runs the same code with every test in it.
+    let fallback = "for.checked." + loop
+    if whileLoop { fallback = "while.condition." + loop }
+    let copy = loopRegionCopy(region, loopLabel, variable, position)
+    // A while loop counts in a local of its own, which the body reloads: a load
+    // of it before the region stores it reads the loop position.
+    copy.indexLocal = indexLocal
+    let index = 0
+    let limit = loopInvariant(copy, bound, false)
+    if limit == "" { return false }
+    // A checked accumulation is worth a test of its own: LLVM cannot widen a
+    // loop that traps on every addition. The analysis keeps the copy's guard
+    // unchanged when the region is not a plain accumulation.
+    let guardLines = copy.guard.length
+    let invariantCount = copy.invariant.length
+    let scanCount = copy.scanLists.length
+    let blocksBefore = copy.blocks
+    let ranges = loopRangeGuard(copy, "%local." + Text(counter), limit, walk, fallback)
+    // A while loop has never been versioned for its bounds alone, and its body
+    // may test List lengths LLVM cannot prove: only the growth test earns a
+    // guard there.
+    if whileLoop && !ranges.ok { return false }
+    if !ranges.ok {
+        copy.guard = loopTruncated(copy.guard, guardLines)
+        copy.invariant = loopTruncated(copy.invariant, invariantCount)
+        copy.hoisted = loopTruncated(copy.hoisted, invariantCount)
+        copy.scanLists = loopTruncated(copy.scanLists, scanCount)
+        copy.scanBounds = loopTruncated(copy.scanBounds, scanCount)
+        copy.blocks = blocksBefore
+    }
     // Find every qualifying access first, so the copy uses one value for each
     // hoisted name throughout.
     let getting: List<Text> = []
@@ -572,8 +1056,14 @@ function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Tex
         let values = ""
         if getting[index] != "" { values = loopCheckedList(copy, line, getting[index]) }
         if setting[index] != "" { values = loopCheckedList(copy, line, setting[index]) }
+        let covered = -1
+        if ranges.ok { covered = loopRangeOperation(ranges, index - 1) }
         // Hoisted values are computed once before the loop.
-        if name != "" && loopNamed(copy.invariant, name) >= 0 {
+        if ranges.ok && loopRangeOmitted(ranges, index) {
+            // The growth test covers this operation: no flag, no call.
+        } else if covered >= 0 {
+            body.add("  " + loopRename(copy, ranges.ops[covered].value) + " = " + ranges.ops[covered].operator + " i64 " + loopRename(copy, ranges.ops[covered].left) + ", " + loopRename(copy, ranges.ops[covered].right) + "\n")
+        } else if name != "" && loopNamed(copy.invariant, name) >= 0 {
             values = ""
         } else if getting[index] != "" && values != "" {
             let arguments = loopCallArguments(line, getting[index])
@@ -620,8 +1110,74 @@ function versionCheckedLoop(output: List<Text>, entryPiece: Integer, region: Tex
         all = loopWindowTest(test, loop, listIndex, index, copy.windowOffsets[index], copy.windowLengths[listIndex], first, limit, all)
         index = index + 1
     }
-    output[entryPiece + 1] = "  br i1 %loop.idle." + loop + ", label %for.guard." + loop + ", label %for.checked." + loop + "\n\nfor.guard." + loop + ":\n" + joinText(copy.guard) + joinText(test) + "  br i1 " + all + ", label %for.condition." + loop + copy.suffix + ", label %for.checked." + loop + "\n\n" + joinText(body) + "\nfor.checked." + loop + ":\n" + output[entryPiece + 1]
+    if ranges.ok {
+        // Each List a step reads is scanned once, then each accumulator's
+        // growth is bounded by the number of iterations.
+        copy.guard.add(joinText(ranges.scans))
+        test.add(joinText(ranges.bounds))
+        test.add(joinText(ranges.tests))
+        index = 0
+        while index < ranges.tests.length {
+            let part = "%loop.grow." + loop + "." + Text(index)
+            test.add("  " + part + ".all = and i1 " + all + ", " + part + "\n")
+            all = part + ".all"
+            index = index + 1
+        }
+    }
+    // A for loop gains a checked label for the original body; a while loop
+    // keeps its own condition label and service blocks, so the guard stands
+    // between the entry and the first condition and the copy is one more loop
+    // that ends by branching back into itself.
+    let guardName = "for.guard."
+    let copyLabel = "for.condition." + loop + copy.suffix
+    let tail = "\nfor.checked." + loop + ":\n" + output[entryPiece + 1]
+    let piece = entryPiece + 1
+    if whileLoop {
+        guardName = "while.guard."
+        copyLabel = "while.condition." + loop + copy.suffix
+        tail = "\nwhile.guard.end." + loop + ":\n  br label %while.condition."
+        piece = entryPiece + 2
+    }
+    output[piece] = "  br i1 %loop.idle." + loop + ", label %" + guardName + loop + ", label %" + fallback + "\n\n" + guardName + loop + ":\n" + joinText(copy.guard) + joinText(test) + "  br i1 " + all + ", label %" + copyLabel + ", label %" + fallback + "\n\n" + joinText(body) + tail
     return true
+}
+
+// Version a while loop whose condition compares a counter with a List length
+// and whose body accumulates with checked arithmetic. `entryPiece + 4` opens the
+// condition block, so the pieces after it hold the whole loop; the guard is
+// written over the entry branch at `entryPiece + 2`.
+function versionWhileAccumulation(output: List<Text>, entryPiece: Integer, stepPiece: Integer, loopLabel: Integer, bodyLabel: Integer): Boolean {
+    let loop = Text(loopLabel)
+    if stepPiece + 3 - (entryPiece + 4) > 2000 || stepPiece + 3 <= entryPiece + 4 { return false }
+    let lines: List<Text> = []
+    let piece = entryPiece + 4
+    while piece <= stepPiece + 3 {
+        lines.add(output[piece])
+        piece = piece + 1
+    }
+    let region = joinText(lines)
+    if region.find(".with.overflow.i64(") < 0 || region.find("@.minyar.list.get.") < 0 { return false }
+    let copy = loopRegionCopy(region, loopLabel, -1, "")
+    // The condition's comparison names the counter and the List it walks.
+    let comparison = -1
+    let index = 0
+    while index < copy.lines.length && comparison < 0 {
+        if copy.lines[index].find(" = icmp slt i64 ") >= 0 { comparison = index }
+        index = index + 1
+    }
+    if comparison < 0 { return false }
+    let at = copy.lines[comparison].find(" = icmp slt i64 ") + 16
+    // A comparison repeats no types: its operands are separated by ", ".
+    let parts = copy.lines[comparison].slice(at, copy.lines[comparison].length).split(", ")
+    if parts.length != 2 { return false }
+    let counterLocal = loopLoadedLocal(copy, parts[0])
+    let counter = loopLocalNumber(counterLocal)
+    if counter < 0 { return false }
+    let defined = loopDefinitionLine(copy, parts[1])
+    if defined < 0 || copy.lines[defined].find(" = call i64 @.minyar.list.length(") < 0 { return false }
+    // Only a loop that advances its counter once per iteration visits the
+    // positions one scan reads, which the guard checks again.
+    return versionCheckedLoop(output, entryPiece, region, loopLabel, counter, -1, parts[0], parts[1], true, true, counterLocal)
 }
 
 // --- Text loops ---------------------------------------------------------
@@ -815,7 +1371,7 @@ function loopDropTextTest(copy: LoopCopy, guard: Integer, invariantCount: Intege
 // every enclosing copy, which renames both copies again, so nesting any depth
 // leaves one definition per local name.
 function textLoopVersion(region: Text, loop: Text, label: Text, fields: Boolean): Text {
-    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".text" + loop, loop: loop, blocks: 0, position: "", variable: "", lists: [], values: [], lengths: [], valueLoads: [], positionLists: [], windowLengths: [], windowLists: [], windowOffsets: [], windowCode: [], windowNames: [], windowHoisted: [], fields: fields, texts: [], textLengths: [], textBytes: [] }
+    let copy = LoopCopy { lines: region.split("\n"), defined: [], loaded: [], valueBase: 0, valueLines: [], otherNames: [], otherLines: [], touched: [], invariant: [], hoisted: [], guard: [], suffix: ".text" + loop, loop: loop, blocks: 0, position: "", variable: "", indexLocal: "", lists: [], values: [], lengths: [], valueLoads: [], positionLists: [], windowLengths: [], windowLists: [], windowOffsets: [], windowCode: [], windowNames: [], windowHoisted: [], scanLists: [], scanBounds: [], fields: fields, texts: [], textLengths: [], textBytes: [] }
     loopClassify(copy)
     // The loop's condition label is defined before the region, but the copy
     // ends by branching back to it.
