@@ -1,3 +1,6 @@
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 /* Text operations use validated UTF-8 and scalar positions. Every public
  * entry validates all Text operands before taking empty/length shortcuts. */
 static long long text_scalar_count(const unsigned char *bytes, long long length) {
@@ -39,6 +42,21 @@ static inline long long text_byte_find(const unsigned char *bytes, long long sta
 static inline long long text_byte_scan(const unsigned char *bytes, long long length,
                                        unsigned char wanted, long long *cursor) {
     long long at = *cursor;
+#if defined(__SSE2__)
+    /* Sixteen bytes per test: a line of a few fields is two or three of them,
+     * and the mask names the first separator directly. */
+    __m128i wanted_vector = _mm_set1_epi8((char)wanted);
+    while (length - at >= 16) {
+        __m128i chunk = _mm_loadu_si128((const __m128i *)(const void *)(bytes + at));
+        unsigned mask = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(chunk, wanted_vector));
+        if (mask) {
+            long long hit = at + (long long)__builtin_ctz(mask);
+            *cursor = hit + 1;
+            return hit;
+        }
+        at += 16;
+    }
+#endif
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     uint64_t spread = 0x0101010101010101ULL * wanted;
     while (length - at >= 8) {
@@ -109,6 +127,7 @@ static inline long long *text_search_table(const MinyarText *needle, long long a
     /* text_search_next searches these with the C library's memmem, which
      * needs no table; building one for every search of an IR line was the
      * larger half of a self-compile's Text search time. */
+    (void)small;
     return NULL;
 #else
     return text_search_table_build(needle, small);
@@ -314,7 +333,8 @@ MinyarText *minyar_text_split_next(MinyarText *text, MinyarText *separator, long
         end = start + (lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4);
         next = end;
     } else if (separator->byte_length == 1) {
-        end = text_byte_find(bytes, start, length, separator->bytes[0]);
+        long long scan = start;
+        end = text_byte_scan(bytes, length, separator->bytes[0], &scan);
         next = end < length ? end + 1 : -1;
     } else {
         long long small[TEXT_SEARCH_SMALL];
