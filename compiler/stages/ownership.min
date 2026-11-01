@@ -830,6 +830,8 @@ function finishProvisionalBorrows(context: CompilerContext, output: List<Text>, 
         if borrows.names[memo.length] != "" { genericIndexPut(lookup, borrows.names[memo.length], memo.length) }
         if borrows.natives[memo.length] { memo.add(2) } else { memo.add(0) }
     }
+    let borrowed: List<Boolean> = []
+    while borrowed.length < borrows.starts.length { borrowed.add(false) }
     let index = 0
     while index < borrows.pieces.length {
         let function = borrows.functions[index]
@@ -851,10 +853,13 @@ function finishProvisionalBorrows(context: CompilerContext, output: List<Text>, 
         if keep {
             if slot >= 0 {
                 output[borrows.pieces[index]] = "  call void @minyar_rc_local(i64 " + Text(slot) + ", ptr " + borrows.values[index] + ")\n"
+                kept[function] = true
             } else {
+                // A temporary borrow needs no owner slot: a frame-free function
+                // can still turn it into a retain and a release below.
                 output[borrows.pieces[index]] = "  call void @minyar_rc_borrow(ptr " + borrows.values[index] + ")\n"
+                borrowed[function] = true
             }
-            kept[function] = true
         } else {
             // The slot now starts empty. Its clears go too, unless code that
             // reassigns or moves the binding still writes the slot.
@@ -883,26 +888,38 @@ function finishProvisionalBorrows(context: CompilerContext, output: List<Text>, 
         }
         index = index + 1
     }
+    // A frame the fills did not need goes, and so does one whose only use is a
+    // filled temporary borrow: that borrow becomes a retain the statement
+    // end releases, exactly as a compiled borrow would have.
+    let fixups = functionCycleFixups(returnTypes, 0)
     let function = 0
     while function < borrows.starts.length {
         let start = borrows.starts[function]
         let end = borrows.ends[function]
-        if !kept[function] && borrows.elidable[function] && !rangeUsesFrame(output, start + 1, end) {
-            let entry = output[start]
-            let enter = entry.find("  call void @minyar_rc_enter(i64 ")
-            if enter >= 0 {
-                let rest = entry.slice(enter, entry.length)
-                let close = rest.find(")\n")
-                output[start] = entry.slice(0, enter) + rest.slice(close + 2, rest.length)
-                let piece = start + 1
-                while piece < end {
-                    output[piece] = withoutServiceCalls(output[piece])
-                    piece = piece + 1
-                }
-                settleIdleQueriesIn(output, start + 1, end)
-            }
+        if !kept[function] && borrows.elidable[function] {
+            let free = !rangeUsesFrame(output, start + 1, end)
+            if !free && borrowed[function] { free = releaseStatementTemporaries(output, start + 1, end, fixups) && !rangeUsesFrame(output, start + 1, end) }
+            if free { elideProvisionalFrame(output, start, end) }
         }
         function = function + 1
+    }
+}
+
+// Removes the frame a provisional function turned out not to need: its entry
+// loses the enter, and every service point and idle query in the body goes.
+function elideProvisionalFrame(output: List<Text>, start: Integer, end: Integer) {
+    let entry = output[start]
+    let enter = entry.find("  call void @minyar_rc_enter(i64 ")
+    if enter >= 0 {
+        let rest = entry.slice(enter, entry.length)
+        let close = rest.find(")\n")
+        output[start] = entry.slice(0, enter) + rest.slice(close + 2, rest.length)
+        let piece = start + 1
+        while piece < end {
+            output[piece] = withoutServiceCalls(output[piece])
+            piece = piece + 1
+        }
+        settleIdleQueriesIn(output, start + 1, end)
     }
 }
 
@@ -957,14 +974,14 @@ function blockAssignsEither(tokenKinds: List<Integer>, tokenTexts: List<Text>, s
 // that, a retain and an explicit release at that point replace the frame: the
 // function needs no frame. A temporary whose call a cycle fixup may still
 // rewrite keeps its frame. Returns false, changing nothing, otherwise.
-function releaseStatementTemporaries(output: List<Text>, start: Integer, fixups: List<Integer>): Boolean {
+function releaseStatementTemporaries(output: List<Text>, start: Integer, limit: Integer, fixups: List<Integer>): Boolean {
     let sites: List<Integer> = []
     let widths: List<Integer> = []
     let values: List<Text> = []
     let borrows: List<Boolean> = []
     let ends: List<Integer> = []
     let piece = start
-    while piece < output.length {
+    while piece < limit {
         let text = output[piece]
         // A loop keeps its frame: its back edge is the cleanup service point
         // that keeps a long loop from starving pending retirement.
