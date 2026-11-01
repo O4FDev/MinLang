@@ -126,3 +126,33 @@ Hidden (box B): h geomean=4.826 max=12.940 over2=18 failed=0 | vs Rust 3.236 / 9
   (with c8: h 4.671 but b07 failed to compile — reverted).  Baseline 3832f4373: h 7.453 / max 19.47.
 Visible compare (box M, 22 programs): 2.52 vs fastest, 2.03 vs Rust; worst json 6.38 (baseline 5.32 on 21 programs).
 Gates: sharded 3-way full gate (M/K/J) green except box-env check-determinism-runtime; b07 verified at 1 and 4 threads.
+
+## Run 2 merges (2026-10-31 20:30 → 2026-11-01 02:45 UTC, box B, cachegrind Ir; every merge gated GREEN on M/K/J first)
+| goal tip | what landed | hidden h geomean (vs Rust) | worst h | b serial | visible compare (vs Rust) |
+|---|---|---|---|---|---|
+| 86f8a0405 | run-2 start (c8 reverted) | 4.826 (3.236) | 12.94 | 3.460 | 2.52 (2.03) |
+| a9edf1232 | determinism fix + c8 Text loop versioning re-land | 4.671 (3.133) | 12.94 | 3.282 | — |
+| f77542df3 | real-world suite, dev-check v3, reports (no code) | 4.671 | 12.94 | 3.282 | unchanged |
+| c8d30adca | Map hashing (map) + positional `split` (txt) | **4.384 (2.941)** | 11.10 | 3.117 | 2.34 (txt alone vs a9edf1232; map −5.7% intmap) |
+| 1ab0fef98 | `httpstls.listenTLS` (SYS-18) + compiler huge pages (self-compile −12% wall) | 4.384 | 11.10 | 3.117 | unchanged (compiler-only) |
+| b27b0710b | dev-check selection fixes (no code) | 4.384 | 11.10 | 3.117 | unchanged |
+Rejected by the hidden re-score although gate-GREEN: cg's global unroll threshold (one compute program +3.2%), first txt
+version (two programs +1.1/+1.6%, quadratic split reads), res eager retirement v1 (one RC-heavy program +0.45%).
+
+## 4-thread re-measure, quiet box B, 2026-11-01 01:28–02:40 UTC (a9edf1232 vs goal tip b27b0710b)
+Hidden b programs: 5 interleaved score.sh rounds per tree, median of the `parallel` ratio (Minyar 4-thread wall / fastest
+cached parallel reference); all outputs identical, serial Ir unchanged or lower.
+| program | a9edf1232 median (range) | goal tip median (range) | delta |
+|---|---|---|---|
+| b01 | 1.623 (1.39–1.67) | 1.590 (1.34–3.05) | −2.0% |
+| b02 | 1.883 (1.77–1.92) | 1.869 (1.50–2.66) | −0.7% |
+| b03 | 2.854 (2.47–3.32) | 2.558 (2.17–4.54) | −10.4% |
+| b04 | 3.808 (3.35–3.92) | 3.871 (3.49–5.87) | +1.7% (inside the base's own range) |
+| b05 | 4.943 (4.64–5.30) | 4.910 (4.58–6.83) | −0.7% |
+| b06 | 1.019 (0.98–1.09) | 0.966 (0.89–1.58) | −5.2% |
+| b07 | 1.642 (1.61–1.75) | 1.631 (1.58–2.12) | −0.7% |
+benchmarks/bothmodes (7 interleaved repeats): Ir at 1 and 4 threads identical or lower (textindex@4 3,406.5M → 3,244.0M);
+parallel wall geomean 1.56 → 1.56; mapreduce@4 wall 1.44 → 1.59 with identical 4-thread Ir and sd larger than the gap
+(noise). Verdict: no program slower in parallel mode beyond noise. Logs: ~/Projects/minyar-goal-20261030/logs/pm-20261101/.
+Note: single score.sh runs swing up to ±50% in the parallel column (wall time, cached references); only medians over
+interleaved rounds may be used to judge a parallel regression.

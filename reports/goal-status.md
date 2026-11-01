@@ -4,6 +4,10 @@ misses after idle waits, now being cut by ending agent sessions on waits and res
 the budget reaches $13 (where I stop re-dispatching, keeping $2 for fixes) around 04:00–06:00 UTC, 15+ hours before the
 21:00 stop. Raise it? Until you answer, lanes are paced, not stopped.
 
+**Trade-off awaiting you — Float contraction (FMA):** nbody 1.30× → 1.11× of C, but `a * b + c` is rounded once instead
+of twice, so some Float results print differently. On side branch `goal/r2-cg-fma`, not merged; before/after program in
+reports/tradeoffs.md once the cg lane writes it.
+
 # DECISION FOR LUKE — opt-in `region { … }` block (c5 measured a 29–76% Ir ceiling on parse-then-drop programs)
 ```minyar
 // before (today): every node of `tree` is freed object by object through the bounded cleanup scheduler
@@ -48,7 +52,12 @@ a clean hidden re-score (no program slower than +0.1% Ir) and a clean visible co
 | + 01a0bfe46 determinism fix + c8 re-land a9edf1232 | **4.671 (3.133)** | 3.282 / 2.175, b07 compiles | exprparse −5.6%, tokenizer −5.3% | nested Text loop copies get unique names |
 | candidate r2b (cg unroll, memmem, txt split) — not merged | 4.477 (3.002) | 3.168 / 1.850 | 2.37 (1.91) | h12 +4.9% (cg +3.2%, txt +1.6%), h04 +1.1% (txt), wordfreq +0.25% (memmem): lanes reworking |
 | candidate r2d (res eager small-aggregate retirement) — not merged | 4.611 (3.093) | 3.252 / 2.073 | — | h17 +0.45%: res reworking |
-| candidate r2e (tooling + docs: real-world suite, dev-check v3, reports) | unchanged | unchanged | unchanged | gating |
+| r2e merged f77542df3 (tooling + docs) | 4.671 | 3.282 | unchanged | |
+| r2h2 merged c8d30adca (Map hashing + txt positional split, both reworked) | **4.384 (2.941)** | 3.117 | 2.34 | h06 −32%, h13 −25%, h20 −19%, h08 −14%; nothing slower |
+| r2i+r2j merged 1ab0fef98 (httpstls listener; compiler huge pages) | 4.384 | 3.117 | unchanged | SYS-18 closed in Minyar; objstore adopts one line |
+| r2l merged b27b0710b (dev-check narrows: compiler edit ~24/337 checks) | 4.384 | 3.117 | unchanged | |
+| 4-thread re-measure (quiet box B, n=5 medians) | — | parallel: no program slower beyond noise | bothmodes Ir@4 equal or lower | scoreboard.md |
+| in flight | brw (treewalk −25%; RED after rebase: crash hunt), esc+fbip (inline List slots + buffer reuse), res2, cg | | | |
 Gap register: SYS-18 (`http.listenTLS`, blocks minyar-objstore) added and in progress; SYS-19 (projects behind the
 `Text(bytes)` API change) filed to the owning loops.
 
