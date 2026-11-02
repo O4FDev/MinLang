@@ -157,27 +157,28 @@ public function errorJson(error: rpc.Error): Bytes {
 // Reads a Connect JSON error body, or None when it is not one.
 public function parseErrorJson(body: Bytes): Maybe<rpc.Error> {
     match json.decodeBytes(body, body.length + 1) {
-        Ok(value) {
-            if value.kind != json.OBJECT { return None }
-            let code = rpc.codeFromName(textMember(value, "code"))
-            if code < 0 { return None }
-            let error = rpc.failure(code, textMember(value, "message"))
-            if value.hasMember("details") {
-                let details = value.member("details")
-                if details.kind == json.ARRAY {
-                    for item in details.items {
-                        if item.kind != json.OBJECT { continue }
-                        match unbase64(textMember(item, "value")) {
-                            Some(data) { error.details.add(rpc.Detail { type: textMember(item, "type"); value: data }) }
-                            None {}
-                        }
-                    }
-                }
-            }
-            return Some(error)
-        }
+        Ok(value) { return errorValue(value) }
         Err(_) { return None }
     }
+}
+function errorValue(value: json.Value): Maybe<rpc.Error> {
+    if value.kind != json.OBJECT { return None }
+    let code = rpc.codeFromName(textMember(value, "code"))
+    if code < 0 { return None }
+    let error = rpc.failure(code, textMember(value, "message"))
+    if value.hasMember("details") {
+        let details = value.member("details")
+        if details.kind == json.ARRAY {
+            for item in details.items {
+                if item.kind != json.OBJECT { continue }
+                match unbase64(textMember(item, "value")) {
+                    Some(data) { error.details.add(rpc.Detail { type: textMember(item, "type"); value: data }) }
+                    None {}
+                }
+            }
+        }
+    }
+    return Some(error)
 }
 function textMember(value: json.Value, name: Text): Text {
     if !value.hasMember(name) { return "" }
@@ -619,9 +620,11 @@ public function Server.begin(request: Request): Exchange {
     let path = normalized.target
     let question = path.find("?")
     if question >= 0 { path = path.slice(0, question) }
-    let kind = rpc.UNARY
+    // Unknown procedures are answered at once; other calls that take one
+    // request message wait for the whole body.
+    let kind = -1
     match self.services.lookup(path) { Some(method) { kind = method.kind() } None {} }
-    if normalized.method != "POST" || (kind != rpc.CLIENT_STREAM && kind != rpc.BIDI_STREAM) {
+    if kind >= 0 && (normalized.method != "POST" || (kind != rpc.CLIENT_STREAM && kind != rpc.BIDI_STREAM)) {
         let exchange = self.answered(origin, Response { status: 0; headers: []; body: Bytes() })
         exchange.immediate = None
         exchange.done = false
@@ -1188,6 +1191,12 @@ public record Client {
     sendCompression: Text
     compressMinBytes: Integer
     maxResponseBytes: Integer
+    // "connect", or "grpc" to speak gRPC to a gRPC server; gRPC and
+    // streaming calls need `opener`.
+    protocol: Text
+    // Opens one HTTP exchange that streams both ways, such as an HTTP/2
+    // stream; the Integer is the call's timeout in milliseconds, or -1.
+    opener: Maybe<(Request, Integer) -> Result<Wire, rpc.Error>>
     private keyPrefix: Text
     private serial: Integer
 }
@@ -1195,7 +1204,21 @@ public record Client {
 /// across clients: give each process random text, such as 16 random bytes in hex.
 public function client(baseUrl: Text, codec: Text, transport: (Request) -> Result<Response, rpc.Error>, keyPrefix: Text): Client {
     return Client { baseUrl: baseUrl; codec: codec; headers: []; transport: transport; attempts: 3; compressors: [];
-        sendCompression: ""; compressMinBytes: 1024; maxResponseBytes: 16777216; keyPrefix: keyPrefix; serial: 0 }
+        sendCompression: ""; compressMinBytes: 1024; maxResponseBytes: 16777216; protocol: "connect"; opener: None; keyPrefix: keyPrefix; serial: 0 }
+}
+/// A client whose calls of every kind travel over `opener`'s exchanges, such
+/// as HTTP/2 streams from library/connecth2.min.
+public function streamingClient(baseUrl: Text, codec: Text, opener: (Request, Integer) -> Result<Wire, rpc.Error>, keyPrefix: Text): Client {
+    let made = client(baseUrl, codec, wireTransport(opener), keyPrefix)
+    made.opener = Some(opener)
+    return made
+}
+/// A gRPC client for "proto" or "json" over `opener`'s HTTP/2 streams. The
+/// same calls, typed helpers and generated clients work as over Connect.
+public function grpcClient(baseUrl: Text, codec: Text, opener: (Request, Integer) -> Result<Wire, rpc.Error>): Client {
+    let made = streamingClient(baseUrl, codec, opener, "")
+    made.protocol = "grpc"
+    return made
 }
 public record CallOptions {
     headers: List<rpc.Header>
@@ -1309,6 +1332,7 @@ public function Client.reply(response: Response): Result<Reply, Failure> {
 /// repeated; the same Idempotency-Key lets the server answer a retry without
 /// running the handler again.
 public function Client.unary(procedure: Text, message: Bytes, options: CallOptions): Result<Reply, Failure> {
+    if self.protocol == "grpc" { return self.grpcUnary(procedure, message, options) }
     let retryable = options.idempotency != rpc.IDEMPOTENCY_UNKNOWN || options.get
     let key = options.idempotencyKey
     if key == "" && options.idempotency != rpc.NO_SIDE_EFFECTS && !options.get && self.keyPrefix != "" {
@@ -1360,4 +1384,595 @@ public function call<Request, Reply>(client: Client, procedure: Text, request: R
         }
     }
     return Err(Failure { error: rpc.failure(rpc.INTERNAL, "no " + client.codec + " codec for this reply"); headers: reply.headers; trailers: reply.trailers })
+}
+
+// ---- Streaming client: Connect streams and gRPC over a Wire
+
+/// One HTTP request and its response as they happen, from a transport that
+/// streams both ways, such as an HTTP/2 stream. The opener sends the request
+/// head; the body follows through `write`. A socket transport's `read`
+/// waits for the next event (and ends the call when its timeout passes); a
+/// transport that cannot wait, such as one a simulation drives, returns
+/// Pending instead.
+public record Wire {
+    // Request body bytes; false when the exchange is over.
+    write: (Bytes) -> Boolean
+    // Ends the request body.
+    close: () -> Nothing
+    // Abandons the exchange, as HTTP/2 RST_STREAM CANCEL does.
+    cancel: () -> Nothing
+    read: () -> Arrival
+}
+public choice Arrival {
+    Pending
+    Head(status: Integer, headers: List<rpc.Header>)
+    Data(data: Bytes)
+    // The response is complete, with its HTTP trailers (often none).
+    Ended(trailers: List<rpc.Header>)
+    // The exchange failed: reset, lost connection or timeout.
+    Broken(error: rpc.Error)
+}
+
+/// The next thing a streaming call has for its caller.
+public choice Received<Item> {
+    Message(message: Item)
+    // Nothing yet, from a transport that cannot wait.
+    Waiting
+    // The response ended successfully; trailers are complete.
+    Finished
+    Failed(failure: Failure)
+}
+
+/// One streaming call from the client side, in bytes: send request messages,
+/// close the sending side, receive replies. Every call kind works this way;
+/// unary and client-stream calls receive exactly one message.
+public record Stream {
+    private client: Client
+    private wire: Maybe<Wire>
+    private grpc: Boolean
+    private kind: Integer
+    private sendClosed: Boolean
+    private headSeen: Boolean
+    private headers: List<rpc.Header>
+    private trailers: List<rpc.Header>
+    private input: Bytes
+    private replies: List<Bytes>
+    private received: Integer
+    private decompressor: Maybe<Compressor>
+    // Connect: the end-of-stream message arrived.
+    private endSeen: Boolean
+    // gRPC: the status, once headers or trailers carried it.
+    private status: Maybe<rpc.Error>
+    private finished: Boolean
+    private failure: Maybe<Failure>
+}
+// Response headers, once they arrived (empty before).
+public function Stream.headers(): List<rpc.Header> { return self.headers }
+// Response trailers, complete once receive says Finished or Failed.
+public function Stream.trailers(): List<rpc.Header> { return self.trailers }
+// True until the call finished, failed or was canceled.
+public function Stream.active(): Boolean { return !self.finished && self.failure.isNone() }
+
+/// Opens a call of `kind` (rpc.UNARY, SERVER_STREAM, CLIENT_STREAM or
+/// BIDI_STREAM). A failure to open shows up on the first receive.
+public function Client.stream(procedure: Text, kind: Integer, options: CallOptions): Stream {
+    let stream = Stream { client: self; wire: None; grpc: self.protocol == "grpc"; kind: kind; sendClosed: false; headSeen: false
+        headers: []; trailers: []; input: Bytes(); replies: []; received: 0; decompressor: None; endSeen: false; status: None
+        finished: false; failure: None }
+    match self.opener {
+        Some(opener) {
+            match opener(self.streamRequest(procedure, kind, options), options.timeoutMilliseconds) {
+                Ok(wire) { stream.wire = Some(wire) }
+                Err(error) { stream.fail(error) }
+            }
+        }
+        None { stream.fail(rpc.failure(rpc.UNIMPLEMENTED, "this client has no streaming transport; make it with streamingClient")) }
+    }
+    return stream
+}
+function Client.streamRequest(procedure: Text, kind: Integer, options: CallOptions): Request {
+    let headers: List<rpc.Header> = []
+    for field in self.headers { headers.add(rpc.Header { name: field.name.asciiLowercased(); value: field.value }) }
+    for field in options.headers { headers.add(rpc.Header { name: field.name.asciiLowercased(); value: field.value }) }
+    let names: List<Text> = []
+    for item in self.compressors { names.add(item.name) }
+    if self.protocol == "grpc" {
+        headers.add(rpc.Header { name: "content-type"; value: "application/grpc+" + self.codec })
+        headers.add(rpc.Header { name: "te"; value: "trailers" })
+        if options.timeoutMilliseconds >= 0 { headers.add(rpc.Header { name: "grpc-timeout"; value: grpcTimeout(options.timeoutMilliseconds) }) }
+        if self.sendCompression != "" { headers.add(rpc.Header { name: "grpc-encoding"; value: self.sendCompression }) }
+        if names.length > 0 { headers.add(rpc.Header { name: "grpc-accept-encoding"; value: joinText(names, ",") }) }
+    } else {
+        headers.add(rpc.Header { name: "content-type"; value: "application/connect+" + self.codec })
+        headers.add(rpc.Header { name: "connect-protocol-version"; value: "1" })
+        if options.timeoutMilliseconds >= 0 { headers.add(rpc.Header { name: "connect-timeout-ms"; value: Text(options.timeoutMilliseconds) }) }
+        if self.sendCompression != "" { headers.add(rpc.Header { name: "connect-content-encoding"; value: self.sendCompression }) }
+        if names.length > 0 { headers.add(rpc.Header { name: "connect-accept-encoding"; value: joinText(names, ",") }) }
+    }
+    return Request { method: "POST"; target: self.baseUrl + procedure; headers: headers; body: Bytes() }
+}
+// grpc-timeout: at most eight digits, in the finest unit that fits.
+function grpcTimeout(milliseconds: Integer): Text {
+    if milliseconds < 100000000 { return Text(milliseconds) + "m" }
+    if milliseconds / 1000 < 100000000 { return Text(milliseconds / 1000) + "S" }
+    if milliseconds / 60000 < 100000000 { return Text(milliseconds / 60000) + "M" }
+    return Text(min(99999999, milliseconds / 3600000)) + "H"
+}
+
+/// Sends one request message. False when the call is over or its sending
+/// side is closed; receive tells why.
+public function Stream.send(message: Bytes): Boolean {
+    if self.sendClosed || !self.active() { return false }
+    let flags = 0
+    let body = message
+    if self.client.sendCompression != "" && message.length >= self.client.compressMinBytes {
+        for compressor in self.client.compressors {
+            if compressor.name == self.client.sendCompression {
+                match compressor.compress(message) {
+                    Ok(packed) {
+                        body = packed
+                        flags = 1
+                    }
+                    Err(_) {}
+                }
+            }
+        }
+    }
+    match self.wire {
+        Some(wire) { return wire.write(envelope(flags, body)) }
+        None { return false }
+    }
+}
+/// Ends the sending side: the server sees the end of the request stream.
+public function Stream.closeSend() {
+    if self.sendClosed { return }
+    self.sendClosed = true
+    match self.wire { Some(wire) { wire.close() } None {} }
+}
+/// Cancels the call: the server sees a reset, and receive returns CANCELED
+/// unless the call already finished.
+public function Stream.cancel() {
+    if !self.active() { return }
+    match self.wire { Some(wire) { wire.cancel() } None {} }
+    self.replies = []
+    self.fail(rpc.failure(rpc.CANCELED, "the call was canceled"))
+}
+function Stream.fail(error: rpc.Error) {
+    if self.failure.isSome() || self.finished { return }
+    self.failure = Some(Failure { error: error; headers: self.headers; trailers: self.trailers })
+    self.sendClosed = true
+}
+
+/// The next reply, or why there are no more.
+public function Stream.receive(): Received<Bytes> {
+    while true {
+        if self.replies.length > 0 {
+            let reply = self.replies[0]
+            self.replies = self.replies.slice(1, self.replies.length)
+            return Message(reply)
+        }
+        match self.failure { Some(failure) { return Failed(failure) } None {} }
+        if self.finished { return Finished }
+        match self.wire.unwrap().read() {
+            Pending { return Waiting }
+            Head(status, headers) { self.head(status, lowerHeaders(headers)) }
+            Data(data) {
+                if !self.headSeen { self.fail(rpc.failure(rpc.INTERNAL, "response data before headers")) }
+                else if self.endSeen || self.status.isSome() { self.fail(rpc.failure(rpc.INTERNAL, "response data after the end of the stream")) }
+                else {
+                    self.input.addBytes(data)
+                    self.messages()
+                }
+            }
+            Ended(trailers) { self.end(lowerHeaders(trailers)) }
+            Broken(error) { self.fail(error) }
+        }
+    }
+    return Finished
+}
+function Stream.head(status: Integer, headers: List<rpc.Header>) {
+    if self.headSeen { return }
+    self.headSeen = true
+    if self.grpc {
+        // A trailers-only response carries its status in the headers.
+        if rpc.headerValue(headers, "grpc-status") != "" {
+            self.trailers = headers
+            self.status = Some(grpcStatus(headers))
+        } else { self.headers = headers }
+    } else { self.headers = headers }
+    if status != 200 {
+        let code = codeForStatus(status)
+        if self.grpc { code = grpcCodeForStatus(status) }
+        self.fail(rpc.failure(code, "HTTP status " + Text(status)))
+        return
+    }
+    let contentType = rpc.headerValue(headers, "content-type")
+    if self.grpc {
+        if contentType != "application/grpc" && !contentType.startsWith("application/grpc+") && !contentType.startsWith("application/grpc;") {
+            self.fail(rpc.failure(rpc.UNKNOWN, "unexpected response content-type " + contentType))
+            return
+        }
+    } else if codecFromContentType(contentType, true) != self.client.codec {
+        self.fail(rpc.failure(rpc.INTERNAL, "unexpected response content-type " + contentType))
+        return
+    }
+    let encodingHeader = "connect-content-encoding"
+    if self.grpc { encodingHeader = "grpc-encoding" }
+    let encoding = rpc.headerValue(headers, encodingHeader).asciiLowercased()
+    if encoding != "" && encoding != "identity" {
+        for compressor in self.client.compressors { if compressor.name == encoding { self.decompressor = Some(compressor) } }
+        if self.decompressor.isNone() { self.fail(rpc.failure(rpc.INTERNAL, "unknown response compression " + encoding)) }
+    }
+}
+// Splits complete envelopes off the input into replies or the end message.
+function Stream.messages() {
+    while self.input.length >= 5 && self.active() && !self.endSeen {
+        let flags = self.input[0]
+        let length = (self.input[1] << 24) | (self.input[2] << 16) | (self.input[3] << 8) | self.input[4]
+        if length > self.client.maxResponseBytes {
+            self.fail(rpc.failure(rpc.RESOURCE_EXHAUSTED, "response message is larger than " + Text(self.client.maxResponseBytes) + " bytes"))
+            return
+        }
+        if self.input.length < 5 + length { return }
+        let data = self.input.slice(5, 5 + length)
+        self.input = self.input.slice(5 + length, self.input.length)
+        let ending = !self.grpc && (flags & 2) == 2
+        if (flags & 1) == 1 {
+            match self.decompressor {
+                Some(compressor) {
+                    match compressor.decompress(data, self.client.maxResponseBytes) {
+                        Ok(expanded) { data = expanded }
+                        Err(problem) {
+                            let code = rpc.INTERNAL
+                            if errors.code(problem) == errors.overflowCode() { code = rpc.RESOURCE_EXHAUSTED }
+                            self.fail(rpc.failure(code, "cannot decompress response: " + problem.message()))
+                            return
+                        }
+                    }
+                }
+                None {
+                    self.fail(rpc.failure(rpc.INTERNAL, "compressed response message without an encoding"))
+                    return
+                }
+            }
+        }
+        if ending {
+            self.endSeen = true
+            self.endMessage(data)
+            return
+        }
+        if (flags & 254) != 0 {
+            self.fail(rpc.failure(rpc.INTERNAL, "unexpected envelope flags " + Text(flags)))
+            return
+        }
+        self.received += 1
+        if (self.kind == rpc.UNARY || self.kind == rpc.CLIENT_STREAM) && self.received > 1 {
+            self.fail(rpc.failure(rpc.UNIMPLEMENTED, "more than one response message"))
+            return
+        }
+        self.replies.add(data)
+    }
+}
+// A Connect end-of-stream message: an optional error and the trailers.
+function Stream.endMessage(data: Bytes) {
+    match json.decodeBytes(data, data.length + 1) {
+        Ok(value) {
+            if value.kind != json.OBJECT {
+                self.fail(rpc.failure(rpc.INTERNAL, "malformed end-of-stream message"))
+                return
+            }
+            if value.hasMember("metadata") {
+                let metadata = value.member("metadata")
+                if metadata.kind == json.OBJECT {
+                    for index in 0..metadata.keys.length {
+                        let values = metadata.items[index]
+                        if values.kind != json.ARRAY { continue }
+                        for item in values.items {
+                            if item.kind == json.STRING { self.trailers.add(rpc.Header { name: metadata.keys[index].asciiLowercased(); value: item.text }) }
+                        }
+                    }
+                }
+            }
+            if value.hasMember("error") {
+                match errorValue(value.member("error")) {
+                    Some(error) { self.status = Some(error) }
+                    None { self.status = Some(rpc.failure(rpc.UNKNOWN, "malformed error in the end-of-stream message")) }
+                }
+            }
+        }
+        Err(_) { self.fail(rpc.failure(rpc.INTERNAL, "malformed end-of-stream message")) }
+    }
+}
+// The response ended: settle the call's outcome.
+function Stream.end(trailers: List<rpc.Header>) {
+    if !self.active() { return }
+    if !self.headSeen {
+        self.fail(rpc.failure(rpc.INTERNAL, "the response ended without headers"))
+        return
+    }
+    if self.grpc && self.status.isNone() {
+        self.trailers = trailers
+        if rpc.headerValue(trailers, "grpc-status") == "" {
+            self.fail(rpc.failure(rpc.INTERNAL, "the response has no grpc-status"))
+            return
+        }
+        self.status = Some(grpcStatus(trailers))
+    }
+    if self.input.length > 0 {
+        self.fail(rpc.failure(rpc.INTERNAL, "incomplete response message"))
+        return
+    }
+    if !self.grpc && !self.endSeen {
+        self.fail(rpc.failure(rpc.INTERNAL, "the response ended without an end-of-stream message"))
+        return
+    }
+    match self.status {
+        Some(error) {
+            if error.code != rpc.OK {
+                self.replies = []
+                self.fail(error)
+                return
+            }
+        }
+        None {}
+    }
+    if (self.kind == rpc.UNARY || self.kind == rpc.CLIENT_STREAM) && self.received == 0 {
+        self.fail(rpc.failure(rpc.UNIMPLEMENTED, "the response has no message"))
+        return
+    }
+    self.finished = true
+}
+
+// ---- gRPC status
+
+// The code a gRPC client infers from an HTTP status other than 200.
+public function grpcCodeForStatus(status: Integer): Integer {
+    if status == 400 { return rpc.INTERNAL }
+    if status == 401 { return rpc.UNAUTHENTICATED }
+    if status == 403 { return rpc.PERMISSION_DENIED }
+    if status == 404 { return rpc.UNIMPLEMENTED }
+    if status == 429 || status == 502 || status == 503 || status == 504 { return rpc.UNAVAILABLE }
+    return rpc.UNKNOWN
+}
+// The status in gRPC trailers: grpc-status, grpc-message (percent-encoded)
+// and grpc-status-details-bin (a base64 google.rpc.Status). Code 0 is OK.
+function grpcStatus(trailers: List<rpc.Header>): rpc.Error {
+    let text = rpc.headerValue(trailers, "grpc-status")
+    let code = timeoutMilliseconds(text)
+    if code < 0 || code > 16 { return rpc.failure(rpc.UNKNOWN, "invalid grpc-status " + text) }
+    let message = percentDecoded(rpc.headerValue(trailers, "grpc-message"))
+    let error = rpc.Error { code: code; message: message; details: [] }
+    let encoded = rpc.headerValue(trailers, "grpc-status-details-bin")
+    if encoded != "" {
+        match unbase64(encoded) {
+            Some(data) { statusDetails(data, error) }
+            None {}
+        }
+    }
+    return error
+}
+function percentDecoded(value: Text): Text {
+    if value.find("%") < 0 { return value }
+    let input = Bytes(value)
+    let out = Bytes()
+    let at = 0
+    while at < input.length {
+        if input[at] == 37 && at + 2 < input.length && hexValue(input[at + 1]) >= 0 && hexValue(input[at + 2]) >= 0 {
+            out.add(hexValue(input[at + 1]) * 16 + hexValue(input[at + 2]))
+            at += 3
+        } else {
+            out.add(input[at])
+            at += 1
+        }
+    }
+    return match utf8.decode(out) {
+        Ok(text) { text }
+        Err(_) { value }
+    }
+}
+record Field { number: Integer; wire: Integer; value: Integer; data: Bytes }
+// The fields of one Protobuf message: varints and length-delimited values;
+// None when malformed or another wire type.
+function fields(data: Bytes): Maybe<List<Field>> {
+    let found: List<Field> = []
+    let at = 0
+    while at < data.length {
+        let tag = 0
+        let shift = 0
+        while true {
+            if at >= data.length || shift > 63 { return None }
+            tag = tag | ((data[at] & 127) << shift)
+            at += 1
+            if (data[at - 1] & 128) == 0 { break }
+            shift += 7
+        }
+        let wire = tag & 7
+        let value = 0
+        shift = 0
+        if wire != 0 && wire != 2 { return None }
+        while true {
+            if at >= data.length || shift > 63 { return None }
+            value = value | ((data[at] & 127) << shift)
+            at += 1
+            if (data[at - 1] & 128) == 0 { break }
+            shift += 7
+        }
+        if wire == 0 { found.add(Field { number: tag >> 3; wire: 0; value: value; data: Bytes() }) }
+        else {
+            if value < 0 || value > data.length - at { return None }
+            found.add(Field { number: tag >> 3; wire: 2; value: value; data: data.slice(at, at + value) })
+            at += value
+        }
+    }
+    return Some(found)
+}
+// google.rpc.Status { code = 1; message = 2; repeated google.protobuf.Any details = 3 }.
+function statusDetails(data: Bytes, error: rpc.Error) {
+    match fields(data) {
+        Some(found) {
+            for field in found {
+                if field.number != 3 || field.wire != 2 { continue }
+                let type = ""
+                let value = Bytes()
+                match fields(field.data) {
+                    Some(any) {
+                        for part in any {
+                            if part.number == 1 && part.wire == 2 { type = utf8.decodeOrStop(part.data) }
+                            if part.number == 2 && part.wire == 2 { value = part.data }
+                        }
+                    }
+                    None { continue }
+                }
+                let slash = type.find("/")
+                while slash >= 0 {
+                    type = type.slice(slash + 1, type.length)
+                    slash = type.find("/")
+                }
+                error.details.add(rpc.Detail { type: type; value: value })
+            }
+        }
+        None {}
+    }
+}
+
+// ---- Calls over a Wire
+
+// A unary transport over an opener: the whole request, then the whole response.
+function wireTransport(opener: (Request, Integer) -> Result<Wire, rpc.Error>): (Request) -> Result<Response, rpc.Error> {
+    return function(request: Request): Result<Response, rpc.Error> {
+        let timeout = timeoutMilliseconds(rpc.headerValue(request.headers, "connect-timeout-ms"))
+        let head = Request { method: request.method; target: request.target; headers: request.headers; body: Bytes() }
+        let wire = try opener(head, max(-1, timeout))
+        if request.body.length > 0 && !wire.write(request.body) { return Err(rpc.failure(rpc.UNAVAILABLE, "the request could not be sent")) }
+        wire.close()
+        let response = Response { status: 0; headers: []; body: Bytes() }
+        while true {
+            match wire.read() {
+                Pending { return Err(rpc.failure(rpc.UNIMPLEMENTED, "unary calls need a transport that waits")) }
+                Head(status, headers) {
+                    response.status = status
+                    response.headers = headers
+                }
+                Data(data) { response.body.addBytes(data) }
+                Ended(_) { return Ok(response) }
+                Broken(error) { return Err(error) }
+            }
+        }
+        return Err(rpc.failure(rpc.UNKNOWN, "unreachable"))
+    }
+}
+// A gRPC unary call: one message each way over a stream.
+function Client.grpcUnary(procedure: Text, message: Bytes, options: CallOptions): Result<Reply, Failure> {
+    let retryable = options.idempotency != rpc.IDEMPOTENCY_UNKNOWN
+    let attempt = 0
+    while true {
+        attempt += 1
+        let stream = self.stream(procedure, rpc.UNARY, options)
+        stream.send(message)
+        stream.closeSend()
+        let reply: Maybe<Bytes> = None
+        let failure = Failure { error: rpc.failure(rpc.UNKNOWN, ""); headers: []; trailers: [] }
+        let waiting = true
+        while waiting {
+            match stream.receive() {
+                Message(data) { reply = Some(data) }
+                Waiting {
+                    stream.cancel()
+                    return Err(Failure { error: rpc.failure(rpc.UNIMPLEMENTED, "unary calls need a transport that waits"); headers: []; trailers: [] })
+                }
+                Finished { return Ok(Reply { message: reply.unwrap(); headers: stream.headers; trailers: stream.trailers }) }
+                Failed(problem) {
+                    failure = problem
+                    waiting = false
+                }
+            }
+        }
+        if failure.error.code != rpc.UNAVAILABLE || !retryable || attempt >= self.attempts { return Err(failure) }
+    }
+    return Err(Failure { error: rpc.failure(rpc.UNKNOWN, "unreachable"); headers: []; trailers: [] })
+}
+
+// ---- Typed streaming calls for generated client code
+
+/// A streaming call with typed messages: use send, receive and reply, and the
+/// Stream for closeSend, cancel, headers and trailers.
+public record StreamCall<Request, Reply> {
+    stream: Stream
+    private requests: List<rpc.Codec<Request>>
+    private replies: List<rpc.Codec<Reply>>
+}
+/// Opens a client-streaming or bidirectional call.
+public function open<Request, Reply>(client: Client, procedure: Text, kind: Integer, requestCodecs: List<rpc.Codec<Request>>,
+        replyCodecs: List<rpc.Codec<Reply>>, options: CallOptions): StreamCall<Request, Reply> {
+    return StreamCall<Request, Reply> { stream: client.stream(procedure, kind, options); requests: requestCodecs; replies: replyCodecs }
+}
+/// Opens a server-streaming call: sends its one request and closes the sending side.
+public function serverStream<Request, Reply>(client: Client, procedure: Text, request: Request, requestCodecs: List<rpc.Codec<Request>>,
+        replyCodecs: List<rpc.Codec<Reply>>, options: CallOptions): StreamCall<Request, Reply> {
+    let call = open(client, procedure, rpc.SERVER_STREAM, requestCodecs, replyCodecs, options)
+    send(call, request)
+    call.stream.closeSend()
+    return call
+}
+/// Encodes and sends one request message; false when the call is over. An
+/// encoding failure cancels the call and receive reports INTERNAL.
+public function send<Request, Reply>(call: StreamCall<Request, Reply>, message: Request): Boolean {
+    for codec in call.requests {
+        if codec.name == call.stream.client.codec {
+            match codec.encode(message) {
+                Ok(data) { return call.stream.send(data) }
+                Err(problem) {
+                    call.stream.cancel()
+                    call.stream.failure = Some(Failure { error: rpc.failure(rpc.INTERNAL, "cannot encode request: " + problem.message); headers: []; trailers: [] })
+                    return false
+                }
+            }
+        }
+    }
+    call.stream.cancel()
+    call.stream.failure = Some(Failure { error: rpc.failure(rpc.INTERNAL, "no " + call.stream.client.codec + " codec for this request"); headers: []; trailers: [] })
+    return false
+}
+/// The next reply, decoded.
+public function receive<Request, Reply>(call: StreamCall<Request, Reply>): Received<Reply> {
+    match call.stream.receive() {
+        Message(data) {
+            for codec in call.replies {
+                if codec.name == call.stream.client.codec {
+                    match codec.decode(data) {
+                        Ok(message) {
+                            let typed: Received<Reply> = Message(message)
+                            return typed
+                        }
+                        Err(problem) {
+                            call.stream.cancel()
+                            let failure = Failure { error: rpc.failure(rpc.INTERNAL, "cannot decode reply: " + problem.message); headers: call.stream.headers; trailers: call.stream.trailers }
+                            call.stream.failure = Some(failure)
+                            return Failed(failure)
+                        }
+                    }
+                }
+            }
+            return Failed(Failure { error: rpc.failure(rpc.INTERNAL, "no " + call.stream.client.codec + " codec for this reply"); headers: []; trailers: [] })
+        }
+        Waiting { return Waiting }
+        Finished { return Finished }
+        Failed(failure) { return Failed(failure) }
+    }
+    return Finished
+}
+/// Closes the sending side of a client-streaming call and waits for its one
+/// reply. It needs a transport that waits.
+public function reply<Request, Reply>(call: StreamCall<Request, Reply>): Result<Reply, Failure> {
+    call.stream.closeSend()
+    let answer: Maybe<Reply> = None
+    while true {
+        match receive(call) {
+            Message(message) { answer = Some(message) }
+            Waiting { return Err(Failure { error: rpc.failure(rpc.UNIMPLEMENTED, "reply needs a transport that waits; use receive"); headers: []; trailers: [] }) }
+            Finished { return Ok(answer.unwrap()) }
+            Failed(failure) { return Err(failure) }
+        }
+    }
+    return Err(Failure { error: rpc.failure(rpc.UNKNOWN, "unreachable"); headers: []; trailers: [] })
 }

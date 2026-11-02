@@ -1,0 +1,223 @@
+// The streaming Connect client against a Connect server in the same process,
+// over a Wire that steps a Server.begin exchange and never waits: typed and
+// byte-level server, client and bidirectional streams, interleaved full
+// duplex, errors with trailers, cancellation, compression and unary calls
+// through streamingClient.
+use "connect" as connect
+use "rpc" as rpc
+use "errors" as errors
+use "text" as utf8
+
+global clockNow: List<Integer> = [0]
+function clock(): Integer { return clockNow[0] }
+function header(name: Text, value: Text): rpc.Header { return rpc.Header { name: name; value: value } }
+function reversed(data: Bytes): Bytes {
+    let out = Bytes()
+    for index in 0..data.length { out.add(data[data.length - 1 - index]) }
+    return out
+}
+function reverse(): connect.Compressor {
+    return connect.Compressor { name: "reverse"
+        compress: function(data: Bytes): Result<Bytes, errors.Error> { return Ok(reversed(data)) }
+        decompress: function(data: Bytes, limit: Integer): Result<Bytes, errors.Error> { return Ok(reversed(data)) } }
+}
+
+// Arrivals the exchange produced and the client has not read yet.
+record Pipe { arrivals: List<connect.Arrival>; requests: Integer }
+global pipe: Pipe = Pipe { arrivals: []; requests: 0 }
+function opener(server: connect.Server): (connect.Request, Integer) -> Result<connect.Wire, rpc.Error> {
+    return function(request: connect.Request, timeout: Integer): Result<connect.Wire, rpc.Error> {
+        pipe.requests += 1
+        let exchange = server.begin(request)
+        let queue = Pipe { arrivals: []; requests: 0 }
+        return Ok(connect.Wire {
+            write: function(data: Bytes): Boolean {
+                exchange.receive(data)
+                return true
+            }
+            close: function() { exchange.closeInput() }
+            cancel: function() { exchange.cancel() }
+            read: function(): connect.Arrival {
+                if queue.arrivals.length == 0 {
+                    match exchange.step() {
+                        Waiting { return connect.Arrival.Pending }
+                        Respond(response) {
+                            queue.arrivals.add(connect.Arrival.Head(response.status, response.headers))
+                            queue.arrivals.add(connect.Arrival.Data(response.body))
+                            queue.arrivals.add(connect.Arrival.Ended([]))
+                        }
+                        Start(head) { queue.arrivals.add(connect.Arrival.Head(head.status, head.headers)) }
+                        Write(piece) { queue.arrivals.add(connect.Arrival.Data(piece)) }
+                        End(piece) {
+                            // Split the last piece so envelopes cross reads.
+                            let half = piece.length / 2
+                            queue.arrivals.add(connect.Arrival.Data(piece.slice(0, half)))
+                            queue.arrivals.add(connect.Arrival.Data(piece.slice(half, piece.length)))
+                            queue.arrivals.add(connect.Arrival.Ended([]))
+                        }
+                    }
+                }
+                let next = queue.arrivals[0]
+                queue.arrivals = queue.arrivals.slice(1, queue.arrivals.length)
+                return next
+            }
+        })
+    }
+}
+
+let text = rpc.Codec<Text> { name: "json"
+    decode: function(data: Bytes): Result<Text, rpc.Error> {
+        return match utf8.decode(data) {
+            Ok(value) { Ok(value) }
+            Err(_) { Err(rpc.failure(rpc.INVALID_ARGUMENT, "not text")) }
+        }
+    }
+    encode: function(value: Text): Result<Bytes, rpc.Error> {
+        if value == "unencodable" { return Err(rpc.failure(rpc.INTERNAL, "refused")) }
+        return Ok(Bytes(value))
+    } }
+let codecs = [text]
+
+let services = rpc.services()
+services.add(rpc.serverStream("/t.v1.S/Count", codecs, codecs, function(call: rpc.Call, request: Text, sender: rpc.Sender<Text>): Result<Nothing, rpc.Error> {
+    call.responseHeaders.add(header("x-asked", request))
+    call.responseTrailers.add(header("x-total", "3"))
+    for index in 0..3 { rpc.send(sender, request + Text(index)) }
+    if request == "fail" { return Err(rpc.failure(rpc.FAILED_PRECONDITION, "failed after three").withDetail("t.v1.Why", Bytes("why"))) }
+    return Ok()
+}))
+services.add(rpc.clientStream("/t.v1.S/Join", codecs, codecs, function(call: rpc.Call, sender: rpc.Sender<Text>): Result<rpc.Listener<Text>, rpc.Error> {
+    let parts: List<Text> = []
+    return Ok(rpc.Listener<Text> {
+        message: function(part: Text): Result<Nothing, rpc.Error> {
+            parts.add(part)
+            return Ok()
+        }
+        end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> {
+            if error.isSome() { return Ok() }
+            if parts.length == 0 { return Err(rpc.failure(rpc.INVALID_ARGUMENT, "nothing to join")) }
+            rpc.send(sender, joinText(parts, "+"))
+            return Ok()
+        }
+    })
+}))
+global heard: List<Text> = []
+services.add(rpc.bidiStream("/t.v1.S/Chat", codecs, codecs, function(call: rpc.Call, sender: rpc.Sender<Text>): Result<rpc.Listener<Text>, rpc.Error> {
+    return Ok(rpc.Listener<Text> {
+        message: function(line: Text): Result<Nothing, rpc.Error> {
+            heard.add(line)
+            rpc.send(sender, "re: " + line)
+            return Ok()
+        }
+        end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> {
+            match error {
+                Some(problem) { heard.add("end " + rpc.codeName(problem.code)) }
+                None {
+                    heard.add("end")
+                    rpc.send(sender, "bye")
+                }
+            }
+            return Ok()
+        }
+    })
+}))
+services.addUnary("/t.v1.S/Say", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+    return Ok(Bytes("said " + utf8.decodeOrStop(data)))
+})
+let options = connect.defaults(clock)
+options.compressors.add(reverse())
+options.compressMinBytes = 4
+let server = connect.server(services, options)
+let client = connect.streamingClient("", "json", opener(server), "k")
+
+function show(label: Text, received: connect.Received<Text>): Boolean {
+    match received {
+        Message(message) { print(label + " message " + message); return true }
+        Waiting { print(label + " waiting"); return false }
+        Finished { print(label + " finished"); return false }
+        Failed(failure) {
+            let details = ""
+            for detail in failure.error.details { details = details + " [" + detail.type + "=" + utf8.decodeOrStop(detail.value) + "]" }
+            print(label + " failed " + rpc.codeName(failure.error.code) + " " + failure.error.message + details)
+            return false
+        }
+    }
+}
+function metadata(label: Text, stream: connect.Stream) {
+    let line = label
+    for field in stream.headers() { if field.name.startsWith("x-") { line = line + " [" + field.name + ": " + field.value + "]" } }
+    line = line + " /"
+    for field in stream.trailers() { line = line + " [" + field.name + ": " + field.value + "]" }
+    print(line)
+}
+function drain(label: Text, call: connect.StreamCall<Text, Text>) {
+    while show(label, connect.receive(call)) {}
+}
+
+let counted = connect.serverStream(client, "/t.v1.S/Count", "n", codecs, codecs, connect.callOptions())
+drain("count", counted)
+metadata("count metadata", counted.stream)
+let failing = connect.serverStream(client, "/t.v1.S/Count", "fail", codecs, codecs, connect.callOptions())
+drain("count-fail", failing)
+metadata("count-fail metadata", failing.stream)
+
+let joined = connect.open(client, "/t.v1.S/Join", rpc.CLIENT_STREAM, codecs, codecs, connect.callOptions())
+for part in ["a", "b", "c"] { connect.send(joined, part) }
+match connect.reply(joined) {
+    Ok(answer) { print("join reply " + answer) }
+    Err(failure) { print("join failed " + failure.error.message) }
+}
+let empty = connect.open(client, "/t.v1.S/Join", rpc.CLIENT_STREAM, codecs, codecs, connect.callOptions())
+match connect.reply(empty) {
+    Ok(answer) { print("empty reply " + answer) }
+    Err(failure) { print("empty failed " + rpc.codeName(failure.error.code) + " " + failure.error.message) }
+}
+
+// Full duplex: each reply arrives before the next message is sent.
+let chat = connect.open(client, "/t.v1.S/Chat", rpc.BIDI_STREAM, codecs, codecs, connect.callOptions())
+show("chat before", connect.receive(chat))
+for line in ["hello", "how are you"] {
+    connect.send(chat, line)
+    show("chat", connect.receive(chat))
+    show("chat", connect.receive(chat))
+}
+chat.stream.closeSend()
+print("send after close " + Text(connect.send(chat, "late")))
+drain("chat end", chat)
+print("heard " + joinText(heard, ", "))
+heard.truncate(0)
+
+// Canceled mid-call: the server hears CANCELED, the client sees it too.
+let canceled = connect.open(client, "/t.v1.S/Chat", rpc.BIDI_STREAM, codecs, codecs, connect.callOptions())
+connect.send(canceled, "one")
+show("cancel", connect.receive(canceled))
+canceled.stream.cancel()
+show("cancel after", connect.receive(canceled))
+print("send after cancel " + Text(connect.send(canceled, "two")) + " active " + Text(canceled.stream.active()))
+print("heard " + joinText(heard, ", "))
+heard.truncate(0)
+
+// Compressed both ways, and an encoding failure.
+client.compressors.add(reverse())
+client.sendCompression = "reverse"
+client.compressMinBytes = 4
+let packed = connect.open(client, "/t.v1.S/Chat", rpc.BIDI_STREAM, codecs, codecs, connect.callOptions())
+connect.send(packed, "squeezed")
+packed.stream.closeSend()
+drain("packed", packed)
+print("heard " + joinText(heard, ", "))
+heard.truncate(0)
+let refused = connect.open(client, "/t.v1.S/Chat", rpc.BIDI_STREAM, codecs, codecs, connect.callOptions())
+print("unencodable sent " + Text(connect.send(refused, "unencodable")))
+drain("unencodable", refused)
+
+// Unary over the same opener, and calls the server rejects.
+match client.unary("/t.v1.S/Say", Bytes("hi"), connect.callOptions()) {
+    Ok(reply) { print("unary " + utf8.decodeOrStop(reply.message)) }
+    Err(failure) { print("unary failed " + failure.error.message) }
+}
+drain("missing", connect.open(client, "/t.v1.S/Nothing", rpc.BIDI_STREAM, codecs, codecs, connect.callOptions()))
+drain("wrong kind", connect.serverStream(client, "/t.v1.S/Say", "x", codecs, codecs, connect.callOptions()))
+let jsonless = connect.streamingClient("", "proto", opener(server), "k")
+drain("proto codec", connect.serverStream(jsonless, "/t.v1.S/Count", "n", codecs, codecs, connect.callOptions()))
+print("requests " + Text(pipe.requests))
