@@ -64,7 +64,7 @@ function regressions(port: Integer) {
         Invalid { raw: plain("Content-Length: +1\r\n"); status: 400 }, Invalid { raw: plain("Content-Length: 999999999999999999999\r\n"); status: 413 },
         Invalid { raw: plain("Transfer-Encoding: chunked\r\nContent-Length: 0\r\n"); status: 400 },
         Invalid { raw: plain("Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n"); status: 400 },
-        Invalid { raw: wire.request("/", "GET", text("Transfer-Encoding: chunked\r\n"), text("0\r\n\r\n"), false); status: 501 },
+        Invalid { raw: wire.request("/", "GET", text("Transfer-Encoding: gzip\r\n"), Bytes(), false); status: 501 },
         Invalid { raw: plain("Expect: 100-continue\r\nContent-Length: 5\r\n"); status: 417 }, Invalid { raw: plain("Content-Length : 0\r\n"); status: 400 },
         Invalid { raw: plain(" folded: x\r\n"); status: 400 }, Invalid { raw: joined([text("GET / HTTP/1.1\r\nHost: localhost\r\nX-Bad: "), repeated(255, 1), text("\r\n\r\n")]); status: 400 },
         Invalid { raw: joined([text("GET / HTTP/1.1\r\nHost: localhost\r\nX-Bad: "), repeated(0, 1), text("\r\n\r\n")]); status: 400 },
@@ -78,11 +78,24 @@ function regressions(port: Integer) {
         wire.eof(peer)
         wire.close(peer)
     }
-    let chunkedHead = wire.open(port)
-    wire.send(chunkedHead, wire.request("/", "HEAD", text("Transfer-Encoding: chunked\r\n"), Bytes(), false))
-    test.check(wire.response(chunkedHead, true).status == 501, "chunked HEAD")
-    wire.eof(chunkedHead)
-    wire.close(chunkedHead)
+    let codedHead = wire.open(port)
+    wire.send(codedHead, wire.request("/", "HEAD", text("Transfer-Encoding: gzip\r\n"), Bytes(), false))
+    test.check(wire.response(codedHead, true).status == 501, "transfer-coded HEAD")
+    wire.eof(codedHead)
+    wire.close(codedHead)
+    // A chunked upload, split byte by byte, is decoded into the request body;
+    // the pipelined request after its trailers is served on the same connection.
+    let upload = wire.open(port)
+    let chunked = wire.request("/", "POST", text("Transfer-Encoding: chunked\r\n"), text("4;ext=1\r\nWiki\r\n5\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nx-trailer: yes\r\n\r\n"), false)
+    chunked.addBytes(wire.get("/head", true))
+    for byte in chunked {
+        let piece = Bytes(1)
+        piece[0] = byte
+        wire.send(upload, piece)
+    }
+    test.check(utf8.decodeOrStop(wire.response(upload, false).body) == "Wikipedia in\r\n\r\nchunks.", "chunked request body")
+    test.check(utf8.decodeOrStop(wire.response(upload, false).body) == "hello", "request after a chunked body")
+    wire.close(upload)
     let options = wire.open(port)
     wire.send(options, text("OPTIONS * HTTP/1.1\r\nHost: [::1]:80\r\nConnection: close\r\n\r\n"))
     test.check(wire.response(options, false).status == 200, "OPTIONS asterisk")

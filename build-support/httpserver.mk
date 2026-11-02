@@ -75,3 +75,22 @@ check-proxy-http-drain-sanitize: build/minyarc build/tooling/tests/proxy-http-dr
 
 check-httpserver: check-proxy-http-drain
 check-httpserver-sanitize: check-proxy-http-drain-sanitize
+
+.PHONY: check-httpserver-session check-httpserver-streams
+# The socket-free Session: a deterministic simulation of streamed responses,
+# chunked request bodies and client release, at O0 and O2.
+check-httpserver-session: build/minyarc build/minyar-default-runtime.o
+	mkdir -p build/httpserver
+	MINYAR_CLANG="$(LLVM_CC)" ./minyar --debug tests/httpserver-session.min -o build/httpserver/session-debug
+	$(LIMITED) ./build/httpserver/session-debug
+	MINYAR_CLANG="$(LLVM_CC)" ./minyar --release tests/httpserver-session.min -o build/httpserver/session-release
+	$(LIMITED) ./build/httpserver/session-release
+
+check check-portable: check-httpserver-session
+
+# Streamed responses through curl --no-buffer, an EventSource and 1,000
+# concurrent loopback streams.
+check-httpserver-streams: build/minyarc build/minyar-default-runtime.o
+	MINYAR_CLANG="$(LLVM_CC)" python3 tests/httpserver-streams.py "$(CURDIR)/minyar"
+
+check check-portable: check-httpserver-streams

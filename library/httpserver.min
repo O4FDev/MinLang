@@ -50,13 +50,15 @@ public record Limits {
     bodyMilliseconds: Integer
     applicationMilliseconds: Integer
     writeMilliseconds: Integer
+    // Unsent bytes one streamed response may queue before send returns false.
+    streamBufferBytes: Integer
 }
 public function defaults(): Limits {
     return Limits { maxConnections: 1024; maxHeaderBytes: 16384; maxHeaders: 64;
         maxBodyBytes: 1048576; maxResponseBytes: 16777216; maxRequestsPerConnection: 1000;
         acceptBudget: 32; ioBudget: 65536; maxEvents: 256; idleMilliseconds: 30000;
         headerMilliseconds: 5000; bodyMilliseconds: 10000; applicationMilliseconds: 30000;
-        writeMilliseconds: 10000 }
+        writeMilliseconds: 10000; streamBufferBytes: 65536 }
 }
 public record Header { name: Text; value: Text }
 public record Request {
@@ -86,13 +88,16 @@ record Head {
     target: Text
     headers: List<Header>
     length: Integer
+    // Transfer-Encoding: chunked; the body is decoded as it arrives.
+    chunked: Boolean
     keepAlive: Boolean
 }
 record Connection {
     active: Boolean
     socket: Integer
     registration: Integer
-    // 0 reading, 1 application (unwatched), 2 writing.
+    // 0 reading, 1 application (unwatched), 2 writing, 3 streaming a chunked
+    // body (the request ticket stays valid until finishStream).
     phase: Integer
     input: Bytes
     inputStart: Integer
@@ -113,6 +118,11 @@ record Connection {
     closeSent: Boolean
     writeHup: Boolean
     writeProbeAt: Integer
+    // Chunked request body: the next chunk-size line and the decoded bytes.
+    chunkAt: Integer
+    decoded: Bytes
+    // A streamed HEAD response: pieces are accepted and not sent.
+    quiet: Boolean
 }
 public record Server {
     private handle: Integer
@@ -129,10 +139,20 @@ public record Server {
     private closed: Boolean
     private draining: Boolean
     private error: errors.Error
+    // Tickets of streams released since the last Batch.
+    private ended: List<Integer>
 }
-public record Batch { private requests: List<Request>; private error: errors.Error }
+public record Batch { private requests: List<Request>; private error: errors.Error; private ended: List<Integer>; private accepted: Integer }
 public function requests(batch: Batch): List<Request> { return batch.requests }
 public function batchError(batch: Batch): errors.Error { return batch.error }
+// requestIds of streams the server released (client disconnect, stalled
+// writes or close) since the previous Batch; their send calls return false.
+public function endedStreams(batch: Batch): List<Integer> { return batch.ended }
+// Bytes a Session.receive call consumed; the caller offers the rest later.
+public function accepted(batch: Batch): Integer { return batch.accepted }
+function makeBatch(requests: List<Request>, error: errors.Error, ended: List<Integer>): Batch {
+    return Batch { requests: requests; error: error; ended: ended; accepted: 0 }
+}
 public function serverError(server: Server): errors.Error { return server.error }
 public function ok(server: Server): Boolean { return !server.closed && !errors.isError(server.error) }
 public function port(server: Server): Integer {
@@ -156,7 +176,18 @@ function validLimits(limits: Limits): Boolean {
         limits.maxEvents > 0 && limits.maxEvents <= 4096 &&
         durationValid(limits.idleMilliseconds) && durationValid(limits.headerMilliseconds) &&
         durationValid(limits.bodyMilliseconds) && durationValid(limits.applicationMilliseconds) &&
-        durationValid(limits.writeMilliseconds)
+        durationValid(limits.writeMilliseconds) &&
+        limits.streamBufferBytes >= 1024 && limits.streamBufferBytes <= 16777216
+}
+// Snapshot mutable Limits so callers cannot raise bounds mid-connection.
+function copyLimits(limits: Limits): Limits {
+    return Limits { maxConnections: limits.maxConnections; maxHeaderBytes: limits.maxHeaderBytes;
+        maxHeaders: limits.maxHeaders; maxBodyBytes: limits.maxBodyBytes; maxResponseBytes: limits.maxResponseBytes;
+        maxRequestsPerConnection: limits.maxRequestsPerConnection; acceptBudget: limits.acceptBudget;
+        ioBudget: limits.ioBudget; maxEvents: limits.maxEvents; idleMilliseconds: limits.idleMilliseconds;
+        headerMilliseconds: limits.headerMilliseconds; bodyMilliseconds: limits.bodyMilliseconds;
+        applicationMilliseconds: limits.applicationMilliseconds; writeMilliseconds: limits.writeMilliseconds;
+        streamBufferBytes: limits.streamBufferBytes }
 }
 public function listen(host: Text, port: Integer, limits: Limits): Server {
     return start(host, port, limits, None)
@@ -168,16 +199,10 @@ public function listenWith(host: Text, port: Integer, limits: Limits, factory: T
     return start(host, port, limits, Some(TlsState { factory: factory; ops: [] }))
 }
 function start(host: Text, port: Integer, limits: Limits, tls: Maybe<TlsState>): Server {
-    // Snapshot mutable Limits so callers cannot raise bounds mid-connection.
-    let copied = Limits { maxConnections: limits.maxConnections; maxHeaderBytes: limits.maxHeaderBytes;
-        maxHeaders: limits.maxHeaders; maxBodyBytes: limits.maxBodyBytes; maxResponseBytes: limits.maxResponseBytes;
-        maxRequestsPerConnection: limits.maxRequestsPerConnection; acceptBudget: limits.acceptBudget;
-        ioBudget: limits.ioBudget; maxEvents: limits.maxEvents; idleMilliseconds: limits.idleMilliseconds;
-        headerMilliseconds: limits.headerMilliseconds; bodyMilliseconds: limits.bodyMilliseconds;
-        applicationMilliseconds: limits.applicationMilliseconds; writeMilliseconds: limits.writeMilliseconds }
+    let copied = copyLimits(limits)
     let server = Server { handle: -1; listener: -1; listenerRegistration: -1; limits: copied;
         tls: tls;
-        connections: []; freeSlots: []; freeCount: 0; active: 0; nextTicket: 1; closed: false; draining: false; error: errors.none() }
+        connections: []; freeSlots: []; freeCount: 0; active: 0; nextTicket: 1; closed: false; draining: false; error: errors.none(); ended: [] }
     if !validLimits(copied) {
         server.error = errors.make(errors.invalidDataCode(), 0, "invalid HTTP server limits")
         server.closed = true
@@ -214,15 +239,23 @@ function start(host: Text, port: Integer, limits: Limits, tls: Maybe<TlsState>):
     return server
 }
 
+// The connection is gone: report an open stream and free its buffers.
+function release(connection: Connection, ended: List<Integer>) {
+    if connection.phase == 3 && connection.ticket != 0 { ended.add(connection.ticket) }
+    connection.active = false
+    connection.ticket = 0
+    connection.input = Bytes(); connection.output = Bytes(); connection.body = Bytes(); connection.decoded = Bytes()
+    connection.parsed = badHead(0)
+}
 function badHead(status: Integer): Head {
-    return Head { status: status; method: ""; target: ""; headers: []; length: 0; keepAlive: false }
+    return Head { status: status; method: ""; target: ""; headers: []; length: 0; chunked: false; keepAlive: false }
 }
 function newConnection(socket: Integer, deadline: Integer): Connection {
     return Connection { active: true; socket: socket; registration: -1;
         phase: 0; input: Bytes();
         inputStart: 0; scan: 0; headerBytes: 0; parsed: badHead(0); deadline: deadline; started: false;
         needsParse: false; eof: false; ticket: 0; count: 0; output: Bytes(); body: Bytes();
-        sent: 0; bodySent: 0; closing: false; closeSent: false; writeHup: false; writeProbeAt: -1 }
+        sent: 0; bodySent: 0; closing: false; closeSent: false; writeHup: false; writeProbeAt: -1; chunkAt: 0; decoded: Bytes(); quiet: false }
 }
 function removeWatch(server: Server, connection: Connection) {
     if connection.registration >= 0 {
@@ -256,10 +289,7 @@ function drop(server: Server, slot: Integer) {
     if !connection.active { return }
     removeWatch(server, connection)
     net.close(connection.socket)
-    connection.active = false
-    connection.ticket = 0
-    connection.input = Bytes(); connection.output = Bytes(); connection.body = Bytes()
-    connection.parsed = badHead(0)
+    release(connection, server.ended)
     match server.tls {
         Some(state) { if slot < state.ops.length { state.ops[slot] = None } }
         None {}
@@ -392,17 +422,64 @@ function decimal(data: Bytes, start: Integer, end: Integer, maximum: Integer): I
     }
     return value
 }
+// RFC 4291 text form: eight hex groups, one optional "::" and an optional
+// dotted IPv4 tail. Checked here rather than natively so a Session stays pure.
+function ipv6Literal(data: Bytes, from: Integer, to: Integer): Boolean {
+    let groups = 0
+    let compressed = false
+    let at = from
+    if to - from >= 2 && data[from] == 58 && data[from + 1] == 58 {
+        compressed = true
+        at = from + 2
+    } else { if at >= to || data[at] == 58 { return false } }
+    while at < to {
+        let start = at
+        while at < to && at - start < 5 && hexValue(data[at]) >= 0 { at += 1 }
+        if at < to && data[at] == 46 {
+            if !ipv4Tail(data, start, to) { return false }
+            groups += 2
+            at = to
+        } else {
+            if at == start || at - start > 4 { return false }
+            groups += 1
+            if at < to {
+                if data[at] != 58 || at + 1 == to { return false }
+                at += 1
+                if data[at] == 58 {
+                    if compressed { return false }
+                    compressed = true
+                    at += 1
+                }
+            }
+        }
+    }
+    if compressed { return groups <= 7 }
+    return groups == 8
+}
+function ipv4Tail(data: Bytes, from: Integer, to: Integer): Boolean {
+    let parts = 0
+    let at = from
+    while at < to {
+        let start = at
+        let value = 0
+        while at < to && data[at] >= 48 && data[at] <= 57 && at - start < 3 { value = value * 10 + data[at] - 48; at += 1 }
+        if at == start || value > 255 || at - start > 1 && data[start] == 48 { return false }
+        parts += 1
+        if at < to {
+            if data[at] != 46 || parts == 4 { return false }
+            at += 1
+            if at == to { return false }
+        }
+    }
+    return parts == 4
+}
 function validHost(data: Bytes): Boolean {
     if data.length == 0 { return false }
     let hostEnd = data.length
     let portAt = -1
     if data[0] == 91 {
         let end = findByte(data, 93, 1, data.length)
-        if end < 0 { return false }
-        match utf8.decode(data.slice(1, end)) {
-            Ok(address) { if net.ipVersion(address) != 6 { return false } }
-            Err(error) { return false }
-        }
+        if end < 0 || !ipv6Literal(data, 1, end) { return false }
         if end + 1 < data.length {
             if data[end + 1] != 58 { return false }
             portAt = end + 2
@@ -458,6 +535,7 @@ function parseHead(data: Bytes, start: Integer, end: Integer, limits: Limits): H
     let hostCount = 0
     let lengthCount = 0
     let transferCount = 0
+    let chunked = false
     let length = 0
     let framingStatus = 0
     let closing = false
@@ -490,7 +568,11 @@ function parseHead(data: Bytes, start: Integer, end: Integer, limits: Limits): H
             if length == -1 { framingStatus = 400 }
             if length == -2 && framingStatus == 0 { framingStatus = 413 }
         }
-        if name == "transfer-encoding" { transferCount += 1 }
+        if name == "transfer-encoding" {
+            transferCount += 1
+            // Only chunked is decoded; any other coding (or a list) is 501.
+            chunked = from < to && lowercase(raw) == "chunked"
+        }
         if name == "expect" { expectation = true }
         if name == "upgrade" { upgrade = true }
         if name == "connection" {
@@ -504,10 +586,10 @@ function parseHead(data: Bytes, start: Integer, end: Integer, limits: Limits): H
         return badHead(400)
     }
     if framingStatus != 0 { return badHead(framingStatus) }
-    if transferCount > 0 { return badHead(501) }
+    if transferCount > 0 && !chunked { return badHead(501) }
     if expectation { return badHead(417) }
     if upgrade { return badHead(501) }
-    return Head { status: 0; method: method; target: target; headers: fields; length: length; keepAlive: !closing }
+    return Head { status: 0; method: method; target: target; headers: fields; length: length; chunked: chunked; keepAlive: !closing }
 }
 
 function reason(status: Integer): Text {
@@ -526,6 +608,260 @@ function reason(status: Integer): Text {
     if status == 502 { return "Bad Gateway" }
     return "Response"
 }
+
+// Connection core: request parsing, response framing and streaming state.
+// Nothing here touches a socket, the event loop or a clock, so Server and
+// Session share it and a deterministic simulation can drive a Session.
+constant NEVER = 9223372036854775807
+record Parsed { status: Integer; request: Maybe<Request> }
+function parsed(status: Integer): Parsed { return Parsed { status: status; request: None } }
+function bodiless(status: Integer): Boolean { return status == 204 || status == 205 || status == 304 }
+function hexValue(byte: Integer): Integer {
+    if byte >= 48 && byte <= 57 { return byte - 48 }
+    if byte >= 65 && byte <= 70 { return byte - 55 }
+    if byte >= 97 && byte <= 102 { return byte - 87 }
+    return -1
+}
+function chunk(piece: Bytes): Bytes {
+    let framed = Bytes(utf8.hex(piece.length) + "\r\n")
+    framed.addBytes(piece)
+    framed.addBytes(Bytes("\r\n"))
+    return framed
+}
+// Queue bytes after any unsent output, replacing a drained buffer.
+function append(connection: Connection, bytes: Bytes) {
+    if connection.sent == connection.output.length { connection.output = bytes; connection.sent = 0; return }
+    if connection.sent >= 65536 {
+        connection.output = connection.output.slice(connection.sent, connection.output.length); connection.sent = 0
+    }
+    connection.output.addBytes(bytes)
+}
+function queuedOutput(connection: Connection): Integer {
+    return connection.output.length - connection.sent + connection.body.length - connection.bodySent
+}
+function closingAfter(connection: Connection, limits: Limits, draining: Boolean): Boolean {
+    return draining || !connection.parsed.keepAlive || connection.count >= limits.maxRequestsPerConnection ||
+        connection.eof && connection.inputStart == connection.input.length
+}
+// The end of the CRLF-terminated line starting at `from` (the CR), -1 when it
+// is not complete before `limit`, or -2 for a bare CR/LF or a control byte.
+function lineEnd(data: Bytes, from: Integer, limit: Integer): Integer {
+    for at in from..limit {
+        let byte = data[at]
+        if byte == 13 {
+            if at + 1 == data.length { return -1 }
+            if data[at + 1] != 10 { return -2 }
+            return at
+        }
+        if (byte < 32 && byte != 9) || byte == 127 { return -2 }
+    }
+    return -1
+}
+// Decode complete chunks from chunkAt into `decoded`, consuming their framing
+// so it never counts against the input bound. Chunk extensions and trailer
+// fields are read and discarded. Returns 0 when the body is complete (chunkAt
+// then ends the request), -1 to wait for input, or a rejection status.
+function decodeChunks(connection: Connection, limits: Limits): Integer {
+    while true {
+        let data = connection.input
+        let at = connection.chunkAt
+        let line = lineEnd(data, at, min(data.length, at + 1024))
+        if line == -2 { return 400 }
+        if line < 0 {
+            if data.length - at >= 1024 { return 400 }
+            return -1
+        }
+        let size = 0
+        let digits = 0
+        let cursor = at
+        while cursor < line && hexValue(data[cursor]) >= 0 {
+            size = size * 16 + hexValue(data[cursor])
+            if size > limits.maxBodyBytes { return 413 }
+            digits += 1
+            cursor += 1
+        }
+        if digits == 0 || cursor < line && data[cursor] != 59 && data[cursor] != 32 && data[cursor] != 9 { return 400 }
+        if size > limits.maxBodyBytes - connection.decoded.length { return 413 }
+        if size == 0 {
+            // The trailer section: fields until an empty line, bounded like a header.
+            let field = line + 2
+            while true {
+                let end = lineEnd(data, field, min(data.length, line + 2 + limits.maxHeaderBytes))
+                if end == -2 { return 400 }
+                if end < 0 {
+                    if data.length - line - 2 >= limits.maxHeaderBytes { return 431 }
+                    return -1
+                }
+                if end == field { connection.chunkAt = end + 2; return 0 }
+                if findByte(data, 58, field, end) <= field { return 400 }
+                field = end + 2
+            }
+        }
+        let after = line + 2 + size
+        if data.length < after + 2 { return -1 }
+        if data[after] != 13 || data[after + 1] != 10 { return 400 }
+        connection.decoded.addBytes(data.slice(line + 2, after))
+        connection.chunkAt = after + 2
+        connection.inputStart = connection.chunkAt
+        let unread = data.length - connection.inputStart
+        if connection.inputStart >= 65536 && connection.inputStart >= unread {
+            connection.input = data.slice(connection.inputStart, data.length)
+            connection.inputStart = 0; connection.chunkAt = 0
+        }
+    }
+    return -1
+}
+// Parse the next buffered request. Status 0 waits for input, a positive status
+// is the rejection to send, -2 means tickets are exhausted, and -1 carries a
+// Request that moves the connection to the application phase.
+function parseNext(connection: Connection, limits: Limits, now: Integer, owner: Integer, slot: Integer, ticket: Integer): Parsed {
+    connection.needsParse = false
+    let data = connection.input
+    let start = connection.inputStart
+    if connection.headerBytes == 0 {
+        let at = connection.scan
+        while at < data.length {
+            let byte = data[at]
+            // Validate all header octets before Text conversion, including CRLF.
+            if byte == 13 {
+                if at + 1 == data.length { break }
+                if data[at + 1] != 10 { return parsed(400) }
+            } else {
+                if byte == 10 {
+                    if at == 0 || data[at - 1] != 13 { return parsed(400) }
+                } else {
+                    if (byte < 32 && byte != 9) || byte >= 127 { return parsed(400) }
+                }
+            }
+            if at >= start + 3 && byte == 10 && data[at - 1] == 13 && data[at - 2] == 10 && data[at - 3] == 13 {
+                connection.headerBytes = at + 1 - start; break
+            }
+            at += 1
+            if at - start >= limits.maxHeaderBytes { return parsed(431) }
+        }
+        connection.scan = at
+        if connection.headerBytes == 0 {
+            if connection.eof { return parsed(400) }
+            return parsed(0)
+        }
+        connection.parsed = parseHead(data, start, start + connection.headerBytes, limits)
+        if connection.parsed.status != 0 { return parsed(connection.parsed.status) }
+        connection.deadline = now + limits.bodyMilliseconds
+        connection.chunkAt = start + connection.headerBytes
+        connection.decoded = Bytes()
+    }
+    let body = Bytes()
+    let total = start + connection.headerBytes + connection.parsed.length
+    if connection.parsed.chunked {
+        let status = decodeChunks(connection, limits)
+        if status == -1 {
+            if connection.eof { return parsed(400) }
+            return parsed(0)
+        }
+        if status > 0 { return parsed(status) }
+        body = connection.decoded
+        connection.decoded = Bytes()
+        total = connection.chunkAt
+    } else {
+        if data.length < total {
+            if connection.eof { return parsed(400) }
+            return parsed(0)
+        }
+        if connection.parsed.length > 0 { body = data.slice(start + connection.headerBytes, total) }
+    }
+    if ticket == 9223372036854775807 { return parsed(-2) }
+    let head = connection.parsed
+    if total == connection.input.length { connection.input.clear(); connection.inputStart = 0 }
+    else { connection.inputStart = total }
+    connection.ticket = ticket
+    connection.count += 1
+    connection.phase = 1
+    connection.deadline = now + limits.applicationMilliseconds
+    return Parsed { status: -1; request: Some(Request { method: head.method; target: head.target; headers: head.headers;
+        body: body; keepAlive: head.keepAlive; owner: owner; slot: slot; ticket: ticket }) }
+}
+// A rejection answers HEAD without a body and discards the unread input.
+function rejectHead(connection: Connection): Boolean {
+    let head = false
+    if connection.parsed.method != "" { head = connection.parsed.method == "HEAD" }
+    else {
+        let start = connection.inputStart
+        if connection.input.length - start >= 5 {
+            head = connection.input[start] == 72 && connection.input[start + 1] == 69 && connection.input[start + 2] == 65 &&
+                connection.input[start + 3] == 68 && connection.input[start + 4] == 32
+        }
+    }
+    connection.input.clear(); connection.inputStart = 0; connection.parsed = badHead(0)
+    return head
+}
+// Serialize a response head with a small body or a stream's first chunk, and
+// move the connection to writing (phase 2) or streaming (phase 3). The caller
+// queues the returned bytes, through TLS when the connection uses it.
+function queueResponse(connection: Connection, limits: Limits, response: Response, head: Boolean, closing: Boolean, streaming: Boolean, now: Integer): Bytes {
+    let output = Bytes("HTTP/1.1 " + Text(response.status) + " " + reason(response.status) + "\r\n")
+    for field in response.headers { output.addBytes(Bytes(field.name + ": " + field.value + "\r\n")) }
+    if streaming { output.addBytes(Bytes("transfer-encoding: chunked\r\n")) }
+    else {
+        let length = response.body.length
+        if response.status == 205 { length = 0 }
+        if response.status != 204 { output.addBytes(Bytes("content-length: " + Text(length) + "\r\n")) }
+    }
+    if closing { output.addBytes(Bytes("connection: close\r\n\r\n")) }
+    else { output.addBytes(Bytes("connection: keep-alive\r\n\r\n")) }
+    connection.body = Bytes()
+    if streaming {
+        if !head && response.body.length > 0 { output.addBytes(chunk(response.body)) }
+    } else {
+        if !head && !bodiless(response.status) {
+            // Send small headers+body together. Separate TCP_NODELAY writes create
+            // two packets and extra receiver wakeups on the common cache-hit path.
+            // Larger bodies stay borrowed and use range writes without a copy.
+            if response.body.length <= 65536 { output.addBytes(response.body) }
+            else { connection.body = response.body }
+        }
+    }
+    connection.bodySent = 0; connection.writeHup = false; connection.writeProbeAt = -1; connection.closeSent = false
+    connection.closing = closing
+    connection.quiet = streaming && head
+    connection.deadline = now + limits.writeMilliseconds
+    if streaming { connection.phase = 3 } else { connection.phase = 2; connection.ticket = 0 }
+    return output
+}
+// One piece may exceed the stream buffer only when nothing is queued.
+function streamRoom(connection: Connection, limits: Limits, size: Integer): Boolean {
+    let queued = queuedOutput(connection)
+    return size <= limits.maxResponseBytes && (queued == 0 || queued + size <= limits.streamBufferBytes)
+}
+// End a stream: the last chunk is written, then the next request is served.
+function finishChunks(connection: Connection, limits: Limits, now: Integer): Bytes {
+    connection.phase = 2; connection.ticket = 0
+    connection.deadline = now + limits.writeMilliseconds
+    if connection.quiet { return Bytes() }
+    return Bytes("0\r\n\r\n")
+}
+// A stream with nothing queued has no deadline and keeps no output buffer.
+function streamDrained(connection: Connection) {
+    connection.output = Bytes(); connection.sent = 0; connection.deadline = NEVER
+}
+// The response is written: return to reading the next request.
+function nextRequest(connection: Connection, limits: Limits, now: Integer) {
+    connection.output.clear(); connection.sent = 0; connection.body = Bytes()
+    connection.phase = 0
+    let unread = connection.input.length - connection.inputStart
+    // Keep retained storage bounded without copying the unread pipeline after
+    // every request. Copy only when the consumed prefix can pay for the tail.
+    if connection.inputStart >= 65536 && connection.inputStart >= unread {
+        connection.input = connection.input.slice(connection.inputStart, connection.input.length)
+        connection.inputStart = 0
+    }
+    connection.started = connection.inputStart < connection.input.length
+    connection.needsParse = connection.started
+    connection.scan = connection.inputStart; connection.headerBytes = 0; connection.parsed = badHead(0)
+    connection.deadline = now + limits.idleMilliseconds
+    if connection.started { connection.deadline = now + limits.headerMilliseconds }
+}
+
+// Socket driver.
 function flush(server: Server, slot: Integer, now: Integer) {
     let connection = server.connections[slot]
     connection.writeProbeAt = -1
@@ -545,7 +881,7 @@ function flush(server: Server, slot: Integer, now: Integer) {
                 if ops.state() != TRANSPORT_ESTABLISHED { drop(server, slot); return }
             }
             // A closing TLS connection ends with an authenticated close_notify.
-            if connection.closing && !connection.closeSent && connection.sent == connection.output.length &&
+            if connection.phase == 2 && connection.closing && !connection.closeSent && connection.sent == connection.output.length &&
                connection.bodySent == connection.body.length && ops.state() == TRANSPORT_ESTABLISHED {
                 connection.closeSent = true
                 ops.close()
@@ -572,131 +908,64 @@ function flush(server: Server, slot: Integer, now: Integer) {
         if count <= 0 { drop(server, slot); return }
         if writingHead { connection.sent += count } else { connection.bodySent += count }
         budget -= count
+        // A stream's deadline only bounds a stalled reader.
+        if connection.phase == 3 { connection.deadline = now + server.limits.writeMilliseconds }
     }
-    if connection.sent != connection.output.length || connection.bodySent != connection.body.length ||
-       secure && connection.closing && !connection.closeSent {
+    if queuedOutput(connection) != 0 || secure && connection.phase == 2 && connection.closing && !connection.closeSent {
         // A paused writer that used its I/O budget made real progress. Give it
         // one more bounded turn without reinstalling a permanently ready HUP.
         if connection.registration < 0 { connection.writeProbeAt = now }
         return
     }
-    connection.output.clear(); connection.body = Bytes()
-    if connection.closing { drop(server, slot); return }
-    connection.phase = 0
-    let unread = connection.input.length - connection.inputStart
-    // Keep retained storage bounded without copying the unread pipeline after
-    // every request. Copy only when the consumed prefix can pay for the tail.
-    if connection.inputStart >= 65536 && connection.inputStart >= unread {
-        connection.input = connection.input.slice(connection.inputStart, connection.input.length)
-        connection.inputStart = 0
+    if connection.phase == 3 {
+        streamDrained(connection)
+        watch(server, slot, loop.readableInterest())
+        return
     }
-    connection.started = connection.inputStart < connection.input.length
-    connection.needsParse = connection.started
-    connection.scan = connection.inputStart; connection.headerBytes = 0; connection.parsed = badHead(0)
-    connection.deadline = now + server.limits.idleMilliseconds
-    if connection.started { connection.deadline = now + server.limits.headerMilliseconds }
+    if connection.closing { drop(server, slot); return }
+    nextRequest(connection, server.limits, now)
     watch(server, slot, loop.readableInterest())
 }
-function startResponse(server: Server, slot: Integer, response: Response, head: Boolean, closing: Boolean): Boolean {
+// Queue response bytes for the socket, sealing them first on TLS.
+function place(server: Server, slot: Integer, bytes: Bytes): Boolean {
     let connection = server.connections[slot]
-    let output = Bytes("HTTP/1.1 " + Text(response.status) + " " + reason(response.status) + "\r\n")
-    for field in response.headers { output.addBytes(Bytes(field.name + ": " + field.value + "\r\n")) }
-    let length = response.body.length
-    if response.status == 205 { length = 0 }
-    if response.status != 204 { output.addBytes(Bytes("content-length: " + Text(length) + "\r\n")) }
-    if closing { output.addBytes(Bytes("connection: close\r\n\r\n")) }
-    else { output.addBytes(Bytes("connection: keep-alive\r\n\r\n")) }
-    connection.body = response.body
-    if head || response.status == 204 || response.status == 205 || response.status == 304 { connection.body = Bytes() }
-    else {
-        // Send small headers+body together. Separate TCP_NODELAY writes create
-        // two packets and extra receiver wakeups on the common cache-hit path.
-        // Larger bodies stay borrowed and use range writes without a copy.
-        if response.body.length <= 65536 {
-            output.addBytes(response.body)
-            connection.body = Bytes()
-        }
-    }
     if isTls(server, slot) {
-        // Keep any queued TLS control records first, then the sealed response.
+        // Keep any queued TLS control records first, then the sealed bytes.
         let ops = tlsSession(server, slot)
-        ops.send(output)
-        connection.output.addBytes(ops.takeOutgoing())
+        ops.send(bytes)
+        append(connection, ops.takeOutgoing())
         if ops.state() != TRANSPORT_ESTABLISHED { drop(server, slot); return false }
-    } else { connection.output = output }
-    connection.sent = 0; connection.bodySent = 0; connection.phase = 2; connection.ticket = 0
-    connection.writeHup = false; connection.writeProbeAt = -1; connection.closeSent = false
-    connection.closing = closing
+    } else { append(connection, bytes) }
+    return true
+}
+function startResponse(server: Server, slot: Integer, response: Response, head: Boolean, closing: Boolean, streaming: Boolean): Boolean {
+    let connection = server.connections[slot]
     let now = net.monotonicMilliseconds()
-    connection.deadline = now + server.limits.writeMilliseconds
-    if !watch(server, slot, loop.writableInterest()) { return false }
+    if !place(server, slot, queueResponse(connection, server.limits, response, head, closing, streaming, now)) { return false }
+    let interest = loop.writableInterest()
+    // A stream also reads, so a client that leaves releases it promptly.
+    if streaming { interest = loop.readWriteInterest() }
+    if !watch(server, slot, interest) { return false }
     flush(server, slot, now)
     return true
 }
 function reject(server: Server, slot: Integer, status: Integer) {
-    let connection = server.connections[slot]
-    let head = false
-    let start = connection.inputStart
-    if connection.input.length - start >= 5 {
-        head = connection.input[start] == 72 && connection.input[start + 1] == 69 && connection.input[start + 2] == 65 &&
-            connection.input[start + 3] == 68 && connection.input[start + 4] == 32
-    }
-    connection.input.clear(); connection.inputStart = 0; connection.parsed = badHead(0)
-    startResponse(server, slot, response(status, "text/plain", Bytes(reason(status))), head, true)
+    let head = rejectHead(server.connections[slot])
+    startResponse(server, slot, response(status, "text/plain", Bytes(reason(status))), head, true, false)
 }
 function parseReady(server: Server, slot: Integer, now: Integer, ready: List<Request>) {
     let connection = server.connections[slot]
-    connection.needsParse = false
-    let data = connection.input
-    let start = connection.inputStart
-    if connection.headerBytes == 0 {
-        let at = connection.scan
-        while at < data.length {
-            let byte = data[at]
-            // Validate all header octets before Text conversion, including CRLF.
-            if byte == 13 {
-                if at + 1 == data.length { break }
-                if data[at + 1] != 10 { reject(server, slot, 400); return }
-            } else {
-                if byte == 10 {
-                    if at == 0 || data[at - 1] != 13 { reject(server, slot, 400); return }
-                } else {
-                    if (byte < 32 && byte != 9) || byte >= 127 { reject(server, slot, 400); return }
-                }
-            }
-            if at >= start + 3 && byte == 10 && data[at - 1] == 13 && data[at - 2] == 10 && data[at - 3] == 13 {
-                connection.headerBytes = at + 1 - start; break
-            }
-            at += 1
-            if at - start >= server.limits.maxHeaderBytes { reject(server, slot, 431); return }
+    let result = parseNext(connection, server.limits, now, server.handle, slot, server.nextTicket)
+    if result.status == -2 { drop(server, slot); return }
+    if result.status > 0 { reject(server, slot, result.status); return }
+    match result.request {
+        Some(request) {
+            server.nextTicket += 1
+            removeWatch(server, connection)
+            ready.add(request)
         }
-        connection.scan = at
-        if connection.headerBytes == 0 {
-            if connection.eof { reject(server, slot, 400) }
-            return
-        }
-        connection.parsed = parseHead(data, start, start + connection.headerBytes, server.limits)
-        if connection.parsed.status != 0 { reject(server, slot, connection.parsed.status); return }
-        connection.deadline = now + server.limits.bodyMilliseconds
+        None {}
     }
-    let total = start + connection.headerBytes + connection.parsed.length
-    if data.length < total {
-        if connection.eof { reject(server, slot, 400) }
-        return
-    }
-    let body = Bytes()
-    if connection.parsed.length > 0 { body = data.slice(start + connection.headerBytes, total) }
-    let parsed = connection.parsed
-    if total == data.length { connection.input.clear(); connection.inputStart = 0 }
-    else { connection.inputStart = total }
-    if server.nextTicket == 9223372036854775807 { drop(server, slot); return }
-    connection.ticket = server.nextTicket; server.nextTicket += 1
-    connection.count += 1
-    connection.phase = 1
-    connection.deadline = now + server.limits.applicationMilliseconds
-    removeWatch(server, connection)
-    ready.add(Request { method: parsed.method; target: parsed.target; headers: parsed.headers;
-        body: body; keepAlive: parsed.keepAlive; owner: server.handle; slot: slot; ticket: connection.ticket })
 }
 // TLS connections feed socket bytes through their session; only authenticated
 // plaintext reaches the HTTP parser. Handshake output is written before more
@@ -765,14 +1034,44 @@ function readReady(server: Server, slot: Integer, now: Integer, ready: List<Requ
     }
     parseReady(server, slot, now, ready)
 }
+// A streaming connection reads only to notice the client leaving: end of
+// input or a reset releases the stream. Pipelined bytes wait in the bounded
+// input until the stream finishes; a client that overfills it is dropped.
+function readStreaming(server: Server, slot: Integer) {
+    let connection = server.connections[slot]
+    let capacity = server.limits.maxHeaderBytes + server.limits.maxBodyBytes
+    let buffered = connection.input.length - connection.inputStart
+    if buffered >= capacity { drop(server, slot); return }
+    let limit = min(min(server.limits.ioBudget, 4096), capacity - buffered)
+    if isTls(server, slot) {
+        let ops = tlsSession(server, slot)
+        let count = ops.feed(connection.socket, limit)
+        if count == 0 || count == -2 || ops.state() != TRANSPORT_ESTABLISHED { drop(server, slot); return }
+        let pending = ops.takeIncoming()
+        if pending.length > 0 { connection.input.addBytes(pending) }
+        let reply = ops.takeOutgoing()
+        if reply.length > 0 {
+            append(connection, reply)
+            watch(server, slot, loop.readWriteInterest())
+        }
+        return
+    }
+    let count = net.readInto(connection.socket, connection.input, limit)
+    if count == 0 || count == -2 { drop(server, slot) }
+}
 public function requestActive(server: Server, request: Request): Boolean {
     if server.closed || request.owner != server.handle || request.slot < 0 || request.slot >= server.connections.length { return false }
     let connection = server.connections[request.slot]
     return connection.active && connection.phase == 1 && connection.ticket == request.ticket &&
         net.monotonicMilliseconds() < connection.deadline
 }
+// Close the connection of an active request or stream without replying further.
+// An abandoned stream is not reported by endedStreams.
 public function abandon(server: Server, request: Request) {
-    if requestActive(server, request) { drop(server, request.slot) }
+    if requestActive(server, request) || streamActive(server, request) {
+        server.connections[request.slot].ticket = 0
+        drop(server, request.slot)
+    }
 }
 function validResponse(response: Response, limits: Limits): Boolean {
     if response.status < 200 || response.status > 599 || response.body.length > limits.maxResponseBytes ||
@@ -794,9 +1093,53 @@ function validResponse(response: Response, limits: Limits): Boolean {
 public function respond(server: Server, request: Request, response: Response): Boolean {
     if !requestActive(server, request) || !validResponse(response, server.limits) { return false }
     let connection = server.connections[request.slot]
-    let closing = server.draining || !connection.parsed.keepAlive || connection.count >= server.limits.maxRequestsPerConnection ||
-        connection.eof && connection.inputStart == connection.input.length
-    return startResponse(server, request.slot, response, connection.parsed.method == "HEAD", closing)
+    return startResponse(server, request.slot, response, connection.parsed.method == "HEAD",
+        closingAfter(connection, server.limits, server.draining), false)
+}
+// Start a chunked response for an active request. The request stays the
+// stream's handle: send body pieces with send and end them with finishStream.
+// A non-empty response.body is sent as the first piece. 204, 205 and 304
+// cannot stream. A HEAD request gets the head; its pieces are accepted unsent.
+public function stream(server: Server, request: Request, response: Response): Boolean {
+    if !requestActive(server, request) || !validResponse(response, server.limits) || bodiless(response.status) { return false }
+    let connection = server.connections[request.slot]
+    return startResponse(server, request.slot, response, connection.parsed.method == "HEAD",
+        closingAfter(connection, server.limits, server.draining), true)
+}
+// True while the stream accepts pieces: started, not finished, client present.
+public function streamActive(server: Server, request: Request): Boolean {
+    if server.closed || request.owner != server.handle || request.slot < 0 || request.slot >= server.connections.length { return false }
+    let connection = server.connections[request.slot]
+    return connection.active && connection.phase == 3 && connection.ticket == request.ticket
+}
+// Queue one body piece as a chunk and start writing it. False when the stream
+// ended (see streamActive) or its unsent bytes would exceed streamBufferBytes;
+// a full stream accepts pieces again once a later poll has written some.
+public function send(server: Server, request: Request, piece: Bytes): Boolean {
+    if !streamActive(server, request) { return false }
+    let connection = server.connections[request.slot]
+    if !streamRoom(connection, server.limits, piece.length) { return false }
+    if piece.length == 0 || connection.quiet { return true }
+    let now = net.monotonicMilliseconds()
+    let idle = queuedOutput(connection) == 0
+    if !place(server, request.slot, chunk(piece)) { return false }
+    if idle {
+        connection.deadline = now + server.limits.writeMilliseconds
+        if !watch(server, request.slot, loop.readWriteInterest()) { return false }
+    }
+    flush(server, request.slot, now)
+    return true
+}
+// Write the last chunk. The connection then serves its next request or closes.
+public function finishStream(server: Server, request: Request): Boolean {
+    if !streamActive(server, request) { return false }
+    let connection = server.connections[request.slot]
+    let now = net.monotonicMilliseconds()
+    let last = finishChunks(connection, server.limits, now)
+    if last.length > 0 && !place(server, request.slot, last) { return false }
+    if !watch(server, request.slot, loop.writableInterest()) { return false }
+    flush(server, request.slot, now)
+    return true
 }
 
 // Clamp a shared loop's wait to the earliest deadline and buffered pipeline work.
@@ -816,12 +1159,17 @@ public function waitMilliseconds(server: Server, requested: Integer): Integer {
     }
     return timeout
 }
+function takeEnded(server: Server): List<Integer> {
+    let ended = server.ended
+    server.ended = []
+    return ended
+}
 public function advance(server: Server, batch: loop.Batch): Batch {
     let ready: List<Request> = []
-    if server.closed { return Batch { requests: ready; error: server.error } }
+    if server.closed { return makeBatch(ready, server.error, takeEnded(server)) }
     if errors.isError(loop.batchError(batch)) {
         server.error = loop.batchError(batch); close(server)
-        return Batch { requests: ready; error: server.error }
+        return makeBatch(ready, server.error, takeEnded(server))
     }
     let now = net.monotonicMilliseconds()
     // Each connection gets at most one buffered dispatch per batch.
@@ -863,15 +1211,190 @@ public function advance(server: Server, batch: loop.Batch): Batch {
                                 removeWatch(server, connection)
                             }
                             flush(server, slot, now)
+                        } else {
+                            if connection.phase == 3 {
+                                if loop.isReadable(event) || loop.isClosed(event) || loop.isError(event) { readStreaming(server, slot) }
+                                if connection.active && connection.phase == 3 && loop.isWritable(event) { flush(server, slot, now) }
+                            }
                         }
                     }
                 }
             }
         }
     }
-    return Batch { requests: ready; error: server.error }
+    return makeBatch(ready, server.error, takeEnded(server))
 }
 public function poll(server: Server, timeoutMilliseconds: Integer): Batch {
-    if server.closed { return Batch { requests: []; error: server.error } }
+    if server.closed { return makeBatch([], server.error, takeEnded(server)) }
     return advance(server, loop.wait(server.handle, waitMilliseconds(server, timeoutMilliseconds), server.limits.maxEvents))
+}
+
+/// One HTTP/1.1 server connection without a socket or clock. Offer the peer's
+/// bytes with receive, send what takeOutgoing returns, and answer requests with
+/// the same respond and stream operations as a Server. Every call takes or
+/// reuses the caller's millisecond clock, so a deterministic simulation can
+/// drive it. Use a Request only with the Session that returned it.
+public record Session {
+    private connection: Connection
+    private limits: Limits
+    private nextTicket: Integer
+    private now: Integer
+    private ended: List<Integer>
+    private error: errors.Error
+}
+public function session(limits: Limits, nowMillis: Integer): Session {
+    let copied = copyLimits(limits)
+    let state = Session { connection: newConnection(-1, nowMillis + copied.idleMilliseconds); limits: copied; nextTicket: 1
+        now: nowMillis; ended: []; error: errors.none() }
+    if !validLimits(copied) {
+        state.error = errors.make(errors.invalidDataCode(), 0, "invalid HTTP server limits")
+        state.connection.active = false
+    }
+    return state
+}
+public function Session.error(): errors.Error { return self.error }
+// The session closed its connection: close the transport after sending what
+// takeOutgoing returned. A closed session accepts and returns no more bytes.
+public function Session.closed(): Boolean { return !self.connection.active }
+public function Session.pendingOutput(): Integer {
+    if !self.connection.active { return 0 }
+    return queuedOutput(self.connection)
+}
+function Session.finish(ready: List<Request>, accepted: Integer): Batch {
+    let ended = self.ended
+    self.ended = []
+    return Batch { requests: ready; error: self.error; ended: ended; accepted: accepted }
+}
+function Session.drop() { if self.connection.active { release(self.connection, self.ended) } }
+function Session.reject(status: Integer) {
+    let head = rejectHead(self.connection)
+    append(self.connection, queueResponse(self.connection, self.limits, response(status, "text/plain", Bytes(reason(status))), head, true, false, self.now))
+}
+function Session.parse(ready: List<Request>) {
+    let result = parseNext(self.connection, self.limits, self.now, -1, 0, self.nextTicket)
+    if result.status == -2 { self.drop(); return }
+    if result.status > 0 { self.reject(result.status); return }
+    match result.request {
+        Some(request) { self.nextTicket += 1; ready.add(request) }
+        None {}
+    }
+}
+// Deadlines first: false when the connection expired at the current time.
+function Session.current(nowMillis: Integer): Boolean {
+    self.now = max(self.now, nowMillis)
+    let connection = self.connection
+    if !connection.active { return false }
+    if self.now < connection.deadline { return true }
+    if connection.phase == 0 && connection.started { self.reject(408) } else { self.drop() }
+    return false
+}
+/// Apply deadlines and dispatch a buffered pipelined request. Call it after
+/// takeOutgoing completes a response and whenever the clock advances.
+public function Session.tick(nowMillis: Integer): Batch {
+    let ready: List<Request> = []
+    if self.current(nowMillis) && self.connection.phase == 0 && self.connection.needsParse { self.parse(ready) }
+    return self.finish(ready, 0)
+}
+/// Offer bytes from the peer. The Batch reports how many were accepted; input
+/// is bounded like a Server's, so offer the rest after the session has answered.
+public function Session.receive(bytes: Bytes, nowMillis: Integer): Batch {
+    let ready: List<Request> = []
+    if !self.current(nowMillis) || self.connection.eof { return self.finish(ready, 0) }
+    let connection = self.connection
+    let capacity = self.limits.maxHeaderBytes + self.limits.maxBodyBytes
+    let take = max(0, min(bytes.length, capacity - (connection.input.length - connection.inputStart)))
+    if take == bytes.length { connection.input.addBytes(bytes) }
+    else { if take > 0 { connection.input.addBytes(bytes.slice(0, take)) } }
+    if connection.phase == 0 {
+        if !connection.started && take > 0 { connection.started = true; connection.deadline = self.now + self.limits.headerMilliseconds }
+        if take > 0 || connection.needsParse { self.parse(ready) }
+    }
+    return self.finish(ready, take)
+}
+/// The peer ended its input. An open stream is released, a partial request is
+/// answered with 400, and queued responses can still be taken.
+public function Session.finishInput(nowMillis: Integer): Batch {
+    let ready: List<Request> = []
+    if self.current(nowMillis) && !self.connection.eof {
+        let connection = self.connection
+        connection.eof = true
+        if connection.phase == 3 { self.drop() }
+        else {
+            if connection.phase == 0 {
+                if connection.inputStart == connection.input.length { self.drop() } else { self.parse(ready) }
+            }
+        }
+    }
+    return self.finish(ready, 0)
+}
+/// Up to `maximum` bytes for the peer, in order.
+public function Session.takeOutgoing(maximum: Integer): Bytes {
+    if maximum < 1 { fail("httpserver: outgoing maximum must be positive") }
+    let result = Bytes()
+    let connection = self.connection
+    if !connection.active { return result }
+    while result.length < maximum {
+        if connection.sent < connection.output.length {
+            let take = min(maximum - result.length, connection.output.length - connection.sent)
+            result.addBytes(connection.output.slice(connection.sent, connection.sent + take))
+            connection.sent += take
+        } else {
+            if connection.bodySent >= connection.body.length { break }
+            let take = min(maximum - result.length, connection.body.length - connection.bodySent)
+            result.addBytes(connection.body.slice(connection.bodySent, connection.bodySent + take))
+            connection.bodySent += take
+        }
+    }
+    if result.length > 0 && connection.phase == 3 { connection.deadline = self.now + self.limits.writeMilliseconds }
+    if queuedOutput(connection) == 0 {
+        if connection.phase == 3 { streamDrained(connection) }
+        if connection.phase == 2 {
+            if connection.closing { self.drop() } else { nextRequest(connection, self.limits, self.now) }
+        }
+    }
+    return result
+}
+public function Session.requestActive(request: Request): Boolean {
+    let connection = self.connection
+    return request.owner == -1 && connection.active && connection.phase == 1 && connection.ticket == request.ticket &&
+        self.now < connection.deadline
+}
+public function Session.streamActive(request: Request): Boolean {
+    let connection = self.connection
+    return request.owner == -1 && connection.active && connection.phase == 3 && connection.ticket == request.ticket
+}
+public function Session.respond(request: Request, response: Response): Boolean {
+    if !self.requestActive(request) || !validResponse(response, self.limits) { return false }
+    let connection = self.connection
+    append(connection, queueResponse(connection, self.limits, response, connection.parsed.method == "HEAD",
+        closingAfter(connection, self.limits, false), false, self.now))
+    return true
+}
+public function Session.stream(request: Request, response: Response): Boolean {
+    if !self.requestActive(request) || !validResponse(response, self.limits) || bodiless(response.status) { return false }
+    let connection = self.connection
+    append(connection, queueResponse(connection, self.limits, response, connection.parsed.method == "HEAD",
+        closingAfter(connection, self.limits, false), true, self.now))
+    return true
+}
+public function Session.send(request: Request, piece: Bytes): Boolean {
+    if !self.streamActive(request) { return false }
+    let connection = self.connection
+    if !streamRoom(connection, self.limits, piece.length) { return false }
+    if piece.length == 0 || connection.quiet { return true }
+    if queuedOutput(connection) == 0 { connection.deadline = self.now + self.limits.writeMilliseconds }
+    append(connection, chunk(piece))
+    return true
+}
+public function Session.finishStream(request: Request): Boolean {
+    if !self.streamActive(request) { return false }
+    let last = finishChunks(self.connection, self.limits, self.now)
+    if last.length > 0 { append(self.connection, last) }
+    return true
+}
+public function Session.abandon(request: Request) {
+    if self.requestActive(request) || self.streamActive(request) {
+        self.connection.ticket = 0
+        self.drop()
+    }
 }

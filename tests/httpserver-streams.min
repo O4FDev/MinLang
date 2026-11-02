@@ -1,0 +1,56 @@
+// Event streams for tests/httpserver-streams.py. GET /events opens a stream
+// whose first event is "0", /tick sends the next event to every open stream,
+// /finish ends them all, /stats reports "open released connections".
+use "httpserver" as http
+use "errors" as errors
+
+function main(): Integer {
+    let limits = http.defaults()
+    limits.maxConnections = 1100
+    let server = http.listen("127.0.0.1", 0, limits)
+    if !http.ok(server) { fail(errors.message(http.serverError(server))) }
+    print(http.port(server))
+    let streams: List<http.Request> = []
+    let released = 0
+    let next = 1
+    let running = true
+    while running {
+        let batch = http.poll(server, 1000)
+        if errors.isError(http.batchError(batch)) { fail(errors.message(http.batchError(batch))) }
+        let ended = http.endedStreams(batch)
+        if ended.length > 0 {
+            released += ended.length
+            let kept: List<http.Request> = []
+            for request in streams { if http.streamActive(server, request) { kept.add(request) } }
+            streams = kept
+        }
+        for request in http.requests(batch) {
+            if request.target == "/events" {
+                let head = http.response(200, "text/event-stream", Bytes("data: 0\n\n"))
+                head.headers.add(http.Header { name: "cache-control"; value: "no-cache" })
+                head.headers.add(http.Header { name: "access-control-allow-origin"; value: "*" })
+                if !http.stream(server, request, head) { fail("stream rejected") }
+                streams.add(request)
+            } else {
+                let body = ""
+                if request.target == "/tick" {
+                    let sent = 0
+                    for stream in streams { if http.send(server, stream, Bytes("data: " + Text(next) + "\n\n")) { sent += 1 } }
+                    next += 1
+                    body = Text(sent)
+                }
+                if request.target == "/finish" {
+                    let finished = 0
+                    for stream in streams { if http.finishStream(server, stream) { finished += 1 } }
+                    streams = []
+                    body = Text(finished)
+                }
+                if request.target == "/stats" { body = Text(streams.length) + " " + Text(released) + " " + Text(http.connectionCount(server)) }
+                if request.target == "/quit" { running = false }
+                if !http.respond(server, request, http.response(200, "text/plain", Bytes(body))) { fail("response rejected") }
+            }
+        }
+    }
+    http.close(server)
+    return 0
+}

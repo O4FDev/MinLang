@@ -1,0 +1,227 @@
+// httpserver.Session without sockets: a deterministic simulation delivers a
+// pipelined client in random fragments and drains the server's output in
+// random slices, while the server streams chunked responses on timers. Every
+// seed must produce the same bytes, and the same seed the same run. Direct
+// checks then cover chunked request bodies, stream bounds, stalls and release.
+use "httpserver" as http
+use "simulation" as sim
+use "text" as utf8
+
+constant FRAGMENT = 1
+constant TICK = 2
+constant PIECES = 4
+
+function limits(): http.Limits {
+    let limits = http.defaults()
+    limits.maxHeaderBytes = 1024
+    limits.maxBodyBytes = 4096
+    limits.streamBufferBytes = 1024
+    limits.writeMilliseconds = 1000
+    return limits
+}
+function joined(parts: List<Text>): Bytes {
+    let result = Bytes()
+    for part in parts { result.addBytes(Bytes(part)) }
+    return result
+}
+function echoBody(): Text { return "alpha-beta-gamma-delta" }
+// /events streams PIECES events; /echo returns the decoded body; /leave
+// streams until the client leaves after two events.
+function client(): Bytes {
+    return joined(["GET /events HTTP/1.1\r\nHost: sim\r\n\r\n",
+        "POST /echo HTTP/1.1\r\nHost: [::1]:8080\r\nTransfer-Encoding: chunked\r\n\r\n",
+        "6;name=value\r\nalpha-\r\n", "5\r\nbeta-\r\n", "B\r\ngamma-delta\r\n", "0\r\nx-checksum: 1\r\n\r\n",
+        "GET /leave HTTP/1.1\r\nHost: sim\r\n\r\n"])
+}
+function event(index: Integer): Text { return "data: " + Text(index) + "\n\n" }
+function chunkText(piece: Text): Text { return utf8.hex(Bytes(piece).length) + "\r\n" + piece + "\r\n" }
+function expected(): Text {
+    let stream = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n"
+    let result = stream
+    for index in 0..PIECES + 1 { result = result + chunkText(event(index)) }
+    result = result + "0\r\n\r\n"
+    result = result + "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: " + Text(echoBody().byteLength) +
+        "\r\nconnection: keep-alive\r\n\r\n" + echoBody()
+    result = result + stream + chunkText(event(0)) + chunkText(event(1)) + chunkText(event(2))
+    return result
+}
+
+record Run { received: Bytes; streams: List<http.Request>; sent: List<Integer>; left: Integer; released: Boolean; closed: Boolean }
+
+function serve(session: http.Session, run: Run, batch: http.Batch) {
+    for id in http.endedStreams(batch) { if id == run.left { run.released = true } }
+    for request in http.requests(batch) {
+        if request.target == "/echo" {
+            if request.method != "POST" || http.header(request, "transfer-encoding") != "chunked" { fail("echo request head") }
+            if !session.respond(request, http.response(200, "text/plain", request.body)) { fail("echo response") }
+        } else {
+            if !session.stream(request, http.response(200, "text/event-stream", Bytes(event(0)))) { fail("stream start") }
+            run.streams.add(request)
+            run.sent.add(1)
+            if request.target == "/leave" { run.left = http.requestId(request) }
+        }
+    }
+}
+// One tick: every live stream sends its next event; /events finishes after PIECES.
+function tick(session: http.Session, run: Run) {
+    for index in 0..run.streams.length {
+        let request = run.streams[index]
+        if session.streamActive(request) {
+            let last = PIECES
+            if request.target == "/leave" { last = 2 }
+            if run.sent[index] <= last {
+                if session.send(request, Bytes(event(run.sent[index]))) { run.sent[index] = run.sent[index] + 1 }
+            } else {
+                if request.target == "/events" && !session.finishStream(request) { fail("finish stream") }
+            }
+        }
+    }
+}
+deterministic function universe(seed: Integer): Text {
+    let world = sim.create(seed)
+    let session = http.session(limits(), 0)
+    let run = Run { received: Bytes(); streams: []; sent: []; left: -1; released: false; closed: false }
+    let script = client()
+    let offset = 0
+    sim.submitPacket(world, 0, script.slice(0, 1 + sim.choose(world, 40)), sim.choose(world, 5), FRAGMENT)
+    sim.submitTimer(world, 3, TICK)
+    let steps = 0
+    while sim.pendingCount(world) > 0 {
+        steps += 1
+        if steps > 100000 { fail("simulation did not finish") }
+        let done = sim.next(world)
+        let now = done.at
+        if done.token == FRAGMENT {
+            let batch = session.receive(done.data, now)
+            offset += http.accepted(batch)
+            serve(session, run, batch)
+            if offset < script.length {
+                let size = 1 + sim.choose(world, 60)
+                sim.submitPacket(world, 0, script.slice(offset, min(script.length, offset + size)), 1 + sim.choose(world, 4), FRAGMENT)
+            }
+        } else {
+            tick(session, run)
+            serve(session, run, session.tick(now))
+            // The client leaves once /leave delivered two events.
+            let leaving = run.streams.length == 2 && run.sent[1] == 3 && session.pendingOutput() == 0
+            if leaving {
+                let batch = session.finishInput(now)
+                if !run.released { serve(session, run, batch) }
+                if !run.released { fail("a client leaving did not release its stream on that call") }
+                if !session.closed() { fail("session still open after its client left") }
+            } else { sim.submitTimer(world, 1 + sim.choose(world, 9), TICK) }
+        }
+        let output = session.takeOutgoing(1 + sim.choose(world, 200))
+        run.received.addBytes(output)
+        serve(session, run, session.tick(now))
+    }
+    if session.pendingOutput() != 0 || !session.closed() { fail("session left output or stayed open") }
+    return utf8.decodeOrStop(run.received)
+}
+
+function exchange(session: http.Session, raw: Text): Text {
+    let batch = session.receive(Bytes(raw), 0)
+    for request in http.requests(batch) { session.respond(request, http.response(200, "text/plain", request.body)) }
+    return utf8.decodeOrStop(session.takeOutgoing(65536))
+}
+function statusOf(raw: Text): Text {
+    let session = http.session(limits(), 0)
+    let reply = exchange(session, raw)
+    if !reply.startsWith("HTTP/1.1 ") || reply.byteLength < 12 { return "none" }
+    return utf8.decodeOrStop(Bytes(reply).slice(9, 12))
+}
+function requests() {
+    let head = "POST / HTTP/1.1\r\nHost: sim\r\n"
+    let cases = [
+        [head + "Transfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", "200"],
+        [head + "Transfer-Encoding: Chunked\r\n\r\n3 ; a=b\r\nabc\r\n0\r\n\r\n", "200"],
+        [head + "Transfer-Encoding: gzip\r\n\r\n", "501"],
+        [head + "Transfer-Encoding: gzip, chunked\r\n\r\n", "501"],
+        [head + "Transfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n3\r\nabc\r\n0\r\n\r\n", "400"],
+        [head + "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "400"],
+        [head + "Transfer-Encoding: chunked\r\n\r\nzz\r\n", "400"],
+        [head + "Transfer-Encoding: chunked\r\n\r\n3\nabc\r\n0\r\n\r\n", "400"],
+        [head + "Transfer-Encoding: chunked\r\n\r\n3\r\nabcd\r\n0\r\n\r\n", "400"],
+        [head + "Transfer-Encoding: chunked\r\n\r\n1001\r\n", "413"],
+        [head + "Transfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFFFF\r\n", "413"],
+        [head + "Transfer-Encoding: chunked\r\n\r\n0\r\nno-colon\r\n\r\n", "400"],
+        [head + "Content-Length: 0\r\n\r\n", "200"]]
+    for item in cases {
+        let status = statusOf(item[0])
+        if status != item[1] { fail("chunked request case expected " + item[1] + " got " + status + ": " + item[0]) }
+    }
+    // A body split across many chunks reaches the limit exactly, then one byte over is refused.
+    let exact = head + "Transfer-Encoding: chunked\r\n\r\n"
+    for index in 0..64 { exact = exact + "40\r\n" + "x".repeat(64) + "\r\n" }
+    let reply = exchange(http.session(limits(), 0), exact + "0\r\n\r\n")
+    if !reply.contains("content-length: 4096") { fail("4096-byte chunked body") }
+    if statusOf(exact + "1\r\ny\r\n0\r\n\r\n") != "413" { fail("chunked body above the limit") }
+    // A truncated chunked body is answered when the input ends.
+    let truncated = http.session(limits(), 0)
+    truncated.receive(Bytes(head + "Transfer-Encoding: chunked\r\n\r\n5\r\nab"), 0)
+    truncated.finishInput(1)
+    if !utf8.decodeOrStop(truncated.takeOutgoing(4096)).startsWith("HTTP/1.1 400") || !truncated.closed() { fail("truncated chunked body") }
+    // Framing overhead is consumed as it is decoded: 1-byte chunks carrying the
+    // whole 4096-byte body never overflow the 5120-byte input bound.
+    let small = http.session(limits(), 0)
+    let pending = Bytes(head + "Transfer-Encoding: chunked\r\n\r\n")
+    for index in 0..4096 { pending.addBytes(Bytes("1\r\nz\r\n")) }
+    pending.addBytes(Bytes("0\r\n\r\n"))
+    let delivered = 0
+    let count = 0
+    while delivered < pending.length {
+        let batch = small.receive(pending.slice(delivered, min(pending.length, delivered + 700)), 0)
+        delivered += http.accepted(batch)
+        count += http.requests(batch).length
+        if http.accepted(batch) == 0 { fail("chunked framing filled the input bound") }
+    }
+    if count != 1 { fail("1-byte chunk request count " + Text(count)) }
+}
+function streams() {
+    // A full stream refuses pieces until output is taken, then accepts them again.
+    let session = http.session(limits(), 0)
+    let request = http.requests(session.receive(Bytes("GET /s HTTP/1.1\r\nHost: sim\r\n\r\n"), 0))[0]
+    if !session.stream(request, http.response(200, "text/plain", Bytes())) { fail("stream start") }
+    let accepted = 0
+    while session.send(request, Bytes("p".repeat(100))) { accepted += 1 }
+    if !session.streamActive(request) || accepted < 8 || accepted > 10 { fail("stream buffer bound " + Text(accepted)) }
+    session.takeOutgoing(65536)
+    if !session.send(request, Bytes("after")) { fail("drained stream refused a piece") }
+    if session.respond(request, http.response(200, "text/plain", Bytes())) { fail("respond on a streaming request") }
+    // A reader that stops taking output stalls the stream past writeMilliseconds.
+    let batch = session.tick(999)
+    if http.endedStreams(batch).length != 0 { fail("stream released before its write deadline") }
+    batch = session.tick(1000)
+    if http.endedStreams(batch).length != 1 || http.endedStreams(batch)[0] != http.requestId(request) || !session.closed() { fail("stalled stream release") }
+    if session.send(request, Bytes("late")) || session.streamActive(request) { fail("released stream accepted a piece") }
+    // An idle stream has no deadline; finishing returns the connection to keep-alive.
+    let idle = http.session(limits(), 0)
+    let first = http.requests(idle.receive(Bytes("GET /a HTTP/1.1\r\nHost: sim\r\n\r\nGET /b HTTP/1.1\r\nHost: sim\r\n\r\n"), 0))[0]
+    idle.stream(first, http.response(200, "text/plain", Bytes("one")))
+    idle.takeOutgoing(65536)
+    if http.endedStreams(idle.tick(100000000)).length != 0 || !idle.streamActive(first) { fail("idle stream expired") }
+    idle.finishStream(first)
+    if utf8.decodeOrStop(idle.takeOutgoing(65536)) != "0\r\n\r\n" { fail("last chunk") }
+    let second = http.requests(idle.tick(100000001))
+    if second.length != 1 || second[0].target != "/b" { fail("pipelined request after a stream") }
+    // HEAD streams send the head only; 204 cannot stream; an empty piece sends nothing.
+    let quiet = http.session(limits(), 0)
+    let probe = http.requests(quiet.receive(Bytes("HEAD /h HTTP/1.1\r\nHost: sim\r\n\r\n"), 0))[0]
+    if quiet.stream(probe, http.response(204, "text/plain", Bytes())) { fail("204 stream accepted") }
+    quiet.stream(probe, http.response(200, "text/plain", Bytes("hidden")))
+    quiet.send(probe, Bytes("hidden"))
+    quiet.send(probe, Bytes())
+    quiet.finishStream(probe)
+    let text = utf8.decodeOrStop(quiet.takeOutgoing(65536))
+    if !text.endsWith("\r\n\r\n") || text.contains("hidden") || !text.contains("transfer-encoding: chunked") { fail("HEAD stream: " + text) }
+}
+
+let reference = expected()
+for seed in 1..201 {
+    let first = universe(seed)
+    if first != reference { fail("seed " + Text(seed) + " produced:\n" + first + "\nexpected:\n" + reference) }
+    if universe(seed) != first { fail("seed " + Text(seed) + " is not reproducible") }
+}
+requests()
+streams()
+print("httpserver session: 200 simulated pipelines with streams, chunked uploads and client release; request, bound and stall checks passed")
