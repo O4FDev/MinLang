@@ -1,0 +1,694 @@
+// gRPC server over the bounded HTTP/2 server in library/http2.min: unary,
+// deferred and server-streaming methods from an rpc.Services registry, with
+// length-prefixed messages carried as Bytes (no Protobuf codec here), status
+// codes and trailers, grpc-timeout deadlines and client cancellation.
+// A Connection takes bytes in and returns bytes out, reads no clock and opens
+// no socket, so a deterministic simulation can drive it. listen/poll serve it
+// over h2c; library/grpctls.min adds TLS 1.3 with ALPN "h2".
+use "http2" as h2
+use "rpc" as rpc
+use "errors" as errors
+use "net" as net
+use "eventloop" as loop
+use "text" as utf8
+
+public record Limits {
+    // Largest request or response message, excluding its 5-byte prefix.
+    maxMessageBytes: Integer
+    // Unsent response bytes one stream may queue before send returns false.
+    streamBufferBytes: Integer
+    // Socket servers: concurrent connections and idle connection lifetime.
+    maxConnections: Integer
+    idleMilliseconds: Integer
+}
+public function defaults(): Limits {
+    return Limits { maxMessageBytes: 4194304; streamBufferBytes: 1048576; maxConnections: 256; idleMilliseconds: 300000 }
+}
+function validLimits(limits: Limits): Boolean {
+    return limits.maxMessageBytes >= 1024 && limits.maxMessageBytes <= 67108864 &&
+        limits.streamBufferBytes >= 1024 && limits.streamBufferBytes <= 67108864 &&
+        limits.maxConnections > 0 && limits.maxConnections <= 65536 &&
+        limits.idleMilliseconds > 0 && limits.idleMilliseconds <= 86400000
+}
+function copyLimits(limits: Limits): Limits {
+    return Limits { maxMessageBytes: limits.maxMessageBytes; streamBufferBytes: limits.streamBufferBytes
+        maxConnections: limits.maxConnections; idleMilliseconds: limits.idleMilliseconds }
+}
+
+// The clock handlers see through rpc.Call: the time of the latest call into
+// the Connection, never a host clock.
+record Clock { now: Integer }
+// The response side a Responder writes to. It holds no reference back to the
+// Connection or the Responder, so a call's state forms no reference cycle.
+record Lane {
+    call: rpc.Call
+    contentType: Text
+    out: Bytes
+    outAt: Integer
+    messages: Integer
+    single: Boolean
+    finished: Boolean
+    error: Maybe<rpc.Error>
+    // Canceled, expired or already ended: nothing more is queued.
+    closed: Boolean
+    limit: Integer
+    buffer: Integer
+}
+record Active {
+    id: Integer
+    input: Bytes
+    message: Maybe<Bytes>
+    method: Maybe<rpc.Method>
+    lane: Lane
+    responder: Maybe<rpc.Responder>
+    dispatched: Boolean
+    headersSent: Boolean
+    // Trailers (or a reset) are queued in HTTP/2; the call only awaits release.
+    ended: Boolean
+    deadline: Integer
+}
+/// One HTTP/2 connection serving gRPC calls without I/O.
+public record Connection {
+    private transport: h2.Server
+    private services: rpc.Services
+    private limits: Limits
+    private clock: Clock
+    private calls: List<Active>
+    private error: errors.Error
+    private finished: Boolean
+}
+public function connection(services: rpc.Services, limits: Limits, nowMillis: Integer): Connection {
+    let state = Connection { transport: h2.create(); services: services; limits: copyLimits(limits); clock: Clock { now: nowMillis }
+        calls: []; error: errors.none(); finished: false }
+    if !validLimits(state.limits) { state.error = errors.make(errors.invalidDataCode(), 0, "invalid gRPC limits") }
+    else { advance(state) }
+    return state
+}
+public function connectionError(connection: Connection): errors.Error {
+    if errors.isError(connection.error) { return connection.error }
+    return h2.connectionError(connection.transport)
+}
+// Calls whose handlers may still send: dispatched and not yet ended.
+public function activeCalls(connection: Connection): Integer {
+    let count = 0
+    for active in connection.calls { if !active.ended { count += 1 } }
+    return count
+}
+public function retainedCalls(connection: Connection): Integer { return connection.calls.length }
+public function bufferedOutput(connection: Connection): Integer { return h2.bufferedOutput(connection.transport) }
+// True once the connection failed or the peer ended its input and every
+// response has been taken: close the transport.
+public function closed(connection: Connection): Boolean {
+    if h2.bufferedOutput(connection.transport) > 0 { return false }
+    if errors.isError(connectionError(connection)) { return true }
+    return connection.finished && activeCalls(connection) == 0
+}
+// The earliest call deadline or HTTP/2 timer, or -1 for none.
+public function nextDeadline(connection: Connection): Integer {
+    let next = -1
+    let transport = h2.nextDeadlineMillis(connection.transport)
+    if transport > 0 { next = transport }
+    for active in connection.calls {
+        if !active.ended && active.deadline >= 0 && (next < 0 || active.deadline < next) { next = active.deadline }
+    }
+    return next
+}
+
+/// Feed bytes received from the peer. Handlers run inside this call.
+public function receive(connection: Connection, bytes: Bytes, nowMillis: Integer): errors.BooleanResult {
+    if errors.isError(connection.error) { return errors.booleanFailure(connection.error) }
+    connection.clock.now = max(connection.clock.now, nowMillis)
+    let result = h2.receive(connection.transport, bytes)
+    advance(connection)
+    return result
+}
+/// The peer ended its input. Calls in progress still finish their responses.
+public function finish(connection: Connection, nowMillis: Integer) {
+    connection.clock.now = max(connection.clock.now, nowMillis)
+    if !connection.finished {
+        connection.finished = true
+        if !errors.isError(connection.error) && !errors.isError(h2.connectionError(connection.transport)) { h2.finish(connection.transport) }
+    }
+    advance(connection)
+}
+/// Apply deadlines and HTTP/2 timers, and move held streams' messages out.
+public function tick(connection: Connection, nowMillis: Integer) {
+    connection.clock.now = max(connection.clock.now, nowMillis)
+    if !errors.isError(connection.error) { h2.tick(connection.transport, connection.clock.now) }
+    advance(connection)
+}
+/// Up to `maximum` bytes for the peer, in order.
+public function takeOutgoing(connection: Connection, maximum: Integer): Bytes {
+    advance(connection)
+    let bytes = h2.takeOutgoing(connection.transport, maximum)
+    advance(connection)
+    return bytes
+}
+
+function problem(code: Integer, message: Text): rpc.Error { return rpc.failure(code, message) }
+function advance(connection: Connection) {
+    if errors.isError(connection.error) { return }
+    accept(connection)
+    for active in connection.calls {
+        if !active.ended {
+            observe(connection, active)
+            if !active.ended && active.deadline >= 0 && connection.clock.now >= active.deadline {
+                expire(connection, active, problem(rpc.DEADLINE_EXCEEDED, "deadline exceeded"))
+            }
+            if !active.ended && !active.dispatched { readRequest(connection, active) }
+            if !active.ended { pump(connection, active) }
+        }
+    }
+    let kept: List<Active> = []
+    for active in connection.calls {
+        if !(active.ended && errors.booleanOk(h2.release(connection.transport, active.id))) { kept.add(active) }
+    }
+    connection.calls = kept
+}
+// New HTTP/2 requests become calls; invalid ones are answered at once.
+function accept(connection: Connection) {
+    let request = h2.requests(connection.transport)
+    while h2.requestOk(request) {
+        let id = h2.streamID(request)
+        let fields = h2.headers(request)
+        let lane = Lane { call: rpc.call("", "grpc", "proto", [], -1, clockOf(connection.clock)); contentType: "application/grpc"
+            out: Bytes(); outAt: 0; messages: 0; single: true; finished: false; error: None; closed: false
+            limit: connection.limits.maxMessageBytes; buffer: connection.limits.streamBufferBytes }
+        let active = Active { id: id; input: Bytes(); message: None; method: None; lane: lane; responder: None
+            dispatched: false; headersSent: false; ended: false; deadline: -1 }
+        connection.calls.add(active)
+        let content = h2.headerValue(fields, "content-type")
+        let codec = codecOf(content)
+        if h2.headerValue(fields, ":method") != "POST" { plainStatus(connection, active, "405") }
+        else if codec == "" { plainStatus(connection, active, "415") }
+        else {
+            let path = h2.headerValue(fields, ":path")
+            let timeout = timeoutMillis(h2.headerValue(fields, "grpc-timeout"))
+            let headers: List<rpc.Header> = []
+            for field in fields { if !field.name.startsWith(":") { headers.add(rpc.Header { name: field.name; value: field.value }) } }
+            lane.contentType = content
+            lane.call = rpc.call(path, "grpc", codec, headers, -1, clockOf(connection.clock))
+            let encoding = h2.headerValue(fields, "grpc-encoding")
+            if timeout == -2 { reject(connection, active, problem(rpc.INTERNAL, "malformed grpc-timeout")) }
+            else if encoding != "" && encoding != "identity" {
+                reject(connection, active, problem(rpc.UNIMPLEMENTED, "grpc-encoding " + encoding + " is not supported"))
+            } else {
+                if timeout >= 0 {
+                    active.deadline = connection.clock.now + timeout
+                    lane.call.deadline = active.deadline
+                }
+                active.method = connection.services.lookup(path)
+                match active.method {
+                    Some(method) { lane.single = method.kind() == rpc.UNARY }
+                    None { reject(connection, active, problem(rpc.UNIMPLEMENTED, "unknown method " + path)) }
+                }
+            }
+        }
+        request = h2.requests(connection.transport)
+    }
+}
+function clockOf(clock: Clock): () -> Integer { return function(): Integer { return clock.now } }
+function codecOf(content: Text): Text {
+    if content == "application/grpc" || content == "application/grpc+proto" { return "proto" }
+    if content == "application/grpc+json" { return "json" }
+    return ""
+}
+// grpc-timeout in milliseconds, rounded up; -1 when absent, -2 when malformed.
+function timeoutMillis(value: Text): Integer {
+    if value == "" { return -1 }
+    let bytes = Bytes(value)
+    if bytes.length < 2 || bytes.length > 9 { return -2 }
+    let number = 0
+    for at in 0..bytes.length - 1 {
+        if bytes[at] < 48 || bytes[at] > 57 { return -2 }
+        number = number * 10 + bytes[at] - 48
+    }
+    let unit = bytes[bytes.length - 1]
+    if unit == 72 { return number * 3600000 }
+    if unit == 77 { return number * 60000 }
+    if unit == 83 { return number * 1000 }
+    if unit == 109 { return number }
+    if unit == 117 { return (number + 999) / 1000 }
+    if unit == 110 { return (number + 999999) / 1000000 }
+    return -2
+}
+// A non-gRPC answer for a request that is not a gRPC call.
+function plainStatus(connection: Connection, active: Active, status: Text) {
+    active.lane.closed = true
+    let sent = h2.respond(connection.transport, active.id, [h2.Header { name: ":status"; value: status }], true)
+    if !errors.booleanOk(sent) { h2.resetStream(connection.transport, active.id, 2) }
+    active.ended = true
+}
+// The client reset the stream or the connection failed: cancel the handler.
+function observe(connection: Connection, active: Active) {
+    if active.dispatched && !errors.isError(h2.connectionError(connection.transport)) {
+        // The request is complete, so a read only reports end of stream or the reset.
+        let status = errors.bytesStatus(h2.read(connection.transport, active.id, 1))
+        if status == errors.endOfStreamStatus() || status == errors.wouldBlockStatus() { return }
+    } else {
+        if !errors.isError(h2.connectionError(connection.transport)) { return }
+    }
+    abandon(active)
+}
+function abandon(active: Active) {
+    active.lane.closed = true
+    active.lane.out = Bytes(); active.lane.outAt = 0
+    match active.responder {
+        Some(responder) { rpc.cancel(responder) }
+        None {}
+    }
+    active.ended = true
+}
+// Read request DATA until END_STREAM, collecting exactly one message.
+function readRequest(connection: Connection, active: Active) {
+    while true {
+        let room = connection.limits.maxMessageBytes + 5 - active.input.length
+        let result = h2.read(connection.transport, active.id, max(1, min(16384, room)))
+        let status = errors.bytesStatus(result)
+        if status == errors.successStatus() {
+            active.input.addBytes(errors.bytesValue(result))
+            if !messages(connection, active) { return }
+        } else {
+            if status == errors.endOfStreamStatus() {
+                if active.input.length > 0 { reject(connection, active, problem(rpc.INTERNAL, "truncated request message")); return }
+                match active.message {
+                    Some(message) { dispatch(connection, active, message) }
+                    None { reject(connection, active, problem(rpc.INTERNAL, "no request message")) }
+                }
+                return
+            }
+            if status != errors.wouldBlockStatus() { abandon(active) }
+            return
+        }
+    }
+}
+// Split complete length-prefixed messages off the input; false after failing the call.
+function messages(connection: Connection, active: Active): Boolean {
+    while active.input.length >= 5 {
+        let input = active.input
+        let size = (input[1] << 24) | (input[2] << 16) | (input[3] << 8) | input[4]
+        if input[0] != 0 {
+            reject(connection, active, problem(rpc.INTERNAL, "compressed message without grpc-encoding")); return false
+        }
+        if size > connection.limits.maxMessageBytes {
+            reject(connection, active, problem(rpc.RESOURCE_EXHAUSTED, "request message larger than " + Text(connection.limits.maxMessageBytes) + " bytes"))
+            return false
+        }
+        if input.length < 5 + size { return true }
+        if active.message.isSome() { reject(connection, active, problem(rpc.UNIMPLEMENTED, "more than one request message")); return false }
+        active.message = Some(input.slice(5, 5 + size))
+        active.input = input.slice(5 + size, input.length)
+    }
+    return true
+}
+function dispatch(connection: Connection, active: Active, message: Bytes) {
+    active.dispatched = true
+    let lane = active.lane
+    let method = active.method.unwrap()
+    match method.handler {
+        Unary(body) {
+            match body(lane.call, message) {
+                Ok(reply) { queue(lane, reply, true); lane.finished = true }
+                Err(error) { lane.finished = true; lane.error = Some(error) }
+            }
+        }
+        ServerStream(body) { stream(active, body, message) }
+        Deferred(body) { stream(active, body, message) }
+    }
+}
+function stream(active: Active, body: (rpc.Call, Bytes, rpc.Responder) -> Result<Nothing, rpc.Error>, message: Bytes) {
+    let lane = active.lane
+    let responder = rpc.responder(function(bytes: Bytes): Boolean { return queue(lane, bytes, false) },
+        function(error: Maybe<rpc.Error>) { lane.finished = true; lane.error = error })
+    active.responder = Some(responder)
+    match body(lane.call, message, responder) {
+        Ok() { if !rpc.held(responder) { responder.finish(None) } }
+        Err(error) { responder.finish(Some(error)) }
+    }
+}
+// Queue one framed response message. A unary reply always fits; a stream
+// accepts a message while its queue is empty or below streamBufferBytes.
+function queue(lane: Lane, bytes: Bytes, forced: Boolean): Boolean {
+    if lane.closed || lane.finished || bytes.length > lane.limit || lane.single && lane.messages > 0 { return false }
+    let queued = lane.out.length - lane.outAt
+    if !forced && queued > 0 && queued + bytes.length + 5 > lane.buffer { return false }
+    if lane.outAt > 0 && lane.outAt >= queued { lane.out = lane.out.slice(lane.outAt, lane.out.length); lane.outAt = 0 }
+    lane.out.add(0)
+    for shift in [24, 16, 8, 0] { lane.out.add((bytes.length >> shift) & 255) }
+    lane.out.addBytes(bytes)
+    lane.messages += 1
+    return true
+}
+// Move a call's queued response into HTTP/2 as its windows and buffers allow.
+function pump(connection: Connection, active: Active) {
+    let lane = active.lane
+    let pending = lane.out.length - lane.outAt
+    if !lane.finished && pending == 0 { return }
+    if lane.finished && lane.error.isNone() && lane.single && lane.messages == 0 {
+        lane.error = Some(problem(rpc.INTERNAL, "the handler finished without a response message"))
+    }
+    if !active.headersSent {
+        if lane.finished && pending == 0 && lane.error.isSome() {
+            // Trailers-only: the status travels in the only HEADERS frame.
+            let fields = responseHead(lane)
+            for field in trailers(lane) { fields.add(field) }
+            if errors.booleanOk(h2.respond(connection.transport, active.id, fields, true)) { finished(active) }
+            else { drop(connection, active) }
+            return
+        }
+        let head = h2.respond(connection.transport, active.id, responseHead(lane), false)
+        if !errors.booleanOk(head) {
+            if !errors.isWouldBlock(errors.booleanError(head)) { drop(connection, active) }
+            return
+        }
+        active.headersSent = true
+    }
+    while lane.out.length - lane.outAt > 0 {
+        let size = min(16384, lane.out.length - lane.outAt)
+        let written = h2.write(connection.transport, active.id, lane.out.slice(lane.outAt, lane.outAt + size))
+        if !errors.booleanOk(written) {
+            if !errors.isWouldBlock(errors.booleanError(written)) { drop(connection, active) }
+            return
+        }
+        lane.outAt += size
+    }
+    lane.out = Bytes(); lane.outAt = 0
+    if lane.finished {
+        let closing = h2.closeStream(connection.transport, active.id, trailers(lane))
+        if errors.booleanOk(closing) { finished(active) }
+        else { if !errors.isWouldBlock(errors.booleanError(closing)) { drop(connection, active) } }
+    }
+}
+function finished(active: Active) { active.lane.closed = true; active.ended = true }
+function drop(connection: Connection, active: Active) {
+    h2.resetStream(connection.transport, active.id, 2)
+    abandon(active)
+}
+function reject(connection: Connection, active: Active, error: rpc.Error) {
+    active.lane.finished = true
+    active.lane.error = Some(error)
+    pump(connection, active)
+}
+// Deadline passed: unsent messages are dropped and the status is 4.
+function expire(connection: Connection, active: Active, error: rpc.Error) {
+    match active.responder {
+        Some(responder) { rpc.cancel(responder) }
+        None {}
+    }
+    active.lane.out = Bytes(); active.lane.outAt = 0
+    if active.headersSent { h2.discardPendingData(connection.transport, active.id) }
+    active.lane.finished = true
+    active.lane.single = false
+    active.lane.error = Some(error)
+    pump(connection, active)
+}
+function responseHead(lane: Lane): List<h2.Header> {
+    let fields = [h2.Header { name: ":status"; value: "200" }, h2.Header { name: "content-type"; value: lane.contentType }]
+    for field in lane.call.responseHeaders { fields.add(h2.Header { name: field.name.asciiLowercased(); value: field.value }) }
+    return fields
+}
+function trailers(lane: Lane): List<h2.Header> {
+    let fields: List<h2.Header> = []
+    match lane.error {
+        Some(error) {
+            fields.add(h2.Header { name: "grpc-status"; value: Text(error.code) })
+            if error.message != "" { fields.add(h2.Header { name: "grpc-message"; value: percent(error.message) }) }
+            if error.details.length > 0 { fields.add(h2.Header { name: "grpc-status-details-bin"; value: base64(statusDetails(error)) }) }
+        }
+        None { fields.add(h2.Header { name: "grpc-status"; value: "0" }) }
+    }
+    for field in lane.call.responseTrailers { fields.add(h2.Header { name: field.name.asciiLowercased(); value: field.value }) }
+    return fields
+}
+// grpc-message: percent-encode bytes outside printable ASCII and "%".
+function percent(message: Text): Text {
+    let digits = Bytes("0123456789ABCDEF")
+    let result = Bytes()
+    for byte in Bytes(message) {
+        if byte >= 32 && byte <= 126 && byte != 37 { result.add(byte) }
+        else { result.add(37); result.add(digits[byte >> 4]); result.add(digits[byte & 15]) }
+    }
+    return utf8.decodeOrStop(result)
+}
+// google.rpc.Status { code = 1; message = 2; repeated google.protobuf.Any details = 3 }.
+function statusDetails(error: rpc.Error): Bytes {
+    let status = Bytes()
+    if error.code != 0 { status.add(8); varint(status, error.code) }
+    field(status, 18, Bytes(error.message))
+    for detail in error.details {
+        let any = Bytes()
+        field(any, 10, Bytes("type.googleapis.com/" + detail.type))
+        field(any, 18, detail.value)
+        field(status, 26, any)
+    }
+    return status
+}
+function varint(bytes: Bytes, value: Integer) {
+    let rest = value
+    while rest >= 128 { bytes.add((rest & 127) | 128); rest = rest >> 7 }
+    bytes.add(rest)
+}
+function field(bytes: Bytes, tag: Integer, value: Bytes) {
+    if value.length == 0 { return }
+    bytes.add(tag)
+    varint(bytes, value.length)
+    bytes.addBytes(value)
+}
+// Unpadded standard base64, as gRPC writes binary metadata.
+function base64(data: Bytes): Text {
+    let alphabet = Bytes("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+    let result = Bytes()
+    let at = 0
+    while at < data.length {
+        let count = min(3, data.length - at)
+        let group = data[at] << 16
+        if count > 1 { group = group | (data[at + 1] << 8) }
+        if count > 2 { group = group | data[at + 2] }
+        for index in 0..count + 1 { result.add(alphabet[(group >> (18 - index * 6)) & 63]) }
+        at += 3
+    }
+    return utf8.decodeOrStop(result)
+}
+
+// Socket server: one owner polls; handlers run inside poll. Plain TCP serves
+// h2c with prior knowledge; a TlsFactory (library/grpctls.min) terminates TLS.
+public constant TRANSPORT_ESTABLISHED = 3
+public record TlsOps {
+    state: () -> Integer
+    takeIncoming: () -> Bytes
+    takeOutgoing: () -> Bytes
+    send: (Bytes) -> Nothing
+    // Read up to limit socket bytes into the session; net.readInto count rules.
+    feed: (Integer, Integer) -> Integer
+}
+public record TlsFactory { validate: () -> Text; open: () -> Maybe<TlsOps> }
+record Peer {
+    socket: Integer
+    registration: Integer
+    rpc: Connection
+    tls: Maybe<TlsOps>
+    output: Bytes
+    sent: Integer
+    idleSince: Integer
+    input: Bytes
+}
+public record Server {
+    private handle: Integer
+    private listener: Integer
+    private listenerRegistration: Integer
+    private services: rpc.Services
+    private limits: Limits
+    private tls: Maybe<TlsFactory>
+    private peers: List<Maybe<Peer>>
+    private active: Integer
+    private closed: Boolean
+    private error: errors.Error
+}
+public function ok(server: Server): Boolean { return !server.closed && !errors.isError(server.error) }
+public function serverError(server: Server): errors.Error { return server.error }
+public function port(server: Server): Integer {
+    if server.closed { return -1 }
+    return net.localPort(server.listener)
+}
+public function connectionCount(server: Server): Integer { return server.active }
+public function listen(host: Text, port: Integer, services: rpc.Services, limits: Limits): Server {
+    return start(host, port, services, limits, None)
+}
+public function listenWith(host: Text, port: Integer, services: rpc.Services, limits: Limits, factory: TlsFactory): Server {
+    return start(host, port, services, limits, Some(factory))
+}
+function start(host: Text, port: Integer, services: rpc.Services, limits: Limits, tls: Maybe<TlsFactory>): Server {
+    let server = Server { handle: -1; listener: -1; listenerRegistration: -1; services: services; limits: copyLimits(limits)
+        tls: tls; peers: []; active: 0; closed: false; error: errors.none() }
+    if !validLimits(server.limits) {
+        server.error = errors.make(errors.invalidDataCode(), 0, "invalid gRPC limits"); server.closed = true; return server
+    }
+    match tls {
+        Some(factory) {
+            let problem = factory.validate()
+            if problem != "" { server.error = errors.make(errors.invalidDataCode(), 0, problem); server.closed = true; return server }
+        }
+        None {}
+    }
+    let created = loop.create()
+    if !errors.integerOk(created) { server.error = errors.integerError(created); server.closed = true; return server }
+    server.handle = errors.integerValue(created)
+    server.listener = net.listen(host, port, server.limits.maxConnections)
+    if server.listener < 0 {
+        server.error = errors.make(errors.systemCode(), net.lastErrorCode(), "gRPC listen failed"); close(server); return server
+    }
+    let watched = loop.watch(server.handle, server.listener, loop.readableInterest(), -1)
+    if !errors.integerOk(watched) { server.error = errors.integerError(watched); close(server); return server }
+    server.listenerRegistration = errors.integerValue(watched)
+    return server
+}
+public function close(server: Server) {
+    if server.closed { return }
+    server.closed = true
+    for slot in 0..server.peers.length { disconnect(server, slot) }
+    if server.listenerRegistration >= 0 { loop.remove(server.handle, server.listenerRegistration); server.listenerRegistration = -1 }
+    if server.listener >= 0 { net.close(server.listener); server.listener = -1 }
+    if server.handle >= 0 { loop.close(server.handle) }
+}
+function disconnect(server: Server, slot: Integer) {
+    match server.peers[slot] {
+        Some(peer) {
+            // Handlers still holding a Responder see active() turn false.
+            finish(peer.rpc, net.monotonicMilliseconds())
+            for active in peer.rpc.calls { if !active.ended { abandon(active) } }
+            if peer.registration >= 0 { loop.remove(server.handle, peer.registration) }
+            net.close(peer.socket)
+            server.peers[slot] = None
+            server.active -= 1
+        }
+        None {}
+    }
+}
+function acceptReady(server: Server, now: Integer) {
+    for turn in 0..32 {
+        if server.active >= server.limits.maxConnections { return }
+        let socket = net.accept(server.listener)
+        if socket < 0 { return }
+        net.setNoDelay(socket, true)
+        let tls: Maybe<TlsOps> = None
+        match server.tls {
+            Some(factory) {
+                tls = factory.open()
+                if tls.isNone() { net.close(socket); continue }
+            }
+            None {}
+        }
+        let slot = server.peers.length
+        for index in 0..server.peers.length { if slot == server.peers.length && server.peers[index].isNone() { slot = index } }
+        let peer = Peer { socket: socket; registration: -1; rpc: connection(server.services, server.limits, now); tls: tls
+            output: Bytes(); sent: 0; idleSince: now; input: Bytes() }
+        if slot == server.peers.length { server.peers.add(Some(peer)) } else { server.peers[slot] = Some(peer) }
+        server.active += 1
+        let watched = loop.watch(server.handle, socket, loop.readableInterest(), slot)
+        if !errors.integerOk(watched) { disconnect(server, slot) }
+        else { peer.registration = errors.integerValue(watched) }
+    }
+}
+// Read what the socket has, then write what the connection has queued.
+function service(server: Server, slot: Integer, now: Integer, readable: Boolean) {
+    let peer = server.peers[slot].unwrap()
+    if readable {
+        let count = 0
+        match peer.tls {
+            Some(ops) {
+                count = ops.feed(peer.socket, 65536)
+                let plain = ops.takeIncoming()
+                if plain.length > 0 { receive(peer.rpc, plain, now) }
+                // A failed handshake or record, or the peer's close_notify, ends the connection.
+                if ops.state() > TRANSPORT_ESTABLISHED { disconnect(server, slot); return }
+            }
+            None {
+                peer.input.clear()
+                count = net.readInto(peer.socket, peer.input, 65536)
+                if count > 0 { receive(peer.rpc, peer.input, now) }
+            }
+        }
+        // HTTP/2 clients never half-close: end of input or a reset means the
+        // client is gone, so its held calls are canceled now.
+        if count == -2 || count == 0 { disconnect(server, slot); return }
+        if count > 0 { peer.idleSince = now }
+    }
+    tick(peer.rpc, now)
+    flush(server, slot, now)
+}
+function flush(server: Server, slot: Integer, now: Integer) {
+    let peer = server.peers[slot].unwrap()
+    while true {
+        if peer.sent == peer.output.length {
+            match peer.tls {
+                Some(ops) {
+                    // HTTP/2 bytes wait until the handshake completes.
+                    if ops.state() == TRANSPORT_ESTABLISHED {
+                        let plain = takeOutgoing(peer.rpc, 65536)
+                        if plain.length > 0 { ops.send(plain) }
+                    }
+                    peer.output = ops.takeOutgoing()
+                }
+                None { peer.output = takeOutgoing(peer.rpc, 65536) }
+            }
+            peer.sent = 0
+            if peer.output.length == 0 { break }
+        }
+        let count = net.writeRange(peer.socket, peer.output, peer.sent, peer.output.length - peer.sent)
+        if count == -1 { break }
+        if count <= 0 { disconnect(server, slot); return }
+        peer.sent += count
+        peer.idleSince = now
+    }
+    if closed(peer.rpc) && peer.sent == peer.output.length { disconnect(server, slot); return }
+    let interest = loop.readableInterest()
+    if peer.sent < peer.output.length { interest = loop.readWriteInterest() }
+    loop.update(server.handle, peer.registration, interest, slot)
+}
+// Wait for socket events or the earliest deadline (at most `milliseconds`,
+// -1 to wait for work), then serve them. Held streams' messages are written
+// on every poll, so a holder that sends between polls is flushed promptly.
+public function poll(server: Server, milliseconds: Integer): errors.Error {
+    if server.closed { return server.error }
+    let now = net.monotonicMilliseconds()
+    let wait = milliseconds
+    if wait < 0 { wait = 86400000 }
+    for slot in 0..server.peers.length {
+        match server.peers[slot] {
+            Some(peer) {
+                tick(peer.rpc, now)
+                flush(server, slot, now)
+                match server.peers[slot] {
+                    Some(still) {
+                        let next = nextDeadline(still.rpc)
+                        if next >= 0 { wait = min(wait, max(0, next - now)) }
+                        wait = min(wait, max(0, still.idleSince + server.limits.idleMilliseconds - now))
+                    }
+                    None {}
+                }
+            }
+            None {}
+        }
+    }
+    let batch = loop.wait(server.handle, wait, 256)
+    if errors.isError(loop.batchError(batch)) { server.error = loop.batchError(batch); close(server); return server.error }
+    now = net.monotonicMilliseconds()
+    for event in loop.events(batch) {
+        if event.registration == server.listenerRegistration && event.token == -1 { acceptReady(server, now) }
+        else {
+            let slot = event.token
+            if slot >= 0 && slot < server.peers.length && server.peers[slot].isSome() {
+                service(server, slot, now, loop.isReadable(event) || loop.isClosed(event) || loop.isError(event))
+            }
+        }
+    }
+    for slot in 0..server.peers.length {
+        match server.peers[slot] {
+            Some(peer) {
+                if activeCalls(peer.rpc) == 0 && now - peer.idleSince >= server.limits.idleMilliseconds { disconnect(server, slot) }
+            }
+            None {}
+        }
+    }
+    return errors.none()
+}

@@ -1,0 +1,273 @@
+// grpc.Connection without sockets: a minimal HTTP/2 client written here
+// (literal HPACK, no Huffman) drives unary, deferred and server-streaming
+// calls, handler errors, deadlines, cancellation and backpressure, and a
+// deterministic simulation fragments the same conversation for many seeds.
+use "grpc" as grpc
+use "rpc" as rpc
+use "simulation" as sim
+use "text" as utf8
+
+record Frame { type: Integer; flags: Integer; stream: Integer; payload: Bytes }
+record Field { name: Text; value: Text }
+record Peer { input: Bytes; frames: List<Frame> }
+record State { held: List<rpc.Responder>; log: List<Text> }
+
+function add32(bytes: Bytes, value: Integer) { for shift in [24, 16, 8, 0] { bytes.add((value >> shift) & 255) } }
+function frame(type: Integer, flags: Integer, stream: Integer, payload: Bytes): Bytes {
+    let bytes = Bytes()
+    bytes.add((payload.length >> 16) & 255); bytes.add((payload.length >> 8) & 255); bytes.add(payload.length & 255)
+    bytes.add(type); bytes.add(flags); add32(bytes, stream); bytes.addBytes(payload)
+    return bytes
+}
+function literal(bytes: Bytes, name: Text, value: Text) {
+    bytes.add(0)
+    let key = Bytes(name)
+    let text = Bytes(value)
+    bytes.add(key.length); bytes.addBytes(key)
+    if text.length < 127 { bytes.add(text.length) } else { bytes.add(127); let rest = text.length - 127; while rest >= 128 { bytes.add((rest & 127) | 128); rest = rest >> 7 }; bytes.add(rest) }
+    bytes.addBytes(text)
+}
+function preface(): Bytes {
+    let bytes = Bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+    bytes.addBytes(frame(4, 0, 0, Bytes()))
+    return bytes
+}
+function request(stream: Integer, path: Text, extra: List<Field>, message: Maybe<Bytes>): Bytes {
+    let block = Bytes()
+    literal(block, ":method", "POST"); literal(block, ":scheme", "http"); literal(block, ":path", path)
+    literal(block, ":authority", "sim"); literal(block, "content-type", "application/grpc"); literal(block, "te", "trailers")
+    for field in extra { literal(block, field.name, field.value) }
+    let bytes = frame(1, 4, stream, block)
+    match message {
+        Some(body) { bytes.addBytes(frame(0, 1, stream, envelope(body))) }
+        None { bytes.addBytes(frame(0, 1, stream, Bytes())) }
+    }
+    return bytes
+}
+function envelope(body: Bytes): Bytes {
+    let bytes = Bytes()
+    bytes.add(0)
+    add32(bytes, body.length)
+    bytes.addBytes(body)
+    return bytes
+}
+// Parse whole frames from the peer's input, acknowledging SETTINGS.
+function parse(peer: Peer, outgoing: Bytes) {
+    while peer.input.length >= 9 {
+        let size = (peer.input[0] << 16) | (peer.input[1] << 8) | peer.input[2]
+        if peer.input.length < 9 + size { return }
+        let item = Frame { type: peer.input[3]; flags: peer.input[4]; stream: ((peer.input[5] & 127) << 24) | (peer.input[6] << 16) | (peer.input[7] << 8) | peer.input[8]
+            payload: peer.input.slice(9, 9 + size) }
+        peer.input = peer.input.slice(9 + size, peer.input.length)
+        if item.type == 4 && (item.flags & 1) == 0 { outgoing.addBytes(frame(4, 1, 0, Bytes())) }
+        if item.type != 4 && item.type != 8 { peer.frames.add(item) }
+    }
+}
+// The server's HPACK: literal never-indexed fields with literal names.
+function fields(block: Bytes): List<Field> {
+    let result: List<Field> = []
+    let at = 0
+    while at < block.length {
+        if block[at] != 16 { fail("unexpected HPACK representation " + Text(block[at])) }
+        let nameLength = block[at + 1]
+        let name = utf8.decodeOrStop(block.slice(at + 2, at + 2 + nameLength))
+        at = at + 2 + nameLength
+        let length = block[at] & 127
+        at += 1
+        if length == 127 {
+            let shift = 0
+            while true { let byte = block[at]; at += 1; length += (byte & 127) << shift; shift += 7; if byte < 128 { break } }
+        }
+        result.add(Field { name: name; value: utf8.decodeOrStop(block.slice(at, at + length)) })
+        at += length
+    }
+    return result
+}
+function value(list: List<Field>, name: Text): Text { for field in list { if field.name == name { return field.value } }; return "" }
+// A readable transcript of one stream's frames: headers, messages and trailers.
+function describe(peer: Peer, stream: Integer): Text {
+    let lines: List<Text> = []
+    let data = Bytes()
+    for item in peer.frames {
+        if item.stream == stream {
+            if item.type == 1 {
+                let list = fields(item.payload)
+                let parts: List<Text> = []
+                for field in list { parts.add(field.name + "=" + field.value) }
+                let end = ""
+                if (item.flags & 1) != 0 { end = " end" }
+                lines.add("headers " + joinText(parts, " ") + end)
+            }
+            if item.type == 0 {
+                data.addBytes(item.payload)
+                while data.length >= 5 && data.length >= 5 + ((data[1] << 24) | (data[2] << 16) | (data[3] << 8) | data[4]) {
+                    let size = (data[1] << 24) | (data[2] << 16) | (data[3] << 8) | data[4]
+                    lines.add("message " + utf8.decodeOrStop(data.slice(5, 5 + size)))
+                    data = data.slice(5 + size, data.length)
+                }
+                if (item.flags & 1) != 0 { lines.add("data end") }
+            }
+            if item.type == 3 { lines.add("reset " + Text((item.payload[0] << 24) | (item.payload[1] << 16) | (item.payload[2] << 8) | item.payload[3])) }
+        }
+    }
+    return joinText(lines, "\n")
+}
+
+function services(state: State): rpc.Services {
+    let services = rpc.services()
+    services.addUnary("/t.S/Echo", rpc.NO_SIDE_EFFECTS, function(call: rpc.Call, message: Bytes): Result<Bytes, rpc.Error> {
+        call.responseTrailers.add(rpc.Header { name: "x-codec"; value: call.codec })
+        return Ok(message)
+    })
+    services.addServerStream("/t.S/Count", function(call: rpc.Call, message: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        for index in 0..3 { responder.send(Bytes("n" + Text(index))) }
+        return Ok()
+    })
+    services.addUnary("/t.S/Fail", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, message: Bytes): Result<Bytes, rpc.Error> {
+        return Err(rpc.failure(rpc.NOT_FOUND, "gone 100%\n"))
+    })
+    services.addDeferred("/t.S/Hold", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, message: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        state.log.add("hold deadline " + Text(call.deadline) + " remaining " + Text(call.remaining()))
+        responder.hold()
+        state.held.add(responder)
+        return Ok()
+    })
+    services.addServerStream("/t.S/Flood", function(call: rpc.Call, message: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        let accepted = 0
+        while responder.send(Bytes("x".repeat(1000))) { accepted += 1 }
+        state.log.add("flood accepted " + Text(accepted) + " active " + Text(responder.active()))
+        responder.hold()
+        state.held.add(responder)
+        return Ok()
+    })
+    return services
+}
+function limits(): grpc.Limits {
+    let limits = grpc.defaults()
+    limits.maxMessageBytes = 4096
+    limits.streamBufferBytes = 8192
+    return limits
+}
+// Exchange bytes until neither side has more to say.
+function settle(connection: grpc.Connection, peer: Peer, input: Bytes, now: Integer) {
+    let pending = input
+    for round in 0..64 {
+        if pending.length > 0 { grpc.receive(connection, pending, now) }
+        pending = Bytes()
+        let out = grpc.takeOutgoing(connection, 1 << 20)
+        if out.length == 0 && round > 0 { return }
+        peer.input.addBytes(out)
+        parse(peer, pending)
+    }
+}
+function expect(actual: Text, expected: Text, label: Text) {
+    if actual != expected { fail(label + ":\n" + actual + "\n--- expected ---\n" + expected) }
+}
+function direct() {
+    let state = State { held: []; log: [] }
+    let connection = grpc.connection(services(state), limits(), 1000)
+    let peer = Peer { input: Bytes(); frames: [] }
+    settle(connection, peer, preface(), 1000)
+    settle(connection, peer, request(1, "/t.S/Echo", [], Some(Bytes("hello"))), 1000)
+    expect(describe(peer, 1), "headers :status=200 content-type=application/grpc\nmessage hello\nheaders grpc-status=0 x-codec=proto end", "unary")
+    settle(connection, peer, request(3, "/t.S/Count", [], Some(Bytes("go"))), 1000)
+    expect(describe(peer, 3), "headers :status=200 content-type=application/grpc\nmessage n0\nmessage n1\nmessage n2\nheaders grpc-status=0 end", "server stream")
+    settle(connection, peer, request(5, "/t.S/Fail", [], Some(Bytes())), 1000)
+    expect(describe(peer, 5), "headers :status=200 content-type=application/grpc grpc-status=5 grpc-message=gone 100%25%0A end", "handler error")
+    settle(connection, peer, request(7, "/t.S/Nope", [], Some(Bytes())), 1000)
+    expect(describe(peer, 7), "headers :status=200 content-type=application/grpc grpc-status=12 grpc-message=unknown method /t.S/Nope end", "unknown method")
+    settle(connection, peer, request(9, "/t.S/Echo", [], None), 1000)
+    expect(describe(peer, 9), "headers :status=200 content-type=application/grpc grpc-status=13 grpc-message=no request message end", "no message")
+    settle(connection, peer, request(11, "/t.S/Echo", [Field { name: "grpc-encoding"; value: "gzip" }], Some(Bytes("z"))), 1000)
+    expect(describe(peer, 11), "headers :status=200 content-type=application/grpc grpc-status=12 grpc-message=grpc-encoding gzip is not supported end", "encoding")
+    settle(connection, peer, request(13, "/t.S/Echo", [], Some(Bytes("y".repeat(4097)))), 1000)
+    expect(describe(peer, 13), "headers :status=200 content-type=application/grpc grpc-status=8 grpc-message=request message larger than 4096 bytes end", "message limit")
+    // A deadline from grpc-timeout ends a held call with status 4 and cancels its Responder.
+    settle(connection, peer, request(15, "/t.S/Hold", [Field { name: "grpc-timeout"; value: "250m" }], Some(Bytes("h"))), 1000)
+    expect(state.log[0], "hold deadline 1250 remaining 250", "deadline seen by the handler")
+    expect(Text(grpc.nextDeadline(connection)), "1250", "next deadline")
+    grpc.tick(connection, 1249)
+    if !state.held[0].active() { fail("held call expired early") }
+    grpc.tick(connection, 1250)
+    settle(connection, peer, Bytes(), 1250)
+    expect(describe(peer, 15), "headers :status=200 content-type=application/grpc grpc-status=4 grpc-message=deadline exceeded end", "deadline")
+    if state.held[0].active() || state.held[0].send(Bytes("late")) { fail("expired responder still active") }
+    // A client RST_STREAM cancels a held call; its state is released.
+    settle(connection, peer, request(17, "/t.S/Hold", [], Some(Bytes("h"))), 1300)
+    let reset = Bytes(); add32(reset, 8)
+    settle(connection, peer, frame(3, 0, 17, reset), 1300)
+    if state.held[1].active() { fail("canceled call still active") }
+    expect(describe(peer, 17), "", "canceled call wrote nothing")
+    // Backpressure: a flood fills the stream buffer, then drains as the client reads.
+    settle(connection, peer, request(19, "/t.S/Flood", [], Some(Bytes("f"))), 1400)
+    expect(state.log[2], "flood accepted 8 active true", "flood bound")
+    let flood = state.held[2]
+    let sent = 8
+    for round in 0..40 {
+        if flood.send(Bytes("x".repeat(1000))) { sent += 1 }
+        let update = Bytes(); add32(update, 65536)
+        let credit = frame(8, 0, 0, update); credit.addBytes(frame(8, 0, 19, update))
+        settle(connection, peer, credit, 1400)
+    }
+    flood.finish(None)
+    settle(connection, peer, Bytes(), 1400)
+    let lines = describe(peer, 19).split("\n")
+    expect(Text(lines.length - 2), Text(sent), "flood messages delivered")
+    expect(lines[lines.length - 1], "headers grpc-status=0 end", "flood trailers")
+    if grpc.retainedCalls(connection) != 0 { fail("retained calls " + Text(grpc.retainedCalls(connection))) }
+}
+
+deterministic function universe(seed: Integer): Text {
+    let world = sim.create(seed)
+    let state = State { held: []; log: [] }
+    let connection = grpc.connection(services(state), limits(), 0)
+    let peer = Peer { input: Bytes(); frames: [] }
+    let script = preface()
+    script.addBytes(request(1, "/t.S/Echo", [], Some(Bytes("one"))))
+    script.addBytes(request(3, "/t.S/Count", [], Some(Bytes("two"))))
+    script.addBytes(request(5, "/t.S/Fail", [], Some(Bytes("three"))))
+    script.addBytes(request(7, "/t.S/Hold", [Field { name: "grpc-timeout"; value: "40m" }], Some(Bytes("four"))))
+    let offset = 0
+    let replies = Bytes()
+    sim.submitPacket(world, 0, Bytes(), 1, 0)
+    while sim.pendingCount(world) > 0 {
+        let done = sim.next(world)
+        if done.data.length > 0 { grpc.receive(connection, done.data, done.at) } else { grpc.tick(connection, done.at) }
+        if offset < script.length {
+            let size = 1 + sim.choose(world, 50)
+            sim.submitPacket(world, 0, script.slice(offset, min(script.length, offset + size)), 1 + sim.choose(world, 3), 0)
+            offset = min(script.length, offset + size)
+        } else {
+            if grpc.activeCalls(connection) > 0 { sim.submitTimer(world, 1 + sim.choose(world, 20), 0) }
+        }
+        let out = grpc.takeOutgoing(connection, 1 + sim.choose(world, 300))
+        peer.input.addBytes(out)
+        // The client's replies (SETTINGS acknowledgements) follow its script in order.
+        parse(peer, replies)
+        if replies.length > 0 {
+            script.addBytes(replies)
+            replies = Bytes()
+            if sim.pendingCount(world) == 0 { sim.submitTimer(world, 1, 0) }
+        }
+    }
+    while true {
+        let out = grpc.takeOutgoing(connection, 4096)
+        if out.length == 0 { break }
+        peer.input.addBytes(out)
+        parse(peer, replies)
+    }
+    return describe(peer, 1) + "\n" + describe(peer, 3) + "\n" + describe(peer, 5) + "\n" + describe(peer, 7)
+}
+
+direct()
+let reference = universe(1)
+expect(reference, "headers :status=200 content-type=application/grpc\nmessage one\nheaders grpc-status=0 x-codec=proto end\n" +
+    "headers :status=200 content-type=application/grpc\nmessage n0\nmessage n1\nmessage n2\nheaders grpc-status=0 end\n" +
+    "headers :status=200 content-type=application/grpc grpc-status=5 grpc-message=gone 100%25%0A end\n" +
+    "headers :status=200 content-type=application/grpc grpc-status=4 grpc-message=deadline exceeded end", "simulated conversation")
+for seed in 2..61 {
+    let run = universe(seed)
+    if run != reference { fail("seed " + Text(seed) + ":\n" + run) }
+    if universe(seed) != run { fail("seed " + Text(seed) + " is not reproducible") }
+}
+print("grpc session: unary, deferred, streaming, errors, limits, deadlines, cancellation and backpressure; 60 simulated seeds agree")

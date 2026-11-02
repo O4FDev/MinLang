@@ -1,0 +1,47 @@
+// TLS 1.3 with ALPN "h2" for the gRPC server in library/grpc.min. A plain
+// grpc.listen program never imports, links or starts the TLS natives.
+use "grpc" as grpc
+use "rpc" as rpc
+use "net" as net
+use "random" as secureRandom
+use "tlsserver" as tlsserver
+
+record Wire { data: Bytes }
+
+function transport(session: tlsserver.Session): grpc.TlsOps {
+    let wire = Wire { data: Bytes() }
+    return grpc.TlsOps {
+        state: function(): Integer { return session.state },
+        takeIncoming: function(): Bytes { return tlsserver.takeIncoming(session) },
+        takeOutgoing: function(): Bytes { return tlsserver.takeOutgoing(session) },
+        send: function(data: Bytes) { tlsserver.send(session, data) },
+        feed: function(socket: Integer, limit: Integer): Integer {
+            wire.data.clear()
+            let count = net.readInto(socket, wire.data, limit)
+            if count > 0 {
+                tlsserver.receive(session, wire.data)
+                wire.data = Bytes()
+            }
+            return count
+        }
+    }
+}
+
+// The same server as grpc.listen over TLS. `identity` is a List of DER
+// certificates (leaf first) and `privateKey` a PKCS#8 DER key; a client must
+// offer ALPN "h2". An invalid identity or key fails before accepting.
+public function listenTLS(host: Text, port: Integer, services: rpc.Services, limits: grpc.Limits, identity: List<Bytes>, privateKey: Bytes): grpc.Server {
+    let factory = grpc.TlsFactory {
+        validate: function(): Text {
+            let probe = tlsserver.server(secureRandom.bytes(64), "h2", identity, privateKey, [], false)
+            if probe.state == tlsserver.FAILED { return "invalid TLS server identity or private key" }
+            return ""
+        },
+        open: function(): Maybe<grpc.TlsOps> {
+            let session = tlsserver.server(secureRandom.bytes(64), "h2", identity, privateKey, [], false)
+            if session.state == tlsserver.FAILED { return None }
+            return Some(transport(session))
+        }
+    }
+    return grpc.listenWith(host, port, services, limits, factory)
+}

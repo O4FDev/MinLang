@@ -1,0 +1,105 @@
+// gRPC server for tests/grpc-interop.py: the same services over h2c and over
+// TLS with ALPN "h2". Arguments: leaf certificate DER, PKCS#8 key DER.
+// Prints "<h2c port> <tls port>", then serves until /test.Probe/Quit.
+use "grpc" as grpc
+use "grpctls" as grpctls
+use "rpc" as rpc
+use "errors" as errors
+use "io" as io
+use "process" as processInfo
+use "text" as utf8
+
+record Held { name: Text; responder: rpc.Responder }
+record State { held: List<Held>; running: Boolean }
+
+function counted(state: State, name: Text): Text {
+    let open = 0
+    let gone = 0
+    for item in state.held {
+        if item.name == name {
+            if item.responder.active() { open += 1 } else { gone += 1 }
+        }
+    }
+    return name + " open=" + Text(open) + " canceled=" + Text(gone)
+}
+function services(state: State): rpc.Services {
+    let services = rpc.services()
+    services.addUnary("/test.Probe/Echo", rpc.NO_SIDE_EFFECTS, function(call: rpc.Call, message: Bytes): Result<Bytes, rpc.Error> {
+        if call.header("x-probe") != "" { call.responseHeaders.add(rpc.Header { name: "x-probe-seen"; value: call.header("x-probe") }) }
+        call.responseTrailers.add(rpc.Header { name: "x-served-by"; value: "minyar" })
+        return Ok(message)
+    })
+    services.addServerStream("/test.Probe/Count", function(call: rpc.Call, message: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        let count = 0
+        match utf8.integerBytes(message) {
+            Ok(value) { count = value }
+            Err(problem) { return Err(rpc.failure(rpc.INVALID_ARGUMENT, "count must be decimal")) }
+        }
+        for index in 0..count { if !responder.send(Bytes("item " + Text(index))) { return Err(rpc.failure(rpc.INTERNAL, "send refused")) } }
+        return Ok()
+    })
+    services.addUnary("/test.Probe/Fail", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, message: Bytes): Result<Bytes, rpc.Error> {
+        call.responseTrailers.add(rpc.Header { name: "x-reason"; value: "fixture" })
+        return Err(rpc.failure(rpc.NOT_FOUND, "no such thing: 100% gone é").withDetail("test.Missing", Bytes("detail-bytes")))
+    })
+    services.addServerStream("/test.Probe/FailLater", function(call: rpc.Call, message: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        responder.send(Bytes("before"))
+        return Err(rpc.failure(rpc.PERMISSION_DENIED, "stopped after one"))
+    })
+    // Never answered: the deadline ends it.
+    services.addDeferred("/test.Probe/Slow", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, message: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        responder.hold()
+        state.held.add(Held { name: "slow"; responder: responder })
+        return Ok()
+    })
+    // One message, then held open until the client cancels.
+    services.addServerStream("/test.Probe/Hang", function(call: rpc.Call, message: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        responder.send(Bytes("first"))
+        responder.hold()
+        state.held.add(Held { name: "hang"; responder: responder })
+        return Ok()
+    })
+    // A deferred unary answered on a later poll.
+    services.addDeferred("/test.Probe/Later", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, message: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        responder.hold()
+        state.held.add(Held { name: "later"; responder: responder })
+        return Ok()
+    })
+    services.addUnary("/test.Probe/Stats", rpc.NO_SIDE_EFFECTS, function(call: rpc.Call, message: Bytes): Result<Bytes, rpc.Error> {
+        return Ok(Bytes(counted(state, utf8.decodeOrStop(message))))
+    })
+    services.addUnary("/test.Probe/Quit", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, message: Bytes): Result<Bytes, rpc.Error> {
+        state.running = false
+        return Ok(Bytes())
+    })
+    return services
+}
+
+let state = State { held: []; running: true }
+let registry = services(state)
+let limits = grpc.defaults()
+let plain = grpc.listen("127.0.0.1", 0, registry, limits)
+if !grpc.ok(plain) { fail(errors.message(grpc.serverError(plain))) }
+let identity: List<Bytes> = [io.readBytesFile(processInfo.argument(0))]
+let secure = grpctls.listenTLS("127.0.0.1", 0, registry, limits, identity, io.readBytesFile(processInfo.argument(1)))
+if !grpc.ok(secure) { fail(errors.message(grpc.serverError(secure))) }
+print(Text(grpc.port(plain)) + " " + Text(grpc.port(secure)))
+while state.running {
+    for item in state.held {
+        if item.name == "later" && item.responder.active() {
+            item.responder.send(Bytes("answered later"))
+            item.responder.finish(None)
+        }
+    }
+    let first = grpc.poll(plain, 2)
+    if errors.isError(first) { fail(errors.message(first)) }
+    let second = grpc.poll(secure, 2)
+    if errors.isError(second) { fail(errors.message(second)) }
+}
+// Let the Quit reply reach its client.
+for round in 0..20 {
+    grpc.poll(plain, 5)
+    grpc.poll(secure, 5)
+}
+grpc.close(plain)
+grpc.close(secure)
