@@ -1399,20 +1399,23 @@ function Module.services(taken: Set<Text>) {
     }
 }
 
-/// A Connect client for one service: a method per unary RPC, over
-/// `connect.call`. Streaming methods are not generated yet.
+/// A client for one service, a method per RPC: unary methods over
+/// `connect.call`, streaming methods returning a `connect.StreamCall`. The
+/// connect.Client chooses the protocol, Connect or gRPC.
 function Module.client(service: descriptor.ServiceDescriptorProto, local: Text, fullName: Text, fields: List<Text>, codecNames: Map<Text, Text>, taken: Set<Text>) {
     self.usesConnect = true
     let name = unique(local + "Client", taken)
     let unary: List<Integer> = []
+    let all: List<Integer> = []
     for position in 0..service.method.length {
         let method = service.method[position]
         if !method.clientStreaming() && !method.serverStreaming() { unary.add(position) }
+        all.add(position)
     }
-    self.line(0, "/// A Connect client for `" + fullName + "`, with one method per unary RPC.")
+    self.line(0, "/// A client for `" + fullName + "`, with one method per RPC.")
     self.line(0, "public record " + name + " {")
     self.line(1, "connection: connect.Client")
-    for position in unary {
+    for position in all {
         let method = service.method[position]
         self.line(1, "private " + fields[position] + "Requests: List<rpc.Codec<" + self.typeOf(withoutDot(method.inputType())) + ">>")
         self.line(1, "private " + fields[position] + "Replies: List<rpc.Codec<" + self.typeOf(withoutDot(method.outputType())) + ">>")
@@ -1423,7 +1426,7 @@ function Module.client(service: descriptor.ServiceDescriptorProto, local: Text, 
     self.line(0, "public function " + decapitalized(name) + "(connection: connect.Client, registry: protobuf.Registry): " + name + " {")
     self.line(1, "return " + name + " {")
     self.line(2, "connection: connection")
-    for position in unary {
+    for position in all {
         let method = service.method[position]
         let input = codecNames[withoutDot(method.inputType())]
         let output = codecNames[withoutDot(method.outputType())]
@@ -1450,6 +1453,33 @@ function Module.client(service: descriptor.ServiceDescriptorProto, local: Text, 
             chosen = "chosen"
         }
         self.line(1, "return connect.call<" + request + ", " + reply + ">(self.connection, " + quoted("/" + fullName + "/" + method.name()) + ", request, self." + fields[position] + "Requests, self." + fields[position] + "Replies, " + chosen + ")")
+        self.line(0, "}")
+        self.line(0, "")
+    }
+    for position in all {
+        let method = service.method[position]
+        if !method.clientStreaming() && !method.serverStreaming() { continue }
+        let request = self.typeOf(withoutDot(method.inputType()))
+        let reply = self.typeOf(withoutDot(method.outputType()))
+        let types = "<" + request + ", " + reply + ">"
+        let procedure = quoted("/" + fullName + "/" + method.name())
+        let codecs = "self." + fields[position] + "Requests, self." + fields[position] + "Replies, options"
+        let result = "connect.StreamCall" + types
+        if !method.clientStreaming() {
+            self.line(0, "/// Call `" + fullName + "/" + method.name() + "`: receive its replies from the returned call.")
+            self.line(0, "public function " + name + "." + fields[position] + "(request: " + request + ", options: connect.CallOptions): " + result + " {")
+            self.line(1, "return connect.serverStream" + types + "(self.connection, " + procedure + ", request, " + codecs + ")")
+        } else {
+            let kind = "rpc.CLIENT_STREAM"
+            let use = "send requests, then take the one reply with connect.reply."
+            if method.serverStreaming() {
+                kind = "rpc.BIDI_STREAM"
+                use = "send requests and receive replies, in any order."
+            }
+            self.line(0, "/// Open `" + fullName + "/" + method.name() + "`: " + use)
+            self.line(0, "public function " + name + "." + fields[position] + "(options: connect.CallOptions): " + result + " {")
+            self.line(1, "return connect.open" + types + "(self.connection, " + procedure + ", " + kind + ", " + codecs + ")")
+        }
         self.line(0, "}")
         self.line(0, "")
     }

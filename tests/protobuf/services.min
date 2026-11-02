@@ -6,8 +6,8 @@ use "./greeter.min" as greeter
 use "./sample/shared.min" as shared
 // Generated service code for tests/protobuf/greeter.proto, run by
 // tests/protoc-gen-minyar-test.min: registration, idempotency levels and both
-// codecs through the rpc handler API, and the generated Connect client calling
-// a Connect server in the same process.
+// codecs through the rpc handler API, and the generated client calling a
+// Connect server in the same process for all four kinds of method.
 
 function stop(message: Text) {
     print("FAIL " + message)
@@ -123,6 +123,82 @@ for codec in ["proto", "json"] {
     match client.touch(request, connect.callOptions()) {
         Ok(reply) { expect(reply.seconds == 86400, "well-known reply over " + codec) }
         Err(failure) { stop("touch over " + codec + ": " + failure.error.message) }
+    }
+}
+// Streaming methods through the generated client, over a Wire that steps a
+// Server.begin exchange in this process.
+record Arrivals { items: List<connect.Arrival> }
+let opener = function(outgoing: connect.Request, timeout: Integer): Result<connect.Wire, rpc.Error> {
+    let exchange = server.begin(outgoing)
+    let queue = Arrivals { items: [] }
+    return Ok(connect.Wire {
+        write: function(data: Bytes): Boolean {
+            exchange.receive(data)
+            return true
+        }
+        close: function() { exchange.closeInput() }
+        cancel: function() { exchange.cancel() }
+        read: function(): connect.Arrival {
+            if queue.items.length == 0 {
+                match exchange.step() {
+                    Waiting { return connect.Arrival.Pending }
+                    Respond(response) {
+                        queue.items.add(connect.Arrival.Head(response.status, response.headers))
+                        queue.items.add(connect.Arrival.Data(response.body))
+                        queue.items.add(connect.Arrival.Ended([]))
+                    }
+                    Start(head) { queue.items.add(connect.Arrival.Head(head.status, head.headers)) }
+                    Write(piece) { queue.items.add(connect.Arrival.Data(piece)) }
+                    End(piece) {
+                        queue.items.add(connect.Arrival.Data(piece))
+                        queue.items.add(connect.Arrival.Ended([]))
+                    }
+                }
+            }
+            let next = queue.items[0]
+            queue.items = queue.items.slice(1, queue.items.length)
+            return next
+        }
+    })
+}
+for codec in ["proto", "json"] {
+    let client = greeter.greeterClient(connect.streamingClient("", codec, opener, "test-" + codec), registry)
+    let ask = greeter.newHelloRequest()
+    ask.count = 3
+    let counted: List<Text> = []
+    let countDown = client.countDown(ask, connect.callOptions())
+    let going = true
+    while going {
+        match connect.receive(countDown) {
+            Message(reply) { counted.add(reply.message) }
+            Finished { going = false }
+            Waiting { stop("count down waits over " + codec) }
+            Failed(failure) { stop("count down over " + codec + ": " + failure.error.message) }
+        }
+    }
+    expect(joinText(counted, ",") == "3,2,1", "server stream over " + codec + ": " + joinText(counted, ","))
+    let upload = client.upload(connect.callOptions())
+    for name in ["Ada", "Grace"] {
+        let part = greeter.newHelloRequest()
+        part.name = name
+        expect(connect.send(upload, part), "upload send over " + codec)
+    }
+    match connect.reply(upload) {
+        Ok(reply) { expect(reply.message == "uploaded Ada,Grace", "client stream over " + codec + ": " + reply.message) }
+        Err(failure) { stop("upload over " + codec + ": " + failure.error.message) }
+    }
+    let chat = client.chat(connect.callOptions())
+    let hello = greeter.newHelloRequest()
+    hello.name = "Lin"
+    connect.send(chat, hello)
+    match connect.receive(chat) {
+        Message(reply) { expect(reply.message == "hi Lin", "bidirectional reply over " + codec) }
+        _ { stop("no bidirectional reply over " + codec) }
+    }
+    chat.stream.closeSend()
+    match connect.receive(chat) {
+        Finished {}
+        _ { stop("bidirectional stream did not finish over " + codec) }
     }
 }
 print("ok")
