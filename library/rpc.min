@@ -1,0 +1,281 @@
+// The handler API shared by RPC transports: Connect (library/connect.min) and
+// gRPC. A handler sees one Call and message bytes already in the call's codec
+// ("proto" or "json"); it never sees sockets, HTTP framing or a Protobuf type.
+// Generated code supplies a Codec per message type and registers typed
+// handlers with unary/serverStream.
+use "errors" as errors
+
+// Status codes, numbered as in gRPC and Connect. OK is 0 and never an Error.
+public constant OK = 0
+public constant CANCELED = 1
+public constant UNKNOWN = 2
+public constant INVALID_ARGUMENT = 3
+public constant DEADLINE_EXCEEDED = 4
+public constant NOT_FOUND = 5
+public constant ALREADY_EXISTS = 6
+public constant PERMISSION_DENIED = 7
+public constant RESOURCE_EXHAUSTED = 8
+public constant FAILED_PRECONDITION = 9
+public constant ABORTED = 10
+public constant OUT_OF_RANGE = 11
+public constant UNIMPLEMENTED = 12
+public constant INTERNAL = 13
+public constant UNAVAILABLE = 14
+public constant DATA_LOSS = 15
+public constant UNAUTHENTICATED = 16
+
+// How a method may be retried and whether Connect may serve it over GET.
+public constant IDEMPOTENCY_UNKNOWN = 0
+public constant NO_SIDE_EFFECTS = 1
+public constant IDEMPOTENT = 2
+
+public constant UNARY = 0
+public constant SERVER_STREAM = 1
+
+/// One header or trailer. Transports store names in lowercase.
+public record Header { name: Text; value: Text }
+
+/// A typed error detail: `type` is the fully qualified Protobuf message name
+/// (no type URL prefix) and `value` its binary encoding.
+public record Detail { type: Text; value: Bytes }
+
+/// An RPC failure with a status code from 1 to 16.
+public record Error { code: Integer; message: Text; details: List<Detail> }
+
+public function failure(code: Integer, message: Text): Error {
+    if code < 1 || code > 16 { return Error { code: UNKNOWN; message: message; details: [] } }
+    return Error { code: code; message: message; details: [] }
+}
+public function Error.withDetail(type: Text, value: Bytes): Error {
+    self.details.add(Detail { type: type; value: value })
+    return self
+}
+// An errors.Error from library code becomes an RPC error with the given code.
+public function fromError(code: Integer, problem: errors.Error): Error { return failure(code, problem.describe()) }
+
+constant NAMES = 17
+public function codeName(code: Integer): Text {
+    if code == OK { return "ok" }
+    if code == CANCELED { return "canceled" }
+    if code == UNKNOWN { return "unknown" }
+    if code == INVALID_ARGUMENT { return "invalid_argument" }
+    if code == DEADLINE_EXCEEDED { return "deadline_exceeded" }
+    if code == NOT_FOUND { return "not_found" }
+    if code == ALREADY_EXISTS { return "already_exists" }
+    if code == PERMISSION_DENIED { return "permission_denied" }
+    if code == RESOURCE_EXHAUSTED { return "resource_exhausted" }
+    if code == FAILED_PRECONDITION { return "failed_precondition" }
+    if code == ABORTED { return "aborted" }
+    if code == OUT_OF_RANGE { return "out_of_range" }
+    if code == UNIMPLEMENTED { return "unimplemented" }
+    if code == INTERNAL { return "internal" }
+    if code == UNAVAILABLE { return "unavailable" }
+    if code == DATA_LOSS { return "data_loss" }
+    if code == UNAUTHENTICATED { return "unauthenticated" }
+    return "unknown"
+}
+// The code for a Connect name, or -1 when the name is not a code.
+public function codeFromName(name: Text): Integer {
+    for code in 1..NAMES { if codeName(code) == name { return code } }
+    return -1
+}
+
+public function headerValue(headers: List<Header>, name: Text): Text {
+    let lower = name.asciiLowercased()
+    for field in headers { if field.name == lower { return field.value } }
+    return ""
+}
+public function headerValues(headers: List<Header>, name: Text): List<Text> {
+    let lower = name.asciiLowercased()
+    let values: List<Text> = []
+    for field in headers { if field.name == lower { values.add(field.value) } }
+    return values
+}
+
+/// One call as a handler sees it. Handlers may append to `responseHeaders`
+/// and `responseTrailers`; transports send them with the response or error.
+/// A streaming transport sends headers with the first message, so add them
+/// before the first send.
+public record Call {
+    procedure: Text
+    protocol: Text
+    codec: Text
+    requestHeaders: List<Header>
+    responseHeaders: List<Header>
+    responseTrailers: List<Header>
+    // Milliseconds on the transport's clock, or -1 without a deadline.
+    deadline: Integer
+    private clock: () -> Integer
+}
+public function call(procedure: Text, protocol: Text, codec: Text, headers: List<Header>, deadline: Integer, clock: () -> Integer): Call {
+    return Call { procedure: procedure; protocol: protocol; codec: codec; requestHeaders: headers;
+        responseHeaders: []; responseTrailers: []; deadline: deadline; clock: clock }
+}
+public function Call.header(name: Text): Text { return headerValue(self.requestHeaders, name) }
+public function Call.now(): Integer { return self.clock() }
+public function Call.expired(): Boolean { return self.deadline >= 0 && self.clock() >= self.deadline }
+// Milliseconds left before the deadline, or -1 without one.
+public function Call.remaining(): Integer {
+    if self.deadline < 0 { return -1 }
+    return max(0, self.deadline - self.clock())
+}
+
+/// The response side of one streaming or deferred call. The transport supplies
+/// `deliver` and `end`; a handler sends messages and finishes exactly once.
+public record Responder {
+    private deliver: (Bytes) -> Boolean
+    private end: (Maybe<Error>) -> Nothing
+    private finished: Boolean
+    private canceled: Boolean
+    private held: Boolean
+    private sent: Integer
+}
+public function responder(deliver: (Bytes) -> Boolean, end: (Maybe<Error>) -> Nothing): Responder {
+    return Responder { deliver: deliver; end: end; finished: false; canceled: false; held: false; sent: 0 }
+}
+// False when the message was not taken. With active() still true the
+// transport's bounded buffer is full: keep the message and send it again
+// after a later poll. With active() false the call finished or was canceled.
+public function Responder.send(message: Bytes): Boolean {
+    if self.finished || self.canceled { return false }
+    if !self.deliver(message) { return false }
+    self.sent += 1
+    return true
+}
+// Ends the call: None for success, or the error to report. Later calls do nothing.
+public function Responder.finish(error: Maybe<Error>) {
+    if self.finished { return }
+    self.finished = true
+    if !self.canceled { self.end(error) }
+}
+// Keeps the call open after the handler returns; finish it later.
+public function Responder.hold() { self.held = true }
+public function Responder.active(): Boolean { return !self.finished && !self.canceled }
+public function Responder.sentCount(): Integer { return self.sent }
+// Transports: the client canceled or the deadline passed. Later sends fail.
+public function cancel(responder: Responder) { responder.canceled = true }
+public function held(responder: Responder): Boolean { return responder.held }
+public function finished(responder: Responder): Boolean { return responder.finished }
+
+/// The byte-level handler shapes a transport dispatches.
+public choice Handler {
+    Unary(body: (Call, Bytes) -> Result<Bytes, Error>)
+    // Send responses through the Responder. Returning Ok finishes the call
+    // unless the handler called hold(); returning Err finishes with that error.
+    ServerStream(body: (Call, Bytes, Responder) -> Result<Nothing, Error>)
+    // A unary call answered later, for handlers that wait on other I/O: send
+    // exactly one message and finish, or finish with an error. Hold the
+    // Responder when returning Ok before answering.
+    Deferred(body: (Call, Bytes, Responder) -> Result<Nothing, Error>)
+}
+public record Method { procedure: Text; idempotency: Integer; handler: Handler }
+public function Method.kind(): Integer {
+    return match self.handler {
+        Unary(_) { UNARY }
+        ServerStream(_) { SERVER_STREAM }
+        Deferred(_) { UNARY }
+    }
+}
+
+/// A set of methods keyed by procedure, "/package.Service/Method".
+public record Services { private methods: List<Method>; private index: Map<Text, Integer> }
+public function services(): Services {
+    let index: Map<Text, Integer> = Map()
+    return Services { methods: []; index: index }
+}
+// A procedure registered twice keeps its latest handler.
+public function Services.add(method: Method) {
+    if self.index.has(method.procedure) {
+        self.methods[self.index[method.procedure]] = method
+        return
+    }
+    self.index[method.procedure] = self.methods.length
+    self.methods.add(method)
+}
+public function Services.lookup(procedure: Text): Maybe<Method> {
+    if !self.index.has(procedure) { return None }
+    return Some(self.methods[self.index[procedure]])
+}
+public function Services.procedures(): List<Text> {
+    let names: List<Text> = []
+    for method in self.methods { names.add(method.procedure) }
+    return names
+}
+public function Services.addUnary(procedure: Text, idempotency: Integer, body: (Call, Bytes) -> Result<Bytes, Error>) {
+    self.add(Method { procedure: procedure; idempotency: idempotency; handler: Unary(body) })
+}
+public function Services.addDeferred(procedure: Text, idempotency: Integer, body: (Call, Bytes, Responder) -> Result<Nothing, Error>) {
+    self.add(Method { procedure: procedure; idempotency: idempotency; handler: Deferred(body) })
+}
+public function Services.addServerStream(procedure: Text, body: (Call, Bytes, Responder) -> Result<Nothing, Error>) {
+    self.add(Method { procedure: procedure; idempotency: IDEMPOTENCY_UNKNOWN; handler: ServerStream(body) })
+}
+
+/// Converts one message type to and from bytes for one codec name. Generated
+/// code supplies a "proto" and a "json" Codec for every message.
+public record Codec<Message> {
+    name: Text
+    decode: (Bytes) -> Result<Message, Error>
+    encode: (Message) -> Result<Bytes, Error>
+}
+function codecFor<Message>(codecs: List<Codec<Message>>, name: Text): Maybe<Codec<Message>> {
+    for codec in codecs { if codec.name == name { return Some(codec) } }
+    return None
+}
+function decodeWith<Message>(codecs: List<Codec<Message>>, name: Text, data: Bytes): Result<Message, Error> {
+    match codecFor(codecs, name) {
+        Some(codec) {
+            return match codec.decode(data) {
+                Ok(message) { Ok(message) }
+                Err(problem) { Err(failure(INVALID_ARGUMENT, "cannot decode " + name + " request: " + problem.message)) }
+            }
+        }
+        None { return Err(failure(INTERNAL, "no " + name + " codec for this message")) }
+    }
+}
+function encodeWith<Message>(codecs: List<Codec<Message>>, name: Text, message: Message): Result<Bytes, Error> {
+    match codecFor(codecs, name) {
+        Some(codec) {
+            return match codec.encode(message) {
+                Ok(data) { Ok(data) }
+                Err(problem) { Err(failure(INTERNAL, "cannot encode " + name + " response: " + problem.message)) }
+            }
+        }
+        None { return Err(failure(INTERNAL, "no " + name + " codec for this message")) }
+    }
+}
+
+/// A typed unary method for generated service code.
+public function unary<Request, Reply>(procedure: Text, idempotency: Integer, requests: List<Codec<Request>>,
+        replies: List<Codec<Reply>>, body: (Call, Request) -> Result<Reply, Error>): Method {
+    let bytes = function(call: Call, data: Bytes): Result<Bytes, Error> {
+        let request = try decodeWith(requests, call.codec, data)
+        let reply = try body(call, request)
+        return encodeWith(replies, call.codec, reply)
+    }
+    return Method { procedure: procedure; idempotency: idempotency; handler: Unary(bytes) }
+}
+
+/// Typed messages for a server-streaming handler. Finish, hold or test the
+/// call through `sender.responder`.
+public record Sender<Reply> { responder: Responder; private codecs: List<Codec<Reply>>; private codec: Text }
+// Encodes and sends one message; an encoding failure finishes the call as INTERNAL.
+public function send<Reply>(sender: Sender<Reply>, message: Reply): Boolean {
+    match encodeWith(sender.codecs, sender.codec, message) {
+        Ok(data) { return sender.responder.send(data) }
+        Err(problem) {
+            sender.responder.finish(Some(problem))
+            return false
+        }
+    }
+}
+
+/// A typed server-streaming method for generated service code.
+public function serverStream<Request, Reply>(procedure: Text, requests: List<Codec<Request>>, replies: List<Codec<Reply>>,
+        body: (Call, Request, Sender<Reply>) -> Result<Nothing, Error>): Method {
+    let bytes = function(call: Call, data: Bytes, responder: Responder): Result<Nothing, Error> {
+        let request = try decodeWith(requests, call.codec, data)
+        return body(call, request, Sender { responder: responder; codecs: replies; codec: call.codec })
+    }
+    return Method { procedure: procedure; idempotency: IDEMPOTENCY_UNKNOWN; handler: ServerStream(bytes) }
+}
