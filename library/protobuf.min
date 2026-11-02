@@ -1,5 +1,10 @@
+use "encoding" as encoding
 use "errors" as errors
+use "json" as json
+use "math" as math
 use "text" as textTools
+use "time" as time
+use "uint64" as u64
 // Protocol Buffers: the binary wire format and the proto3 JSON mapping.
 // Import it with `use "protobuf" as protobuf`.
 //
@@ -125,7 +130,8 @@ public function Reader.readTag(): Integer {
     let tag = self.readVarint()
     if self.error != "" { return 0 }
     let wireType = tag & 7
-    if tag < 8 || tag > LOW_32 || wireType > 5 {
+    // A key is at most a 32-bit varint, so at most five bytes long.
+    if tag < 8 || tag > LOW_32 || wireType > 5 || self.position - self.tagStart > 5 {
         self.fail("invalid field key")
         return 0
     }
@@ -301,4 +307,544 @@ public function Reader.keep(tag: Integer, unknown: Bytes) {
 public function keepVarint(unknown: Bytes, field: Integer, value: Integer) {
     writeTag(unknown, field, VARINT)
     writeVarint(unknown, value)
+}
+
+// ----- The proto3 JSON mapping -----
+
+// A local name for json.Value: a callback type cannot yet name a local type
+// after a module-qualified one.
+type JsonValue = json.Value
+
+/// How JSON is read and written. `ignoreUnknownFields` skips unknown field
+/// names and enum value names instead of rejecting them.
+public record JsonOptions {
+    registry: Registry
+    ignoreUnknownFields: Boolean
+}
+
+/// One message type that `Any` can hold: its full name and conversions
+/// between its binary encoding and its JSON form. Generated `register`
+/// functions add an entry for each message of a file and of its imports.
+public record TypeEntry {
+    fullName: Text
+    toJson: (Bytes, JsonOptions) -> Result<Text, errors.Error>
+    fromJson: (JsonValue, JsonOptions) -> Result<Bytes, errors.Error>
+    // A well-known type whose JSON is not an object of fields is wrapped as
+    // `{"@type": ..., "value": ...}` inside an Any.
+    wrapped: Boolean
+}
+
+/// The message types that `google.protobuf.Any` values can be converted to and from JSON as.
+public record Registry {
+    private entries: List<TypeEntry>
+    private index: Map<Text, Integer>
+}
+
+public function registry(): Registry { return Registry { entries: []; index: Map() } }
+
+public function Registry.add(entry: TypeEntry) {
+    if self.index.has(entry.fullName) { return }
+    self.index[entry.fullName] = self.entries.length
+    self.entries.add(entry)
+}
+
+public function Registry.has(fullName: Text): Boolean { return self.index.has(fullName) }
+
+/// Find a type by full name or by type URL, such as `type.googleapis.com/pkg.Message`.
+public function Registry.find(name: Text): Maybe<TypeEntry> {
+    let slash = name.length - 1
+    while slash >= 0 && name[slash] != '/' { slash -= 1 }
+    let fullName = name.slice(slash + 1, name.length)
+    if !self.index.has(fullName) { return None }
+    return Some(self.entries[self.index[fullName]])
+}
+
+
+public function jsonOptions(registry: Registry): JsonOptions {
+    return JsonOptions { registry: registry; ignoreUnknownFields: false }
+}
+
+public function jsonError(message: Text): errors.Error {
+    return errors.make(errors.invalidDataCode(), 0, "invalid protobuf JSON: " + message)
+}
+
+/// Read JSON text for a generated `decodeJson` function.
+public function parseJson(source: Text): Result<json.Value, errors.Error> {
+    match json.decode(source) {
+        Ok(value) { return Ok(value) }
+        Err(problem) { return Err(jsonError(problem.message())) }
+    }
+}
+
+/// Read UTF-8 JSON bytes, as an RPC body arrives.
+public function parseJsonBytes(source: Bytes): Result<json.Value, errors.Error> {
+    match textTools.decode(source) {
+        Ok(decoded) { return parseJson(decoded) }
+        Err(problem) { return Err(jsonError("the body is not UTF-8")) }
+    }
+}
+
+// Writing: generated code appends pieces to a List<Text>.
+
+/// Start an object member: a comma unless the object opened at `start` is still empty, then the quoted name.
+public function jsonMember(parts: List<Text>, start: Integer, name: Text) {
+    if parts.length > start + 1 { parts.add(",") }
+    parts.add(json.quote(name))
+    parts.add(":")
+}
+
+/// A separating comma for the next element of an array or object opened at `start`.
+public function jsonComma(parts: List<Text>, start: Integer) {
+    if parts.length > start + 1 { parts.add(",") }
+}
+
+public function jsonSigned64(value: Integer): Text { return "\"" + Text(value) + "\"" }
+public function jsonUnsigned32(value: Integer): Text { return Text(value & LOW_32) }
+public function jsonUnsigned64(value: Integer): Text { return "\"" + u64.format(value) + "\"" }
+public function jsonBoolean(value: Boolean): Text { if value { return "true" }; return "false" }
+public function jsonText(value: Text): Text { return json.quote(value) }
+public function jsonBytes(value: Bytes): Text { return "\"" + encoding.base64Encode(value) + "\"" }
+
+/// A float or double: a JSON number, or the strings "NaN", "Infinity" and "-Infinity".
+public function jsonFloat(value: Float): Text {
+    if value != value { return "\"NaN\"" }
+    if value > 1.7976931348623157e308 { return "\"Infinity\"" }
+    if value < -1.7976931348623157e308 { return "\"-Infinity\"" }
+    return Text(value)
+}
+
+/// An enum value: its name, or its number when it has none.
+public function jsonEnum(name: Text, number: Integer): Text {
+    if name == "" { return Text(number) }
+    return json.quote(name)
+}
+
+/// A map key: always a JSON string.
+public function jsonKey(key: Text): Text { return json.quote(key) }
+
+// Reading: generated code passes each member's json.Value to these.
+
+function numberSpelling(value: json.Value, what: Text): Result<Text, errors.Error> {
+    if value.kind == json.NUMBER { return Ok(value.text) }
+    if value.kind == json.STRING {
+        if value.text.length == 0 { return Err(jsonError(what + " string is not a number")) }
+        return Ok(value.text)
+    }
+    return Err(jsonError("expected a number for " + what))
+}
+
+function digitsOnly(text: Text): Boolean {
+    if text.length == 0 { return false }
+    for c in text { if c < '0' || c > '9' { return false } }
+    return true
+}
+
+// An integral JSON number spelling as a sign and canonical decimal digits
+// (no leading zeros), or an error for fractions, malformed text and values
+// with more than twenty digits.
+record Integral { negative: Boolean; digits: Text }
+
+function integral(spelling: Text, what: Text): Result<Integral, errors.Error> {
+    let text = spelling
+    let negative = false
+    if text.length > 0 && text[0] == '-' {
+        negative = true
+        text = text.slice(1, text.length)
+    }
+    let exponent = 0
+    let marker = text.find("e")
+    if marker < 0 { marker = text.find("E") }
+    if marker >= 0 {
+        let exponentText = text.slice(marker + 1, text.length)
+        let exponentNegative = false
+        if exponentText.length > 0 && (exponentText[0] == '+' || exponentText[0] == '-') {
+            exponentNegative = exponentText[0] == '-'
+            exponentText = exponentText.slice(1, exponentText.length)
+        }
+        if !digitsOnly(exponentText) { return Err(jsonError(what + " is not a number")) }
+        if exponentText.length > 6 { exponentText = "999999" }
+        exponent = try textTools.integer(exponentText)
+        if exponentNegative { exponent = 0 - exponent }
+        text = text.slice(0, marker)
+    }
+    let whole = text
+    let fraction = ""
+    let point = text.find(".")
+    if point >= 0 {
+        whole = text.slice(0, point)
+        fraction = text.slice(point + 1, text.length)
+        if !digitsOnly(fraction) { return Err(jsonError(what + " is not a number")) }
+    }
+    if !digitsOnly(whole) || (whole.length > 1 && whole[0] == '0') { return Err(jsonError(what + " is not a number")) }
+    let digits = whole + fraction
+    let scale = exponent - fraction.length
+    let start = 0
+    while start < digits.length - 1 && digits[start] == '0' { start += 1 }
+    digits = digits.slice(start, digits.length)
+    if digits == "0" { return Ok(Integral { negative: negative; digits: "0" }) }
+    if scale < 0 {
+        let keep = digits.length + scale
+        for index in max(keep, 0)..digits.length {
+            if digits[index] != '0' { return Err(jsonError(what + " is not an integer")) }
+        }
+        if keep <= 0 { return Ok(Integral { negative: negative; digits: "0" }) }
+        digits = digits.slice(0, keep)
+    } else if scale > 0 {
+        if digits.length + scale > 20 { return Err(jsonError(what + " is out of range")) }
+        digits = digits + "0".repeat(scale)
+    }
+    if digits.length > 20 { return Err(jsonError(what + " is out of range")) }
+    return Ok(Integral { negative: negative; digits: digits })
+}
+
+function unsignedDigits(digits: Text, what: Text): Result<Integer, errors.Error> {
+    match u64.parse(digits) {
+        Ok(value) { return Ok(value) }
+        Err(problem) { return Err(jsonError(what + " is out of range")) }
+    }
+}
+
+function signedValue(value: json.Value, lowest: Integer, highest: Integer, what: Text): Result<Integer, errors.Error> {
+    let number = try integral(try numberSpelling(value, what), what)
+    let magnitude = try unsignedDigits(number.digits, what)
+    if number.negative {
+        // The magnitude may be 2^63, whose bit pattern is the minimum Integer.
+        if magnitude < 0 && magnitude != -9223372036854775807 - 1 { return Err(jsonError(what + " is out of range")) }
+        let negated = wrappingSubtract(0, magnitude)
+        if magnitude != 0 && negated >= 0 { return Err(jsonError(what + " is out of range")) }
+        if negated < lowest { return Err(jsonError(what + " is out of range")) }
+        return Ok(negated)
+    }
+    if magnitude < 0 || magnitude > highest { return Err(jsonError(what + " is out of range")) }
+    return Ok(magnitude)
+}
+
+public function jsonInt32(value: json.Value): Result<Integer, errors.Error> { return signedValue(value, -2147483648, 2147483647, "an int32") }
+public function jsonInt64(value: json.Value): Result<Integer, errors.Error> { return signedValue(value, -9223372036854775807 - 1, 9223372036854775807, "an int64") }
+
+public function jsonUint32(value: json.Value): Result<Integer, errors.Error> {
+    let number = try integral(try numberSpelling(value, "a uint32"), "a uint32")
+    let magnitude = try unsignedDigits(number.digits, "a uint32")
+    if (number.negative && magnitude != 0) || magnitude < 0 || magnitude > LOW_32 { return Err(jsonError("a uint32 is out of range")) }
+    return Ok(magnitude)
+}
+
+/// A uint64 or fixed64 value as its Integer bit pattern.
+public function jsonUint64(value: json.Value): Result<Integer, errors.Error> {
+    let number = try integral(try numberSpelling(value, "a uint64"), "a uint64")
+    let magnitude = try unsignedDigits(number.digits, "a uint64")
+    if number.negative && magnitude != 0 { return Err(jsonError("a uint64 is out of range")) }
+    return Ok(magnitude)
+}
+
+function finiteNumber(spelling: Text, what: Text): Result<Float, errors.Error> {
+    // A JSON number spelling, read with the json module's exact decimal conversion.
+    match json.decode(spelling) {
+        Ok(parsed) {
+            if parsed.kind == json.NUMBER && parsed.text == spelling { return Ok(parsed.number) }
+        }
+        Err(problem) {}
+    }
+    return Err(jsonError(what + " is not a number"))
+}
+
+function floating(value: json.Value, what: Text): Result<Float, errors.Error> {
+    if value.kind == json.STRING {
+        if value.text == "NaN" { return Ok(0.0 / 0.0) }
+        if value.text == "Infinity" { return Ok(1.0 / 0.0) }
+        if value.text == "-Infinity" { return Ok(-1.0 / 0.0) }
+    }
+    if value.kind == json.NUMBER { return Ok(value.number) }
+    return finiteNumber(try numberSpelling(value, what), what)
+}
+
+public function jsonDouble(value: json.Value): Result<Float, errors.Error> { return floating(value, "a double") }
+
+/// A float, rounded to 32 bits; finite values outside the float range are errors.
+public function jsonFloat32(value: json.Value): Result<Float, errors.Error> {
+    let number = try floating(value, "a float")
+    let rounded = math.toFloat32(number)
+    if number == number && number - number == 0.0 && rounded - rounded != 0.0 { return Err(jsonError("a float is out of range")) }
+    return Ok(rounded)
+}
+
+public function jsonBool(value: json.Value): Result<Boolean, errors.Error> {
+    if value.kind != json.BOOLEAN { return Err(jsonError("expected true or false")) }
+    return Ok(value.truth)
+}
+
+public function jsonString(value: json.Value): Result<Text, errors.Error> {
+    if value.kind != json.STRING { return Err(jsonError("expected a string")) }
+    return Ok(value.text)
+}
+
+/// Bytes from standard or URL-safe Base64, with or without padding.
+public function jsonBytesValue(value: json.Value): Result<Bytes, errors.Error> {
+    if value.kind != json.STRING { return Err(jsonError("expected a base64 string")) }
+    let text = value.text
+    let decoded: Result<Bytes, errors.Error> = Ok(Bytes())
+    if text.contains("-") || text.contains("_") {
+        decoded = encoding.base64UrlDecode(text)
+    } else {
+        let padded = text
+        while padded.length % 4 != 0 { padded = padded + "=" }
+        decoded = encoding.base64Decode(padded)
+    }
+    match decoded {
+        Ok(bytes) { return Ok(bytes) }
+        Err(problem) { return Err(jsonError("invalid base64 bytes")) }
+    }
+}
+
+/// An enum given by number, for generated `enumFromJson` functions.
+public function jsonEnumNumber(value: json.Value): Result<Integer, errors.Error> {
+    if value.kind != json.NUMBER { return Err(jsonError("expected an enum name or number")) }
+    return jsonInt32(value)
+}
+
+/// A map key, which JSON always spells as a string.
+public function jsonMapKey(key: Text): json.Value {
+    return json.Value { kind: json.STRING; text: key; number: 0.0; truth: false; items: []; keys: [] }
+}
+
+public function jsonBoolKey(key: Text): Result<Boolean, errors.Error> {
+    if key == "true" { return Ok(true) }
+    if key == "false" { return Ok(false) }
+    return Err(jsonError("a bool map key must be \"true\" or \"false\""))
+}
+
+public function jsonObject(value: json.Value, what: Text): Result<Nothing, errors.Error> {
+    if value.kind != json.OBJECT { return Err(jsonError("expected an object for " + what)) }
+    return Ok()
+}
+
+public function jsonArray(value: json.Value): Result<Nothing, errors.Error> {
+    if value.kind != json.ARRAY { return Err(jsonError("expected an array")) }
+    return Ok()
+}
+
+public function jsonUnknownField(name: Text, what: Text): errors.Error {
+    return jsonError("unknown field \"" + name + "\" in " + what)
+}
+
+public function jsonDuplicateOneof(name: Text): errors.Error {
+    return jsonError("more than one field of oneof " + name + " is set")
+}
+
+// ----- Well-known types -----
+
+constant MINIMUM_TIMESTAMP = -62135596800
+constant MAXIMUM_TIMESTAMP = 253402300799
+constant MAXIMUM_DURATION = 315576000000
+
+function fractionDigits(nanos: Integer): Text {
+    if nanos == 0 { return "" }
+    if nanos % 1000000 == 0 { return "." + Text(nanos / 1000000).padStart(3, "0") }
+    if nanos % 1000 == 0 { return "." + Text(nanos / 1000).padStart(6, "0") }
+    return "." + Text(nanos).padStart(9, "0")
+}
+
+/// RFC 3339 text for a google.protobuf.Timestamp, always in UTC.
+public function formatTimestamp(seconds: Integer, nanos: Integer): Result<Text, errors.Error> {
+    if seconds < MINIMUM_TIMESTAMP || seconds > MAXIMUM_TIMESTAMP || nanos < 0 || nanos > 999999999 {
+        return Err(jsonError("Timestamp is out of range"))
+    }
+    let civil = time.civilFromSeconds(seconds)
+    let date = Text(civil.year).padStart(4, "0") + "-" + Text(civil.month).padStart(2, "0") + "-" + Text(civil.day).padStart(2, "0")
+    let clock = Text(civil.hour).padStart(2, "0") + ":" + Text(civil.minute).padStart(2, "0") + ":" + Text(civil.second).padStart(2, "0")
+    return Ok("\"" + date + "T" + clock + fractionDigits(nanos) + "Z\"")
+}
+
+/// Seconds and nanoseconds, as read from Timestamp and Duration JSON.
+public record Instant { seconds: Integer; nanos: Integer }
+
+function fixedDigits(text: Text, start: Integer, count: Integer): Integer {
+    if start + count > text.length { return -1 }
+    let value = 0
+    for index in start..(start + count) {
+        let c = text[index]
+        if c < '0' || c > '9' { return -1 }
+        value = value * 10 + Integer(c) - 48
+    }
+    return value
+}
+
+// Up to nine fraction digits after a point at `start`, as nanoseconds; the
+// position after them is returned in `end`.
+record Fraction { nanos: Integer; end: Integer }
+
+function fraction(text: Text, start: Integer): Fraction {
+    if start >= text.length || text[start] != '.' { return Fraction { nanos: 0; end: start } }
+    let position = start + 1
+    let nanos = 0
+    let count = 0
+    while position < text.length && text[position] >= '0' && text[position] <= '9' {
+        if count == 9 { return Fraction { nanos: -1; end: position } }
+        nanos = nanos * 10 + Integer(text[position]) - 48
+        count += 1
+        position += 1
+    }
+    if count == 0 { return Fraction { nanos: -1; end: position } }
+    for padding in count..9 { nanos = nanos * 10 }
+    return Fraction { nanos: nanos; end: position }
+}
+
+public function parseTimestamp(value: json.Value): Result<Instant, errors.Error> {
+    if value.kind != json.STRING { return Err(jsonError("expected a Timestamp string")) }
+    let text = value.text
+    let invalid = jsonError("invalid Timestamp \"" + text + "\"")
+    let year = fixedDigits(text, 0, 4)
+    let month = fixedDigits(text, 5, 2)
+    let day = fixedDigits(text, 8, 2)
+    let hour = fixedDigits(text, 11, 2)
+    let minute = fixedDigits(text, 14, 2)
+    let second = fixedDigits(text, 17, 2)
+    if text.length < 20 || year < 0 || month < 1 || month > 12 || day < 1 || hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 { return Err(invalid) }
+    if text[4] != '-' || text[7] != '-' || text[10] != 'T' || text[13] != ':' || text[16] != ':' { return Err(invalid) }
+    let civil = time.Civil { year: year; month: month; day: day; hour: hour; minute: minute; second: second; weekday: 0; microsecond: 0 }
+    let seconds = time.secondsFromCivil(civil)
+    let check = time.civilFromSeconds(seconds)
+    if check.day != day || check.month != month { return Err(invalid) }
+    let part = fraction(text, 19)
+    if part.nanos < 0 { return Err(invalid) }
+    let position = part.end
+    if position >= text.length { return Err(invalid) }
+    if text[position] == 'Z' {
+        if position + 1 != text.length { return Err(invalid) }
+    } else if text[position] == '+' || text[position] == '-' {
+        let offsetHours = fixedDigits(text, position + 1, 2)
+        let offsetMinutes = fixedDigits(text, position + 4, 2)
+        if position + 6 != text.length || offsetHours < 0 || offsetHours > 23 || offsetMinutes < 0 || offsetMinutes > 59 || text[position + 3] != ':' { return Err(invalid) }
+        let offset = offsetHours * 3600 + offsetMinutes * 60
+        if text[position] == '+' { seconds -= offset } else { seconds += offset }
+    } else {
+        return Err(invalid)
+    }
+    if seconds < MINIMUM_TIMESTAMP || seconds > MAXIMUM_TIMESTAMP { return Err(jsonError("Timestamp is out of range")) }
+    return Ok(Instant { seconds: seconds; nanos: part.nanos })
+}
+
+/// JSON text for a google.protobuf.Duration, such as "1.5s".
+public function formatDuration(seconds: Integer, nanos: Integer): Result<Text, errors.Error> {
+    if seconds < 0 - MAXIMUM_DURATION || seconds > MAXIMUM_DURATION || nanos < -999999999 || nanos > 999999999 || (seconds > 0 && nanos < 0) || (seconds < 0 && nanos > 0) {
+        return Err(jsonError("Duration is out of range"))
+    }
+    let sign = ""
+    if seconds < 0 || nanos < 0 { sign = "-" }
+    return Ok("\"" + sign + Text(abs(seconds)) + fractionDigits(abs(nanos)) + "s\"")
+}
+
+public function parseDuration(value: json.Value): Result<Instant, errors.Error> {
+    if value.kind != json.STRING { return Err(jsonError("expected a Duration string")) }
+    let text = value.text
+    let invalid = jsonError("invalid Duration \"" + text + "\"")
+    if text.length < 2 || text[text.length - 1] != 's' { return Err(invalid) }
+    let start = 0
+    let negative = false
+    if text[0] == '-' {
+        negative = true
+        start = 1
+    }
+    let position = start
+    while position < text.length && text[position] >= '0' && text[position] <= '9' { position += 1 }
+    if position == start || position - start > 12 { return Err(invalid) }
+    let seconds = fixedDigits(text, start, position - start)
+    let part = fraction(text, position)
+    if part.nanos < 0 || part.end != text.length - 1 { return Err(invalid) }
+    if seconds > MAXIMUM_DURATION { return Err(jsonError("Duration is out of range")) }
+    if negative { return Ok(Instant { seconds: 0 - seconds; nanos: 0 - part.nanos }) }
+    return Ok(Instant { seconds: seconds; nanos: part.nanos })
+}
+
+/// FieldMask JSON: the paths in lowerCamelCase, joined by commas.
+public function formatFieldMask(paths: List<Text>): Result<Text, errors.Error> {
+    let parts: List<Text> = []
+    for path in paths {
+        let converted: List<Text> = []
+        let upperNext = false
+        for c in path {
+            if c >= 'A' && c <= 'Z' { return Err(jsonError("FieldMask path \"" + path + "\" is not lower snake case")) }
+            if c == '_' {
+                if upperNext { return Err(jsonError("FieldMask path \"" + path + "\" cannot be converted")) }
+                upperNext = true
+            } else if upperNext {
+                if c < 'a' || c > 'z' { return Err(jsonError("FieldMask path \"" + path + "\" cannot be converted")) }
+                converted.add(Text(Character(Integer(c) - 32)))
+                upperNext = false
+            } else {
+                converted.add(Text(c))
+            }
+        }
+        if upperNext { return Err(jsonError("FieldMask path \"" + path + "\" cannot be converted")) }
+        parts.add(joinText(converted))
+    }
+    return Ok(json.quote(joinText(parts, ",")))
+}
+
+public function parseFieldMask(value: json.Value): Result<List<Text>, errors.Error> {
+    if value.kind != json.STRING { return Err(jsonError("expected a FieldMask string")) }
+    let paths: List<Text> = []
+    if value.text == "" { return Ok(paths) }
+    for path in value.text.split(",") {
+        let converted: List<Text> = []
+        for c in path {
+            if c == '_' { return Err(jsonError("FieldMask path \"" + path + "\" is not lowerCamelCase")) }
+            if c >= 'A' && c <= 'Z' {
+                converted.add("_")
+                converted.add(Text(Character(Integer(c) + 32)))
+            } else {
+                converted.add(Text(c))
+            }
+        }
+        paths.add(joinText(converted))
+    }
+    return Ok(paths)
+}
+
+/// The JSON text of an Any: its type's JSON object with "@type" first, or
+/// `{"@type": ..., "value": ...}` for a well-known type.
+public function formatAny(typeUrl: Text, value: Bytes, options: JsonOptions): Result<Text, errors.Error> {
+    if typeUrl == "" && value.length == 0 { return Ok("{}") }
+    let entry = try typeEntry(typeUrl, options)
+    let body = try entry.toJson(value, options)
+    let head = "{\"@type\":" + json.quote(typeUrl)
+    if entry.wrapped { return Ok(head + ",\"value\":" + body + "}") }
+    if body == "{}" { return Ok(head + "}") }
+    return Ok(head + "," + body.slice(1, body.length))
+}
+
+function typeEntry(typeUrl: Text, options: JsonOptions): Result<TypeEntry, errors.Error> {
+    match options.registry.find(typeUrl) {
+        Some(entry) { return Ok(entry) }
+        None { return Err(jsonError("Any type \"" + typeUrl + "\" is not in the registry")) }
+    }
+}
+
+/// An Any's type URL and binary value from its JSON object.
+public record AnyValue { typeUrl: Text; value: Bytes }
+
+public function parseAny(value: json.Value, options: JsonOptions): Result<AnyValue, errors.Error> {
+    try jsonObject(value, "google.protobuf.Any")
+    if value.keys.length == 0 { return Ok(AnyValue { typeUrl: ""; value: Bytes() }) }
+    let typeUrl = ""
+    let found = false
+    let keys: List<Text> = []
+    let items: List<json.Value> = []
+    for index in 0..value.keys.length {
+        if value.keys[index] == "@type" {
+            typeUrl = try jsonString(value.items[index])
+            found = true
+        } else {
+            keys.add(value.keys[index])
+            items.add(value.items[index])
+        }
+    }
+    if !found { return Err(jsonError("Any has no \"@type\"")) }
+    let entry = try typeEntry(typeUrl, options)
+    if entry.wrapped {
+        if keys.length != 1 || keys[0] != "value" { return Err(jsonError("Any of a well-known type needs exactly \"value\"")) }
+        return Ok(AnyValue { typeUrl: typeUrl; value: try entry.fromJson(items[0], options) })
+    }
+    let rest = json.Value { kind: json.OBJECT; text: ""; number: 0.0; truth: false; items: items; keys: keys }
+    return Ok(AnyValue { typeUrl: typeUrl; value: try entry.fromJson(rest, options) })
 }

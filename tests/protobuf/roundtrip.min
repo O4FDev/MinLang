@@ -1,5 +1,6 @@
 use "io" as io
 use "process" as process
+use "protobuf" as protobuf
 use "./everything.min" as everything
 use "./legacy.min" as legacy
 use "./sample/shared.min" as shared
@@ -157,6 +158,37 @@ function check() {
     let badGroup = Bytes()
     badGroup.add(91)
     expect(legacy.decodeLegacy(badGroup).isErr(), "unterminated group")
+    // The JSON mapping: names, 64-bit strings, enums, maps and oneofs.
+    let options = protobuf.jsonOptions(protobuf.registry())
+    let text = built().toJson(options).unwrap()
+    for piece in ["\"int64Value\":\"-9223372036854775808\"", "\"uint64Value\":\"18446744073709551615\"", "\"doubleValue\":-0.0",
+        "\"bytesValue\":\"cmF3\"", "\"color\":\"green\"", "\"packedColor\":[\"RED\",9]", "\"names\":{\"-1\":\"minus\"}",
+        "\"choiceText\":\"picked\"", "\"optionalInt32\":0", "\"mood\":\"CALM\"", "\"unknownFields\":3", "\"Leading\":4"] {
+        expect(text.contains(piece), "JSON contains " + piece + " in " + text)
+    }
+    match everything.decodeJsonEverything(text, options) {
+        Ok(decoded) { expect(decoded.toJson(options).unwrap() == text, "JSON round trip") }
+        Err(problem) { stop("JSON decode: " + problem.message()) }
+    }
+    let spelled = everything.decodeJsonEverything(#"{"int32_value": "7", "mood": "PEACEFUL", "unknownName": 1}"#, options)
+    expect(spelled.isErr(), "unknown JSON fields are rejected")
+    options.ignoreUnknownFields = true
+    match everything.decodeJsonEverything(#"{"int32_value": "7", "mood": "PEACEFUL", "color": "PURPLE", "unknownName": 1}"#, options) {
+        Ok(decoded) { expect(decoded.int32Value == 7 && decoded.mood.number() == 2 && decoded.color.number() == 0, "proto names, aliases and ignored values") }
+        Err(problem) { stop("ignored unknown JSON: " + problem.message()) }
+    }
+    options.ignoreUnknownFields = false
+    expect(everything.decodeJsonEverything(#"{"choiceText": "a", "choiceNumber": 1}"#, options).isErr(), "two members of a oneof")
+    match legacy.decodeJsonLegacy(#"{"name": "n", "item": {"id": 3}, "entry": [{"key": 1}], "big": "18446744073709551615"}"#, options) {
+        Ok(decoded) {
+            expect(decoded.big() == -1 && decoded.entry.length == 1, "proto2 JSON")
+            match decoded.item {
+                Some(item) { expect(item.id() == 3, "group JSON") }
+                None { stop("group missing") }
+            }
+        }
+        Err(problem) { stop("proto2 JSON: " + problem.message()) }
+    }
     print("ok")
 }
 

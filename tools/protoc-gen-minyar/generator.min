@@ -101,7 +101,6 @@ record Module {
     // Imported proto files and their aliases, in first-use order.
     imports: List<Text>
     aliases: List<Text>
-    usesJson: Boolean
     // Local type names, so oneof choices avoid them.
     names: Set<Text>
 }
@@ -230,7 +229,7 @@ function joinedName(prefix: Text, name: Text): Text {
 
 function joinedLocal(outer: Text, name: Text): Text {
     if outer == "" { return typeName(name) }
-    return outer + "_" + typeName(name)
+    return outer + "_" + capitalized(identifierOnly(name))
 }
 
 function indexMessage(generator: Generator, file: Text, scope: Text, outer: Text, message: descriptor.DescriptorProto, proto3: Boolean, taken: Set<Text>) {
@@ -371,7 +370,7 @@ function messageOf(generator: Generator, info: TypeInfo, taken: Set<Text>): Mess
         }
         if oneof.fields.length > 0 {
             oneof.name = unique(fieldName(declaration.name()), fieldNames)
-            let candidate = info.local + "_" + typeName(camel(declaration.name()))
+            let candidate = info.local + "_" + capitalized(identifierOnly(camel(declaration.name())))
             if taken.contains(candidate) { candidate = candidate + "Oneof" }
             oneof.typeName = unique(candidate, taken)
         }
@@ -823,6 +822,447 @@ function Module.dedupeEntries(field: Field) {
     self.line(1, "}")
 }
 
+// ----- JSON -----
+
+// Well-known types whose JSON is not an object of fields.
+global WRAPPERS: List<Text> = ["google.protobuf.DoubleValue", "google.protobuf.FloatValue", "google.protobuf.Int64Value", "google.protobuf.UInt64Value", "google.protobuf.Int32Value", "google.protobuf.UInt32Value", "google.protobuf.BoolValue", "google.protobuf.StringValue", "google.protobuf.BytesValue"]
+global SPECIAL: List<Text> = ["google.protobuf.Any", "google.protobuf.Timestamp", "google.protobuf.Duration", "google.protobuf.FieldMask", "google.protobuf.Struct", "google.protobuf.Value", "google.protobuf.ListValue"]
+
+function listed(names: List<Text>, name: Text): Boolean {
+    for candidate in names { if candidate == name { return true } }
+    return false
+}
+
+function specialJson(fullName: Text): Boolean { return listed(SPECIAL, fullName) || listed(WRAPPERS, fullName) }
+
+/// Whether JSON null is a value of this field's type rather than "absent".
+function nullIsValue(field: Field): Boolean {
+    return (field.kind == MESSAGE && field.typeName == "google.protobuf.Value") || (field.kind == ENUM && field.typeName == "google.protobuf.NullValue")
+}
+
+/// An expression for the JSON text of one scalar value.
+function Module.jsonScalar(field: Field, value: Text): Text {
+    let kind = field.kind
+    if kind == INT64 || kind == SINT64 || kind == SFIXED64 { return "protobuf.jsonSigned64(" + value + ")" }
+    if kind == UINT64 || kind == FIXED64 { return "protobuf.jsonUnsigned64(" + value + ")" }
+    if kind == FLOAT || kind == DOUBLE { return "protobuf.jsonFloat(" + value + ")" }
+    if kind == BOOL { return "protobuf.jsonBoolean(" + value + ")" }
+    if kind == STRING { return "protobuf.jsonText(" + value + ")" }
+    if kind == BYTES { return "protobuf.jsonBytes(" + value + ")" }
+    if kind == ENUM {
+        if field.typeName == "google.protobuf.NullValue" { return "\"null\"" }
+        return "protobuf.jsonEnum(" + value + ".name(), " + value + ".number())"
+    }
+    return "Text(" + value + ")"
+}
+
+/// Statements appending the JSON of one value.
+function Module.jsonWriteValue(indent: Integer, field: Field, value: Text) {
+    if field.kind == MESSAGE || field.kind == GROUP {
+        self.line(indent, "try " + self.name(field.typeName, "writeJson") + "(parts, " + value + ", options)")
+    } else {
+        self.line(indent, "parts.add(" + self.jsonScalar(field, value) + ")")
+    }
+}
+
+function Module.jsonKeyText(key: Field, value: Text): Text {
+    if key.kind == STRING { return "protobuf.jsonKey(" + value + ")" }
+    if key.kind == BOOL { return "protobuf.jsonKey(protobuf.jsonBoolean(" + value + "))" }
+    if key.kind == UINT64 || key.kind == FIXED64 { return "protobuf.jsonUnsigned64(" + value + ")" }
+    return "protobuf.jsonKey(Text(" + value + "))"
+}
+
+function Module.jsonWriteField(field: Field) {
+    let access = "message." + field.name
+    let member = "protobuf.jsonMember(parts, start, " + quoted(field.jsonName) + ")"
+    if field.entry.length == 2 {
+        let key = field.entry[0]
+        let value = field.entry[1]
+        self.line(1, "if " + access + ".length > 0 {")
+        self.line(2, member)
+        self.line(2, "let map = parts.length")
+        self.line(2, "parts.add(\"{\")")
+        if field.entryList {
+            self.line(2, "for entry in " + access + " {")
+            self.line(3, "protobuf.jsonComma(parts, map)")
+            self.line(3, "parts.add(" + self.jsonKeyText(key, "entry.key") + ")")
+            self.line(3, "parts.add(\":\")")
+            self.jsonWriteValue(3, value, "entry.value")
+        } else {
+            self.line(2, "for key in " + access + " {")
+            self.line(3, "protobuf.jsonComma(parts, map)")
+            self.line(3, "parts.add(" + self.jsonKeyText(key, "key") + ")")
+            self.line(3, "parts.add(\":\")")
+            self.jsonWriteValue(3, value, access + "[key]")
+        }
+        self.line(2, "}")
+        self.line(2, "parts.add(\"}\")")
+        self.line(1, "}")
+    } else if field.repeated {
+        self.line(1, "if " + access + ".length > 0 {")
+        self.line(2, member)
+        self.line(2, "let list = parts.length")
+        self.line(2, "parts.add(\"[\")")
+        self.line(2, "for value in " + access + " {")
+        self.line(3, "protobuf.jsonComma(parts, list)")
+        self.jsonWriteValue(3, field, "value")
+        self.line(2, "}")
+        self.line(2, "parts.add(\"]\")")
+        self.line(1, "}")
+    } else if field.presence {
+        self.line(1, "if " + access + " is Some(value) {")
+        self.line(2, member)
+        self.jsonWriteValue(2, field, "value")
+        self.line(1, "}")
+    } else {
+        self.line(1, "if " + self.notDefault(field, access) + " {")
+        self.line(2, member)
+        self.jsonWriteValue(2, field, access)
+        self.line(1, "}")
+    }
+}
+
+function Module.jsonWriteOneof(oneof: Oneof) {
+    self.line(1, "if message." + oneof.name + " is Some(choice) {")
+    self.line(2, "match choice {")
+    for field in oneof.fields {
+        self.line(3, field.caseName + "(value) {")
+        self.line(4, "protobuf.jsonMember(parts, start, " + quoted(field.jsonName) + ")")
+        self.jsonWriteValue(4, field, "value")
+        self.line(3, "}")
+    }
+    self.line(2, "}")
+    self.line(1, "}")
+}
+
+/// An expression reading one scalar from the json.Value `item`, as a Result.
+function jsonReader(kind: Integer): Text {
+    if kind == INT32 || kind == SINT32 || kind == SFIXED32 { return "protobuf.jsonInt32" }
+    if kind == UINT32 || kind == FIXED32 { return "protobuf.jsonUint32" }
+    if kind == INT64 || kind == SINT64 || kind == SFIXED64 { return "protobuf.jsonInt64" }
+    if kind == UINT64 || kind == FIXED64 { return "protobuf.jsonUint64" }
+    if kind == FLOAT { return "protobuf.jsonFloat32" }
+    if kind == DOUBLE { return "protobuf.jsonDouble" }
+    if kind == BOOL { return "protobuf.jsonBool" }
+    if kind == STRING { return "protobuf.jsonString" }
+    return "protobuf.jsonBytesValue"
+}
+
+/// Statements reading one value from `item` and completing `store` with it.
+function Module.jsonReadValue(indent: Integer, field: Field, item: Text, store: Text, close: Text) {
+    if field.kind == MESSAGE || field.kind == GROUP {
+        self.line(indent, "let created = " + self.name(field.typeName, "new") + "()")
+        self.line(indent, "try " + self.name(field.typeName, "readJson") + "(" + item + ", created, options)")
+        self.line(indent, store + "created" + close)
+    } else if field.kind == ENUM {
+        self.line(indent, "let found = try " + self.name(field.typeName, "enumFromJson") + "(" + item + ", options)")
+        self.line(indent, "if found is Some(choice) { " + store + "choice" + close + " }")
+    } else {
+        self.line(indent, store + "try " + jsonReader(field.kind) + "(" + item + ")" + close)
+    }
+}
+
+function Module.jsonReadKey(indent: Integer, key: Field, raw: Text) {
+    if key.kind == STRING { self.line(indent, "let mapKey = " + raw) }
+    else if key.kind == BOOL { self.line(indent, "let mapKey = try protobuf.jsonBoolKey(" + raw + ")") }
+    else { self.line(indent, "let mapKey = try " + jsonReader(key.kind) + "(protobuf.jsonMapKey(" + raw + "))") }
+}
+
+function Module.jsonReadField(field: Field, message: Message, first: Boolean) {
+    let access = "message." + field.name
+    let condition = "key == " + quoted(field.jsonName)
+    if field.protoName != field.jsonName { condition = condition + " || key == " + quoted(field.protoName) }
+    if first { self.line(2, "if " + condition + " {") } else { self.line(2, "} else if " + condition + " {") }
+    let indent = 3
+    if !nullIsValue(field) {
+        self.line(3, "if item.kind != json.NULL {")
+        indent = 4
+    }
+    if field.oneof >= 0 {
+        let oneof = message.oneofs[field.oneof]
+        self.line(indent, "if seen" + Text(field.oneof) + " { return Err(protobuf.jsonDuplicateOneof(" + quoted(oneof.protoName) + ")) }")
+        self.line(indent, "seen" + Text(field.oneof) + " = true")
+        self.jsonReadValue(indent, field, "item", "message." + oneof.name + " = Some(" + oneof.typeName + "." + field.caseName + "(", "))")
+    } else if field.entry.length == 2 {
+        self.line(indent, "try protobuf.jsonObject(item, " + quoted(field.protoName) + ")")
+        self.line(indent, "for position in 0..item.keys.length {")
+        self.jsonReadKey(indent + 1, field.entry[0], "item.keys[position]")
+        if field.entryList {
+            self.jsonReadValue(indent + 1, field.entry[1], "item.items[position]", access + ".add(" + field.entryType + " { key: mapKey; value: ", " })")
+        } else {
+            self.jsonReadValue(indent + 1, field.entry[1], "item.items[position]", access + "[mapKey] = ", "")
+        }
+        self.line(indent, "}")
+    } else if field.repeated {
+        self.line(indent, "try protobuf.jsonArray(item)")
+        self.line(indent, "for element in item.items {")
+        self.jsonReadValue(indent + 1, field, "element", access + ".add(", ")")
+        self.line(indent, "}")
+    } else if field.presence {
+        self.jsonReadValue(indent, field, "item", access + " = Some(", ")")
+    } else {
+        self.jsonReadValue(indent, field, "item", access + " = ", "")
+    }
+    if !nullIsValue(field) { self.line(3, "}") }
+}
+
+function Module.jsonFunctions(message: Message) {
+    let name = message.info.local
+    let fullName = message.info.fullName
+    self.line(0, "public function " + name + ".toJson(options: protobuf.JsonOptions): Result<Text, errors.Error> {")
+    self.line(1, "let parts: List<Text> = []")
+    self.line(1, "try writeJson" + name + "(parts, self, options)")
+    self.line(1, "return Ok(joinText(parts))")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "public function decodeJson" + name + "(source: Text, options: protobuf.JsonOptions): Result<" + name + ", errors.Error> {")
+    self.line(1, "let value = try protobuf.parseJson(source)")
+    self.line(1, "let message = new" + name + "()")
+    self.line(1, "try readJson" + name + "(value, message, options)")
+    self.line(1, "return Ok(message)")
+    self.line(0, "}")
+    self.line(0, "")
+    if specialJson(fullName) {
+        self.specialJsonFunctions(message)
+        return
+    }
+    self.line(0, "public function writeJson" + name + "(parts: List<Text>, message: " + name + ", options: protobuf.JsonOptions): Result<Nothing, errors.Error> {")
+    self.line(1, "let start = parts.length")
+    self.line(1, "parts.add(\"{\")")
+    let written: Set<Integer> = Set()
+    for field in message.fields {
+        if field.oneof >= 0 {
+            if !written.contains(field.oneof) {
+                written.add(field.oneof)
+                self.jsonWriteOneof(message.oneofs[field.oneof])
+            }
+        } else {
+            self.jsonWriteField(field)
+        }
+    }
+    self.line(1, "parts.add(\"}\")")
+    self.line(1, "return Ok()")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "public function readJson" + name + "(value: json.Value, message: " + name + ", options: protobuf.JsonOptions): Result<Nothing, errors.Error> {")
+    self.line(1, "try protobuf.jsonObject(value, " + quoted(fullName) + ")")
+    for position in 0..message.oneofs.length {
+        if message.oneofs[position].fields.length > 0 { self.line(1, "let seen" + Text(position) + " = false") }
+    }
+    self.line(1, "for index in 0..value.keys.length {")
+    self.line(2, "let key = value.keys[index]")
+    self.line(2, "let item = value.items[index]")
+    let first = true
+    for field in message.fields {
+        self.jsonReadField(field, message, first)
+        first = false
+    }
+    if first {
+        self.line(2, "if !options.ignoreUnknownFields { return Err(protobuf.jsonUnknownField(key, " + quoted(fullName) + ")) }")
+    } else {
+        self.line(2, "} else if !options.ignoreUnknownFields {")
+        self.line(3, "return Err(protobuf.jsonUnknownField(key, " + quoted(fullName) + "))")
+        self.line(2, "}")
+    }
+    self.line(1, "}")
+    self.line(1, "return Ok()")
+    self.line(0, "}")
+    self.line(0, "")
+}
+
+function Module.specialHeader(name: Text) {
+    self.line(0, "public function writeJson" + name + "(parts: List<Text>, message: " + name + ", options: protobuf.JsonOptions): Result<Nothing, errors.Error> {")
+}
+
+function Module.specialReader(name: Text) {
+    self.line(0, "public function readJson" + name + "(value: json.Value, message: " + name + ", options: protobuf.JsonOptions): Result<Nothing, errors.Error> {")
+}
+
+function Module.specialEnd() {
+    self.line(1, "return Ok()")
+    self.line(0, "}")
+    self.line(0, "")
+}
+
+/// The JSON forms of the well-known types, in the modules generated for them.
+function Module.specialJsonFunctions(message: Message) {
+    let name = message.info.local
+    let fullName = message.info.fullName
+    if listed(WRAPPERS, fullName) {
+        let field = message.fields[0]
+        self.specialHeader(name)
+        self.jsonWriteValue(1, field, "message.value")
+        self.specialEnd()
+        self.specialReader(name)
+        self.line(1, "message.value = try " + jsonReader(field.kind) + "(value)")
+        self.specialEnd()
+    } else if fullName == "google.protobuf.Timestamp" || fullName == "google.protobuf.Duration" {
+        self.specialHeader(name)
+        self.line(1, "parts.add(try protobuf.format" + name + "(message.seconds, message.nanos))")
+        self.specialEnd()
+        self.specialReader(name)
+        self.line(1, "let instant = try protobuf.parse" + name + "(value)")
+        self.line(1, "message.seconds = instant.seconds")
+        self.line(1, "message.nanos = instant.nanos")
+        self.specialEnd()
+    } else if fullName == "google.protobuf.FieldMask" {
+        self.specialHeader(name)
+        self.line(1, "parts.add(try protobuf.formatFieldMask(message.paths))")
+        self.specialEnd()
+        self.specialReader(name)
+        self.line(1, "message.paths = try protobuf.parseFieldMask(value)")
+        self.specialEnd()
+    } else if fullName == "google.protobuf.Any" {
+        self.specialHeader(name)
+        self.line(1, "parts.add(try protobuf.formatAny(message.typeUrl, message.value, options))")
+        self.specialEnd()
+        self.specialReader(name)
+        self.line(1, "let any = try protobuf.parseAny(value, options)")
+        self.line(1, "message.typeUrl = any.typeUrl")
+        self.line(1, "message.value = any.value")
+        self.specialEnd()
+    } else if fullName == "google.protobuf.Struct" {
+        self.specialHeader(name)
+        self.line(1, "let start = parts.length")
+        self.line(1, "parts.add(\"{\")")
+        self.line(1, "for entry in message.fields {")
+        self.line(2, "protobuf.jsonComma(parts, start)")
+        self.line(2, "parts.add(protobuf.jsonKey(entry.key))")
+        self.line(2, "parts.add(\":\")")
+        self.line(2, "try writeJsonValue(parts, entry.value, options)")
+        self.line(1, "}")
+        self.line(1, "parts.add(\"}\")")
+        self.specialEnd()
+        self.specialReader(name)
+        self.line(1, "try protobuf.jsonObject(value, \"google.protobuf.Struct\")")
+        self.line(1, "for index in 0..value.keys.length {")
+        self.line(2, "let created = newValue()")
+        self.line(2, "try readJsonValue(value.items[index], created, options)")
+        self.line(2, "message.fields.add(Struct_FieldsEntry { key: value.keys[index]; value: created })")
+        self.line(1, "}")
+        self.specialEnd()
+    } else if fullName == "google.protobuf.ListValue" {
+        self.specialHeader(name)
+        self.line(1, "let start = parts.length")
+        self.line(1, "parts.add(\"[\")")
+        self.line(1, "for element in message.values {")
+        self.line(2, "protobuf.jsonComma(parts, start)")
+        self.line(2, "try writeJsonValue(parts, element, options)")
+        self.line(1, "}")
+        self.line(1, "parts.add(\"]\")")
+        self.specialEnd()
+        self.specialReader(name)
+        self.line(1, "try protobuf.jsonArray(value)")
+        self.line(1, "for element in value.items {")
+        self.line(2, "let created = newValue()")
+        self.line(2, "try readJsonValue(element, created, options)")
+        self.line(2, "message.values.add(created)")
+        self.line(1, "}")
+        self.specialEnd()
+    } else if fullName == "google.protobuf.Value" {
+        self.specialHeader(name)
+        self.line(1, "match message.kind {")
+        self.line(2, "Some(NullValue(_)) { parts.add(\"null\") }")
+        self.line(2, "Some(NumberValue(number)) {")
+        self.line(3, "if number != number || number - number != 0.0 { return Err(protobuf.jsonError(\"a Value number must be finite\")) }")
+        self.line(3, "parts.add(protobuf.jsonFloat(number))")
+        self.line(2, "}")
+        self.line(2, "Some(StringValue(text)) { parts.add(protobuf.jsonText(text)) }")
+        self.line(2, "Some(BoolValue(truth)) { parts.add(protobuf.jsonBoolean(truth)) }")
+        self.line(2, "Some(StructValue(inner)) { try writeJsonStruct(parts, inner, options) }")
+        self.line(2, "Some(ListValue(inner)) { try writeJsonListValue(parts, inner, options) }")
+        self.line(2, "None { return Err(protobuf.jsonError(\"a Value has no kind\")) }")
+        self.line(1, "}")
+        self.specialEnd()
+        self.specialReader(name)
+        self.line(1, "if value.kind == json.NULL { message.kind = Some(Value_Kind.NullValue(NullValue.NULL_VALUE)) }")
+        self.line(1, "else if value.kind == json.NUMBER { message.kind = Some(Value_Kind.NumberValue(value.number)) }")
+        self.line(1, "else if value.kind == json.STRING { message.kind = Some(Value_Kind.StringValue(value.text)) }")
+        self.line(1, "else if value.kind == json.BOOLEAN { message.kind = Some(Value_Kind.BoolValue(value.truth)) }")
+        self.line(1, "else if value.kind == json.OBJECT {")
+        self.line(2, "let created = newStruct()")
+        self.line(2, "try readJsonStruct(value, created, options)")
+        self.line(2, "message.kind = Some(Value_Kind.StructValue(created))")
+        self.line(1, "} else if value.kind == json.ARRAY {")
+        self.line(2, "let created = newListValue()")
+        self.line(2, "try readJsonListValue(value, created, options)")
+        self.line(2, "message.kind = Some(Value_Kind.ListValue(created))")
+        self.line(1, "} else { return Err(protobuf.jsonError(\"invalid Value\")) }")
+        self.specialEnd()
+    }
+}
+
+function Module.enumJson(info: TypeInfo) {
+    let name = info.local
+    self.line(0, "/// The value's name in its .proto file, or \"\" for an unrecognized number.")
+    self.line(0, "public function " + name + ".name(): Text {")
+    self.line(1, "match self {")
+    for position in 0..info.cases.length {
+        if info.cases[position] != "" { self.line(2, info.cases[position] + " { return " + quoted(info.enumeration.value[position].name()) + " }") }
+    }
+    self.line(2, "Unrecognized(_) { return \"\" }")
+    self.line(1, "}")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "/// A JSON enum value: a name, including aliases, or a number. An unknown name is")
+    self.line(0, "/// an error, or None when the options ignore unknown fields.")
+    self.line(0, "public function enumFromJson" + name + "(value: json.Value, options: protobuf.JsonOptions): Result<Maybe<" + name + ">, errors.Error> {")
+    if info.fullName == "google.protobuf.NullValue" {
+        self.line(1, "if value.kind == json.NULL { return Ok(Some(" + name + ".NULL_VALUE)) }")
+    }
+    self.line(1, "if value.kind == json.STRING {")
+    self.line(2, "match value.text {")
+    for position in 0..info.enumeration.value.length {
+        let item = info.enumeration.value[position]
+        self.line(3, quoted(item.name()) + " { return Ok(Some(" + name + "." + enumCase(info, item.number()) + ")) }")
+    }
+    self.line(3, "_ {}")
+    self.line(2, "}")
+    self.line(2, "if options.ignoreUnknownFields { return Ok(None) }")
+    self.line(2, "return Err(protobuf.jsonError(\"unknown " + info.fullName + " value \\\"\" + value.text + \"\\\"\"))")
+    self.line(1, "}")
+    self.line(1, "return Ok(Some(enum" + name + "(try protobuf.jsonEnumNumber(value))))")
+    self.line(0, "}")
+    self.line(0, "")
+}
+
+/// `register` adds this file's message types to a registry for Any, and those of
+/// the files whose types it uses.
+function Module.registerFunction() {
+    let messages: List<TypeInfo> = []
+    for info in self.generator.types {
+        if info.file == self.file.name() && !info.isEnum && !isMapEntry(info) { messages.add(info) }
+    }
+    for info in messages {
+        let name = info.local
+        self.line(0, "function anyJson" + name + "(data: Bytes, options: protobuf.JsonOptions): Result<Text, errors.Error> {")
+        self.line(1, "let message = try decode" + name + "(data)")
+        self.line(1, "return message.toJson(options)")
+        self.line(0, "}")
+        self.line(0, "")
+        self.line(0, "function anyBinary" + name + "(value: json.Value, options: protobuf.JsonOptions): Result<Bytes, errors.Error> {")
+        self.line(1, "let message = new" + name + "()")
+        self.line(1, "try readJson" + name + "(value, message, options)")
+        self.line(1, "return Ok(message.encode())")
+        self.line(0, "}")
+        self.line(0, "")
+    }
+    let imported: List<Text> = []
+    for alias in self.aliases { imported.add(alias) }
+    imported.sort()
+    self.line(0, "/// Add this file's message types, and those of the files it uses, to a registry for")
+    self.line(0, "/// converting `google.protobuf.Any` values to and from JSON.")
+    self.line(0, "public function register(registry: protobuf.Registry) {")
+    if messages.length > 0 { self.line(1, "if registry.has(" + quoted(messages[0].fullName) + ") { return }") }
+    for info in messages {
+        let wrapped = "false"
+        if specialJson(info.fullName) { wrapped = "true" }
+        self.line(1, "registry.add(protobuf.TypeEntry { fullName: " + quoted(info.fullName) + "; toJson: anyJson" + info.local + "; fromJson: anyBinary" + info.local + "; wrapped: " + wrapped + " })")
+    }
+    for alias in imported { self.line(1, alias + ".register(registry)") }
+    self.line(0, "}")
+}
+
 // ----- Declarations -----
 
 function Module.enumeration(info: TypeInfo) {
@@ -853,6 +1293,7 @@ function Module.enumeration(info: TypeInfo) {
     self.line(1, "}")
     self.line(0, "}")
     self.line(0, "")
+    self.enumJson(info)
 }
 
 function Module.record(message: Message) {
@@ -932,6 +1373,7 @@ function Module.record(message: Message) {
     self.line(1, "return Ok(message)")
     self.line(0, "}")
     self.line(0, "")
+    self.jsonFunctions(message)
     self.line(0, "public function write" + name + "(out: Bytes, message: " + name + ") {")
     let written: Set<Integer> = Set()
     for field in encodingOrder(message) {
@@ -979,16 +1421,18 @@ function outputName(path: Text): Text { return withoutProto(path) + ".min" }
 
 function Generator.file(position: Integer): plugin.CodeGeneratorResponse_File {
     let file = self.request.protoFile[position]
-    let module = Module { generator: self; file: file; lines: []; imports: []; aliases: []; usesJson: false; names: Set() }
+    let module = Module { generator: self; file: file; lines: []; imports: []; aliases: []; names: Set() }
     let taken: Set<Text> = Set()
     for info in self.types { if info.file == file.name() { taken.add(info.local) } }
     for info in self.types {
         if info.file == file.name() { module.declarations(info, taken) }
     }
+    module.registerFunction()
     let header: List<Text> = []
     header.add("// Code generated by protoc-gen-minyar. DO NOT EDIT.\n")
     header.add("// source: " + file.name() + "\n")
     header.add("use \"errors\" as errors\n")
+    header.add("use \"json\" as json\n")
     header.add("use \"protobuf\" as protobuf\n")
     let order: List<Integer> = []
     for position in 0..module.imports.length { order.add(position) }

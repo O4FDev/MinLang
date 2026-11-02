@@ -38,5 +38,6 @@ Upstream: <https://github.com/nothings/stb>
   `3d9642a662d10e68ebae5e53f14dcce5105684212d5078f8e0d47d1ab3ae6b64`).
   `protobuf/LICENSE` carries its BSD-3-Clause license. protoc-gen-minyar
   regenerates its own bindings from `descriptor.proto` and
-  `compiler/plugin.proto`; `make check-protoc-gen-minyar` checks that doing so
-  changes nothing.
+  `compiler/plugin.proto`, and the bundled `library/protobuf-*.min` modules
+  from the well-known types; `make check-protoc-gen-minyar` checks that doing
+  so changes nothing.
