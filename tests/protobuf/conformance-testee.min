@@ -1,0 +1,103 @@
+use "files" as files
+use "protobuf" as protobuf
+use "system" as system
+use "./conformance/conformance.min" as conformance
+use "./google/protobuf/test_messages_proto3.min" as proto3
+// The testee for Google's conformance_test_runner, built by
+// tests/protobuf-conformance-test.min beside the plugin's output for
+// conformance.proto and test_messages_proto3.proto. Each request and response
+// is a little-endian 32-bit length followed by the encoded message.
+
+global INPUT: Bytes = Bytes()
+
+// Read until `count` bytes are buffered; false at the end of input.
+function fill(count: Integer): Boolean {
+    while INPUT.length < count {
+        let read = system.readTerminal(0, INPUT, 65536)
+        if read == 0 { return false }
+        if read < 0 {
+            system.writeStandardError("conformance testee: cannot read standard input\n")
+            exit(1)
+        }
+    }
+    return true
+}
+
+function take(count: Integer): Bytes {
+    let taken = INPUT.slice(0, count)
+    let rest = INPUT.slice(count, INPUT.length)
+    INPUT.clear()
+    INPUT.addBytes(rest)
+    return taken
+}
+
+function send(data: Bytes) {
+    let offset = 0
+    while offset < data.length {
+        let count = files.write(1, data, offset, data.length - offset)
+        if count <= 0 {
+            system.writeStandardError("conformance testee: cannot write standard output\n")
+            exit(1)
+        }
+        offset += count
+    }
+}
+
+function result(value: conformance.ConformanceResponse_Result): conformance.ConformanceResponse {
+    let response = conformance.newConformanceResponse()
+    response.result = Some(value)
+    return response
+}
+
+function answer(request: conformance.ConformanceRequest, registry: protobuf.Registry): conformance.ConformanceResponse {
+    if request.messageType == "conformance.FailureSet" {
+        return result(ProtobufPayload(conformance.newFailureSet().encode()))
+    }
+    if request.messageType != "protobuf_test_messages.proto3.TestAllTypesProto3" {
+        return result(Skipped("only proto3 messages are supported"))
+    }
+    let options = protobuf.jsonOptions(registry)
+    options.ignoreUnknownFields = request.testCategory.number() == conformance.TestCategory.JSON_IGNORE_UNKNOWN_PARSING_TEST.number()
+    let decoded: Result<proto3.TestAllTypesProto3, errors.Error> = Ok(proto3.newTestAllTypesProto3())
+    match request.payload {
+        Some(ProtobufPayload(data)) { decoded = proto3.decodeTestAllTypesProto3(data) }
+        Some(JsonPayload(text)) { decoded = proto3.decodeJsonTestAllTypesProto3(text, options) }
+        _ { return result(Skipped("only binary and JSON input are supported")) }
+    }
+    match decoded {
+        Ok(message) {
+            let format = request.requestedOutputFormat.number()
+            if format == conformance.WireFormat.PROTOBUF.number() { return result(ProtobufPayload(message.encode())) }
+            if format == conformance.WireFormat.JSON.number() {
+                match message.toJson(options) {
+                    Ok(text) { return result(JsonPayload(text)) }
+                    Err(problem) { return result(SerializeError(problem.message())) }
+                }
+            }
+            return result(Skipped("only binary and JSON output are supported"))
+        }
+        Err(problem) { return result(ParseError(problem.message())) }
+    }
+}
+
+use "errors" as errors
+
+let registry = protobuf.registry()
+proto3.register(registry)
+while fill(4) {
+    let length = take(4).getUInt32(0)
+    if !fill(length) {
+        system.writeStandardError("conformance testee: truncated request\n")
+        exit(1)
+    }
+    let response = conformance.newConformanceResponse()
+    match conformance.decodeConformanceRequest(take(length)) {
+        Ok(request) { response = answer(request, registry) }
+        Err(problem) { response = result(RuntimeError(problem.message())) }
+    }
+    let encoded = response.encode()
+    let frame = Bytes()
+    frame.addUInt32(encoded.length)
+    frame.addBytes(encoded)
+    send(frame)
+}

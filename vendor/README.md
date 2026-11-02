@@ -40,4 +40,5 @@ Upstream: <https://github.com/nothings/stb>
   regenerates its own bindings from `descriptor.proto` and
   `compiler/plugin.proto`, and the bundled `library/protobuf-*.min` modules
   from the well-known types; `make check-protoc-gen-minyar` checks that doing
-  so changes nothing.
+  so changes nothing. `conformance/conformance.proto` and
+  `test_messages_proto3.proto` define the conformance suite's testee messages.
