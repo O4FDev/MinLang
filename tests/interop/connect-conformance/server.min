@@ -1,0 +1,353 @@
+// The server under test for connectrpc/conformance (check-connect-conformance):
+// connectrpc.conformance.v1.ConformanceService over library/connect.min behind
+// httpserver, with Protobuf code from protoc-gen-minyar. It reads one
+// length-prefixed ServerCompatRequest from the file its first argument names
+// (the runner's stdin, saved by tests/connect-conformance.py), listens on
+// loopback, writes a length-prefixed ServerCompatResponse to stdout, and
+// serves until killed.
+// Handlers follow the reference server in connectrpc/conformance.
+use "httpserver" as http
+use "connect" as connect
+use "connecthttp" as connecthttp
+use "connectgzip" as connectgzip
+use "rpc" as rpc
+use "protobuf" as protobuf
+use "protobuf-any" as anypb
+use "io" as io
+use "system" as system
+use "process" as process
+use "errors" as errors
+use "text" as utf8
+use "./connectrpc/conformance/v1/service.min" as conformance
+use "./connectrpc/conformance/v1/server_compat.min" as compat
+
+constant TYPE_PREFIX = "type.googleapis.com/"
+function now(): Integer { return system.monotonicNanoseconds() / 1000000 }
+
+// The HTTP request being dispatched, for the GET query in RequestInfo.
+record Current { target: Text }
+global current: Current = Current { target: "" }
+
+function packed(name: Text, data: Bytes): anypb.Any {
+    let any = anypb.newAny()
+    any.typeUrl = TYPE_PREFIX + name
+    any.value = data
+    return any
+}
+// Headers as the reference server reports them: one entry per name.
+function protoHeaders(fields: List<rpc.Header>): List<conformance.Header> {
+    let headers: List<conformance.Header> = []
+    for field in fields {
+        let found = false
+        for header in headers {
+            if header.name == field.name {
+                header.value.add(field.value)
+                found = true
+            }
+        }
+        if !found {
+            let header = conformance.newHeader()
+            header.name = field.name
+            header.value.add(field.value)
+            headers.add(header)
+        }
+    }
+    return headers
+}
+function queryParams(target: Text): List<conformance.Header> {
+    let question = target.find("?")
+    let fields: List<rpc.Header> = []
+    if question < 0 { return [] }
+    for pair in target.slice(question + 1, target.length).split("&") {
+        if pair == "" { continue }
+        let equals = pair.find("=")
+        let name = pair
+        let value = ""
+        if equals >= 0 {
+            name = pair.slice(0, equals)
+            value = pair.slice(equals + 1, pair.length)
+        }
+        fields.add(rpc.Header { name: unescape(name); value: unescape(value) })
+    }
+    return protoHeaders(fields)
+}
+function hexValue(character: Character): Integer {
+    let code = Integer(character)
+    if code >= 48 && code <= 57 { return code - 48 }
+    if code >= 97 && code <= 102 { return code - 87 }
+    if code >= 65 && code <= 70 { return code - 55 }
+    return -1
+}
+function unescape(value: Text): Text {
+    let out = Bytes()
+    let at = 0
+    while at < value.length {
+        let character = value[at]
+        if character == '%' && at + 2 < value.length && hexValue(value[at + 1]) >= 0 && hexValue(value[at + 2]) >= 0 {
+            out.add(hexValue(value[at + 1]) * 16 + hexValue(value[at + 2]))
+            at += 3
+        } else {
+            if character == '+' { out.addBytes(Bytes(" ")) } else { out.addBytes(Bytes(Text(character))) }
+            at += 1
+        }
+    }
+    return match utf8.decode(out) {
+        Ok(text) { text }
+        Err(_) { value }
+    }
+}
+function requestInfo(call: rpc.Call, request: anypb.Any): conformance.ConformancePayload_RequestInfo {
+    let info = conformance.newConformancePayload_RequestInfo()
+    info.requestHeaders = protoHeaders(call.requestHeaders)
+    if call.deadline >= 0 { info.timeoutMs = Some(call.remaining()) }
+    info.requests.add(request)
+    if current.target.find("?") >= 0 {
+        let get = conformance.newConformancePayload_ConnectGetInfo()
+        get.queryParams = queryParams(current.target)
+        info.connectGetInfo = Some(get)
+    }
+    return info
+}
+function addHeaders(headers: List<conformance.Header>, out: List<rpc.Header>) {
+    for header in headers { for value in header.value { out.add(rpc.Header { name: header.name; value: value }) } }
+}
+function connectError(definition: conformance.Error): rpc.Error {
+    let message = ""
+    match definition.message { Some(text) { message = text } None {} }
+    let error = rpc.failure(definition.code.number(), message)
+    for detail in definition.details {
+        let name = detail.typeUrl
+        let slash = name.find("/")
+        while slash >= 0 {
+            name = name.slice(slash + 1, name.length)
+            slash = name.find("/")
+        }
+        error.details.add(rpc.Detail { type: name; value: detail.value })
+    }
+    return error
+}
+// The reference server's unary behaviour: the payload echoes the request
+// info, an error definition fails with that error plus the request info as a
+// detail, and headers and trailers apply either way. The response delay is
+// applied by `later` without blocking the server.
+function unaryPayload(call: rpc.Call, definition: Maybe<conformance.UnaryResponseDefinition>, request: anypb.Any): Result<conformance.ConformancePayload, rpc.Error> {
+    let info = requestInfo(call, request)
+    let payload = conformance.newConformancePayload()
+    match definition {
+        None {
+            payload.requestInfo = Some(info)
+            return Ok(payload)
+        }
+        Some(spec) {
+            addHeaders(spec.responseHeaders, call.responseHeaders)
+            addHeaders(spec.responseTrailers, call.responseTrailers)
+            match spec.response {
+                Some(Error(value)) {
+                    let error = connectError(value)
+                    error.details.add(rpc.Detail { type: "connectrpc.conformance.v1.ConformancePayload.RequestInfo"; value: info.encode() })
+                    return Err(error)
+                }
+                Some(ResponseData(data)) { payload.data = data }
+                None {}
+            }
+            payload.requestInfo = Some(info)
+            return Ok(payload)
+        }
+    }
+}
+function unary(call: rpc.Call, request: conformance.UnaryRequest): Result<conformance.UnaryResponse, rpc.Error> {
+    let response = conformance.newUnaryResponse()
+    response.payload = Some(try unaryPayload(call, request.responseDefinition, packed("connectrpc.conformance.v1.UnaryRequest", request.encode())))
+    return Ok(response)
+}
+function idempotentUnary(call: rpc.Call, request: conformance.IdempotentUnaryRequest): Result<conformance.IdempotentUnaryResponse, rpc.Error> {
+    let response = conformance.newIdempotentUnaryResponse()
+    response.payload = Some(try unaryPayload(call, request.responseDefinition, packed("connectrpc.conformance.v1.IdempotentUnaryRequest", request.encode())))
+    return Ok(response)
+}
+function unimplemented(call: rpc.Call, request: conformance.UnimplementedRequest): Result<conformance.UnimplementedResponse, rpc.Error> {
+    return Err(rpc.failure(rpc.UNIMPLEMENTED, "connectrpc.conformance.v1.ConformanceService.Unimplemented is not implemented"))
+}
+// A server stream in progress: messages paced by the response delay, then
+// the definition's error or a clean end.
+record Streaming { sender: rpc.Sender<conformance.ServerStreamResponse>; messages: List<conformance.ServerStreamResponse>
+    next: Integer; every: Integer; due: Integer; error: Maybe<rpc.Error> }
+global streams: List<Streaming> = []
+// The reference server's server stream: headers and trailers from the
+// definition, one message per response datum with the request info on the
+// first, and the definition's error at the end, carrying the request info
+// when no message was sent.
+function serverStream(call: rpc.Call, request: conformance.ServerStreamRequest, sender: rpc.Sender<conformance.ServerStreamResponse>): Result<Nothing, rpc.Error> {
+    match request.responseDefinition {
+        None { return Ok() }
+        Some(spec) {
+            addHeaders(spec.responseHeaders, call.responseHeaders)
+            addHeaders(spec.responseTrailers, call.responseTrailers)
+            let info = requestInfo(call, packed("connectrpc.conformance.v1.ServerStreamRequest", request.encode()))
+            let messages: List<conformance.ServerStreamResponse> = []
+            for data in spec.responseData {
+                let payload = conformance.newConformancePayload()
+                payload.data = data
+                if messages.length == 0 { payload.requestInfo = Some(info) }
+                let response = conformance.newServerStreamResponse()
+                response.payload = Some(payload)
+                messages.add(response)
+            }
+            let failure: Maybe<rpc.Error> = None
+            match spec.error {
+                Some(definition) {
+                    let error = connectError(definition)
+                    if messages.length == 0 {
+                        error.details.add(rpc.Detail { type: "connectrpc.conformance.v1.ConformancePayload.RequestInfo"; value: info.encode() })
+                    }
+                    failure = Some(error)
+                }
+                None {}
+            }
+            sender.responder.hold()
+            streams.add(Streaming { sender: sender; messages: messages; next: 0; every: spec.responseDelayMs
+                due: now() + spec.responseDelayMs; error: failure })
+            return Ok()
+        }
+    }
+}
+
+// A held answer, sent by the main loop once its delay has passed.
+record Pending { responder: rpc.Responder; result: Result<Bytes, rpc.Error>; due: Integer }
+global pending: List<Pending> = []
+function codecNamed<Message>(codecs: List<rpc.Codec<Message>>, name: Text): Maybe<rpc.Codec<Message>> {
+    for codec in codecs { if codec.name == name { return Some(codec) } }
+    return None
+}
+// A unary method answered after the request's response delay. The reference
+// server sleeps; a single-owner server holds the call instead, so other calls
+// and deadlines keep moving.
+function later<Request, Reply>(procedure: Text, idempotency: Integer, requests: List<rpc.Codec<Request>>, replies: List<rpc.Codec<Reply>>,
+        body: (rpc.Call, Request) -> Result<Reply, rpc.Error>, delay: (Request) -> Integer): rpc.Method {
+    let answer = function(call: rpc.Call, data: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        let request = try codecNamed(requests, call.codec).unwrap().decode(data)
+        let result: Result<Bytes, rpc.Error> = Err(rpc.failure(rpc.INTERNAL, "no reply"))
+        match body(call, request) {
+            Ok(reply) { result = codecNamed(replies, call.codec).unwrap().encode(reply) }
+            Err(problem) { result = Err(problem) }
+        }
+        let wait = delay(request)
+        if wait <= 0 {
+            deliver(responder, result)
+            return Ok()
+        }
+        responder.hold()
+        pending.add(Pending { responder: responder; result: result; due: now() + wait })
+        return Ok()
+    }
+    return rpc.Method { procedure: procedure; idempotency: idempotency; handler: rpc.Handler.Deferred(answer) }
+}
+function deliver(responder: rpc.Responder, result: Result<Bytes, rpc.Error>) {
+    match result {
+        Ok(data) {
+            responder.send(data)
+            responder.finish(None)
+        }
+        Err(problem) { responder.finish(Some(problem)) }
+    }
+}
+function delayOf(definition: Maybe<conformance.UnaryResponseDefinition>): Integer {
+    return match definition {
+        Some(spec) { spec.responseDelayMs }
+        None { 0 }
+    }
+}
+// Sends held answers and stream messages that are due; returns milliseconds
+// until the next one, or -1.
+function release(): Integer {
+    let kept: List<Pending> = []
+    let wait = -1
+    for item in pending {
+        if !item.responder.active() { continue }
+        let left = item.due - now()
+        if left <= 0 {
+            deliver(item.responder, item.result)
+            continue
+        }
+        kept.add(item)
+        if wait < 0 || left < wait { wait = left }
+    }
+    pending.truncate(0)
+    for item in kept { pending.add(item) }
+    let open: List<Streaming> = []
+    for stream in streams {
+        let responder = stream.sender.responder
+        while responder.active() && stream.next < stream.messages.length && now() >= stream.due {
+            // A full stream buffer refuses the message; try again on the next turn.
+            if !rpc.send(stream.sender, stream.messages[stream.next]) { break }
+            stream.next += 1
+            stream.due = now() + stream.every
+        }
+        if !responder.active() { continue }
+        if stream.next >= stream.messages.length {
+            responder.finish(stream.error)
+            continue
+        }
+        open.add(stream)
+        let left = max(0, stream.due - now())
+        if wait < 0 || left < wait { wait = left }
+    }
+    streams.truncate(0)
+    for stream in open { streams.add(stream) }
+    return wait
+}
+
+let input = io.readBytesFile(process.argument(0))
+if input.length < 4 { fail("missing ServerCompatRequest") }
+let length = (input[0] << 24) | (input[1] << 16) | (input[2] << 8) | input[3]
+let compatRequest = compat.decodeServerCompatRequest(input.slice(4, 4 + length)).unwrap()
+
+let registry = protobuf.registry()
+conformance.register(registry)
+let services = rpc.services()
+conformance.registerConformanceService(services, conformance.ConformanceServiceHandlers { unary: unary; serverStream: serverStream
+    unimplemented: unimplemented; idempotentUnary: idempotentUnary }, registry)
+services.add(later<conformance.UnaryRequest, conformance.UnaryResponse>("/connectrpc.conformance.v1.ConformanceService/Unary", rpc.IDEMPOTENCY_UNKNOWN,
+    [conformance.codecUnaryRequest(), conformance.jsonCodecUnaryRequest(registry)],
+    [conformance.codecUnaryResponse(), conformance.jsonCodecUnaryResponse(registry)], unary,
+    function(request: conformance.UnaryRequest): Integer { return delayOf(request.responseDefinition) }))
+services.add(later<conformance.IdempotentUnaryRequest, conformance.IdempotentUnaryResponse>("/connectrpc.conformance.v1.ConformanceService/IdempotentUnary", rpc.NO_SIDE_EFFECTS,
+    [conformance.codecIdempotentUnaryRequest(), conformance.jsonCodecIdempotentUnaryRequest(registry)],
+    [conformance.codecIdempotentUnaryResponse(), conformance.jsonCodecIdempotentUnaryResponse(registry)], idempotentUnary,
+    function(request: conformance.IdempotentUnaryRequest): Integer { return delayOf(request.responseDefinition) }))
+let options = connect.defaults(now)
+if compatRequest.messageReceiveLimit > 0 { options.maxRequestBytes = compatRequest.messageReceiveLimit }
+options.compressors.add(connectgzip.gzip())
+let service = connect.server(services, options)
+let limits = http.defaults()
+limits.maxBodyBytes = 16777216
+let server = http.listen("127.0.0.1", 0, limits)
+if !http.ok(server) { fail(errors.message(http.serverError(server))) }
+let host = connecthttp.host(server, service)
+
+let compatResponse = compat.newServerCompatResponse()
+compatResponse.host = "127.0.0.1"
+compatResponse.port = http.port(server)
+let reply = compatResponse.encode()
+let framed = Bytes(4)
+framed[0] = (reply.length >> 24) & 255
+framed[1] = (reply.length >> 16) & 255
+framed[2] = (reply.length >> 8) & 255
+framed[3] = reply.length & 255
+framed.addBytes(reply)
+io.writeBytesFile("/dev/stdout", framed)
+
+let wait = -1
+while true {
+    let batch = http.poll(server, wait)
+    if errors.isError(http.batchError(batch)) { fail(errors.message(http.batchError(batch))) }
+    host.forget(batch)
+    for request in http.requests(batch) {
+        current.target = request.target
+        host.open(request)
+    }
+    let due = release()
+    host.pump()
+    wait = host.timeout(now())
+    if due >= 0 && (wait < 0 || due < wait) { wait = due }
+}
