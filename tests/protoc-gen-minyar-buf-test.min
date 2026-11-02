@@ -1,0 +1,56 @@
+use "../tools/testing.min" as test
+use "io" as io
+use "system" as system
+// protoc-gen-minyar as a Buf plugin: `buf generate` over descriptor.proto,
+// plugin.proto and every well-known type (the vendored copies and Buf's own),
+// and over tests/protobuf with its imports, produces modules that compile.
+
+constant PLUGIN = "build/tooling/tools/protoc-gen-minyar/main"
+
+function sh(script: Text, log: Text, seconds: Integer): test.Result {
+    return test.run(["/bin/sh", "-c", script], system.environment(), "", log, seconds)
+}
+
+function quoted(path: Text): Text { return "'" + path + "'" }
+
+function template(out: Text): Text {
+    return quoted("{\"version\":\"v2\",\"plugins\":[{\"local\":\"" + test.resolvePath(PLUGIN) + "\",\"out\":\"" + out + "\",\"strategy\":\"all\"}]}")
+}
+
+let scratch = test.scratch()
+let vendored = scratch + "/vendored"
+let imported = scratch + "/imported"
+test.require(sh("buf generate vendor/protobuf --path vendor/protobuf/google/protobuf --template " + template(vendored), scratch + "/vendored-generate", 120), "buf generate the vendored protos")
+test.require(sh("buf generate tests/protobuf --include-imports --include-wkt --template " + template(imported), scratch + "/imported-generate", 120), "buf generate tests/protobuf with its imports")
+
+let names = ["any", "api", "descriptor", "duration", "empty", "field_mask", "source_context", "struct", "timestamp", "type", "wrappers"]
+// The vendored inputs give exactly the bundled modules.
+for name in names {
+    test.check(io.readTextFile(vendored + "/google/protobuf/" + name + ".min") == io.readTextFile("library/protobuf-" + name + ".min"), "buf generate changes library/protobuf-" + name + ".min")
+}
+test.check(io.readTextFile(vendored + "/google/protobuf/compiler/plugin.min") == io.readTextFile("tools/protoc-gen-minyar/google/protobuf/compiler/plugin.min"), "buf generate changes the plugin's own bindings")
+
+// One program imports every generated module, from both runs.
+// The vendored run has the eleven well-known types, plugin.proto and
+// test_messages_proto3.proto; the other run has tests/protobuf's four files and
+// the eleven well-known types Buf includes.
+for pair in [[vendored, "13"], [imported, "15"]] {
+    let root = pair[0]
+    let program: List<Text> = []
+    let index = 0
+    let listed = test.run(["find", root, "-name", "*.min"], system.environment(), "", root + ".list", 30)
+    test.require(listed, "list generated modules")
+    let modules = test.lines(listed.output)
+    modules.sort()
+    for path in modules {
+        if path == "" { continue }
+        program.add("use \"." + path.slice(root.length, path.length) + "\" as generated" + Text(index) + "\n")
+        index += 1
+    }
+    test.check(Text(index) == pair[1], "buf generated " + Text(index) + " modules under " + root + ", not " + pair[1])
+    program.add("print(\"compiled\")\n")
+    io.writeTextFile(root + "/all.min", joinText(program))
+    test.require(test.run(["./build/minyarc-modules", root + "/all.min", root + "/all.ll", "--library", "library"], system.environment(), "", root + "/compile", 600), "compile the modules buf generated under " + root)
+}
+test.removeScratch(scratch)
+print("protoc-gen-minyar under buf: ok")
