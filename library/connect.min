@@ -1,10 +1,13 @@
 // Connect protocol (connectrpc.com) server and client over the rpc handler API.
 // No sockets: Server.handle turns one HTTP request into one HTTP response
-// (Server.open and Exchange.step for answers that come later), and
+// (Server.open and Exchange.step for answers that come later, Server.begin
+// for request bodies that arrive in pieces, as over HTTP/2), and
 // Client.unary sends through a caller-supplied transport, so the same code runs
 // behind httpserver (library/connecthttp.min) and inside simulation tests.
 // Unary calls use application/proto or application/json bodies over POST, or
 // GET for NO_SIDE_EFFECTS methods. Errors are Connect JSON with details.
+// Server, client and bidirectional streams use enveloped messages; over
+// HTTP/1.1 a client or bidirectional stream is half-duplex.
 use "rpc" as rpc
 use "errors" as errors
 use "json" as json
@@ -427,12 +430,13 @@ public choice Step {
     End(piece: Bytes)
 }
 
-/// A deferred unary call or a server stream that outlives its handler.
+/// A deferred unary call or a stream that outlives its handler.
 public record Exchange {
     private server: Server
     private call: rpc.Call
     private responder: rpc.Responder
     private streaming: Boolean
+    private kind: Integer
     private requestHeaders: List<rpc.Header>
     private compressor: Maybe<Compressor>
     private queue: Bytes
@@ -444,16 +448,133 @@ public record Exchange {
     private replayKey: Text
     private replayFingerprint: Integer
     private started: Integer
+    // Client and bidirectional streams: request envelopes not yet complete.
+    private receiver: Maybe<rpc.Receiver>
+    private input: Bytes
+    private inputCompressor: Maybe<Compressor>
+    private inputClosed: Boolean
+    private notified: Boolean
+    // Server.begin for other calls: the request until its body is complete,
+    // then the exchange that serves it or the answer to send.
+    private buffering: Boolean
+    private buffered: Request
+    private inner: Maybe<Exchange>
+    private immediate: Maybe<Response>
 }
 // The call's deadline on the server clock, or -1; step it then at the latest.
-public function Exchange.deadline(): Integer { return self.call.deadline }
-public function Exchange.finished(): Boolean { return self.done }
+public function Exchange.deadline(): Integer {
+    match self.inner { Some(inner) { return inner.deadline() } None {} }
+    return self.call.deadline
+}
+public function Exchange.finished(): Boolean {
+    match self.inner { Some(inner) { return inner.finished() } None {} }
+    return self.done
+}
 // The client went away: the handler's later sends fail and nothing is stored.
 public function Exchange.cancel() {
+    match self.inner { Some(inner) { inner.cancel(); return } None {} }
     if self.done { return }
     self.done = true
     rpc.cancel(self.responder)
+    self.notify(rpc.failure(rpc.CANCELED, "the client canceled the call"))
     if self.replayKey != "" { self.server.running.remove(self.replayKey) }
+}
+// True for client and bidirectional streams, whose handler takes request
+// messages as they arrive.
+public function Exchange.receiving(): Boolean { return self.receiver.isSome() }
+
+/// Request body bytes for a call started with `begin`, in any pieces.
+public function Exchange.receive(data: Bytes) {
+    match self.inner { Some(inner) { inner.receive(data); return } None {} }
+    if self.buffering {
+        // Past the limit the call fails anyway; keep only enough to say so.
+        let room = self.server.options.maxRequestBytes + 6 - self.buffered.body.length
+        if room > 0 { self.buffered.body.addBytes(data.slice(0, min(room, data.length))) }
+        return
+    }
+    if self.done || self.inputClosed || self.receiver.isNone() || self.outcome.isSome() { return }
+    self.input.addBytes(data)
+    self.messages()
+}
+/// The request body is complete.
+public function Exchange.closeInput() {
+    match self.inner { Some(inner) { inner.closeInput(); return } None {} }
+    if self.buffering {
+        self.buffering = false
+        match self.server.dispatch(self.buffered, self.origin) {
+            Complete(response) { self.immediate = Some(self.server.withCors(self.origin, response)) }
+            Started(exchange) { self.inner = Some(exchange) }
+        }
+        return
+    }
+    if self.inputClosed { return }
+    self.inputClosed = true
+    if self.done || self.outcome.isSome() { return }
+    match self.receiver {
+        Some(receiver) {
+            if self.input.length > 0 {
+                self.fail(rpc.failure(rpc.INVALID_ARGUMENT, "incomplete request envelope"))
+                return
+            }
+            self.notified = true
+            match receiver.end(None) {
+                Ok() { if !rpc.held(self.responder) { self.responder.finish(None) } }
+                Err(problem) { self.responder.finish(Some(problem)) }
+            }
+        }
+        None {}
+    }
+}
+// Hands complete request envelopes to the receiver.
+function Exchange.messages() {
+    let limit = self.server.options.maxRequestBytes
+    while self.input.length >= 5 && self.outcome.isNone() && !self.done {
+        let flags = self.input[0]
+        let length = (self.input[1] << 24) | (self.input[2] << 16) | (self.input[3] << 8) | self.input[4]
+        if length > limit { self.fail(rpc.failure(rpc.RESOURCE_EXHAUSTED, "request message is larger than " + Text(limit) + " bytes")); return }
+        if (flags & 254) != 0 { self.fail(rpc.failure(rpc.INVALID_ARGUMENT, "unexpected envelope flags")); return }
+        if self.input.length < 5 + length { return }
+        let data = self.input.slice(5, 5 + length)
+        self.input = self.input.slice(5 + length, self.input.length)
+        if (flags & 1) == 1 {
+            match self.inputCompressor {
+                Some(compressor) {
+                    match compressor.decompress(data, limit) {
+                        Ok(expanded) { data = expanded }
+                        Err(problem) {
+                            let code = rpc.INVALID_ARGUMENT
+                            if errors.code(problem) == errors.overflowCode() { code = rpc.RESOURCE_EXHAUSTED }
+                            self.fail(rpc.failure(code, "cannot decompress request: " + problem.message()))
+                            return
+                        }
+                    }
+                }
+                None { self.fail(rpc.failure(rpc.INTERNAL, "compressed message without connect-content-encoding")); return }
+            }
+        }
+        match self.receiver.unwrap().message(data) {
+            Ok() {}
+            Err(problem) { self.responder.finish(Some(problem)) }
+        }
+    }
+}
+// Ends the call with an error the handler did not choose.
+function Exchange.fail(error: rpc.Error) {
+    if self.outcome.isNone() { self.outcome = Some(Some(error)) }
+    rpc.cancel(self.responder)
+    self.notify(error)
+}
+// Tells a receiving handler its call broke, once.
+function Exchange.notify(error: rpc.Error) {
+    if self.notified || rpc.finished(self.responder) { return }
+    match self.receiver {
+        Some(receiver) {
+            self.notified = true
+            // The call is over; what the handler returns changes nothing.
+            match receiver.end(Some(error)) { Ok() {} Err(_) {} }
+        }
+        None {}
+    }
 }
 
 /// Starts one call. Most callers use `handle`; transports that can wait use
@@ -465,10 +586,58 @@ public function Server.open(request: Request): Opened {
     if normalized.method == "OPTIONS" && rpc.headerValue(headers, "access-control-request-method") != "" {
         return Complete(self.preflight(origin))
     }
-    return match self.dispatch(normalized, origin) {
-        Complete(response) { Complete(self.withCors(origin, response)) }
-        Started(exchange) { Started(exchange) }
+    match self.dispatch(normalized, origin) {
+        Complete(response) { return Complete(self.withCors(origin, response)) }
+        Started(exchange) {
+            if exchange.receiving() {
+                exchange.receive(normalized.body)
+                exchange.closeInput()
+            }
+            return Started(exchange)
+        }
     }
+    return Complete(failed(rpc.INTERNAL, "unreachable"))
+}
+
+/// Starts a call whose request body arrives later, as over HTTP/2; the body
+/// in `request` may be empty. Pass the rest to Exchange.receive and its end to
+/// closeInput, and step the Exchange as for `open` (it may Respond at once).
+/// A client or bidirectional stream starts its handler now; other calls start
+/// when the body is complete.
+public function Server.begin(request: Request): Exchange {
+    let headers = lowerHeaders(request.headers)
+    let normalized = Request { method: request.method.asciiUppercased(); target: request.target; headers: headers; body: request.body }
+    let origin = rpc.headerValue(headers, "origin")
+    if normalized.method == "OPTIONS" && rpc.headerValue(headers, "access-control-request-method") != "" {
+        return self.answered(origin, self.preflight(origin))
+    }
+    let path = normalized.target
+    let question = path.find("?")
+    if question >= 0 { path = path.slice(0, question) }
+    let kind = rpc.UNARY
+    match self.services.lookup(path) { Some(method) { kind = method.kind() } None {} }
+    if normalized.method != "POST" || (kind != rpc.CLIENT_STREAM && kind != rpc.BIDI_STREAM) {
+        let exchange = self.answered(origin, Response { status: 0; headers: []; body: Bytes() })
+        exchange.immediate = None
+        exchange.done = false
+        exchange.buffering = true
+        exchange.buffered = normalized
+        return exchange
+    }
+    match self.dispatch(normalized, origin) {
+        Complete(response) { return self.answered(origin, self.withCors(origin, response)) }
+        Started(exchange) {
+            exchange.receive(normalized.body)
+            return exchange
+        }
+    }
+    return self.answered(origin, failed(rpc.INTERNAL, "unreachable"))
+}
+// An exchange whose only step is this response.
+function Server.answered(origin: Text, response: Response): Exchange {
+    let exchange = self.exchange(rpc.call("", "connect", "", [], -1, self.options.clock), rpc.UNARY, [], "", origin, "", 0, 0)
+    exchange.immediate = Some(response)
+    return exchange
 }
 
 record Parsed { codec: Text; body: Bytes; compression: Text; get: Boolean; problem: Maybe<Response> }
@@ -615,7 +784,7 @@ function Server.dispatch(request: Request, origin: Text): Opened {
         return Complete(Response { status: 404; headers: missing.headers; body: missing.body })
     }
     let method = found.unwrap()
-    let streaming = method.kind() == rpc.SERVER_STREAM
+    let streaming = method.kind() != rpc.UNARY
     let allowGet = method.idempotency == rpc.NO_SIDE_EFFECTS && !streaming
     if request.method != "POST" && !(request.method == "GET" && allowGet) {
         let allow = "POST"
@@ -646,11 +815,15 @@ function Server.dispatch(request: Request, origin: Text): Opened {
 }
 
 function Server.prepare(request: Request, method: rpc.Method, path: Text, parsed: Parsed, origin: Text): Opened {
-    let streaming = method.kind() == rpc.SERVER_STREAM
+    let kind = method.kind()
+    let streaming = kind != rpc.UNARY
     let limit = self.options.maxRequestBytes
     let body = parsed.body
     let compressed = parsed.compression != "" && parsed.compression != "identity"
-    if streaming {
+    if kind == rpc.CLIENT_STREAM || kind == rpc.BIDI_STREAM {
+        // Request envelopes go to the handler's Receiver as they arrive.
+        compressed = false
+    } else if streaming {
         // One enveloped message; flag 1 marks it compressed.
         if body.length == 0 { return Complete(failed(rpc.UNIMPLEMENTED, "a server stream needs exactly one request message")) }
         if body.length < 5 { return Complete(failed(rpc.INVALID_ARGUMENT, "incomplete request envelope")) }
@@ -726,20 +899,38 @@ function Server.prepare(request: Request, method: rpc.Method, path: Text, parsed
             return Complete(response)
         }
         Deferred(handler) {
-            let exchange = self.exchange(call, false, request.headers, "", origin, replayKey, replayFingerprint, started)
+            let exchange = self.exchange(call, rpc.UNARY, request.headers, "", origin, replayKey, replayFingerprint, started)
             if replayKey != "" { self.running.add(replayKey) }
             exchange.run(handler(call, body, exchange.responder))
             return Started(exchange)
         }
         ServerStream(handler) {
-            let exchange = self.exchange(call, true, request.headers, rpc.headerValue(request.headers, "connect-accept-encoding"), origin, "", 0, started)
+            let exchange = self.exchange(call, rpc.SERVER_STREAM, request.headers, rpc.headerValue(request.headers, "connect-accept-encoding"), origin, "", 0, started)
             exchange.run(handler(call, body, exchange.responder))
             return Started(exchange)
         }
+        ClientStream(handler) { return Started(self.receiving(call, rpc.CLIENT_STREAM, handler, request.headers, parsed.compression, origin, started)) }
+        BidiStream(handler) { return Started(self.receiving(call, rpc.BIDI_STREAM, handler, request.headers, parsed.compression, origin, started)) }
     }
 }
+function Server.receiving(call: rpc.Call, kind: Integer, handler: (rpc.Call, rpc.Responder) -> Result<rpc.Receiver, rpc.Error>,
+        headers: List<rpc.Header>, compression: Text, origin: Text, started: Integer): Exchange {
+    let exchange = self.exchange(call, kind, headers, rpc.headerValue(headers, "connect-accept-encoding"), origin, "", 0, started)
+    if compression != "" && compression != "identity" { exchange.inputCompressor = self.compressor(compression) }
+    match handler(call, exchange.responder) {
+        Ok(receiver) { exchange.receiver = Some(receiver) }
+        Err(problem) {
+            // Still receiving, so the transport reads and drops the rest of the body.
+            exchange.receiver = Some(rpc.Receiver { message: function(data: Bytes): Result<Nothing, rpc.Error> { return Ok() }
+                end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> { return Ok() } })
+            exchange.notified = true
+            exchange.responder.finish(Some(problem))
+        }
+    }
+    return exchange
+}
 
-function Server.exchange(call: rpc.Call, streaming: Boolean, headers: List<rpc.Header>, accepted: Text, origin: Text,
+function Server.exchange(call: rpc.Call, kind: Integer, headers: List<rpc.Header>, accepted: Text, origin: Text,
         replayKey: Text, replayFingerprint: Integer, started: Integer): Exchange {
     let compressor: Maybe<Compressor> = None
     for piece in accepted.split(",") {
@@ -747,8 +938,10 @@ function Server.exchange(call: rpc.Call, streaming: Boolean, headers: List<rpc.H
         if compressor.isNone() && name != "" { compressor = self.compressor(name) }
     }
     let exchange = Exchange { server: self; call: call; responder: rpc.responder(function(data: Bytes): Boolean { return false }, function(error: Maybe<rpc.Error>) {})
-        streaming: streaming; requestHeaders: headers; compressor: compressor; queue: Bytes(); headSent: false; message: None
-        outcome: None; done: false; origin: origin; replayKey: replayKey; replayFingerprint: replayFingerprint; started: started }
+        streaming: kind != rpc.UNARY; kind: kind; requestHeaders: headers; compressor: compressor; queue: Bytes(); headSent: false; message: None
+        outcome: None; done: false; origin: origin; replayKey: replayKey; replayFingerprint: replayFingerprint; started: started
+        receiver: None; input: Bytes(); inputCompressor: None; inputClosed: false; notified: false
+        buffering: false; buffered: Request { method: ""; target: ""; headers: []; body: Bytes() }; inner: None; immediate: None }
     exchange.responder = rpc.responder(function(data: Bytes): Boolean { return exchange.deliver(data) },
         function(error: Maybe<rpc.Error>) { exchange.end(error) })
     return exchange
@@ -763,6 +956,11 @@ function Exchange.deliver(data: Bytes): Boolean {
         }
         self.message = Some(data)
         return true
+    }
+    if self.kind == rpc.CLIENT_STREAM && self.responder.sentCount() > 0 {
+        self.outcome = Some(Some(rpc.failure(rpc.INTERNAL, "a client-stream handler sent more than one message")))
+        rpc.cancel(self.responder)
+        return false
     }
     if self.queue.length >= self.server.options.maxStreamBufferBytes { return false }
     if data.length > self.server.options.maxResponseBytes {
@@ -801,11 +999,17 @@ function Exchange.run(result: Result<Nothing, rpc.Error>) {
 /// The next thing to send. Call it after polling until it returns Waiting,
 /// and again by the call's deadline.
 public function Exchange.step(): Step {
-    if self.done { return Waiting }
-    if self.outcome.isNone() && self.call.expired() {
-        self.outcome = Some(Some(rpc.failure(rpc.DEADLINE_EXCEEDED, "the deadline passed")))
-        rpc.cancel(self.responder)
+    match self.inner { Some(inner) { return inner.step() } None {} }
+    match self.immediate {
+        Some(response) {
+            self.immediate = None
+            self.done = true
+            return Respond(response)
+        }
+        None {}
     }
+    if self.done || self.buffering { return Waiting }
+    if self.outcome.isNone() && self.call.expired() { self.fail(rpc.failure(rpc.DEADLINE_EXCEEDED, "the deadline passed")) }
     if !self.streaming {
         match self.outcome {
             Some(error) {
@@ -825,8 +1029,15 @@ public function Exchange.step(): Step {
             None { return Waiting }
         }
     }
+    if self.kind == rpc.CLIENT_STREAM && self.outcome.isSome() && self.outcome.unwrap().isNone() && self.responder.sentCount() == 0 {
+        self.outcome = Some(Some(rpc.failure(rpc.INTERNAL, "the handler finished without a message")))
+    }
     // The head goes out once the handler has returned, so a client sees the
-    // stream's headers before a slow first message.
+    // stream's headers before a slow first message. Client and bidirectional
+    // handlers set headers as messages arrive, so theirs wait for a message
+    // or the end.
+    let waits = self.kind == rpc.CLIENT_STREAM || self.kind == rpc.BIDI_STREAM
+    if waits && !self.headSent && self.queue.length == 0 && self.outcome.isNone() { return Waiting }
     if !self.headSent {
         self.headSent = true
         let headers: List<rpc.Header> = [rpc.Header { name: "content-type"; value: "application/connect+" + self.call.codec }]

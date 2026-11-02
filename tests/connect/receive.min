@@ -1,0 +1,247 @@
+// Client-streaming and bidirectional calls: request envelopes delivered to the
+// handler's Receiver as they arrive through Server.begin and Exchange.receive,
+// full duplex, and half duplex through Server.open; the end of input, broken
+// calls, envelope errors and request bodies buffered for other calls.
+use "connect" as connect
+use "rpc" as rpc
+use "errors" as errors
+use "text" as utf8
+
+global clockNow: List<Integer> = [0]
+function clock(): Integer { return clockNow[0] }
+function header(name: Text, value: Text): rpc.Header { return rpc.Header { name: name; value: value } }
+function reversed(data: Bytes): Bytes {
+    let out = Bytes()
+    for index in 0..data.length { out.add(data[data.length - 1 - index]) }
+    return out
+}
+function envelopes(body: Bytes): Text {
+    let parts: List<Text> = []
+    let at = 0
+    while at + 5 <= body.length {
+        let length = (body[at + 1] << 24) | (body[at + 2] << 16) | (body[at + 3] << 8) | body[at + 4]
+        let data = body.slice(at + 5, min(body.length, at + 5 + length))
+        if (body[at] & 1) == 1 { data = reversed(data) }
+        parts.add(Text(body[at]) + ":" + utf8.decodeOrStop(data))
+        at += 5 + length
+    }
+    if at != body.length { parts.add("<" + Text(body.length - at) + " stray bytes>") }
+    return joinText(parts, " | ")
+}
+function headers(response: connect.Response): Text {
+    let line = ""
+    for field in response.headers { line = line + " [" + field.name + ": " + field.value + "]" }
+    return line
+}
+function steps(label: Text, exchange: connect.Exchange) {
+    let line = label
+    while true {
+        match exchange.step() {
+            Waiting {
+                print(line + " / waiting")
+                return
+            }
+            Respond(response) {
+                print(line + " / respond " + Text(response.status) + headers(response) + " " + utf8.decodeOrStop(response.body))
+                return
+            }
+            Start(head) { line = line + " / start " + Text(head.status) + headers(head) }
+            Write(piece) { line = line + " / write " + envelopes(piece) }
+            End(piece) {
+                print(line + " / end " + envelopes(piece))
+                return
+            }
+        }
+    }
+}
+function head(target: Text, extra: List<rpc.Header>): connect.Request {
+    let request = connect.Request { method: "POST"; target: target; headers: [header("content-type", "application/connect+json")]; body: Bytes() }
+    for field in extra { request.headers.add(field) }
+    return request
+}
+function message(text: Text): Bytes { return connect.envelope(0, Bytes(text)) }
+
+record Log { lines: List<Text> }
+global log: Log = Log { lines: [] }
+function flush(label: Text) {
+    print(label + ": " + joinText(log.lines, ", "))
+    log.lines.truncate(0)
+}
+function ended(error: Maybe<rpc.Error>): Text {
+    return match error {
+        Some(problem) { "end " + rpc.codeName(problem.code) + " " + problem.message }
+        None { "end" }
+    }
+}
+
+let services = rpc.services()
+// Sums the lengths of the messages and answers once the client is done.
+services.addClientStream("/t.v1.S/Sum", function(call: rpc.Call, responder: rpc.Responder): Result<rpc.Receiver, rpc.Error> {
+    let total: List<Integer> = [0]
+    return Ok(rpc.Receiver {
+        message: function(data: Bytes): Result<Nothing, rpc.Error> {
+            log.lines.add("sum " + utf8.decodeOrStop(data))
+            if utf8.decodeOrStop(data) == "\"bad\"" { return Err(rpc.failure(rpc.INVALID_ARGUMENT, "bad message")) }
+            total[0] += data.length
+            return Ok()
+        }
+        end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> {
+            log.lines.add("sum " + ended(error))
+            if error.isSome() { return Ok() }
+            call.responseHeaders.add(header("x-count", Text(total[0])))
+            call.responseTrailers.add(header("x-done", "yes"))
+            responder.send(Bytes("{\"total\":" + Text(total[0]) + "}"))
+            return Ok()
+        }
+    })
+})
+// Answers each message at once; "stop" ends the call from the server side.
+services.addBidiStream("/t.v1.S/Echo", function(call: rpc.Call, responder: rpc.Responder): Result<rpc.Receiver, rpc.Error> {
+    return Ok(rpc.Receiver {
+        message: function(data: Bytes): Result<Nothing, rpc.Error> {
+            log.lines.add("echo " + utf8.decodeOrStop(data))
+            if call.responseHeaders.length == 0 { call.responseHeaders.add(header("x-first", utf8.decodeOrStop(data))) }
+            if utf8.decodeOrStop(data) == "\"stop\"" {
+                responder.finish(Some(rpc.failure(rpc.ABORTED, "stopped by the server")))
+                return Ok()
+            }
+            responder.send(data)
+            return Ok()
+        }
+        end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> {
+            log.lines.add("echo " + ended(error))
+            return Ok()
+        }
+    })
+})
+// A client stream that never answers, and one that answers twice.
+services.addClientStream("/t.v1.S/Silent", function(call: rpc.Call, responder: rpc.Responder): Result<rpc.Receiver, rpc.Error> {
+    return Ok(rpc.Receiver { message: function(data: Bytes): Result<Nothing, rpc.Error> { return Ok() }
+        end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> { return Ok() } })
+})
+services.addClientStream("/t.v1.S/Twice", function(call: rpc.Call, responder: rpc.Responder): Result<rpc.Receiver, rpc.Error> {
+    return Ok(rpc.Receiver { message: function(data: Bytes): Result<Nothing, rpc.Error> { return Ok() }
+        end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> {
+            responder.send(Bytes("1"))
+            log.lines.add("second " + Text(responder.send(Bytes("2"))))
+            return Ok()
+        } })
+})
+services.addBidiStream("/t.v1.S/Refuse", function(call: rpc.Call, responder: rpc.Responder): Result<rpc.Receiver, rpc.Error> {
+    return Err(rpc.failure(rpc.PERMISSION_DENIED, "not you"))
+})
+services.addUnary("/t.v1.S/Say", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+    return Ok(Bytes("said " + utf8.decodeOrStop(data)))
+})
+let options = connect.defaults(clock)
+options.maxRequestBytes = 32
+options.compressors.add(connect.Compressor { name: "reverse"
+    compress: function(data: Bytes): Result<Bytes, errors.Error> { return Ok(reversed(data)) }
+    decompress: function(data: Bytes, limit: Integer): Result<Bytes, errors.Error> { return Ok(reversed(data)) } })
+let server = connect.server(services, options)
+
+// Full duplex: each message is answered before the client sends the next.
+let echo = server.begin(head("/t.v1.S/Echo", []))
+steps("echo opened", echo)
+let first = message("\"one\"")
+echo.receive(first.slice(0, 3))
+steps("echo partial", echo)
+echo.receive(first.slice(3, first.length))
+steps("echo one", echo)
+let two = message("\"two\"")
+two.addBytes(message("\"three\""))
+echo.receive(two)
+steps("echo two", echo)
+echo.closeInput()
+steps("echo closed", echo)
+flush("echo log")
+
+// A client stream through begin, and the same call half duplex through open.
+let sum = server.begin(head("/t.v1.S/Sum", []))
+sum.receive(message("\"ab\""))
+sum.receive(message("\"cde\""))
+steps("sum open", sum)
+sum.closeInput()
+steps("sum closed", sum)
+flush("sum log")
+let whole = head("/t.v1.S/Sum", [])
+whole.body = message("\"x\"")
+whole.body.addBytes(connect.envelope(1, reversed(Bytes("\"yz\""))))
+whole.headers.add(header("connect-content-encoding", "reverse"))
+match server.open(whole) {
+    Started(exchange) { steps("sum whole", exchange) }
+    Complete(response) { print("sum whole complete " + Text(response.status)) }
+}
+flush("sum whole log")
+print("handle " + envelopes(server.handle(head("/t.v1.S/Sum", [])).body))
+flush("handle log")
+
+// The server ends a bidirectional stream early; later messages are dropped.
+let stopped = server.begin(head("/t.v1.S/Echo", []))
+stopped.receive(message("\"a\""))
+stopped.receive(message("\"stop\""))
+stopped.receive(message("\"late\""))
+stopped.closeInput()
+steps("stopped", stopped)
+flush("stopped log")
+
+// Broken calls: the handler hears why through end, once.
+let canceled = server.begin(head("/t.v1.S/Echo", []))
+canceled.receive(message("\"a\""))
+steps("canceled", canceled)
+canceled.cancel()
+canceled.receive(message("\"b\""))
+canceled.cancel()
+steps("canceled after", canceled)
+flush("canceled log")
+clockNow[0] = 1000
+let late = server.begin(head("/t.v1.S/Sum", [header("connect-timeout-ms", "50")]))
+late.receive(message("\"a\""))
+print("deadline " + Text(late.deadline()))
+clockNow[0] = 1050
+steps("late", late)
+late.closeInput()
+flush("late log")
+
+// Envelope and handler errors end the stream with an error and tell the handler.
+for case in [["too-large", "x"], ["flags", "f"], ["unencoded", "u"], ["truncated", "t"], ["handler", "h"]] {
+    let call = server.begin(head("/t.v1.S/Sum", []))
+    if case[0] == "too-large" { call.receive(message("\"" + "a".repeat(40) + "\"")) }
+    if case[0] == "flags" { call.receive(connect.envelope(2, Bytes("{}"))) }
+    if case[0] == "unencoded" { call.receive(connect.envelope(1, Bytes("\"a\""))) }
+    if case[0] == "truncated" { call.receive(message("\"abc\"").slice(0, 6)) }
+    if case[0] == "handler" { call.receive(message("\"bad\"")) }
+    call.closeInput()
+    steps(case[0], call)
+    flush(case[0] + " log")
+}
+let silent = server.begin(head("/t.v1.S/Silent", []))
+silent.closeInput()
+steps("silent", silent)
+let twice = server.begin(head("/t.v1.S/Twice", []))
+twice.closeInput()
+steps("twice", twice)
+flush("twice log")
+let refused = server.begin(head("/t.v1.S/Refuse", []))
+refused.receive(message("\"ignored\""))
+refused.closeInput()
+steps("refused", refused)
+
+// Other calls through begin wait for the whole body; errors answer at once.
+let say = server.begin(connect.Request { method: "POST"; target: "/t.v1.S/Say"; headers: [header("content-type", "application/json")]; body: Bytes("\"he") })
+steps("say partial", say)
+say.receive(Bytes("llo\""))
+say.closeInput()
+steps("say", say)
+let big = server.begin(connect.Request { method: "POST"; target: "/t.v1.S/Say"; headers: [header("content-type", "application/json")]; body: Bytes() })
+for round in 0..10 { big.receive(Bytes("0123456789")) }
+big.closeInput()
+steps("say big", big)
+let wrongType = server.begin(connect.Request { method: "POST"; target: "/t.v1.S/Echo"; headers: [header("content-type", "application/json")]; body: Bytes() })
+steps("echo unary type", wrongType)
+let missing = server.begin(head("/t.v1.S/Nothing", []))
+missing.closeInput()
+steps("missing", missing)
+let preflight = server.begin(connect.Request { method: "OPTIONS"; target: "/t.v1.S/Echo"; headers: [header("origin", "https://elsewhere.example"),
+    header("access-control-request-method", "POST")]; body: Bytes() })
+steps("preflight", preflight)

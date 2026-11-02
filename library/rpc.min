@@ -2,7 +2,7 @@
 // gRPC. A handler sees one Call and message bytes already in the call's codec
 // ("proto" or "json"); it never sees sockets, HTTP framing or a Protobuf type.
 // Generated code supplies a Codec per message type and registers typed
-// handlers with unary/serverStream.
+// handlers with unary, serverStream, clientStream and bidiStream.
 use "errors" as errors
 
 // Status codes, numbered as in gRPC and Connect. OK is 0 and never an Error.
@@ -31,6 +31,8 @@ public constant IDEMPOTENT = 2
 
 public constant UNARY = 0
 public constant SERVER_STREAM = 1
+public constant CLIENT_STREAM = 2
+public constant BIDI_STREAM = 3
 
 /// One header or trailer. Transports store names in lowercase.
 public record Header { name: Text; value: Text }
@@ -94,8 +96,9 @@ public function headerValues(headers: List<Header>, name: Text): List<Text> {
 
 /// One call as a handler sees it. Handlers may append to `responseHeaders`
 /// and `responseTrailers`; transports send them with the response or error.
-/// A streaming transport may send headers with the first message or as soon
-/// as the handler returns, so add them before either.
+/// A server-streaming transport may send headers with the first message or as
+/// soon as the handler returns, so add them before either. Client and
+/// bidirectional streams send them with the first message or the end.
 public record Call {
     procedure: Text
     protocol: Text
@@ -157,6 +160,20 @@ public function cancel(responder: Responder) { responder.canceled = true }
 public function held(responder: Responder): Boolean { return responder.held }
 public function finished(responder: Responder): Boolean { return responder.finished }
 
+/// What a client-streaming or bidirectional handler does with the request
+/// stream. The transport calls `message` for each request message in order,
+/// then `end` once: with None when the client has sent its last message, or
+/// with the error that broke the call (the client canceled, the deadline
+/// passed, the connection failed or a message was invalid). After a broken
+/// call the Responder is inactive and the result of `end` is ignored. An Err
+/// from either finishes the call with that error; Ok from `end(None)`
+/// finishes it unless the handler called hold() or finished it already.
+/// Nothing more is delivered once the call finishes.
+public record Receiver {
+    message: (Bytes) -> Result<Nothing, Error>
+    end: (Maybe<Error>) -> Result<Nothing, Error>
+}
+
 /// The byte-level handler shapes a transport dispatches.
 public choice Handler {
     Unary(body: (Call, Bytes) -> Result<Bytes, Error>)
@@ -167,6 +184,11 @@ public choice Handler {
     // exactly one message and finish, or finish with an error. Hold the
     // Responder when returning Ok before answering.
     Deferred(body: (Call, Bytes, Responder) -> Result<Nothing, Error>)
+    // Runs when the call opens, before any request message, and returns the
+    // Receiver for them. Send exactly one response message and finish.
+    ClientStream(body: (Call, Responder) -> Result<Receiver, Error>)
+    // As ClientStream, but any number of response messages, sent at any time.
+    BidiStream(body: (Call, Responder) -> Result<Receiver, Error>)
 }
 public record Method { procedure: Text; idempotency: Integer; handler: Handler }
 public function Method.kind(): Integer {
@@ -174,6 +196,8 @@ public function Method.kind(): Integer {
         Unary(_) { UNARY }
         ServerStream(_) { SERVER_STREAM }
         Deferred(_) { UNARY }
+        ClientStream(_) { CLIENT_STREAM }
+        BidiStream(_) { BIDI_STREAM }
     }
 }
 
@@ -209,6 +233,12 @@ public function Services.addDeferred(procedure: Text, idempotency: Integer, body
 }
 public function Services.addServerStream(procedure: Text, body: (Call, Bytes, Responder) -> Result<Nothing, Error>) {
     self.add(Method { procedure: procedure; idempotency: IDEMPOTENCY_UNKNOWN; handler: ServerStream(body) })
+}
+public function Services.addClientStream(procedure: Text, body: (Call, Responder) -> Result<Receiver, Error>) {
+    self.add(Method { procedure: procedure; idempotency: IDEMPOTENCY_UNKNOWN; handler: ClientStream(body) })
+}
+public function Services.addBidiStream(procedure: Text, body: (Call, Responder) -> Result<Receiver, Error>) {
+    self.add(Method { procedure: procedure; idempotency: IDEMPOTENCY_UNKNOWN; handler: BidiStream(body) })
 }
 
 /// Converts one message type to and from bytes for one codec name. Generated
@@ -278,4 +308,41 @@ public function serverStream<Request, Reply>(procedure: Text, requests: List<Cod
         return body(call, request, Sender { responder: responder; codecs: replies; codec: call.codec })
     }
     return Method { procedure: procedure; idempotency: IDEMPOTENCY_UNKNOWN; handler: ServerStream(bytes) }
+}
+
+/// Typed request messages for a client-streaming or bidirectional handler;
+/// see Receiver for when each runs.
+public record Listener<Request> {
+    message: (Request) -> Result<Nothing, Error>
+    end: (Maybe<Error>) -> Result<Nothing, Error>
+}
+function receiver<Request>(requests: List<Codec<Request>>, codec: Text, listener: Listener<Request>): Receiver {
+    return Receiver {
+        message: function(data: Bytes): Result<Nothing, Error> {
+            let request = try decodeWith(requests, codec, data)
+            return listener.message(request)
+        }
+        end: listener.end
+    }
+}
+
+/// A typed client-streaming method for generated service code: send one
+/// reply through the Sender, usually from `end`.
+public function clientStream<Request, Reply>(procedure: Text, requests: List<Codec<Request>>, replies: List<Codec<Reply>>,
+        body: (Call, Sender<Reply>) -> Result<Listener<Request>, Error>): Method {
+    let bytes = function(call: Call, responder: Responder): Result<Receiver, Error> {
+        let listener = try body(call, Sender { responder: responder; codecs: replies; codec: call.codec })
+        return Ok(receiver(requests, call.codec, listener))
+    }
+    return Method { procedure: procedure; idempotency: IDEMPOTENCY_UNKNOWN; handler: ClientStream(bytes) }
+}
+
+/// A typed bidirectional method for generated service code.
+public function bidiStream<Request, Reply>(procedure: Text, requests: List<Codec<Request>>, replies: List<Codec<Reply>>,
+        body: (Call, Sender<Reply>) -> Result<Listener<Request>, Error>): Method {
+    let bytes = function(call: Call, responder: Responder): Result<Receiver, Error> {
+        let listener = try body(call, Sender { responder: responder; codecs: replies; codec: call.codec })
+        return Ok(receiver(requests, call.codec, listener))
+    }
+    return Method { procedure: procedure; idempotency: IDEMPOTENCY_UNKNOWN; handler: BidiStream(bytes) }
 }
