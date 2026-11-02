@@ -1,6 +1,7 @@
 // The server under test for connectrpc/conformance (check-connect-conformance):
 // connectrpc.conformance.v1.ConformanceService over library/connect.min behind
-// httpserver, with Protobuf code from protoc-gen-minyar. It reads one
+// httpserver for HTTP/1.1 or connecth2 for HTTP/2, with Protobuf code from
+// protoc-gen-minyar. It reads one
 // length-prefixed ServerCompatRequest from the file its first argument names
 // (the runner's stdin, saved by tests/connect-conformance.py), listens on
 // loopback, writes a length-prefixed ServerCompatResponse to stdout, and
@@ -9,6 +10,7 @@
 use "httpserver" as http
 use "connect" as connect
 use "connecthttp" as connecthttp
+use "connecth2" as connecth2
 use "connectgzip" as connectgzip
 use "rpc" as rpc
 use "protobuf" as protobuf
@@ -96,11 +98,11 @@ function unescape(value: Text): Text {
         Err(_) { value }
     }
 }
-function requestInfo(call: rpc.Call, request: anypb.Any): conformance.ConformancePayload_RequestInfo {
+function requestInfo(call: rpc.Call, requests: List<anypb.Any>): conformance.ConformancePayload_RequestInfo {
     let info = conformance.newConformancePayload_RequestInfo()
     info.requestHeaders = protoHeaders(call.requestHeaders)
     if call.deadline >= 0 { info.timeoutMs = Some(call.remaining()) }
-    info.requests.add(request)
+    for request in requests { info.requests.add(request) }
     if current.target.find("?") >= 0 {
         let get = conformance.newConformancePayload_ConnectGetInfo()
         get.queryParams = queryParams(current.target)
@@ -130,8 +132,8 @@ function connectError(definition: conformance.Error): rpc.Error {
 // info, an error definition fails with that error plus the request info as a
 // detail, and headers and trailers apply either way. The response delay is
 // applied by `later` without blocking the server.
-function unaryPayload(call: rpc.Call, definition: Maybe<conformance.UnaryResponseDefinition>, request: anypb.Any): Result<conformance.ConformancePayload, rpc.Error> {
-    let info = requestInfo(call, request)
+function unaryPayload(call: rpc.Call, definition: Maybe<conformance.UnaryResponseDefinition>, requests: List<anypb.Any>): Result<conformance.ConformancePayload, rpc.Error> {
+    let info = requestInfo(call, requests)
     let payload = conformance.newConformancePayload()
     match definition {
         None {
@@ -157,12 +159,12 @@ function unaryPayload(call: rpc.Call, definition: Maybe<conformance.UnaryRespons
 }
 function unary(call: rpc.Call, request: conformance.UnaryRequest): Result<conformance.UnaryResponse, rpc.Error> {
     let response = conformance.newUnaryResponse()
-    response.payload = Some(try unaryPayload(call, request.responseDefinition, packed("connectrpc.conformance.v1.UnaryRequest", request.encode())))
+    response.payload = Some(try unaryPayload(call, request.responseDefinition, [packed("connectrpc.conformance.v1.UnaryRequest", request.encode())]))
     return Ok(response)
 }
 function idempotentUnary(call: rpc.Call, request: conformance.IdempotentUnaryRequest): Result<conformance.IdempotentUnaryResponse, rpc.Error> {
     let response = conformance.newIdempotentUnaryResponse()
-    response.payload = Some(try unaryPayload(call, request.responseDefinition, packed("connectrpc.conformance.v1.IdempotentUnaryRequest", request.encode())))
+    response.payload = Some(try unaryPayload(call, request.responseDefinition, [packed("connectrpc.conformance.v1.IdempotentUnaryRequest", request.encode())]))
     return Ok(response)
 }
 function unimplemented(call: rpc.Call, request: conformance.UnimplementedRequest): Result<conformance.UnimplementedResponse, rpc.Error> {
@@ -183,7 +185,7 @@ function serverStream(call: rpc.Call, request: conformance.ServerStreamRequest, 
         Some(spec) {
             addHeaders(spec.responseHeaders, call.responseHeaders)
             addHeaders(spec.responseTrailers, call.responseTrailers)
-            let info = requestInfo(call, packed("connectrpc.conformance.v1.ServerStreamRequest", request.encode()))
+            let info = requestInfo(call, [packed("connectrpc.conformance.v1.ServerStreamRequest", request.encode())])
             let messages: List<conformance.ServerStreamResponse> = []
             for data in spec.responseData {
                 let payload = conformance.newConformancePayload()
@@ -210,6 +212,150 @@ function serverStream(call: rpc.Call, request: conformance.ServerStreamRequest, 
             return Ok()
         }
     }
+}
+
+// Work a stream handler scheduled: the main loop runs each step once it is
+// due and its call is still active, until the step says it is done (a full
+// stream buffer refuses a message until a later turn).
+record Timed { responder: rpc.Responder; due: Integer; run: () -> Boolean }
+global timed: List<Timed> = []
+function at(responder: rpc.Responder, due: Integer, run: () -> Boolean) { timed.add(Timed { responder: responder; due: due; run: run }) }
+
+// The reference server's client stream: every request is recorded, the first
+// one's definition shapes the answer, sent after its delay.
+record Upload { definition: Maybe<conformance.UnaryResponseDefinition>; first: Boolean; requests: List<anypb.Any> }
+function clientStream(call: rpc.Call, sender: rpc.Sender<conformance.ClientStreamResponse>): Result<rpc.Listener<conformance.ClientStreamRequest>, rpc.Error> {
+    let upload = Upload { definition: None; first: true; requests: [] }
+    return Ok(rpc.Listener<conformance.ClientStreamRequest> {
+        message: function(request: conformance.ClientStreamRequest): Result<Nothing, rpc.Error> {
+            if upload.first {
+                upload.definition = request.responseDefinition
+                upload.first = false
+            }
+            upload.requests.add(packed("connectrpc.conformance.v1.ClientStreamRequest", request.encode()))
+            return Ok()
+        }
+        end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> {
+            if error.isSome() { return Ok() }
+            let response = conformance.newClientStreamResponse()
+            response.payload = Some(try unaryPayload(call, upload.definition, upload.requests))
+            let wait = delayOf(upload.definition)
+            if wait <= 0 {
+                rpc.send(sender, response)
+                return Ok()
+            }
+            sender.responder.hold()
+            at(sender.responder, now() + wait, function(): Boolean {
+                rpc.send(sender, response)
+                sender.responder.finish(None)
+                return true
+            })
+            return Ok()
+        }
+    })
+}
+
+// The reference server's bidirectional stream. Full duplex answers each
+// request with the next response datum and stops reading once they run out;
+// half duplex answers after the client is done. Each response waits for the
+// delay, and the definition's error ends the stream.
+record Chat {
+    definition: Maybe<conformance.StreamResponseDefinition>
+    fullDuplex: Boolean
+    first: Boolean
+    sent: Integer
+    requests: List<anypb.Any>
+    // When the last scheduled step runs; later ones follow it.
+    due: Integer
+    done: Boolean
+}
+function chatData(chat: Chat): List<Bytes> {
+    return match chat.definition {
+        Some(spec) { spec.responseData }
+        None { [] }
+    }
+}
+function chatDelay(chat: Chat): Integer {
+    return match chat.definition {
+        Some(spec) { spec.responseDelayMs }
+        None { 0 }
+    }
+}
+function chatSend(call: rpc.Call, sender: rpc.Sender<conformance.BidiStreamResponse>, chat: Chat, info: Maybe<conformance.ConformancePayload_RequestInfo>) {
+    let payload = conformance.newConformancePayload()
+    payload.data = chatData(chat)[chat.sent]
+    payload.requestInfo = info
+    let response = conformance.newBidiStreamResponse()
+    response.payload = Some(payload)
+    chat.sent += 1
+    chat.due = max(chat.due, now()) + chatDelay(chat)
+    at(sender.responder, chat.due, function(): Boolean { return rpc.send(sender, response) })
+}
+// The remaining responses, then the definition's error or a clean end.
+function chatEnd(call: rpc.Call, sender: rpc.Sender<conformance.BidiStreamResponse>, chat: Chat) {
+    chat.done = true
+    sender.responder.hold()
+    while chat.sent < chatData(chat).length {
+        let info: Maybe<conformance.ConformancePayload_RequestInfo> = None
+        if chat.sent == 0 { info = Some(requestInfo(call, chat.requests)) }
+        chatSend(call, sender, chat, info)
+    }
+    let failure: Maybe<rpc.Error> = None
+    match chat.definition {
+        Some(spec) {
+            match spec.error {
+                Some(definition) {
+                    let error = connectError(definition)
+                    if chat.sent == 0 {
+                        error.details.add(rpc.Detail { type: "connectrpc.conformance.v1.ConformancePayload.RequestInfo"; value: requestInfo(call, chat.requests).encode() })
+                    }
+                    failure = Some(error)
+                }
+                None {}
+            }
+        }
+        None {}
+    }
+    at(sender.responder, max(chat.due, now()), function(): Boolean {
+        sender.responder.finish(failure)
+        return true
+    })
+}
+function bidiStream(call: rpc.Call, sender: rpc.Sender<conformance.BidiStreamResponse>): Result<rpc.Listener<conformance.BidiStreamRequest>, rpc.Error> {
+    let chat = Chat { definition: None; fullDuplex: false; first: true; sent: 0; requests: []; due: 0; done: false }
+    return Ok(rpc.Listener<conformance.BidiStreamRequest> {
+        message: function(request: conformance.BidiStreamRequest): Result<Nothing, rpc.Error> {
+            if chat.done { return Ok() }
+            chat.requests.add(packed("connectrpc.conformance.v1.BidiStreamRequest", request.encode()))
+            if chat.first {
+                chat.first = false
+                chat.definition = request.responseDefinition
+                chat.fullDuplex = request.fullDuplex
+                match chat.definition {
+                    Some(spec) {
+                        addHeaders(spec.responseHeaders, call.responseHeaders)
+                        addHeaders(spec.responseTrailers, call.responseTrailers)
+                    }
+                    None {}
+                }
+            }
+            if !chat.fullDuplex { return Ok() }
+            if chat.sent >= chatData(chat).length {
+                chatEnd(call, sender, chat)
+                return Ok()
+            }
+            let info = conformance.newConformancePayload_RequestInfo()
+            if chat.sent == 0 { info = requestInfo(call, chat.requests) }
+            else { for request in chat.requests { info.requests.add(request) } }
+            chatSend(call, sender, chat, Some(info))
+            chat.requests = []
+            return Ok()
+        }
+        end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> {
+            if error.isNone() && !chat.done { chatEnd(call, sender, chat) }
+            return Ok()
+        }
+    })
 }
 
 // A held answer, sent by the main loop once its delay has passed.
@@ -274,6 +420,22 @@ function release(): Integer {
     }
     pending.truncate(0)
     for item in kept { pending.add(item) }
+    // A call schedules its steps at times that never decrease, so running
+    // the due ones in list order keeps each call's sends in order.
+    // After a refused send, nothing else runs this turn, so no step overtakes it.
+    let waiting: List<Timed> = []
+    let blocked = false
+    for item in timed {
+        if !item.responder.active() { continue }
+        let left = item.due - now()
+        if blocked || left > 0 || !item.run() {
+            waiting.add(item)
+            if left <= 0 { blocked = true }
+            if wait < 0 || max(0, left) < wait { wait = max(0, left) }
+        }
+    }
+    timed.truncate(0)
+    for item in waiting { timed.add(item) }
     let open: List<Streaming> = []
     for stream in streams {
         let responder = stream.sender.responder
@@ -297,6 +459,18 @@ function release(): Integer {
     return wait
 }
 
+// Writes the length-prefixed ServerCompatResponse to stdout.
+function announce(response: compat.ServerCompatResponse) {
+    let reply = response.encode()
+    let framed = Bytes(4)
+    framed[0] = (reply.length >> 24) & 255
+    framed[1] = (reply.length >> 16) & 255
+    framed[2] = (reply.length >> 8) & 255
+    framed[3] = reply.length & 255
+    framed.addBytes(reply)
+    io.writeBytesFile("/dev/stdout", framed)
+}
+
 let input = io.readBytesFile(process.argument(0))
 if input.length < 4 { fail("missing ServerCompatRequest") }
 let length = (input[0] << 24) | (input[1] << 16) | (input[2] << 8) | input[3]
@@ -306,7 +480,7 @@ let registry = protobuf.registry()
 conformance.register(registry)
 let services = rpc.services()
 conformance.registerConformanceService(services, conformance.ConformanceServiceHandlers { unary: unary; serverStream: serverStream
-    unimplemented: unimplemented; idempotentUnary: idempotentUnary }, registry)
+    clientStream: clientStream; bidiStream: bidiStream; unimplemented: unimplemented; idempotentUnary: idempotentUnary }, registry)
 services.add(later<conformance.UnaryRequest, conformance.UnaryResponse>("/connectrpc.conformance.v1.ConformanceService/Unary", rpc.IDEMPOTENCY_UNKNOWN,
     [conformance.codecUnaryRequest(), conformance.jsonCodecUnaryRequest(registry)],
     [conformance.codecUnaryResponse(), conformance.jsonCodecUnaryResponse(registry)], unary,
@@ -316,36 +490,35 @@ services.add(later<conformance.IdempotentUnaryRequest, conformance.IdempotentUna
     [conformance.codecIdempotentUnaryResponse(), conformance.jsonCodecIdempotentUnaryResponse(registry)], idempotentUnary,
     function(request: conformance.IdempotentUnaryRequest): Integer { return delayOf(request.responseDefinition) }))
 let options = connect.defaults(now)
+options.observe = function(request: connect.Request) { current.target = request.target }
 if compatRequest.messageReceiveLimit > 0 { options.maxRequestBytes = compatRequest.messageReceiveLimit }
 options.compressors.add(connectgzip.gzip())
 let service = connect.server(services, options)
+let compatResponse = compat.newServerCompatResponse()
+compatResponse.host = "127.0.0.1"
+let wait = -1
+if compatRequest.httpVersion.number() == 2 {
+    let server = connecth2.listen("127.0.0.1", 0, service, connecth2.defaults())
+    if !connecth2.ok(server) { fail(errors.message(connecth2.serverError(server))) }
+    compatResponse.port = connecth2.port(server)
+    announce(compatResponse)
+    while true {
+        let problem = connecth2.poll(server, wait)
+        if errors.isError(problem) { fail(errors.message(problem)) }
+        wait = release()
+    }
+}
 let limits = http.defaults()
 limits.maxBodyBytes = 16777216
 let server = http.listen("127.0.0.1", 0, limits)
 if !http.ok(server) { fail(errors.message(http.serverError(server))) }
 let host = connecthttp.host(server, service)
-
-let compatResponse = compat.newServerCompatResponse()
-compatResponse.host = "127.0.0.1"
 compatResponse.port = http.port(server)
-let reply = compatResponse.encode()
-let framed = Bytes(4)
-framed[0] = (reply.length >> 24) & 255
-framed[1] = (reply.length >> 16) & 255
-framed[2] = (reply.length >> 8) & 255
-framed[3] = reply.length & 255
-framed.addBytes(reply)
-io.writeBytesFile("/dev/stdout", framed)
-
-let wait = -1
+announce(compatResponse)
 while true {
     let batch = http.poll(server, wait)
     if errors.isError(http.batchError(batch)) { fail(errors.message(http.batchError(batch))) }
-    host.forget(batch)
-    for request in http.requests(batch) {
-        current.target = request.target
-        host.open(request)
-    }
+    host.serve(batch)
     let due = release()
     host.pump()
     wait = host.timeout(now())

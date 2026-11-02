@@ -1321,8 +1321,6 @@ function Module.codecs(fullName: Text, codecName: Text) {
     self.line(0, "")
 }
 
-function generatedMethod(method: descriptor.MethodDescriptorProto): Boolean { return !method.clientStreaming() }
-
 function idempotency(method: descriptor.MethodDescriptorProto): Text {
     if method.options is Some(options) {
         let level = options.idempotencyLevel().number()
@@ -1333,8 +1331,7 @@ function idempotency(method: descriptor.MethodDescriptorProto): Text {
 }
 
 /// Server code for each service: codecs, a record of handlers and a function
-/// that adds the methods to an `rpc.Services`. Client- and bidirectional-
-/// streaming methods are not generated yet.
+/// that adds the methods to an `rpc.Services`.
 function Module.services(taken: Set<Text>) {
     if self.file.service.length == 0 { return }
     self.usesRpc = true
@@ -1343,7 +1340,6 @@ function Module.services(taken: Set<Text>) {
     let ordered: List<Text> = []
     for service in self.file.service {
         for method in service.method {
-            if !generatedMethod(method) { continue }
             for typeName in [withoutDot(method.inputType()), withoutDot(method.outputType())] {
                 if !codecNames.has(typeName) {
                     codecNames[typeName] = unique(self.generator.type(typeName).local, codecTaken)
@@ -1365,10 +1361,11 @@ function Module.services(taken: Set<Text>) {
         for method in service.method {
             let field = unique(fieldName(method.name()), methodNames)
             fields.add(field)
-            if !generatedMethod(method) { continue }
             let request = self.typeOf(withoutDot(method.inputType()))
             let reply = self.typeOf(withoutDot(method.outputType()))
-            if method.serverStreaming() {
+            if method.clientStreaming() {
+                self.line(1, field + ": (rpc.Call, rpc.Sender<" + reply + ">) -> Result<rpc.Listener<" + request + ">, rpc.Error>")
+            } else if method.serverStreaming() {
                 self.line(1, field + ": (rpc.Call, " + request + ", rpc.Sender<" + reply + ">) -> Result<Nothing, rpc.Error>")
             } else {
                 self.line(1, field + ": (rpc.Call, " + request + ") -> Result<" + reply + ", rpc.Error>")
@@ -1380,14 +1377,17 @@ function Module.services(taken: Set<Text>) {
         self.line(0, "public function register" + local + "(services: rpc.Services, handlers: " + handlers + ", registry: protobuf.Registry) {")
         for position in 0..service.method.length {
             let method = service.method[position]
-            if !generatedMethod(method) { continue }
             let input = withoutDot(method.inputType())
             let output = withoutDot(method.outputType())
             let procedure = quoted("/" + fullName + "/" + method.name())
             let requests = "[codec" + codecNames[input] + "(), jsonCodec" + codecNames[input] + "(registry)]"
             let replies = "[codec" + codecNames[output] + "(), jsonCodec" + codecNames[output] + "(registry)]"
             let types = "<" + self.typeOf(input) + ", " + self.typeOf(output) + ">"
-            if method.serverStreaming() {
+            if method.clientStreaming() && method.serverStreaming() {
+                self.line(1, "services.add(rpc.bidiStream" + types + "(" + procedure + ", " + requests + ", " + replies + ", handlers." + fields[position] + "))")
+            } else if method.clientStreaming() {
+                self.line(1, "services.add(rpc.clientStream" + types + "(" + procedure + ", " + requests + ", " + replies + ", handlers." + fields[position] + "))")
+            } else if method.serverStreaming() {
                 self.line(1, "services.add(rpc.serverStream" + types + "(" + procedure + ", " + requests + ", " + replies + ", handlers." + fields[position] + "))")
             } else {
                 self.line(1, "services.add(rpc.unary" + types + "(" + procedure + ", " + idempotency(method) + ", " + requests + ", " + replies + ", handlers." + fields[position] + "))")
