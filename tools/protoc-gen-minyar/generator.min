@@ -101,6 +101,8 @@ record Module {
     // Imported proto files and their aliases, in first-use order.
     imports: List<Text>
     aliases: List<Text>
+    // Files with services import the rpc module.
+    usesRpc: Boolean
     // Local type names, so oneof choices avoid them.
     names: Set<Text>
 }
@@ -1263,6 +1265,136 @@ function Module.registerFunction() {
     self.line(0, "}")
 }
 
+// ----- Services -----
+
+/// The proto and JSON codecs for one message type used by a method, named
+/// `codec<Name>` and `jsonCodec<Name>`.
+function Module.codecs(fullName: Text, codecName: Text) {
+    let type = self.typeOf(fullName)
+    let decode = self.name(fullName, "decode")
+    let readJson = self.name(fullName, "readJson")
+    let create = self.name(fullName, "new")
+    self.line(0, "function protoDecode" + codecName + "(data: Bytes): Result<" + type + ", rpc.Error> {")
+    self.line(1, "match " + decode + "(data) {")
+    self.line(2, "Ok(message) { return Ok(message) }")
+    self.line(2, "Err(problem) { return Err(rpc.fromError(rpc.INVALID_ARGUMENT, problem)) }")
+    self.line(1, "}")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "function protoEncode" + codecName + "(message: " + type + "): Result<Bytes, rpc.Error> { return Ok(message.encode()) }")
+    self.line(0, "")
+    self.line(0, "/// The binary codec for `" + fullName + "`.")
+    self.line(0, "public function codec" + codecName + "(): rpc.Codec<" + type + "> {")
+    self.line(1, "return rpc.Codec<" + type + "> { name: \"proto\"; decode: protoDecode" + codecName + "; encode: protoEncode" + codecName + " }")
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "/// The JSON codec for `" + fullName + "`; `registry` resolves Any values. Like")
+    self.line(0, "/// other Connect implementations, it ignores unknown fields in requests.")
+    self.line(0, "public function jsonCodec" + codecName + "(registry: protobuf.Registry): rpc.Codec<" + type + "> {")
+    self.line(1, "let options = protobuf.jsonOptions(registry)")
+    self.line(1, "options.ignoreUnknownFields = true")
+    self.line(1, "return rpc.Codec<" + type + "> {")
+    self.line(2, "name: \"json\"")
+    self.line(2, "decode: function(data: Bytes): Result<" + type + ", rpc.Error> {")
+    self.line(3, "let message = " + create + "()")
+    self.line(3, "match protobuf.parseJsonBytes(data) {")
+    self.line(4, "Ok(value) {")
+    self.line(5, "match " + readJson + "(value, message, options) {")
+    self.line(6, "Ok() { return Ok(message) }")
+    self.line(6, "Err(problem) { return Err(rpc.fromError(rpc.INVALID_ARGUMENT, problem)) }")
+    self.line(5, "}")
+    self.line(4, "}")
+    self.line(4, "Err(problem) { return Err(rpc.fromError(rpc.INVALID_ARGUMENT, problem)) }")
+    self.line(3, "}")
+    self.line(2, "}")
+    self.line(2, "encode: function(message: " + type + "): Result<Bytes, rpc.Error> {")
+    self.line(3, "match message.toJson(options) {")
+    self.line(4, "Ok(text) { return Ok(Bytes(text)) }")
+    self.line(4, "Err(problem) { return Err(rpc.fromError(rpc.INTERNAL, problem)) }")
+    self.line(3, "}")
+    self.line(2, "}")
+    self.line(1, "}")
+    self.line(0, "}")
+    self.line(0, "")
+}
+
+function generatedMethod(method: descriptor.MethodDescriptorProto): Boolean { return !method.clientStreaming() }
+
+function idempotency(method: descriptor.MethodDescriptorProto): Text {
+    if method.options is Some(options) {
+        let level = options.idempotencyLevel().number()
+        if level == 1 { return "rpc.NO_SIDE_EFFECTS" }
+        if level == 2 { return "rpc.IDEMPOTENT" }
+    }
+    return "rpc.IDEMPOTENCY_UNKNOWN"
+}
+
+/// Server code for each service: codecs, a record of handlers and a function
+/// that adds the methods to an `rpc.Services`. Client- and bidirectional-
+/// streaming methods are not generated yet.
+function Module.services(taken: Set<Text>) {
+    if self.file.service.length == 0 { return }
+    self.usesRpc = true
+    let codecNames: Map<Text, Text> = Map()
+    let codecTaken: Set<Text> = Set()
+    let ordered: List<Text> = []
+    for service in self.file.service {
+        for method in service.method {
+            if !generatedMethod(method) { continue }
+            for typeName in [withoutDot(method.inputType()), withoutDot(method.outputType())] {
+                if !codecNames.has(typeName) {
+                    codecNames[typeName] = unique(self.generator.type(typeName).local, codecTaken)
+                    ordered.add(typeName)
+                }
+            }
+        }
+    }
+    for typeName in ordered { self.codecs(typeName, codecNames[typeName]) }
+    let prefix = self.file.package()
+    for service in self.file.service {
+        let local = typeName(service.name())
+        let handlers = unique(local + "Handlers", taken)
+        let fullName = joinedName(prefix, service.name())
+        let methodNames: Set<Text> = Set()
+        let fields: List<Text> = []
+        self.line(0, "/// Handlers for the methods of `" + fullName + "`.")
+        self.line(0, "public record " + handlers + " {")
+        for method in service.method {
+            let field = unique(fieldName(method.name()), methodNames)
+            fields.add(field)
+            if !generatedMethod(method) { continue }
+            let request = self.typeOf(withoutDot(method.inputType()))
+            let reply = self.typeOf(withoutDot(method.outputType()))
+            if method.serverStreaming() {
+                self.line(1, field + ": (rpc.Call, " + request + ", rpc.Sender<" + reply + ">) -> Result<Nothing, rpc.Error>")
+            } else {
+                self.line(1, field + ": (rpc.Call, " + request + ") -> Result<" + reply + ", rpc.Error>")
+            }
+        }
+        self.line(0, "}")
+        self.line(0, "")
+        self.line(0, "/// Add the methods of `" + fullName + "` to `services`; `registry` resolves Any values in JSON.")
+        self.line(0, "public function register" + local + "(services: rpc.Services, handlers: " + handlers + ", registry: protobuf.Registry) {")
+        for position in 0..service.method.length {
+            let method = service.method[position]
+            if !generatedMethod(method) { continue }
+            let input = withoutDot(method.inputType())
+            let output = withoutDot(method.outputType())
+            let procedure = quoted("/" + fullName + "/" + method.name())
+            let requests = "[codec" + codecNames[input] + "(), jsonCodec" + codecNames[input] + "(registry)]"
+            let replies = "[codec" + codecNames[output] + "(), jsonCodec" + codecNames[output] + "(registry)]"
+            let types = "<" + self.typeOf(input) + ", " + self.typeOf(output) + ">"
+            if method.serverStreaming() {
+                self.line(1, "services.add(rpc.serverStream" + types + "(" + procedure + ", " + requests + ", " + replies + ", handlers." + fields[position] + "))")
+            } else {
+                self.line(1, "services.add(rpc.unary" + types + "(" + procedure + ", " + idempotency(method) + ", " + requests + ", " + replies + ", handlers." + fields[position] + "))")
+            }
+        }
+        self.line(0, "}")
+        self.line(0, "")
+    }
+}
+
 // ----- Declarations -----
 
 function Module.enumeration(info: TypeInfo) {
@@ -1421,12 +1553,13 @@ function outputName(path: Text): Text { return withoutProto(path) + ".min" }
 
 function Generator.file(position: Integer): plugin.CodeGeneratorResponse_File {
     let file = self.request.protoFile[position]
-    let module = Module { generator: self; file: file; lines: []; imports: []; aliases: []; names: Set() }
+    let module = Module { generator: self; file: file; lines: []; imports: []; aliases: []; usesRpc: false; names: Set() }
     let taken: Set<Text> = Set()
     for info in self.types { if info.file == file.name() { taken.add(info.local) } }
     for info in self.types {
         if info.file == file.name() { module.declarations(info, taken) }
     }
+    module.services(taken)
     module.registerFunction()
     let header: List<Text> = []
     header.add("// Code generated by protoc-gen-minyar. DO NOT EDIT.\n")
@@ -1434,6 +1567,7 @@ function Generator.file(position: Integer): plugin.CodeGeneratorResponse_File {
     header.add("use \"errors\" as errors\n")
     header.add("use \"json\" as json\n")
     header.add("use \"protobuf\" as protobuf\n")
+    if module.usesRpc { header.add("use \"rpc\" as rpc\n") }
     let order: List<Integer> = []
     for position in 0..module.imports.length { order.add(position) }
     let sorted = order.sortedBy(function(a: Integer, b: Integer): Integer {

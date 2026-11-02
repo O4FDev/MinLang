@@ -1,0 +1,78 @@
+use "protobuf" as protobuf
+use "protobuf-timestamp" as timestamp
+use "rpc" as rpc
+use "./greeter.min" as greeter
+use "./sample/shared.min" as shared
+// Generated service code for tests/protobuf/greeter.proto, run by
+// tests/protoc-gen-minyar-test.min: registration, idempotency levels and both
+// codecs through the rpc handler API.
+
+function stop(message: Text) {
+    print("FAIL " + message)
+    exit(1)
+}
+
+function expect(condition: Boolean, message: Text) { if !condition { stop(message) } }
+
+function call(procedure: Text, codec: Text): rpc.Call {
+    return rpc.call(procedure, "connect", codec, [], -1, function(): Integer { return 0 })
+}
+
+let handlers = greeter.GreeterHandlers {
+    sayHello: function(call: rpc.Call, request: greeter.HelloRequest): Result<greeter.HelloReply, rpc.Error> {
+        let reply = greeter.newHelloReply()
+        reply.message = "hello " + request.name
+        return Ok(reply)
+    }
+    lookup: function(call: rpc.Call, point: shared.Point): Result<greeter.HelloReply, rpc.Error> {
+        return Err(rpc.failure(rpc.NOT_FOUND, "nobody at " + Text(point.x)))
+    }
+    touch: function(call: rpc.Call, request: greeter.HelloRequest): Result<timestamp.Timestamp, rpc.Error> {
+        let now = timestamp.newTimestamp()
+        now.seconds = 86400
+        return Ok(now)
+    }
+    countDown: function(call: rpc.Call, request: greeter.HelloRequest, sender: rpc.Sender<greeter.HelloReply>): Result<Nothing, rpc.Error> {
+        for index in 0..request.count {
+            let reply = greeter.newHelloReply()
+            reply.message = Text(request.count - index)
+            rpc.send(sender, reply)
+        }
+        return Ok()
+    }
+}
+let registry = protobuf.registry()
+greeter.register(registry)
+let services = rpc.services()
+greeter.registerGreeter(services, handlers, registry)
+// Client- and bidirectional-streaming methods are not generated yet.
+expect(joinText(services.procedures(), " ") == "/sample.greeter.Greeter/SayHello /sample.greeter.Greeter/Lookup /sample.greeter.Greeter/Touch /sample.greeter.Greeter/CountDown", "procedures")
+expect(services.lookup("/sample.greeter.Greeter/SayHello").unwrap().idempotency == rpc.IDEMPOTENCY_UNKNOWN, "default idempotency")
+expect(services.lookup("/sample.greeter.Greeter/Lookup").unwrap().idempotency == rpc.NO_SIDE_EFFECTS, "no side effects")
+expect(services.lookup("/sample.greeter.Greeter/Touch").unwrap().idempotency == rpc.IDEMPOTENT, "idempotent")
+expect(services.lookup("/sample.greeter.Greeter/CountDown").unwrap().kind() == rpc.SERVER_STREAM, "server stream")
+
+let request = greeter.newHelloRequest()
+request.name = "Ada"
+match services.lookup("/sample.greeter.Greeter/SayHello").unwrap().handler {
+    Unary(body) {
+        let reply = greeter.decodeHelloReply(body(call("/sample.greeter.Greeter/SayHello", "proto"), request.encode()).unwrap()).unwrap()
+        expect(reply.message == "hello Ada", "binary unary call")
+        // The JSON codec ignores unknown request fields, as Connect servers do.
+        let text = body(call("/sample.greeter.Greeter/SayHello", "json"), Bytes(#"{"name": "Grace", "extra": true}"#)).unwrap()
+        expect(text.length == 25, "JSON unary call")
+        match body(call("/sample.greeter.Greeter/SayHello", "proto"), Bytes(1)) {
+            Ok(_) { stop("malformed request decoded") }
+            Err(problem) { expect(problem.code == rpc.INVALID_ARGUMENT, "malformed requests are invalid arguments") }
+        }
+    }
+    _ { stop("SayHello is not unary") }
+}
+match services.lookup("/sample.greeter.Greeter/Touch").unwrap().handler {
+    Unary(body) {
+        let text = body(call("/sample.greeter.Greeter/Touch", "json"), Bytes("{}")).unwrap()
+        expect(text.length == 22, "a well-known type reply in JSON")
+    }
+    _ { stop("Touch is not unary") }
+}
+print("ok")
