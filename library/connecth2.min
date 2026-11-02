@@ -1,0 +1,372 @@
+// Connect over HTTP/2: a connect.Server behind the bounded HTTP/2 server in
+// library/http2.min. Request bodies reach the server as DATA arrives, so
+// client-streaming and bidirectional calls run full duplex. A Connection
+// takes bytes in and returns bytes out, opens no socket and reads no clock
+// of its own, so a deterministic simulation can drive it; listen/poll serve
+// it over h2c (HTTP/2 with prior knowledge).
+use "http2" as h2
+use "connect" as connect
+use "rpc" as rpc
+use "errors" as errors
+use "net" as net
+use "eventloop" as loop
+
+record Call {
+    id: Integer
+    exchange: connect.Exchange
+    // Response bytes HTTP/2 has not taken yet, from `at`.
+    pending: Bytes
+    at: Integer
+    ending: Boolean
+    inputDone: Boolean
+    // The response is queued in HTTP/2 or the stream was reset.
+    over: Boolean
+}
+/// One HTTP/2 connection serving Connect calls without I/O.
+public record Connection {
+    private transport: h2.Server
+    private service: connect.Server
+    private calls: List<Call>
+    private finished: Boolean
+}
+public function connection(service: connect.Server, nowMillis: Integer): Connection {
+    let state = Connection { transport: h2.create(); service: service; calls: []; finished: false }
+    h2.tick(state.transport, nowMillis)
+    return state
+}
+public function connectionError(connection: Connection): errors.Error { return h2.connectionError(connection.transport) }
+// Calls still being served.
+public function activeCalls(connection: Connection): Integer {
+    let count = 0
+    for call in connection.calls { if !call.over { count += 1 } }
+    return count
+}
+public function bufferedOutput(connection: Connection): Integer { return h2.bufferedOutput(connection.transport) }
+// True once the connection failed or the peer ended its input and every
+// response has been taken: close the transport.
+public function closed(connection: Connection): Boolean {
+    if h2.bufferedOutput(connection.transport) > 0 { return false }
+    if errors.isError(connectionError(connection)) { return true }
+    return connection.finished && activeCalls(connection) == 0
+}
+// The earliest call deadline or HTTP/2 timer, or -1 for none; tick then.
+public function nextDeadline(connection: Connection): Integer {
+    let next = -1
+    let transport = h2.nextDeadlineMillis(connection.transport)
+    if transport > 0 { next = transport }
+    for call in connection.calls {
+        let deadline = call.exchange.deadline()
+        if !call.over && deadline >= 0 && (next < 0 || deadline < next) { next = deadline }
+    }
+    return next
+}
+
+/// Feed bytes received from the peer. Handlers run inside this call.
+public function receive(connection: Connection, bytes: Bytes, nowMillis: Integer): errors.BooleanResult {
+    let result = h2.receive(connection.transport, bytes)
+    advance(connection)
+    return result
+}
+/// The peer ended its input: calls in progress are canceled, since an
+/// HTTP/2 client that closes its side is gone.
+public function finish(connection: Connection, nowMillis: Integer) {
+    if !connection.finished {
+        connection.finished = true
+        if !errors.isError(h2.connectionError(connection.transport)) { h2.finish(connection.transport) }
+        for call in connection.calls { stop(call) }
+    }
+    advance(connection)
+}
+/// Apply deadlines and HTTP/2 timers, and send what handlers have sent since.
+public function tick(connection: Connection, nowMillis: Integer) {
+    h2.tick(connection.transport, nowMillis)
+    advance(connection)
+}
+/// Up to `maximum` bytes for the peer, in order.
+public function takeOutgoing(connection: Connection, maximum: Integer): Bytes {
+    advance(connection)
+    let bytes = h2.takeOutgoing(connection.transport, maximum)
+    advance(connection)
+    return bytes
+}
+
+function stop(call: Call) {
+    if call.over { return }
+    call.over = true
+    call.exchange.cancel()
+}
+function advance(connection: Connection) {
+    if errors.isError(h2.connectionError(connection.transport)) {
+        for call in connection.calls { stop(call) }
+        connection.calls = []
+        return
+    }
+    accept(connection)
+    for call in connection.calls {
+        if !call.over { input(connection, call) }
+        if !call.over { output(connection, call) }
+    }
+    let kept: List<Call> = []
+    for call in connection.calls {
+        if !(call.over && errors.booleanOk(h2.release(connection.transport, call.id))) { kept.add(call) }
+    }
+    connection.calls = kept
+}
+// New HTTP/2 requests become calls.
+function accept(connection: Connection) {
+    let request = h2.requests(connection.transport)
+    while h2.requestOk(request) {
+        let fields = h2.headers(request)
+        let headers: List<rpc.Header> = []
+        for field in fields { if !field.name.startsWith(":") { headers.add(rpc.Header { name: field.name; value: field.value }) } }
+        let head = connect.Request { method: h2.headerValue(fields, ":method"); target: h2.headerValue(fields, ":path"); headers: headers; body: Bytes() }
+        connection.calls.add(Call { id: h2.streamID(request); exchange: connection.service.begin(head); pending: Bytes(); at: 0
+            ending: false; inputDone: false; over: false })
+        request = h2.requests(connection.transport)
+    }
+}
+// Request DATA goes to the exchange as it arrives; a reset cancels the call.
+function input(connection: Connection, call: Call) {
+    while !call.inputDone {
+        let result = h2.read(connection.transport, call.id, 16384)
+        let status = errors.bytesStatus(result)
+        if status == errors.successStatus() { call.exchange.receive(errors.bytesValue(result)) }
+        else if status == errors.endOfStreamStatus() {
+            call.inputDone = true
+            call.exchange.closeInput()
+        } else {
+            if status != errors.wouldBlockStatus() { stop(call) }
+            return
+        }
+    }
+    // After the request ends, a read still reports a reset.
+    let status = errors.bytesStatus(h2.read(connection.transport, call.id, 1))
+    if status != errors.endOfStreamStatus() && status != errors.wouldBlockStatus() { stop(call) }
+}
+function fields(response: connect.Response): List<h2.Header> {
+    let out = [h2.Header { name: ":status"; value: Text(response.status) }]
+    for field in response.headers { out.add(h2.Header { name: field.name.asciiLowercased(); value: field.value }) }
+    return out
+}
+// Moves the exchange's answer into HTTP/2 as its buffers allow.
+function output(connection: Connection, call: Call) {
+    while true {
+        while call.at < call.pending.length {
+            let size = min(16384, call.pending.length - call.at)
+            let written = h2.write(connection.transport, call.id, call.pending.slice(call.at, call.at + size))
+            if !errors.booleanOk(written) {
+                if !errors.isWouldBlock(errors.booleanError(written)) { reset(connection, call) }
+                return
+            }
+            call.at += size
+        }
+        call.pending = Bytes()
+        call.at = 0
+        if call.ending {
+            let closing = h2.closeStream(connection.transport, call.id, [])
+            if errors.booleanOk(closing) { call.over = true }
+            else if !errors.isWouldBlock(errors.booleanError(closing)) { reset(connection, call) }
+            return
+        }
+        if call.exchange.finished() { reset(connection, call); return }
+        match call.exchange.step() {
+            Waiting { return }
+            Respond(response) {
+                if !start(connection, call, response, response.body.length == 0) { return }
+                if response.body.length == 0 { call.over = true; return }
+                call.pending = response.body
+                call.ending = true
+            }
+            Start(head) { if !start(connection, call, head, false) { return } }
+            Write(piece) { call.pending = piece }
+            End(piece) {
+                call.pending = piece
+                call.ending = true
+            }
+        }
+    }
+}
+// Sends the response head; one HTTP/2 refuses, such as a header value outside
+// ASCII, becomes a Connect INTERNAL error. False when the stream was reset.
+function start(connection: Connection, call: Call, response: connect.Response, end: Boolean): Boolean {
+    let sent = h2.respond(connection.transport, call.id, fields(response), end)
+    if errors.booleanOk(sent) { return true }
+    let fallback = connect.Response { status: 500; headers: [rpc.Header { name: "content-type"; value: "application/json" }]
+        body: connect.errorJson(rpc.failure(rpc.INTERNAL, "the response could not be sent")) }
+    if errors.booleanOk(h2.respond(connection.transport, call.id, fields(fallback), false)) {
+        call.exchange.cancel()
+        call.pending = fallback.body
+        call.ending = true
+        return true
+    }
+    reset(connection, call)
+    return false
+}
+function reset(connection: Connection, call: Call) {
+    h2.resetStream(connection.transport, call.id, 2)
+    stop(call)
+}
+
+// Socket server: one owner polls; handlers run inside poll. Plain TCP serves
+// h2c with prior knowledge.
+record Peer { socket: Integer; registration: Integer; rpc: Connection; output: Bytes; sent: Integer; idleSince: Integer; input: Bytes }
+public record Limits {
+    maxConnections: Integer
+    // Idle connections without calls close after this long.
+    idleMilliseconds: Integer
+}
+public function defaults(): Limits { return Limits { maxConnections: 256; idleMilliseconds: 300000 } }
+public record Server {
+    private handle: Integer
+    private listener: Integer
+    private listenerRegistration: Integer
+    private service: connect.Server
+    private limits: Limits
+    private peers: List<Maybe<Peer>>
+    private active: Integer
+    private closed: Boolean
+    private error: errors.Error
+}
+public function ok(server: Server): Boolean { return !server.closed && !errors.isError(server.error) }
+public function serverError(server: Server): errors.Error { return server.error }
+public function port(server: Server): Integer {
+    if server.closed { return -1 }
+    return net.localPort(server.listener)
+}
+public function connectionCount(server: Server): Integer { return server.active }
+public function listen(host: Text, port: Integer, service: connect.Server, limits: Limits): Server {
+    let server = Server { handle: -1; listener: -1; listenerRegistration: -1; service: service
+        limits: Limits { maxConnections: limits.maxConnections; idleMilliseconds: limits.idleMilliseconds }
+        peers: []; active: 0; closed: false; error: errors.none() }
+    if limits.maxConnections <= 0 || limits.maxConnections > 65536 || limits.idleMilliseconds <= 0 || limits.idleMilliseconds > 86400000 {
+        server.error = errors.make(errors.invalidDataCode(), 0, "invalid Connect HTTP/2 limits"); server.closed = true; return server
+    }
+    let created = loop.create()
+    if !errors.integerOk(created) { server.error = errors.integerError(created); server.closed = true; return server }
+    server.handle = errors.integerValue(created)
+    server.listener = net.listen(host, port, limits.maxConnections)
+    if server.listener < 0 {
+        server.error = errors.make(errors.systemCode(), net.lastErrorCode(), "Connect HTTP/2 listen failed"); close(server); return server
+    }
+    let watched = loop.watch(server.handle, server.listener, loop.readableInterest(), -1)
+    if !errors.integerOk(watched) { server.error = errors.integerError(watched); close(server); return server }
+    server.listenerRegistration = errors.integerValue(watched)
+    return server
+}
+public function close(server: Server) {
+    if server.closed { return }
+    server.closed = true
+    for slot in 0..server.peers.length { disconnect(server, slot) }
+    if server.listenerRegistration >= 0 { loop.remove(server.handle, server.listenerRegistration); server.listenerRegistration = -1 }
+    if server.listener >= 0 { net.close(server.listener); server.listener = -1 }
+    if server.handle >= 0 { loop.close(server.handle) }
+}
+function disconnect(server: Server, slot: Integer) {
+    match server.peers[slot] {
+        Some(peer) {
+            // Handlers still holding a Responder see active() turn false.
+            finish(peer.rpc, net.monotonicMilliseconds())
+            if peer.registration >= 0 { loop.remove(server.handle, peer.registration) }
+            net.close(peer.socket)
+            server.peers[slot] = None
+            server.active -= 1
+        }
+        None {}
+    }
+}
+function acceptReady(server: Server, now: Integer) {
+    for turn in 0..32 {
+        if server.active >= server.limits.maxConnections { return }
+        let socket = net.accept(server.listener)
+        if socket < 0 { return }
+        net.setNoDelay(socket, true)
+        let slot = server.peers.length
+        for index in 0..server.peers.length { if slot == server.peers.length && server.peers[index].isNone() { slot = index } }
+        let peer = Peer { socket: socket; registration: -1; rpc: connection(server.service, now); output: Bytes(); sent: 0; idleSince: now; input: Bytes() }
+        if slot == server.peers.length { server.peers.add(Some(peer)) } else { server.peers[slot] = Some(peer) }
+        server.active += 1
+        let watched = loop.watch(server.handle, socket, loop.readableInterest(), slot)
+        if !errors.integerOk(watched) { disconnect(server, slot) }
+        else { peer.registration = errors.integerValue(watched) }
+    }
+}
+function service(server: Server, slot: Integer, now: Integer, readable: Boolean) {
+    let peer = server.peers[slot].unwrap()
+    if readable {
+        peer.input.clear()
+        let count = net.readInto(peer.socket, peer.input, 65536)
+        if count > 0 {
+            receive(peer.rpc, peer.input, now)
+            peer.idleSince = now
+        }
+        if count == -2 || count == 0 { disconnect(server, slot); return }
+    }
+    tick(peer.rpc, now)
+    flush(server, slot, now)
+}
+function flush(server: Server, slot: Integer, now: Integer) {
+    let peer = server.peers[slot].unwrap()
+    while true {
+        if peer.sent == peer.output.length {
+            peer.output = takeOutgoing(peer.rpc, 65536)
+            peer.sent = 0
+            if peer.output.length == 0 { break }
+        }
+        let count = net.writeRange(peer.socket, peer.output, peer.sent, peer.output.length - peer.sent)
+        if count == -1 { break }
+        if count <= 0 { disconnect(server, slot); return }
+        peer.sent += count
+        peer.idleSince = now
+    }
+    if closed(peer.rpc) && peer.sent == peer.output.length { disconnect(server, slot); return }
+    let interest = loop.readableInterest()
+    if peer.sent < peer.output.length { interest = loop.readWriteInterest() }
+    loop.update(server.handle, peer.registration, interest, slot)
+}
+// Wait for socket events or the earliest deadline (at most `milliseconds`,
+// -1 to wait for work), then serve them. Messages handlers sent between
+// polls are written on every poll.
+public function poll(server: Server, milliseconds: Integer): errors.Error {
+    if server.closed { return server.error }
+    let now = net.monotonicMilliseconds()
+    let wait = milliseconds
+    if wait < 0 { wait = 86400000 }
+    for slot in 0..server.peers.length {
+        match server.peers[slot] {
+            Some(peer) {
+                tick(peer.rpc, now)
+                flush(server, slot, now)
+                match server.peers[slot] {
+                    Some(still) {
+                        let next = nextDeadline(still.rpc)
+                        if next >= 0 { wait = min(wait, max(0, next - now)) }
+                        wait = min(wait, max(0, still.idleSince + server.limits.idleMilliseconds - now))
+                    }
+                    None {}
+                }
+            }
+            None {}
+        }
+    }
+    let batch = loop.wait(server.handle, wait, 256)
+    if errors.isError(loop.batchError(batch)) { server.error = loop.batchError(batch); close(server); return server.error }
+    now = net.monotonicMilliseconds()
+    for event in loop.events(batch) {
+        if event.registration == server.listenerRegistration && event.token == -1 { acceptReady(server, now) }
+        else {
+            let slot = event.token
+            if slot >= 0 && slot < server.peers.length && server.peers[slot].isSome() {
+                service(server, slot, now, loop.isReadable(event) || loop.isClosed(event) || loop.isError(event))
+            }
+        }
+    }
+    for slot in 0..server.peers.length {
+        match server.peers[slot] {
+            Some(peer) {
+                if activeCalls(peer.rpc) == 0 && now - peer.idleSince >= server.limits.idleMilliseconds { disconnect(server, slot) }
+            }
+            None {}
+        }
+    }
+    return errors.none()
+}
