@@ -101,8 +101,9 @@ record Module {
     // Imported proto files and their aliases, in first-use order.
     imports: List<Text>
     aliases: List<Text>
-    // Files with services import the rpc module.
+    // Files with services import the rpc and connect modules.
     usesRpc: Boolean
+    usesConnect: Boolean
     // Local type names, so oneof choices avoid them.
     names: Set<Text>
 }
@@ -426,6 +427,8 @@ function Module.qualifier(file: Text): Text {
         if self.imports[position] == file { return self.aliases[position] + "." }
     }
     let alias = identifierOnly(withoutProto(file))
+    // The runtime modules' aliases stay free for a file such as json.proto.
+    if alias == "errors" || alias == "json" || alias == "protobuf" || alias == "rpc" || alias == "connect" { alias = "proto_" + alias }
     self.imports.add(file)
     self.aliases.add(alias)
     return alias + "."
@@ -1392,6 +1395,63 @@ function Module.services(taken: Set<Text>) {
         }
         self.line(0, "}")
         self.line(0, "")
+        self.client(service, local, fullName, fields, codecNames, taken)
+    }
+}
+
+/// A Connect client for one service: a method per unary RPC, over
+/// `connect.call`. Streaming methods are not generated yet.
+function Module.client(service: descriptor.ServiceDescriptorProto, local: Text, fullName: Text, fields: List<Text>, codecNames: Map<Text, Text>, taken: Set<Text>) {
+    self.usesConnect = true
+    let name = unique(local + "Client", taken)
+    let unary: List<Integer> = []
+    for position in 0..service.method.length {
+        let method = service.method[position]
+        if !method.clientStreaming() && !method.serverStreaming() { unary.add(position) }
+    }
+    self.line(0, "/// A Connect client for `" + fullName + "`, with one method per unary RPC.")
+    self.line(0, "public record " + name + " {")
+    self.line(1, "connection: connect.Client")
+    for position in unary {
+        let method = service.method[position]
+        self.line(1, "private " + fields[position] + "Requests: List<rpc.Codec<" + self.typeOf(withoutDot(method.inputType())) + ">>")
+        self.line(1, "private " + fields[position] + "Replies: List<rpc.Codec<" + self.typeOf(withoutDot(method.outputType())) + ">>")
+    }
+    self.line(0, "}")
+    self.line(0, "")
+    self.line(0, "/// Call `" + fullName + "` through `connection`; `registry` resolves Any values in JSON.")
+    self.line(0, "public function " + decapitalized(name) + "(connection: connect.Client, registry: protobuf.Registry): " + name + " {")
+    self.line(1, "return " + name + " {")
+    self.line(2, "connection: connection")
+    for position in unary {
+        let method = service.method[position]
+        let input = codecNames[withoutDot(method.inputType())]
+        let output = codecNames[withoutDot(method.outputType())]
+        self.line(2, fields[position] + "Requests: [codec" + input + "(), jsonCodec" + input + "(registry)]")
+        self.line(2, fields[position] + "Replies: [codec" + output + "(), jsonCodec" + output + "(registry)]")
+    }
+    self.line(1, "}")
+    self.line(0, "}")
+    self.line(0, "")
+    for position in unary {
+        let method = service.method[position]
+        let request = self.typeOf(withoutDot(method.inputType()))
+        let reply = self.typeOf(withoutDot(method.outputType()))
+        let level = idempotency(method)
+        self.line(0, "/// Call `" + fullName + "/" + method.name() + "`. Unless `options` says otherwise, the call")
+        self.line(0, "/// carries the method's idempotency level, which decides whether it is retried.")
+        self.line(0, "public function " + name + "." + fields[position] + "(request: " + request + ", options: connect.CallOptions): Result<" + reply + ", connect.Failure> {")
+        let chosen = "options"
+        if level != "rpc.IDEMPOTENCY_UNKNOWN" {
+            self.line(1, "let chosen = options")
+            self.line(1, "if options.idempotency == rpc.IDEMPOTENCY_UNKNOWN {")
+            self.line(2, "chosen = connect.CallOptions { headers: options.headers; timeoutMilliseconds: options.timeoutMilliseconds; get: options.get; idempotency: " + level + "; idempotencyKey: options.idempotencyKey }")
+            self.line(1, "}")
+            chosen = "chosen"
+        }
+        self.line(1, "return connect.call<" + request + ", " + reply + ">(self.connection, " + quoted("/" + fullName + "/" + method.name()) + ", request, self." + fields[position] + "Requests, self." + fields[position] + "Replies, " + chosen + ")")
+        self.line(0, "}")
+        self.line(0, "")
     }
 }
 
@@ -1553,7 +1613,7 @@ function outputName(path: Text): Text { return withoutProto(path) + ".min" }
 
 function Generator.file(position: Integer): plugin.CodeGeneratorResponse_File {
     let file = self.request.protoFile[position]
-    let module = Module { generator: self; file: file; lines: []; imports: []; aliases: []; usesRpc: false; names: Set() }
+    let module = Module { generator: self; file: file; lines: []; imports: []; aliases: []; usesRpc: false; usesConnect: false; names: Set() }
     let taken: Set<Text> = Set()
     for info in self.types { if info.file == file.name() { taken.add(info.local) } }
     for info in self.types {
@@ -1567,6 +1627,7 @@ function Generator.file(position: Integer): plugin.CodeGeneratorResponse_File {
     header.add("use \"errors\" as errors\n")
     header.add("use \"json\" as json\n")
     header.add("use \"protobuf\" as protobuf\n")
+    if module.usesConnect { header.add("use \"connect\" as connect\n") }
     if module.usesRpc { header.add("use \"rpc\" as rpc\n") }
     let order: List<Integer> = []
     for position in 0..module.imports.length { order.add(position) }

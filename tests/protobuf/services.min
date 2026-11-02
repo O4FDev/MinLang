@@ -1,3 +1,4 @@
+use "connect" as connect
 use "protobuf" as protobuf
 use "protobuf-timestamp" as timestamp
 use "rpc" as rpc
@@ -5,7 +6,8 @@ use "./greeter.min" as greeter
 use "./sample/shared.min" as shared
 // Generated service code for tests/protobuf/greeter.proto, run by
 // tests/protoc-gen-minyar-test.min: registration, idempotency levels and both
-// codecs through the rpc handler API.
+// codecs through the rpc handler API, and the generated Connect client calling
+// a Connect server in the same process.
 
 function stop(message: Text) {
     print("FAIL " + message)
@@ -74,5 +76,26 @@ match services.lookup("/sample.greeter.Greeter/Touch").unwrap().handler {
         expect(text.length == 22, "a well-known type reply in JSON")
     }
     _ { stop("Touch is not unary") }
+}
+// The generated client, over a Connect server in this process.
+let clock = function(): Integer { return 0 }
+let server = connect.server(services, connect.defaults(clock))
+let transport = function(outgoing: connect.Request): Result<connect.Response, rpc.Error> { return Ok(server.handle(outgoing)) }
+for codec in ["proto", "json"] {
+    let client = greeter.greeterClient(connect.client("", codec, transport, "test-" + codec), registry)
+    match client.sayHello(request, connect.callOptions()) {
+        Ok(reply) { expect(reply.message == "hello Ada", "client call over " + codec) }
+        Err(failure) { stop("client call over " + codec + ": " + failure.error.message) }
+    }
+    let point = shared.newPoint()
+    point.x = 4
+    match client.lookup(point, connect.callOptions()) {
+        Ok(_) { stop("an error reply decoded as success") }
+        Err(failure) { expect(failure.error.code == rpc.NOT_FOUND && failure.error.message == "nobody at 4", "client error over " + codec + ": " + failure.error.message) }
+    }
+    match client.touch(request, connect.callOptions()) {
+        Ok(reply) { expect(reply.seconds == 86400, "well-known reply over " + codec) }
+        Err(failure) { stop("touch over " + codec + ": " + failure.error.message) }
+    }
 }
 print("ok")
