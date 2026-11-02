@@ -16,14 +16,92 @@ public function toHttp(response: connect.Response): http.Response {
     for field in response.headers { headers.add(http.Header { name: field.name; value: field.value }) }
     return http.Response { status: response.status; headers: headers; body: response.body }
 }
-// Answers one polled request. A response httpserver refuses, such as a
-// handler header value outside ASCII, becomes an INTERNAL error instead.
+// Answers one polled request that completes at once. A response httpserver
+// refuses, such as a handler header value outside ASCII, becomes INTERNAL.
 public function serve(server: http.Server, service: connect.Server, request: http.Request): Boolean {
-    if http.respond(server, request, toHttp(service.handle(fromHttp(request)))) { return true }
+    return answer(server, request, service.handle(fromHttp(request)))
+}
+function answer(server: http.Server, request: http.Request, response: connect.Response): Boolean {
+    if http.respond(server, request, toHttp(response)) { return true }
     let fallback = connect.Response { status: 500; headers: [rpc.Header { name: "content-type"; value: "application/json" }];
         body: connect.errorJson(rpc.failure(rpc.INTERNAL, "the response could not be sent")) }
     if http.respond(server, request, toHttp(fallback)) { return true }
     http.abandon(server, request)
+    return false
+}
+
+record Open { request: http.Request; exchange: connect.Exchange; pending: Bytes; ending: Boolean }
+/// Serves a connect.Server behind an httpserver.Server, including server
+/// streams and deferred answers. One owner polls the httpserver and passes
+/// each Batch to `serve`; after a handler sends from elsewhere (a timer, a
+/// database reply), call `pump`.
+public record Host { private server: http.Server; private service: connect.Server; private calls: List<Open> }
+public function host(server: http.Server, service: connect.Server): Host { return Host { server: server; service: service; calls: [] } }
+public function Host.openCalls(): Integer { return self.calls.length }
+public function Host.serve(batch: http.Batch) {
+    for id in http.endedStreams(batch) {
+        for call in self.calls { if http.requestId(call.request) == id { call.exchange.cancel() } }
+    }
+    for request in http.requests(batch) {
+        match self.service.open(fromHttp(request)) {
+            Complete(response) { answer(self.server, request, response) }
+            Started(exchange) { self.calls.add(Open { request: request; exchange: exchange; pending: Bytes(); ending: false }) }
+        }
+    }
+    self.pump()
+}
+// Sends what open calls have ready, and drops finished or abandoned calls.
+public function Host.pump() {
+    let kept: List<Open> = []
+    for call in self.calls { if self.advance(call) { kept.add(call) } }
+    self.calls = kept
+}
+// The poll timeout for the next deadline among open calls: -1 for none.
+public function Host.timeout(now: Integer): Integer {
+    let earliest = -1
+    for call in self.calls {
+        let deadline = call.exchange.deadline()
+        if deadline >= 0 && (earliest < 0 || deadline < earliest) { earliest = deadline }
+    }
+    if earliest < 0 { return -1 }
+    return max(0, earliest - now)
+}
+// True while the call stays open.
+function Host.advance(call: Open): Boolean {
+    while true {
+        if call.pending.length > 0 {
+            if !http.send(self.server, call.request, call.pending) {
+                if http.streamActive(self.server, call.request) { return true }
+                call.exchange.cancel()
+                return false
+            }
+            call.pending = Bytes()
+        }
+        if call.ending {
+            http.finishStream(self.server, call.request)
+            return false
+        }
+        if call.exchange.finished() { return false }
+        match call.exchange.step() {
+            Waiting { return true }
+            Respond(response) {
+                answer(self.server, call.request, response)
+                return false
+            }
+            Start(head) {
+                if !http.stream(self.server, call.request, toHttp(head)) {
+                    call.exchange.cancel()
+                    http.abandon(self.server, call.request)
+                    return false
+                }
+            }
+            Write(piece) { call.pending = piece }
+            End(piece) {
+                call.pending = piece
+                call.ending = true
+            }
+        }
+    }
     return false
 }
 

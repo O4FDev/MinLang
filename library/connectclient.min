@@ -1,0 +1,68 @@
+// A connect.Client transport over the portable http module's keep-alive
+// Client: http:// or https:// to one origin, one call at a time. It lives
+// apart from connecthttp so a Connect server never links the TLS client.
+// It needs the portable http module: on macOS build with --library library.
+use "http" as http
+use "connect" as connect
+use "rpc" as rpc
+use "errors" as errors
+
+/// A transport for `connect.client("", codec, transport, keyPrefix)`; request
+/// targets are paths on `origin`. `roots` replace the OS trust roots for
+/// https (empty keeps them). `timeoutMs` bounds each connect and read; a
+/// call's shorter connect-timeout-ms bounds that call on its own connection.
+/// A failure before the response is UNAVAILABLE, so the client may retry it,
+/// and a call that runs out of its own time is DEADLINE_EXCEEDED.
+public function transport(origin: Text, roots: List<Bytes>, timeoutMs: Integer, maxResponseBytes: Integer): Result<(connect.Request) -> Result<connect.Response, rpc.Error>, errors.Error> {
+    let shared = try http.connectTo(origin, roots, timeoutMs)
+    return Ok(function(request: connect.Request): Result<connect.Response, rpc.Error> {
+        let client = shared
+        let limit = callTimeout(request)
+        let limited = limit >= 0 && limit < timeoutMs
+        if limited {
+            match http.connectTo(origin, roots, max(1, limit)) {
+                Ok(own) { client = own }
+                Err(problem) { return Err(rpc.failure(rpc.UNAVAILABLE, problem.message())) }
+            }
+        }
+        let result = exchange(client, request, maxResponseBytes)
+        if limited { client.close() }
+        match result {
+            Ok(response) { return Ok(response) }
+            Err(problem) {
+                if limited && problem.message().endsWith("timed out") { return Err(rpc.failure(rpc.DEADLINE_EXCEEDED, problem.message())) }
+                return Err(rpc.failure(rpc.UNAVAILABLE, problem.message()))
+            }
+        }
+    })
+}
+function callTimeout(request: connect.Request): Integer {
+    let value = rpc.headerValue(request.headers, "connect-timeout-ms")
+    if value == "" || value.length > 10 { return -1 }
+    let total = 0
+    for character in value {
+        if character < '0' || character > '9' { return -1 }
+        total = total * 10 + Integer(character) - 48
+    }
+    return total
+}
+function exchange(client: http.Client, request: connect.Request, maxResponseBytes: Integer): Result<connect.Response, errors.Error> {
+    let lines: List<Text> = []
+    for field in request.headers { lines.add(field.name + ": " + field.value) }
+    let head = try client.begin(request.method, request.target, lines, request.body)
+    let body = try client.readAll(maxResponseBytes)
+    let headers: List<rpc.Header> = []
+    for line in head.headers {
+        let colon = line.find(":")
+        if colon <= 0 { continue }
+        headers.add(rpc.Header { name: line.slice(0, colon).asciiLowercased(); value: trimmed(line.slice(colon + 1, line.length)) })
+    }
+    return Ok(connect.Response { status: head.status; headers: headers; body: body })
+}
+function trimmed(value: Text): Text {
+    let start = 0
+    let end = value.length
+    while start < end && (value[start] == ' ' || value[start] == '\t') { start += 1 }
+    while end > start && (value[end - 1] == ' ' || value[end - 1] == '\t') { end -= 1 }
+    return value.slice(start, end)
+}

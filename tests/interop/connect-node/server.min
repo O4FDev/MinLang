@@ -1,0 +1,180 @@
+// The Minyar side of check-connect-node: interop.proto's Interop service
+// behind httpserver, with hand-written proto and JSON codecs. Prints its port.
+use "httpserver" as http
+use "connect" as connect
+use "connecthttp" as connecthttp
+use "rpc" as rpc
+use "json" as json
+use "system" as system
+use "process" as process
+use "text" as utf8
+use "errors" as errors
+
+record Ping { text: Text; code: Integer; delayMs: Integer }
+record Pong { text: Text }
+
+function varint(out: Bytes, value: Integer) {
+    let rest = value
+    while rest >= 128 {
+        out.add((rest & 127) | 128)
+        rest = rest >> 7
+    }
+    out.add(rest)
+}
+record Cursor { data: Bytes; at: Integer }
+function readVarint(cursor: Cursor): Integer {
+    let value = 0
+    let shift = 0
+    while cursor.at < cursor.data.length && shift < 64 {
+        let byte = cursor.data[cursor.at]
+        cursor.at += 1
+        value = value | ((byte & 127) << shift)
+        if byte < 128 { return value }
+        shift += 7
+    }
+    return -1
+}
+function decodePing(data: Bytes): Result<Ping, rpc.Error> {
+    let ping = Ping { text: ""; code: 0; delayMs: 0 }
+    let cursor = Cursor { data: data; at: 0 }
+    while cursor.at < data.length {
+        let tag = readVarint(cursor)
+        if tag == 10 {
+            let length = readVarint(cursor)
+            if length < 0 || cursor.at + length > data.length { return Err(rpc.failure(rpc.INVALID_ARGUMENT, "truncated text")) }
+            match utf8.decode(data.slice(cursor.at, cursor.at + length)) {
+                Ok(text) { ping.text = text }
+                Err(_) { return Err(rpc.failure(rpc.INVALID_ARGUMENT, "text is not UTF-8")) }
+            }
+            cursor.at += length
+        } else if tag == 16 { ping.code = readVarint(cursor) }
+        else if tag == 24 { ping.delayMs = readVarint(cursor) }
+        else { return Err(rpc.failure(rpc.INVALID_ARGUMENT, "unexpected field")) }
+    }
+    return Ok(ping)
+}
+function encodePong(pong: Pong): Result<Bytes, rpc.Error> {
+    let out = Bytes()
+    if pong.text != "" {
+        out.add(10)
+        varint(out, Bytes(pong.text).length)
+        out.addBytes(Bytes(pong.text))
+    }
+    return Ok(out)
+}
+function jsonInteger(value: json.Value, name: Text): Integer {
+    if !value.hasMember(name) { return 0 }
+    return match value.member(name).asInteger() {
+        Ok(number) { number }
+        Err(_) { 0 }
+    }
+}
+function decodePingJson(data: Bytes): Result<Ping, rpc.Error> {
+    match json.decodeBytes(data, data.length + 1) {
+        Ok(value) {
+            if value.kind != json.OBJECT { return Err(rpc.failure(rpc.INVALID_ARGUMENT, "expected an object")) }
+            let text = ""
+            if value.hasMember("text") { text = value.member("text").text }
+            return Ok(Ping { text: text; code: jsonInteger(value, "code"); delayMs: jsonInteger(value, "delayMs") })
+        }
+        Err(problem) { return Err(rpc.failure(rpc.INVALID_ARGUMENT, problem.message())) }
+    }
+}
+function encodePongJson(pong: Pong): Result<Bytes, rpc.Error> {
+    if pong.text == "" { return Ok(Bytes("{}")) }
+    return Ok(Bytes("{\"text\":" + json.quote(pong.text) + "}"))
+}
+global pings: List<rpc.Codec<Ping>> = [rpc.Codec<Ping> { name: "proto"; decode: decodePing; encode: function(ping: Ping): Result<Bytes, rpc.Error> { return Err(rpc.failure(rpc.INTERNAL, "unused")) } },
+    rpc.Codec<Ping> { name: "json"; decode: decodePingJson; encode: function(ping: Ping): Result<Bytes, rpc.Error> { return Err(rpc.failure(rpc.INTERNAL, "unused")) } }]
+global pongs: List<rpc.Codec<Pong>> = [rpc.Codec<Pong> { name: "proto"; decode: function(data: Bytes): Result<Pong, rpc.Error> { return Err(rpc.failure(rpc.INTERNAL, "unused")) }; encode: encodePong },
+    rpc.Codec<Pong> { name: "json"; decode: function(data: Bytes): Result<Pong, rpc.Error> { return Err(rpc.failure(rpc.INTERNAL, "unused")) }; encode: encodePongJson }]
+global echoes: List<Integer> = [0]
+
+function echo(call: rpc.Call, ping: Ping): Result<Pong, rpc.Error> {
+    echoes[0] += 1
+    call.responseHeaders.add(rpc.Header { name: "x-echo-header"; value: call.header("x-call") })
+    call.responseTrailers.add(rpc.Header { name: "x-echo-trailer"; value: Text(echoes[0]) })
+    return Ok(Pong { text: ping.text + " via " + call.codec })
+}
+function failing(call: rpc.Call, ping: Ping): Result<Pong, rpc.Error> {
+    call.responseHeaders.add(rpc.Header { name: "x-failed"; value: "yes" })
+    call.responseTrailers.add(rpc.Header { name: "x-failed-trailer"; value: "late" })
+    let detail = try encodePong(Pong { text: "detail for " + rpc.codeName(ping.code) })
+    return Err(rpc.failure(ping.code, ping.text).withDetail("minyar.interop.v1.Pong", detail))
+}
+function slow(call: rpc.Call, ping: Ping): Result<Pong, rpc.Error> {
+    match process.sleep(ping.delayMs * 1000000) { Ok() {} Err(problem) { return Err(rpc.fromError(rpc.INTERNAL, problem)) } }
+    return Ok(Pong { text: "slept " + Text(ping.delayMs) })
+}
+function counted(call: rpc.Call, ping: Ping): Result<Pong, rpc.Error> {
+    echoes[0] += 1
+    return Ok(Pong { text: Text(echoes[0]) })
+}
+function now(): Integer { return system.monotonicNanoseconds() / 1000000 }
+// Streams with a delay are held and fed by the main loop as time passes.
+record Ticker { sender: rpc.Sender<Pong>; text: Text; total: Integer; sent: Integer; every: Integer; due: Integer }
+global tickers: List<Ticker> = []
+function streaming(call: rpc.Call, ping: Ping, sender: rpc.Sender<Pong>): Result<Nothing, rpc.Error> {
+    call.responseHeaders.add(rpc.Header { name: "x-stream"; value: "yes" })
+    if ping.delayMs > 0 {
+        sender.responder.hold()
+        tickers.add(Ticker { sender: sender; text: ping.text; total: ping.code; sent: 0; every: ping.delayMs; due: now() })
+        return Ok()
+    }
+    for index in 0..ping.code { rpc.send(sender, Pong { text: ping.text + " " + Text(index + 1) + "/" + Text(ping.code) }) }
+    call.responseTrailers.add(rpc.Header { name: "x-sent"; value: Text(ping.code) })
+    if ping.text == "fail" {
+        let detail = try encodePong(Pong { text: "stopped" })
+        return Err(rpc.failure(rpc.ABORTED, "stream failed").withDetail("minyar.interop.v1.Pong", detail))
+    }
+    return Ok()
+}
+function tick(host: connecthttp.Host): Integer {
+    let kept: List<Ticker> = []
+    let wait = -1
+    for ticker in tickers {
+        if !ticker.sender.responder.active() { continue }
+        if now() >= ticker.due {
+            ticker.sent += 1
+            rpc.send(ticker.sender, Pong { text: ticker.text + " " + Text(ticker.sent) + "/" + Text(ticker.total) })
+            ticker.due = now() + ticker.every
+            if ticker.sent >= ticker.total {
+                ticker.sender.responder.finish(None)
+                continue
+            }
+        }
+        kept.add(ticker)
+        let left = max(0, ticker.due - now())
+        if wait < 0 || left < wait { wait = left }
+    }
+    tickers.truncate(0)
+    for ticker in kept { tickers.add(ticker) }
+    host.pump()
+    let deadline = host.timeout(now())
+    if deadline >= 0 && (wait < 0 || deadline < wait) { wait = deadline }
+    return wait
+}
+
+let services = rpc.services()
+services.add(rpc.unary("/minyar.interop.v1.Interop/Echo", rpc.IDEMPOTENCY_UNKNOWN, pings, pongs, echo))
+services.add(rpc.unary("/minyar.interop.v1.Interop/Fail", rpc.IDEMPOTENCY_UNKNOWN, pings, pongs, failing))
+services.add(rpc.unary("/minyar.interop.v1.Interop/Slow", rpc.IDEMPOTENCY_UNKNOWN, pings, pongs, slow))
+services.add(rpc.unary("/minyar.interop.v1.Interop/Lookup", rpc.NO_SIDE_EFFECTS, pings, pongs, echo))
+services.add(rpc.unary("/minyar.interop.v1.Interop/Count", rpc.IDEMPOTENCY_UNKNOWN, pings, pongs, counted))
+services.add(rpc.serverStream("/minyar.interop.v1.Interop/Stream", pings, pongs, streaming))
+let options = connect.defaults(now)
+options.maxRequestBytes = 4096
+options.cors.allowedOrigins.add("https://app.example")
+options.compressors.add(connecthttp.gzip())
+let service = connect.server(services, options)
+let server = http.listen("127.0.0.1", 0, http.defaults())
+if !http.ok(server) { fail(errors.message(http.serverError(server))) }
+let host = connecthttp.host(server, service)
+print("port " + Text(http.port(server)))
+let wait = -1
+while true {
+    let batch = http.poll(server, wait)
+    if errors.isError(http.batchError(batch)) { fail(errors.message(http.batchError(batch))) }
+    host.serve(batch)
+    wait = tick(host)
+}
