@@ -107,7 +107,9 @@ export LLVM_CC="$MINYAR_CLANG"
 compiler. Set both when using a custom installation. An explicitly set `CC`
 also affects native C bootstrap compilation. With no override, the tools check
 `$HOME/.cache/minyar/toolchains/llvm-23.1.3/bin/clang`, then `clang` on macOS or
-`clang-23` elsewhere. On macOS, an explicit `SDKROOT` overrides SDK discovery.
+`clang-23` elsewhere. On macOS, an explicit `SDKROOT` overrides SDK discovery,
+and `DEVELOPER_DIR` defaults to the Command Line Tools or Xcode directory that
+contains the SDK. A linker older than the SDK cannot read it.
 
 `--doctor` checks prerequisites, C headers, 64-bit code generation, opaque LLVM
 IR, and an actual LTO link. A working `clang --version` by itself is insufficient.

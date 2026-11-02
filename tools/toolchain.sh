@@ -182,10 +182,32 @@ sdkroot() {
     fi
 }
 
+# Apple's linker and SDK must come from one developer directory: xcrun can pair
+# the newest Command Line Tools SDK with an older selected Xcode whose linker
+# rejects that SDK's stubs. Select the directory that ships the SDK, so `ld`,
+# `cc` and `swiftc` shims resolve to tools that read it.
+developer_dir() {
+    if [ "${DEVELOPER_DIR+x}" = x ]; then printf '%s\n' "$DEVELOPER_DIR"; return 0; fi
+    [ "$(host_system)" = Darwin ] || return 0
+    _sdk=$(sdkroot)
+    case $_sdk in
+        */Platforms/*.platform/Developer/SDKs/*) _developer=${_sdk%%/Platforms/*} ;;
+        */SDKs/*) _developer=${_sdk%/SDKs/*} ;;
+        *) return 0 ;;
+    esac
+    if [ -x "$_developer/usr/bin/ld" ] || [ -x "$_developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld" ]; then
+        printf '%s\n' "$_developer"
+    fi
+}
+
 prepare_sdk() {
     if [ "${SDKROOT+x}" != x ]; then
         discovered_sdk=$(sdkroot)
         if [ -n "$discovered_sdk" ]; then SDKROOT=$discovered_sdk; export SDKROOT; fi
+    fi
+    if [ "${DEVELOPER_DIR+x}" != x ]; then
+        discovered_developer=$(developer_dir)
+        if [ -n "$discovered_developer" ]; then DEVELOPER_DIR=$discovered_developer; export DEVELOPER_DIR; fi
     fi
 }
 
@@ -590,6 +612,7 @@ case $command:$# in
     compiler-lto-flags:0) compiler_lto_flags ;;
     default-clang:0) default_clang ;;
     sdkroot:0) sdkroot ;;
+    developer-dir:0) developer_dir ;;
     doctor:0) doctor ;;
     version:1) version "$1" ;;
     bootstrap:*)

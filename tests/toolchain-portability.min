@@ -282,6 +282,37 @@ function sdkDiscovery(f: Fixture) {
     test.require(bootstrap, "bootstrap exports Xcode SDK")
     test.check(io.readTextFile(log) == sdk + "\n", "SDK reaches bootstrap children")
 }
+// A newer Command Line Tools SDK beside an older selected Xcode: the linker must come from the SDK's directory.
+function developerDirectoryDiscovery(f: Fixture) {
+    let tools = f.work + "/Command Line Tools"
+    let xcode = f.work + "/Xcode 26.app/Contents/Developer"
+    tf.directories(tools + "/SDKs/MacOSX.sdk", f.logs)
+    tf.directories(tools + "/usr/bin", f.logs)
+    tf.executable(tools + "/usr/bin/ld", "exit 0\n", f.logs)
+    tf.directories(xcode + "/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk", f.logs)
+    tf.directories(xcode + "/Toolchains/XcodeDefault.xctoolchain/usr/bin", f.logs)
+    tf.executable(xcode + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld", "exit 0\n", f.logs)
+    tf.directories(f.work + "/loose/SDKs/MacOSX.sdk", f.logs)
+    tf.executable(f.bin + "/xcrun", "printf '%s\\n' " + support.shellQuote(tools + "/SDKs/MacOSX.sdk") + "\n", f.logs)
+    let environment = support.merge(tf.without(f.env, ["SDKROOT", "DEVELOPER_DIR"]), ["MINYAR_TEST_HOST_SYSTEM=Darwin"])
+    let command = ["sh", f.root + "/tools/toolchain.sh", "developer-dir"]
+    let found = tf.run(f.logs, command, environment, f.root, 10)
+    test.require(found, "developer directory discovery")
+    test.check(found.output == tools + "\n", "discovered SDK selects its Command Line Tools: " + found.output)
+    let selected = tf.run(f.logs, command, support.merge(environment, ["SDKROOT=" + xcode + "/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"]), f.root, 10)
+    test.check(selected.status == 0 && selected.output == xcode + "\n", "an Xcode SDK selects its Xcode: " + selected.output)
+    let loose = tf.run(f.logs, command, support.merge(environment, ["SDKROOT=" + f.work + "/loose/SDKs/MacOSX.sdk"]), f.root, 10)
+    test.check(loose.status == 0 && loose.output == "", "an SDK without a linker selects nothing: " + loose.output)
+    let explicit = tf.run(f.logs, command, support.merge(environment, ["DEVELOPER_DIR=explicit developer"]), f.root, 10)
+    test.check(explicit.status == 0 && explicit.output == "explicit developer\n", "explicit DEVELOPER_DIR takes precedence")
+    let linux = tf.run(f.logs, command, support.merge(tf.without(environment, ["MINYAR_TEST_HOST_SYSTEM"]), ["MINYAR_TEST_HOST_SYSTEM=Linux"]), f.root, 10)
+    test.check(linux.status == 0 && linux.output == "", "other systems select nothing")
+    let log = f.work + "/developer-environment"
+    tf.executable(f.bin + "/make", "printf '%s\\n' \"$DEVELOPER_DIR\" > " + support.shellQuote(log) + "\n", f.logs)
+    let bootstrap = tf.run(f.logs, ["sh", f.root + "/tools/toolchain.sh", "bootstrap", f.project, "build/minyarc"], environment, f.root, 10)
+    test.require(bootstrap, "bootstrap exports the developer directory")
+    test.check(io.readTextFile(log) == tools + "\n", "developer directory reaches bootstrap children")
+}
 function selectedClangBootstrapsBoth(f: Fixture) {
     f.env = tf.without(f.env, ["CC"])
     tf.executable(f.bin + "/make", "{ for name in CC LLVM_CC; do eval \"present=\\${$name+x}\"; if [ \"$present\" = x ]; then eval \"value=\\$$name\"; printf '%s=%s\\n' \"$name\" \"$value\"; else printf '%s\\n' \"$name\"; fi; done; } > \"$TEST_MAKE_LOG\"\n", f.logs)
@@ -835,7 +866,7 @@ function driverCaptureBounded(f: Fixture) {
     test.check(test.contains(result.errorOutput, "unsupported compiler"), "bounded compiler output must report a normal rejection\n" + result.errorOutput)
 }
 
-let names = ["test_xcode_sdk_discovery_preserves_explicit_overrides", "test_cached_llvm_discovery_preserves_overrides_and_version_checks", "test_concurrent_cold_launches_share_a_complete_bootstrap", "test_selected_clang_bootstraps_both_c_and_llvm",
+let names = ["test_xcode_sdk_discovery_preserves_explicit_overrides", "test_apple_linker_comes_from_the_sdk_developer_directory", "test_cached_llvm_discovery_preserves_overrides_and_version_checks", "test_concurrent_cold_launches_share_a_complete_bootstrap", "test_selected_clang_bootstraps_both_c_and_llvm",
     "test_linux_bootstrap_bounds_matching_lld_threads_with_literal_paths", "test_linux_bootstrap_rejects_old_or_missing_matching_linker",
     "test_compiler_lto_cache_defaults_overrides_and_make_bootstrap_parity",
     "test_bootstrap_make_options_are_literal_and_default_argv_is_unchanged", "test_bootstrap_rejects_malformed_make_options_before_make",
@@ -865,6 +896,7 @@ for name in names {
     if !chosen(name) { continue }
     let f = setUp(root, scratch, cases + 1, logs)
     if name == "test_xcode_sdk_discovery_preserves_explicit_overrides" { sdkDiscovery(f) }
+    else if name == "test_apple_linker_comes_from_the_sdk_developer_directory" { developerDirectoryDiscovery(f) }
     else if name == "test_cached_llvm_discovery_preserves_overrides_and_version_checks" { cachedClangDiscovery(f) }
     else if name == "test_concurrent_cold_launches_share_a_complete_bootstrap" { concurrentColdLaunches(f) }
     else if name == "test_selected_clang_bootstraps_both_c_and_llvm" { selectedClangBootstrapsBoth(f) }

@@ -28,7 +28,9 @@ is discovered automatically by the launcher, link driver and Make. Explicit
 `MINYAR_CLANG` and `LLVM_CC` selections take precedence. The default fallback
 is `clang` on macOS and `clang-23` elsewhere; all selections are version checked.
 On macOS the launcher and Make discover the Xcode SDK with
-`xcrun --show-sdk-path` unless `SDKROOT` has already been set.
+`xcrun --show-sdk-path` unless `SDKROOT` has already been set. Unless
+`DEVELOPER_DIR` is set, they also select the Command Line Tools or Xcode
+directory that contains that SDK, so the linker comes from the same release.
 
 ```sh
 make install                 # once, from the source checkout

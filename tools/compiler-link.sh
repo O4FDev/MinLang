@@ -54,7 +54,8 @@ while [ "$index" -lt "$partitions" ]; do
 done
 for pid in $pids; do wait "$pid"; done
 # The link itself: the same arguments with the split modules in place of the largest input.
-set -- "$@" "-Wl,--thinlto-jobs=$partitions"
+# -flto-jobs reaches lld as --thinlto-jobs and Apple's ld as -mllvm -threads.
+set -- "$@" "-flto-jobs=$partitions"
 count=$#
 index=0
 while [ "$index" -lt "$count" ]; do

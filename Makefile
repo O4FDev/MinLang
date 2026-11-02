@@ -6,6 +6,13 @@ LLVM_CC ?= $(shell sh tools/toolchain.sh default-clang)
 ifeq ($(shell uname -s),Darwin)
 SDKROOT ?= $(shell sh tools/toolchain.sh sdkroot)
 export SDKROOT
+# The linker must come from the developer directory that ships SDKROOT.
+ifeq ($(origin DEVELOPER_DIR),undefined)
+DEVELOPER_DIR := $(shell SDKROOT='$(subst ','"'"',$(SDKROOT))' sh tools/toolchain.sh developer-dir)
+endif
+ifneq ($(DEVELOPER_DIR),)
+export DEVELOPER_DIR
+endif
 endif
 ifeq ($(origin CC),default)
 CC = $(LLVM_CC)
