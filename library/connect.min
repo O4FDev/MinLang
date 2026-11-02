@@ -1430,6 +1430,9 @@ public record Stream {
     private client: Client
     private wire: Maybe<Wire>
     private grpc: Boolean
+    // A Connect unary call: a plain body each way, not envelopes.
+    private plain: Boolean
+    private httpStatus: Integer
     private kind: Integer
     private sendClosed: Boolean
     private headSeen: Boolean
@@ -1456,7 +1459,8 @@ public function Stream.active(): Boolean { return !self.finished && self.failure
 /// Opens a call of `kind` (rpc.UNARY, SERVER_STREAM, CLIENT_STREAM or
 /// BIDI_STREAM). A failure to open shows up on the first receive.
 public function Client.stream(procedure: Text, kind: Integer, options: CallOptions): Stream {
-    let stream = Stream { client: self; wire: None; grpc: self.protocol == "grpc"; kind: kind; sendClosed: false; headSeen: false
+    let stream = Stream { client: self; wire: None; grpc: self.protocol == "grpc"; plain: self.protocol != "grpc" && kind == rpc.UNARY
+        httpStatus: 0; kind: kind; sendClosed: false; headSeen: false
         headers: []; trailers: []; input: Bytes(); replies: []; received: 0; decompressor: None; endSeen: false; status: None
         finished: false; failure: None }
     match self.opener {
@@ -1482,6 +1486,12 @@ function Client.streamRequest(procedure: Text, kind: Integer, options: CallOptio
         if options.timeoutMilliseconds >= 0 { headers.add(rpc.Header { name: "grpc-timeout"; value: grpcTimeout(options.timeoutMilliseconds) }) }
         if self.sendCompression != "" { headers.add(rpc.Header { name: "grpc-encoding"; value: self.sendCompression }) }
         if names.length > 0 { headers.add(rpc.Header { name: "grpc-accept-encoding"; value: joinText(names, ",") }) }
+    } else if kind == rpc.UNARY {
+        headers.add(rpc.Header { name: "content-type"; value: "application/" + self.codec })
+        headers.add(rpc.Header { name: "connect-protocol-version"; value: "1" })
+        if options.timeoutMilliseconds >= 0 { headers.add(rpc.Header { name: "connect-timeout-ms"; value: Text(options.timeoutMilliseconds) }) }
+        if self.sendCompression != "" { headers.add(rpc.Header { name: "content-encoding"; value: self.sendCompression }) }
+        if names.length > 0 { headers.add(rpc.Header { name: "accept-encoding"; value: joinText(names, ", ") }) }
     } else {
         headers.add(rpc.Header { name: "content-type"; value: "application/connect+" + self.codec })
         headers.add(rpc.Header { name: "connect-protocol-version"; value: "1" })
@@ -1505,7 +1515,10 @@ public function Stream.send(message: Bytes): Boolean {
     if self.sendClosed || !self.active() { return false }
     let flags = 0
     let body = message
-    if self.client.sendCompression != "" && message.length >= self.client.compressMinBytes {
+    // A unary body declared its encoding up front, so it is always compressed.
+    let threshold = self.client.compressMinBytes
+    if self.plain { threshold = 0 }
+    if self.client.sendCompression != "" && message.length >= threshold {
         for compressor in self.client.compressors {
             if compressor.name == self.client.sendCompression {
                 match compressor.compress(message) {
@@ -1519,7 +1532,15 @@ public function Stream.send(message: Bytes): Boolean {
         }
     }
     match self.wire {
-        Some(wire) { return wire.write(envelope(flags, body)) }
+        Some(wire) {
+            if self.plain {
+                // The one request message; the body ends with it.
+                let taken = wire.write(body)
+                self.closeSend()
+                return taken
+            }
+            return wire.write(envelope(flags, body))
+        }
         None { return false }
     }
 }
@@ -1558,13 +1579,19 @@ public function Stream.receive(): Received<Bytes> {
             Head(status, headers) { self.head(status, lowerHeaders(headers)) }
             Data(data) {
                 if !self.headSeen { self.fail(rpc.failure(rpc.INTERNAL, "response data before headers")) }
-                else if self.endSeen || self.status.isSome() { self.fail(rpc.failure(rpc.INTERNAL, "response data after the end of the stream")) }
+                else if self.plain {
+                    if self.input.length + data.length > self.client.maxResponseBytes {
+                        self.fail(rpc.failure(rpc.RESOURCE_EXHAUSTED, "response is larger than " + Text(self.client.maxResponseBytes) + " bytes"))
+                    } else { self.input.addBytes(data) }
+                } else if self.endSeen || self.status.isSome() { self.fail(rpc.failure(rpc.INTERNAL, "response data after the end of the stream")) }
                 else {
                     self.input.addBytes(data)
                     self.messages()
                 }
             }
-            Ended(trailers) { self.end(lowerHeaders(trailers)) }
+            Ended(trailers) {
+                if self.plain { self.plainEnd() } else { self.end(lowerHeaders(trailers)) }
+            }
             Broken(error) { self.fail(error) }
         }
     }
@@ -1573,6 +1600,13 @@ public function Stream.receive(): Received<Bytes> {
 function Stream.head(status: Integer, headers: List<rpc.Header>) {
     if self.headSeen { return }
     self.headSeen = true
+    if self.plain {
+        // Settled when the body is complete, as Client.reply does.
+        self.httpStatus = status
+        self.headers = headersOf(headers)
+        self.trailers = trailersOf(headers)
+        return
+    }
     if self.grpc {
         // A trailers-only response carries its status in the headers.
         if rpc.headerValue(headers, "grpc-status") != "" {
@@ -1681,6 +1715,26 @@ function Stream.endMessage(data: Bytes) {
             }
         }
         Err(_) { self.fail(rpc.failure(rpc.INTERNAL, "malformed end-of-stream message")) }
+    }
+}
+// A Connect unary response is complete: its body is the reply or the error.
+function Stream.plainEnd() {
+    if !self.active() { return }
+    if !self.headSeen {
+        self.fail(rpc.failure(rpc.INTERNAL, "the response ended without headers"))
+        return
+    }
+    let headers: List<rpc.Header> = []
+    for field in self.headers { headers.add(field) }
+    for field in self.trailers { headers.add(rpc.Header { name: "trailer-" + field.name; value: field.value }) }
+    match self.client.reply(Response { status: self.httpStatus; headers: headers; body: self.input }) {
+        Ok(reply) {
+            self.input = Bytes()
+            self.received = 1
+            self.replies.add(reply.message)
+            self.finished = true
+        }
+        Err(failure) { self.fail(failure.error) }
     }
 }
 // The response ended: settle the call's outcome.

@@ -1,8 +1,8 @@
 // The streaming Connect client against a Connect server in the same process,
 // over a Wire that steps a Server.begin exchange and never waits: typed and
 // byte-level server, client and bidirectional streams, interleaved full
-// duplex, errors with trailers, cancellation, compression and unary calls
-// through streamingClient.
+// duplex, errors with trailers, cancellation, compression, and unary calls
+// through streamingClient and as cancelable streams.
 use "connect" as connect
 use "rpc" as rpc
 use "errors" as errors
@@ -124,6 +124,11 @@ services.add(rpc.bidiStream("/t.v1.S/Chat", codecs, codecs, function(call: rpc.C
 services.addUnary("/t.v1.S/Say", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
     return Ok(Bytes("said " + utf8.decodeOrStop(data)))
 })
+services.addUnary("/t.v1.S/Refuse", rpc.IDEMPOTENCY_UNKNOWN, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+    call.responseHeaders.add(header("x-why", "testing"))
+    call.responseTrailers.add(header("x-after", "yes"))
+    return Err(rpc.failure(rpc.PERMISSION_DENIED, "not " + utf8.decodeOrStop(data)))
+})
 let options = connect.defaults(clock)
 options.compressors.add(reverse())
 options.compressMinBytes = 4
@@ -221,3 +226,16 @@ drain("wrong kind", connect.serverStream(client, "/t.v1.S/Say", "x", codecs, cod
 let jsonless = connect.streamingClient("", "proto", opener(server), "k")
 drain("proto codec", connect.serverStream(jsonless, "/t.v1.S/Count", "n", codecs, codecs, connect.callOptions()))
 print("requests " + Text(pipe.requests))
+
+// Unary calls as streams: a plain body each way, cancelable.
+let said = connect.open(client, "/t.v1.S/Say", rpc.UNARY, codecs, codecs, connect.callOptions())
+connect.send(said, "as a stream")
+drain("unary stream", said)
+let denied = connect.open(client, "/t.v1.S/Refuse", rpc.UNARY, codecs, codecs, connect.callOptions())
+connect.send(denied, "you")
+drain("unary denied", denied)
+metadata("unary denied metadata", denied.stream)
+let dropped = connect.open(client, "/t.v1.S/Say", rpc.UNARY, codecs, codecs, connect.callOptions())
+connect.send(dropped, "never")
+dropped.stream.cancel()
+drain("unary canceled", dropped)
