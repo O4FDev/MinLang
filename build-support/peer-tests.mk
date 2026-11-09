@@ -90,8 +90,12 @@ check: check-scalar-cleanup-probes
 
 build/tooling/tests/peer-manifest: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/peer-manifest: build/testing/cycle-runtime.o
-check-peer-manifest: check-peer-audit check-suite-catalogue build/tooling/tests/peer-manifest
+# The peer review ledger (tests/data/peer, decisions by past review runs) is bookkeeping, not compiler
+# behaviour, so its audit runs in the full `check` only and no longer gates each peer suite.
+check-peer-manifest: check-suite-catalogue build/tooling/tests/peer-manifest
 	./build/tooling/tests/peer-manifest
+
+check: check-peer-audit
 
 build/tooling/tests/evidence-harness.ll build/tooling/tests/evidence-replay.ll: tests/evidence-support.min
 build/tooling/tests/evidence-harness build/tooling/tests/evidence-replay: TOOL_NATIVE = tests/evidence-support-native.c runtime/native/sha256.c
