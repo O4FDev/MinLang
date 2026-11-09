@@ -1,7 +1,8 @@
 # Working on Minyar
 
 - Read `docs/language.md`, `docs/compiler-syntax.md` and `docs/testing.md` for
-  the area you change. The compiler is Minyar, bootstrapped by `bootstrap/stage0.c`.
+  the area you change. Read `docs/writing-tests.md` before adding or changing
+  a test: assert product behaviour, not incidental detail. The compiler is Minyar, bootstrapped by `bootstrap/stage0.c`.
   New syntax used inside the compiler must also work through stage0.
 - Start with the smallest existing `check-*` target in `build-support/*.mk`.
   `make check-changed-plan` explains the working-tree selection;

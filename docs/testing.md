@@ -1,5 +1,7 @@
 # Testing strategy
 
+What a test should and should not assert is in `docs/writing-tests.md`.
+
 Python harnesses use the standard library. CI selects CPython 3.15.0 from
 `.python-version` through the pinned `actions/setup-python` action; no pip
 packages are needed. Use the same interpreter when reproducing Python
@@ -920,9 +922,12 @@ remaining reclaimable objects at exit. It is included in `check-ownership` and
 the peer CI job. Each of these gates runs every selected suite as its own phony
 child (for example `check-peer-regressions-cpp-java-js`), and each suite spreads
 its cases over `MINYAR_TEST_JOBS` processes (default 2) and writes one merged
-outcome file. `check-peer-manifest` validates the actual audit ledger and runs
-controlled checks that reject missing review decisions, pending enumeration and
-unsupported completion claims. `make check-peer-audit-complete` additionally
+outcome file. `check-peer-manifest` checks that every catalogued peer case is
+wired to its gate. `make check-peer-audit` (in the full `check`, not the
+per-commit gate: the ledger records past review decisions, not compiler
+behaviour) validates the audit ledger and runs controlled checks that reject
+missing review decisions, pending enumeration and unsupported completion
+claims. `make check-peer-audit-complete` additionally
 requires the exhaustive review and implementation backlog to be empty, every
 applicability decision to be resolved, and every generated cohort to have its
 corresponding checked ledger row. Domain artifacts are discovered even when
