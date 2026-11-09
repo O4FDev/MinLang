@@ -42,8 +42,8 @@ check check-portable: check-errors-launcher
 .PHONY: check-errors-review check-errors-review-sanitize check-errors-review-bounded check-errors-review-bounded-sanitize \
 	check-errors-review-bounded-part1 check-errors-review-bounded-part32 check-errors-review-bounded-part1024
 
-check-errors-review: build/minyarc-errors build/errors-compiler-stage3.ll build/minyar-runtime.o build/tooling/tests/errors-review build/testing/cycle-runtime.o build/tooling/tests/compiler-behavior
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile errors --ir build/errors-compiler-stage3.ll
+# The errors stage3 compiler-behavior profile runs once, in check-errors-language.
+check-errors-review: build/minyarc-errors build/minyar-runtime.o build/tooling/tests/errors-review build/testing/cycle-runtime.o
 	MINYAR_ERRORS_COMPILER=./build/minyarc-errors MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/errors-review
 
 check-errors-review-sanitize: build/minyarc-errors-sanitize build/tooling/tests/errors-review

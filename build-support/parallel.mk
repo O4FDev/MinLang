@@ -28,11 +28,12 @@ build/tooling/tests/parallel-signatures: TOOL_NATIVE = tests/evidence-support-na
 build/tooling/tests/parallel-signatures: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/parallel-signatures: tests/evidence-support-native.c runtime/native/sha256.c
 
-# One target per process: one per scalar-control profile, then one per frontend. Each
-# piece keeps its own evidence tree and only removes its own stale evidence directories.
-PARALLEL_SIGNATURE_PREREQUISITES = $(addprefix build/,$(PARALLEL_SIGNATURE_FRONTENDS)) build/minyar-runtime.o build/compiler-stage3.ll build/closure-compiler-stage3.ll build/errors-compiler-stage3.ll $(PARALLEL_SIGNATURE_INPUTS) build/testing/cycle-runtime.o build/tooling/tests/compiler-behavior
+# One target per frontend. Each piece keeps its own evidence tree and only removes its own stale
+# evidence directories. The stage3 compiler-behavior profiles run once each in check-portable-core,
+# check-callbacks and check-errors-language, not again here.
+PARALLEL_SIGNATURE_PREREQUISITES = $(addprefix build/,$(PARALLEL_SIGNATURE_FRONTENDS)) build/minyar-runtime.o $(PARALLEL_SIGNATURE_INPUTS)
 PARALLEL_SIGNATURE_SANITIZER_PREREQUISITES = $(addprefix build/,$(PARALLEL_SIGNATURE_SANITIZER_FRONTENDS)) build/minyar-runtime.o $(PARALLEL_SIGNATURE_INPUTS)
-PARALLEL_SIGNATURE_PARTS = check-parallel-signatures-part1 check-parallel-signatures-part2 check-parallel-signatures-part3 check-parallel-signatures-part4 check-parallel-signatures-part5 check-parallel-signatures-part6
+PARALLEL_SIGNATURE_PARTS = check-parallel-signatures-part1 check-parallel-signatures-part2 check-parallel-signatures-part3
 PARALLEL_SIGNATURE_SANITIZE_PARTS = check-parallel-signatures-sanitize-part1 check-parallel-signatures-sanitize-part2 check-parallel-signatures-sanitize-part3
 .PHONY: $(PARALLEL_SIGNATURE_PARTS) $(PARALLEL_SIGNATURE_SANITIZE_PARTS)
 check-parallel-signatures: $(PARALLEL_SIGNATURE_PARTS)
@@ -40,18 +41,12 @@ check-parallel-signatures-sanitize: $(PARALLEL_SIGNATURE_SANITIZE_PARTS)
 $(PARALLEL_SIGNATURE_PARTS): $(PARALLEL_SIGNATURE_PREREQUISITES) | build
 $(PARALLEL_SIGNATURE_SANITIZE_PARTS): $(PARALLEL_SIGNATURE_SANITIZER_PREREQUISITES) | build
 check-parallel-signatures-part1:
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile core --ir build/compiler-stage3.ll
-check-parallel-signatures-part2:
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile callbacks --ir build/closure-compiler-stage3.ll
-check-parallel-signatures-part3:
-	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/compiler-behavior --profile errors --ir build/errors-compiler-stage3.ll
-check-parallel-signatures-part4:
 	@set -e; rm -rf -- build/parallel-signatures-native-minyarc-*; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-native-minyarc-XXXXXX"); \
 	MINYAR_TEST_COMPILER="./build/minyarc" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/minyarc" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/parallel-signatures
-check-parallel-signatures-part5:
+check-parallel-signatures-part2:
 	@set -e; rm -rf -- build/parallel-signatures-native-minyarc-callbacks-*; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-native-minyarc-callbacks-XXXXXX"); \
 	MINYAR_TEST_COMPILER="./build/minyarc-callbacks" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/minyarc-callbacks" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/parallel-signatures
-check-parallel-signatures-part6:
+check-parallel-signatures-part3:
 	@set -e; rm -rf -- build/parallel-signatures-native-minyarc-errors-*; evidence=$$(mktemp -d "$(abspath build)/parallel-signatures-native-minyarc-errors-XXXXXX"); \
 	MINYAR_TEST_COMPILER="./build/minyarc-errors" MINYAR_PARALLEL_OBSERVATIONS="$$evidence/minyarc-errors" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/parallel-signatures
 
