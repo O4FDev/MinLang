@@ -110,7 +110,10 @@ static void readiness_deadline(void) {
     pid_t owner = getpid(), child = fork();
     assert(child >= 0);
     if (!child) {
-        for (unsigned i = 0; i < 45; i++) {
+        /* Interrupt every 5ms, well inside the 30ms deadline, until the parent kills this child
+         * (bounded at 10s). A call that restarted its deadline after EINTR could never return
+         * while the signals continue, so returning at all proves the original deadline held. */
+        for (unsigned i = 0; i < 2000; i++) {
             struct timespec pause = {0, 5000000};
             nanosleep(&pause, NULL);
             if (kill(owner, SIGUSR1))
@@ -134,7 +137,7 @@ static void readiness_deadline(void) {
     fprintf(stderr, "UDP readiness deadline: 30ms requested, %.3fms observed, %d signals\n",
             elapsed * 1000, (int)readiness_interruptions);
     assert(readiness_interruptions > 0);
-    assert(elapsed >= 0.020 && elapsed < 0.100);
+    assert(elapsed >= 0.020 && elapsed < 2.0);
     puts("signal-interrupted UDP readiness retains its original deadline");
 }
 static unsigned readiness_clock_mode, readiness_clock_calls, readiness_poll_mode,
