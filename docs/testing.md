@@ -1029,6 +1029,17 @@ deliberately removed guards and invalid dominance are rejected. It requires
 tools fail this explicitly requested target. The separate CI job uses LLVM 18;
 ordinary portable checks do not acquire this dependency.
 
+`make check-llvm-lint` (part of `check-portable`) runs LLVM's verifier and Lint
+pass (`tools/llvm-lint.py`) over the release IR of every `benchmarks/compare`
+program and the `tests/codegen`, `tests/miscompiles` and `tests/runtime`
+programs. Each is linked with `build/minyar-default-runtime-release.ll`, so each
+runtime call is checked against the C definition it reaches, and checked as
+emitted and after the O2 pipeline. Any "Undefined behavior" report fails: it
+catches false claims to LLVM such as a call-site ABI attribute (`zeroext`) that
+differs from the definition, a signature that differs from the runtime's, or a
+null or misaligned access the optimizer exposes. It needs `opt` and `llvm-link`
+from the pinned LLVM (or `MINYAR_LLVM_BIN`).
+
 `make check-miscompiles` (part of `check-portable`) runs every
 `tests/miscompiles/<name>.min` once compiled, linked at -O0, -O1 and -O2, and
 requires `<name>.stdout` at all three levels. Add a fixture there for any
