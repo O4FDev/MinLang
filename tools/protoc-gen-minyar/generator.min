@@ -1679,9 +1679,50 @@ function Generator.file(position: Integer): plugin.CodeGeneratorResponse_File {
 }
 
 /// Generate one module for each file the request names.
+// Names reach the generated file's header and comments as they arrive. protoc
+// passes only identifier characters and real paths, but a request can be made
+// by hand and a path can hold a line break; the text after the break would be
+// compiled as code. Such a request is refused whole.
+function plainName(name: Text): Boolean {
+    for c in name {
+        let code = Integer(c)
+        if code < 32 || code == 127 || code == 0x85 || code == 0x2028 || code == 0x2029 { return false }
+    }
+    return true
+}
+function plainEnum(enumeration: descriptor.EnumDescriptorProto): Boolean {
+    if !plainName(enumeration.name()) { return false }
+    for value in enumeration.value { if !plainName(value.name()) { return false } }
+    return true
+}
+function plainMessage(message: descriptor.DescriptorProto): Boolean {
+    if !plainName(message.name()) { return false }
+    for field in message.field { if !plainName(field.name()) || !plainName(field.typeName()) { return false } }
+    for declaration in message.oneofDecl { if !plainName(declaration.name()) { return false } }
+    for enumeration in message.enumType { if !plainEnum(enumeration) { return false } }
+    for nested in message.nestedType { if !plainMessage(nested) { return false } }
+    return true
+}
+function plainFile(file: descriptor.FileDescriptorProto): Boolean {
+    if !plainName(file.name()) || !plainName(file.package()) { return false }
+    for message in file.messageType { if !plainMessage(message) { return false } }
+    for enumeration in file.enumType { if !plainEnum(enumeration) { return false } }
+    for service in file.service {
+        if !plainName(service.name()) { return false }
+        for method in service.method { if !plainName(method.name()) || !plainName(method.inputType()) || !plainName(method.outputType()) { return false } }
+    }
+    return true
+}
+
 public function generate(request: plugin.CodeGeneratorRequest): plugin.CodeGeneratorResponse {
     let response = plugin.newCodeGeneratorResponse()
     response.supportedFeatures = Some(SUPPORTED_FEATURES)
+    for file in request.protoFile {
+        if !plainFile(file) {
+            response.error = Some("protoc-gen-minyar: a file, package, type, field or method name in the request contains a control character")
+            return response
+        }
+    }
     let generator = newGenerator(request)
     for name in request.fileToGenerate {
         if !generator.files.has(name) {

@@ -19,6 +19,8 @@ claim that undiscovered vulnerabilities are absent.
 
 | 5 | `library/connect.min` answered an origin admitted only by `"*"` with that origin and `Access-Control-Allow-Credentials: true` when `Cors.allowCredentials` was set. | Any web page a signed-in user visits, when a service lists `"*"` and allows credentials. | Cross-site requests with the user's cookies whose responses the page can read, medium for a service configured that way. Browsers refuse the literal pair `*` plus credentials to prevent this; echoing the origin defeated it. | Credentials are sent only to origins listed by name; an origin admitted only by `"*"` is answered `*` without credentials. `tests/connect/server.min` covers named, wildcard and mixed lists. |
 
+| 6 | `tools/protoc-gen-minyar/generator.min` quoted every string it emitted as a literal but wrote file and type names into the `// source:` header and `///` comments as they arrived. | A hand-made `CodeGeneratorRequest`, or a `.proto` file whose own name contains a line break (protoc itself only passes identifier characters in type names). | Code injection into the generated module, low: a message named `A\nfail("injected")\n` produced a generated file with `fail("injected")` on a line of its own. | `generate` refuses a request in which a file, package, type, field, oneof, enum value, service or method name contains a control character. `tests/protoc-gen-minyar-test.min` feeds the plugin that request. |
+
 Findings 1 to 3 are the same class: work that grows faster than the input that
 causes it. None is memory corruption, and none lets a peer read or change data.
 
@@ -89,17 +91,7 @@ maintainer can decide.
    in the build's state directory or by `MINYAR_LIVE_STATE`. It is a
    development feature with the trust of the user who runs the program; a
    production build should not include it.
-6. **`protoc-gen-minyar` writes descriptor names into comments unescaped.**
-   `tools/protoc-gen-minyar/generator.min` quotes every string it emits as a
-   literal, but the file name in the `// source:` header and the full names in
-   `///` comments are written as they arrive. protoc only produces identifier
-   characters in type names, so this needs a hand-made `CodeGeneratorRequest`
-   or a `.proto` file whose own name contains a line break; the text after the
-   break would then be compiled as code. It was read, not reproduced. Proposed
-   fix: refuse a request whose file, package, type, field, oneof, service or
-   method name contains a control character, in `generate`, with a test that
-   feeds the plugin such a request.
-7. **Unmerged branches.** WebSocket (`goal/websocket`) and the PostgreSQL client
+6. **Unmerged branches.** WebSocket (`goal/websocket`) and the PostgreSQL client
    (`goal/postgres`) are not in `v2` and were read but not tested here, apart from
    the one reproduction noted. For the branch owners: WebSocket pong replies are queued
    without regard to `maxPendingBytes`, so a peer that sends pings and reads
