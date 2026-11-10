@@ -10,6 +10,8 @@ not here; git history keeps everything removed from this folder.
 
 - [2026-10-19-security](2026-10-19-security/): the security audit, the review
   plan and its results. Current practice is in `docs/security-review.md`.
+- [2026-11-10-security](2026-11-10-security/): the follow-up security audit of
+  the network and RPC libraries and the protocol fuzzer it added.
 - [2026-10-20-perfcs](2026-10-20-perfcs/): runtime performance designs and
   matched measurements; the harness and raw data are in `experiments/perfcs/`.
 - [2026-10-30-goal-run](2026-10-30-goal-run/): the 2026-10-30 performance goal

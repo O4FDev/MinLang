@@ -1,0 +1,965 @@
+// Deterministic mutation fuzzing of the library's socket-free protocol
+// parsers and handshakes. Minyar stops the whole program on a failed bounds check, checked
+// overflow or `fail`, so a server must reach none of them from bytes a peer
+// chose: every case here feeds hostile input to a parser and the only
+// accepted outcomes are a recoverable error or a result. Each target also
+// checks the bounds it documents (queued output, retained streams).
+//
+//   protocol-fuzz [--seed N] [--iterations N] [--target NAME] [--only CASE] [--trace]
+//
+// The same seed gives the same cases on every platform. When a case stops the
+// program, run it again with --target and --trace to print the case number
+// before each case, then --only CASE to replay that case alone.
+// docs/security-review.md describes when this runs.
+use "httpserver" as http1
+use "http2" as h2
+use "grpc" as grpc
+use "connect" as connect
+use "connecth2" as connecth2
+use "rpc" as rpc
+use "protobuf" as protobuf
+use "protobuf-descriptor" as descriptor
+use "protobuf-struct" as structs
+use "json" as json
+use "resp2" as resp2
+use "yamux" as yamux
+use "peerwire" as peerwire
+use "pem" as pem
+use "quicwire" as quic
+use "tls" as tls
+use "tlsserver" as tlsserver
+use "errors" as errors
+use "process" as processInfo
+
+function require(value: Boolean, message: Text) { if !value { fail("protocol-fuzz: " + message) } }
+// How far input got: a fuzzer whose cases all die in the first length check
+// passes without testing anything, so the driver requires each count to grow.
+record Reach {
+    httpRequests: Integer; h2Requests: Integer; handlerCalls: Integer; connectAnswers: Integer
+    descriptors: Integer; documents: Integer; replies: Integer; certificates: Integer; wireFrames: Integer; yamuxBytes: Integer
+    serverHellos: Integer; clientHellos: Integer; quicFrames: Integer; quicParameters: Integer
+}
+global reach: Reach = Reach { httpRequests: 0; h2Requests: 0; handlerCalls: 0; connectAnswers: 0
+    descriptors: 0; documents: 0; replies: 0; certificates: 0; wireFrames: 0; yamuxBytes: 0
+    serverHellos: 0; clientHellos: 0; quicFrames: 0; quicParameters: 0 }
+
+// ---- A small reproducible generator (xorshift64) and the mutations
+
+record Random { state: Integer }
+function Random.next(): Integer {
+    let x = self.state
+    x = x ^ (x << 13)
+    x = x ^ ((x >> 7) & 0x01FFFFFFFFFFFFFF)
+    x = x ^ (x << 17)
+    self.state = x
+    return (x >> 1) & 0x7FFFFFFFFFFFFFFF
+}
+function Random.below(limit: Integer): Integer {
+    if limit <= 1 { return 0 }
+    return self.next() % limit
+}
+function Random.chance(oneIn: Integer): Boolean { return self.below(oneIn) == 0 }
+function seeded(seed: Integer, target: Integer, number: Integer): Random {
+    let random = Random { state: (seed ^ (target << 40) ^ (number << 8)) | 1 }
+    for warm in 0..4 { random.next() }
+    return random
+}
+function interesting(random: Random): Integer {
+    let values = [0, 1, 9, 10, 13, 32, 44, 48, 58, 59, 61, 127, 128, 129, 191, 192, 254, 255]
+    return values[random.below(values.length)]
+}
+function put32(out: Bytes, at: Integer, value: Integer) {
+    for index in 0..4 { if at + index < out.length { out[at + index] = (value >> ((3 - index) * 8)) & 255 } }
+}
+function mutate(random: Random, seed: Bytes, other: Bytes): Bytes {
+    let out = seed.slice(0, seed.length)
+    // Mostly one change: a parser's later checks are only reached by input
+    // that is still nearly valid.
+    let rounds = 1
+    if random.chance(3) { rounds = 2 + random.below(4) }
+    for round in 0..rounds {
+        if out.length == 0 { out.add(random.below(256)); continue }
+        let at = random.below(out.length)
+        let kind = random.below(11)
+        if kind == 0 { out[at] = out[at] ^ (1 << random.below(8)) }
+        else if kind == 1 { out[at] = interesting(random) }
+        else if kind == 2 { out[at] = random.below(256) }
+        else if kind == 3 { out = out.slice(0, at) }
+        else if kind == 4 {
+            let grown = out.slice(0, at)
+            for extra in 0..1 + random.below(8) { grown.add(random.below(256)) }
+            grown.addBytes(out.slice(at, out.length))
+            out = grown
+        } else if kind == 5 {
+            let end = min(out.length, at + 1 + random.below(32))
+            let grown = out.slice(0, end)
+            let copies = 1 + random.below(3)
+            for copy in 0..copies { grown.addBytes(out.slice(at, end)) }
+            grown.addBytes(out.slice(end, out.length))
+            out = grown
+        } else if kind == 6 {
+            let end = min(out.length, at + 1 + random.below(16))
+            let shrunk = out.slice(0, at)
+            shrunk.addBytes(out.slice(end, out.length))
+            out = shrunk
+        } else if kind == 7 {
+            let values = [0, 1, 127, 128, 255, 256, 16383, 16384, 16385, 65535, 65536, 16777215, 2147483647, 2147483648, 4294967295]
+            put32(out, at, values[random.below(values.length)])
+        } else if kind == 8 {
+            let spliced = out.slice(0, at)
+            if other.length > 0 { spliced.addBytes(other.slice(random.below(other.length), other.length)) }
+            out = spliced
+        } else if kind == 9 { out[at] = (out[at] + 1) & 255 }
+        else { out[at] = (out[at] + 255) & 255 }
+    }
+    return out
+}
+// Seeds are chosen and mutated; one case in five is the seed itself.
+function pick(random: Random, seeds: List<Bytes>): Bytes {
+    let seed = seeds[random.below(seeds.length)]
+    if random.chance(5) { return seed.slice(0, seed.length) }
+    return mutate(random, seed, seeds[random.below(seeds.length)])
+}
+function noise(random: Random, limit: Integer): Bytes {
+    let out = Bytes()
+    for index in 0..random.below(limit) { out.add(random.below(256)) }
+    return out
+}
+
+// ---- HTTP/1.1 server session
+
+function httpSeeds(): List<Bytes> {
+    return [
+        Bytes("GET / HTTP/1.1\r\nHost: a\r\n\r\n"),
+        Bytes("POST /p?q=1 HTTP/1.1\r\nHost: a:80\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhelloGET /2 HTTP/1.1\r\nHost: a\r\n\r\n"),
+        Bytes("POST /c HTTP/1.1\r\nHost: [::1]:8080\r\nTransfer-Encoding: chunked\r\n\r\n5;x=y\r\nhello\r\n3\r\nabc\r\n0\r\nTrailer: v\r\n\r\n"),
+        Bytes("HEAD /h HTTP/1.1\r\nHost: a\r\nConnection: close, x\r\n\r\n"),
+        Bytes("OPTIONS * HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nUpgrade: h2c\r\n\r\n"),
+        Bytes("PUT /b HTTP/1.1\r\nHost: 1.2.3.4\r\nContent-Length: 0\r\nX: \t v \t\r\n\r\nPOST /c HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFF\r\n")
+    ]
+}
+function httpCase(random: Random, seeds: List<Bytes>) {
+    let limits = http1.defaults()
+    if random.chance(2) {
+        limits.maxHeaderBytes = 256 + random.below(512); limits.maxBodyBytes = random.below(64); limits.maxHeaders = 1 + random.below(8)
+        limits.maxRequestsPerConnection = 1 + random.below(3); limits.streamBufferBytes = 1024
+    }
+    let session = http1.session(limits, 0)
+    let input = pick(random, seeds)
+    let now = 0
+    let at = 0
+    let idle = 0
+    let taken = 0
+    while !session.closed() && idle < 4 {
+        let size = min(input.length - at, 1 + random.below(96))
+        let batch = session.receive(input.slice(at, at + size), now)
+        let accepted = http1.accepted(batch)
+        require(accepted >= 0 && accepted <= size, "HTTP/1.1 session accepted more than it was offered")
+        at += accepted
+        if at == input.length && random.chance(3) { batch = session.finishInput(now) }
+        let work = accepted
+        for request in http1.requests(batch) {
+            work += 1
+            reach.httpRequests += 1
+            let choice = random.below(6)
+            let body = noise(random, 300)
+            if choice == 0 { session.abandon(request) }
+            else if choice == 1 {
+                if session.stream(request, http1.response(200, "text/plain", body)) {
+                    session.send(request, noise(random, 2000))
+                    if random.chance(2) { session.finishStream(request) }
+                }
+            } else if choice == 2 {
+                session.respond(request, http1.Response { status: 100 + random.below(600)
+                    headers: [http1.Header { name: "x-a\r\n"; value: "b" }, http1.Header { name: "x"; value: "a\nb" }]; body: body })
+                session.respond(request, http1.response(204, "text/plain", Bytes()))
+            } else { session.respond(request, http1.response(200 + random.below(5), "text/plain", body)) }
+        }
+        if random.chance(2) || work == 0 {
+            let out = session.takeOutgoing(1 + random.below(4096))
+            taken += out.length
+            work += out.length
+            require(session.pendingOutput() <= 16777216 + 65536, "HTTP/1.1 session queued more than its response limit")
+        }
+        if random.chance(6) { now += random.below(40000) }
+        session.tick(now)
+        if work == 0 { idle += 1 } else { idle = 0 }
+    }
+}
+
+// ---- HTTP/2, gRPC and Connect over HTTP/2
+
+function frame(kind: Integer, flags: Integer, id: Integer, body: Bytes): Bytes {
+    let out = Bytes()
+    out.add((body.length >> 16) & 255); out.add((body.length >> 8) & 255); out.add(body.length & 255)
+    out.add(kind); out.add(flags)
+    for index in 0..4 { out.add((id >> ((3 - index) * 8)) & 255) }
+    out.addBytes(body)
+    return out
+}
+// HPACK literal fields without indexing and with new names (RFC 7541 6.2.2).
+function block(fields: List<Text>): Bytes {
+    let out = Bytes()
+    for index in 0..fields.length / 2 {
+        let name = Bytes(fields[index * 2])
+        let value = Bytes(fields[index * 2 + 1])
+        out.add(0); out.add(name.length); out.addBytes(name); out.add(value.length); out.addBytes(value)
+    }
+    return out
+}
+function numbers(values: List<Integer>): Bytes {
+    let out = Bytes()
+    for value in values { out.add(value) }
+    return out
+}
+function envelope(flags: Integer, data: Bytes): Bytes {
+    let out = Bytes()
+    out.add(flags); out.add(0); out.add(0); out.add((data.length >> 8) & 255); out.add(data.length & 255)
+    out.addBytes(data)
+    return out
+}
+// Request header blocks for the services below, and bodies to go with them.
+function h2Blocks(): List<Bytes> {
+    return [
+        block([":method", "GET", ":scheme", "http", ":path", "/t.v1.S/Say?encoding=json&message=%7B%7D&connect=v1", ":authority", "a"]),
+        block([":method", "POST", ":scheme", "http", ":path", "/t.v1.S/Say", ":authority", "a", "content-type", "application/grpc", "te", "trailers", "grpc-timeout", "5S"]),
+        block([":method", "POST", ":scheme", "https", ":path", "/t.v1.S/Say", "content-type", "application/json", "connect-timeout-ms", "50", "idempotency-key", "k"]),
+        block([":method", "POST", ":scheme", "http", ":path", "/t.v1.S/Echo", "content-type", "application/connect+json", "connect-content-encoding", "flip"]),
+        block([":method", "POST", ":scheme", "http", ":path", "/t.v1.S/Count", "content-type", "application/connect+proto"]),
+        block([":method", "POST", ":scheme", "http", ":path", "/t.v1.S/Many", "content-type", "application/grpc+proto", "grpc-encoding", "identity"]),
+        block([":method", "POST", ":scheme", "http", ":path", "/t.v1.S/Many", "content-type", "application/connect+proto", "content-length", "7"]),
+        block([":method", "POST", ":scheme", "http", ":path", "/t.v1.S/Later", "content-type", "application/grpc+json", "grpc-timeout", "1n"]),
+        block([":method", "POST", ":scheme", "http", ":path", "/t.v1.S/Later", "content-type", "application/proto", "content-encoding", "flip"]),
+        numbers([130, 134, 132, 65, 140, 241, 227, 194, 229, 242, 58, 107, 160, 171, 144, 244, 255]),
+        numbers([63, 225, 31, 130, 134, 132, 64, 1, 120, 1, 121, 190, 190])
+    ]
+}
+function h2Bodies(): List<Bytes> {
+    let several = envelope(0, Bytes("{}"))
+    several.addBytes(envelope(1, Bytes("}{")))
+    several.addBytes(envelope(0, Bytes()))
+    several.addBytes(envelope(0, Bytes("x")))
+    return [envelope(0, Bytes("{}")), envelope(0, Bytes("abc")), several, Bytes("{}"), Bytes("{\"a\":1}"), envelope(1, Bytes("}{")),
+        numbers([0, 0, 64, 0, 1]), numbers([0, 255, 255, 255, 255, 1, 2]), Bytes()]
+}
+// Control and extension frames that are legal at any point, and frames that
+// are not: the second list ends a connection, so it is used sparingly.
+function h2Controls(): List<Bytes> {
+    return [frame(4, 0, 0, numbers([0, 4, 0, 0, 255, 255, 0, 5, 0, 0, 64, 0, 0, 1, 0, 0, 16, 0])), frame(4, 0, 0, numbers([0, 4, 0, 0, 0, 0])),
+        frame(4, 0, 0, numbers([0, 4, 0, 1, 0, 0])), frame(6, 0, 0, numbers([1, 2, 3, 4, 5, 6, 7, 8])), frame(6, 1, 0, numbers([1, 2, 3, 4, 5, 6, 7, 8])),
+        frame(8, 0, 0, numbers([0, 0, 255, 255])), frame(8, 0, 0, numbers([0, 0, 0, 1])), frame(2, 0, 3, numbers([0, 0, 0, 1, 16])),
+        frame(10, 0, 0, Bytes("ext")), frame(7, 0, 0, numbers([0, 0, 0, 0, 0, 0, 0, 0]))]
+}
+function h2Hostile(): List<Bytes> {
+    return [frame(4, 1, 0, Bytes()), frame(4, 1, 0, Bytes()), frame(5, 4, 1, numbers([0, 0, 0, 2])), frame(8, 0, 0, numbers([127, 255, 255, 255])),
+        frame(8, 0, 0, numbers([0, 0, 0, 0])), frame(0, 0, 0, Bytes("x")), frame(1, 4, 2, Bytes()), frame(9, 4, 1, Bytes()), frame(2, 0, 0, numbers([0, 0, 0, 0, 1])),
+        frame(3, 0, 99, numbers([0, 0, 0, 8])), frame(0, 8, 1, numbers([9, 1])), frame(4, 0, 0, numbers([0, 5, 0, 0, 0, 1])), frame(4, 0, 0, numbers([0, 2, 0, 0, 0, 2]))]
+}
+record H2Seeds { blocks: List<Bytes>; bodies: List<Bytes>; controls: List<Bytes>; hostile: List<Bytes> }
+function h2Frames(): H2Seeds { return H2Seeds { blocks: h2Blocks(); bodies: h2Bodies(); controls: h2Controls(); hostile: h2Hostile() } }
+// A connection as a client would hold it: streams opened in order, each with
+// its DATA, trailers, credit or reset, and control frames between them. Then
+// some frames are damaged or misplaced.
+function h2Input(random: Random, seeds: H2Seeds): Bytes {
+    let pieces: List<Bytes> = []
+    let streams = 1 + random.below(5)
+    for stream in 0..streams {
+        let id = stream * 2 + 1
+        let fields = seeds.blocks[random.below(seeds.blocks.length)]
+        let bodies = random.below(4)
+        let ends = 0
+        if bodies == 0 && random.chance(2) { ends = 1 }
+        if random.chance(5) && fields.length > 2 {
+            let cut = 1 + random.below(fields.length - 1)
+            pieces.add(frame(1, ends, id, fields.slice(0, cut)))
+            if random.chance(3) { pieces.add(frame(9, 0, id, Bytes())) }
+            pieces.add(frame(9, 4, id, fields.slice(cut, fields.length)))
+        } else if random.chance(6) {
+            let padded = numbers([3, 128, 0, 0, 0, 200])
+            padded.addBytes(fields)
+            padded.addBytes(Bytes(3))
+            pieces.add(frame(1, 44 + ends, id, padded))
+        } else { pieces.add(frame(1, 4 + ends, id, fields)) }
+        for index in 0..bodies {
+            let body = seeds.bodies[random.below(seeds.bodies.length)]
+            let last = 0
+            if index + 1 == bodies && random.chance(2) { last = 1 }
+            if random.chance(6) {
+                let padded = numbers([2])
+                padded.addBytes(body)
+                padded.addBytes(Bytes(2))
+                pieces.add(frame(0, 8 + last, id, padded))
+            } else { pieces.add(frame(0, last, id, body)) }
+            if random.chance(3) { pieces.add(seeds.controls[random.below(seeds.controls.length)]) }
+        }
+        let after = random.below(8)
+        if after == 0 { pieces.add(frame(1, 5, id, block(["x-end", "1"]))) }
+        else if after == 1 { pieces.add(frame(3, 0, id, numbers([0, 0, 0, 8]))) }
+        else if after == 2 { pieces.add(frame(8, 0, id, numbers([0, 0, random.below(256), 1]))) }
+        else if after == 3 { pieces.add(frame(0, 1, id, Bytes())) }
+        if random.chance(3) { pieces.add(seeds.controls[random.below(seeds.controls.length)]) }
+    }
+    let input = Bytes("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+    input.addBytes(frame(4, 0, 0, Bytes()))
+    if random.chance(20) { input = mutate(random, input, pieces[0]) }
+    let damage = random.below(4)
+    for index in 0..pieces.length {
+        let piece = pieces[index]
+        if damage == 1 && random.chance(pieces.length) { piece = mutate(random, piece, pieces[random.below(pieces.length)]) }
+        if damage == 2 && random.chance(4) { piece = mutate(random, piece, pieces[random.below(pieces.length)]) }
+        if damage == 3 && random.chance(pieces.length) { input.addBytes(seeds.hostile[random.below(seeds.hostile.length)]) }
+        if damage == 3 && random.chance(pieces.length * 2) { piece = pieces[random.below(pieces.length)] }
+        input.addBytes(piece)
+    }
+    return input
+}
+function h2Fields(random: Random): List<h2.Header> {
+    let choice = random.below(6)
+    if choice == 0 { return [h2.Header { name: ":status"; value: "200" }, h2.Header { name: "x"; value: "y" }] }
+    if choice == 1 { return [h2.Header { name: ":status"; value: "99" }] }
+    if choice == 2 { return [h2.Header { name: "X"; value: "y" }, h2.Header { name: ":status"; value: "200" }] }
+    if choice == 3 { return [h2.Header { name: ":status"; value: "204" }, h2.Header { name: "connection"; value: "close" }] }
+    if choice == 4 { return [] }
+    return [h2.Header { name: ":status"; value: "500" }, h2.Header { name: "a"; value: "b\r\nc" }]
+}
+function h2Case(random: Random, frames: H2Seeds) {
+    let server = h2.create()
+    let input = h2Input(random, frames)
+    let open: List<Integer> = []
+    let at = 0
+    let now = 0
+    h2.tick(server, now)
+    while at < input.length {
+        let size = min(input.length - at, 1 + random.below(200))
+        h2.receive(server, input.slice(at, at + size))
+        at += size
+        let request = h2.requests(server)
+        while h2.requestOk(request) {
+            open.add(h2.streamID(request))
+            reach.h2Requests += 1
+            h2.headers(request)
+            h2.endStream(request)
+            request = h2.requests(server)
+        }
+        for id in open {
+            let choice = random.below(10)
+            if choice == 0 { h2.respond(server, id, h2Fields(random), random.chance(3)) }
+            else if choice == 1 { h2.write(server, id, noise(random, 70000)) }
+            else if choice == 2 { h2.closeStream(server, id, h2Fields(random)) }
+            else if choice == 3 { h2.resetStream(server, id, random.below(14)) }
+            else if choice == 4 { h2.release(server, id) }
+            else if choice == 5 { h2.discardPendingData(server, id) }
+            else if choice == 6 { h2.read(server, id, 1 + random.below(70000)) }
+        }
+        if random.chance(2) { h2.takeOutgoing(server, 1 + random.below(40000)) }
+        if random.chance(8) { now += random.below(12000); h2.tick(server, now) }
+        require(h2.bufferedOutput(server) <= 1048576 && h2.bufferedInput(server) <= 1048576, "HTTP/2 buffers exceed their limit")
+        require(h2.retainedStreams(server) <= 64 && h2.dynamicTableBytes(server) <= 4096, "HTTP/2 retained state exceeds its limit")
+    }
+    if random.chance(2) { h2.finish(server) }
+}
+
+function clock(): Integer { return 0 }
+function flipped(data: Bytes): Bytes {
+    let out = Bytes()
+    for index in 0..data.length { out.add(data[data.length - 1 - index]) }
+    return out
+}
+record Held { responders: List<rpc.Responder> }
+function services(held: Held): rpc.Services {
+    let services = rpc.services()
+    services.addUnary("/t.v1.S/Say", rpc.NO_SIDE_EFFECTS, function(call: rpc.Call, data: Bytes): Result<Bytes, rpc.Error> {
+        reach.handlerCalls += 1
+        if data.length % 5 == 4 { return Err(rpc.failure(rpc.NOT_FOUND, "no \tsuch\n" + Text(data.length)).withDetail("t.v1.Why", data)) }
+        call.responseHeaders.add(rpc.Header { name: "x-size"; value: Text(data.length) })
+        call.responseTrailers.add(rpc.Header { name: "x-after"; value: "yes" })
+        return Ok(data)
+    })
+    services.addDeferred("/t.v1.S/Later", rpc.IDEMPOTENT, function(call: rpc.Call, data: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        reach.handlerCalls += 1
+        responder.hold()
+        held.responders.add(responder)
+        return Ok()
+    })
+    services.addServerStream("/t.v1.S/Many", function(call: rpc.Call, data: Bytes, responder: rpc.Responder): Result<Nothing, rpc.Error> {
+        reach.handlerCalls += 1
+        for index in 0..data.length % 4 { responder.send(data) }
+        if data.length % 3 == 0 { responder.hold(); held.responders.add(responder) }
+        return Ok()
+    })
+    services.addClientStream("/t.v1.S/Count", function(call: rpc.Call, responder: rpc.Responder): Result<rpc.Receiver, rpc.Error> {
+        let total: List<Integer> = [0]
+        return Ok(rpc.Receiver {
+            message: function(data: Bytes): Result<Nothing, rpc.Error> {
+                total[0] += 1
+                reach.handlerCalls += 1
+                if data.length == 3 { return Err(rpc.failure(rpc.INVALID_ARGUMENT, "three")) }
+                return Ok()
+            }
+            end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> {
+                responder.send(Bytes(Text(total[0])))
+                return Ok()
+            }
+        })
+    })
+    services.addBidiStream("/t.v1.S/Echo", function(call: rpc.Call, responder: rpc.Responder): Result<rpc.Receiver, rpc.Error> {
+        return Ok(rpc.Receiver {
+            message: function(data: Bytes): Result<Nothing, rpc.Error> {
+                reach.handlerCalls += 1
+                responder.send(data)
+                if data.length == 1 { responder.finish(Some(rpc.failure(rpc.ABORTED, "stop"))) }
+                return Ok()
+            }
+            end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> { return Ok() }
+        })
+    })
+    return services
+}
+function settle(random: Random, held: Held) {
+    for responder in held.responders {
+        if random.chance(2) { responder.send(Bytes("late")) }
+        if random.chance(2) { responder.finish(None) }
+    }
+}
+function connectOptions(random: Random): connect.Options {
+    let options = connect.defaults(clock)
+    options.compressors.add(connect.Compressor { name: "flip"
+        compress: function(data: Bytes): Result<Bytes, errors.Error> { return Ok(flipped(data)) }
+        decompress: function(data: Bytes, limit: Integer): Result<Bytes, errors.Error> {
+            if data.length > limit { return Err(errors.make(errors.overflowCode(), 0, "too long")) }
+            if data.length % 7 == 6 { return Err(errors.make(errors.invalidDataCode(), 0, "bad")) }
+            return Ok(flipped(data))
+        } })
+    options.compressMinBytes = random.below(8)
+    if random.chance(3) { options.maxRequestBytes = random.below(40); options.maxStreamBufferBytes = 1 + random.below(64) }
+    if random.chance(3) { options.requireProtocolVersion = true }
+    if random.chance(3) { options.cors.allowedOrigins.add("https://a.example") }
+    if random.chance(4) { options.idempotencyEntries = random.below(3) }
+    return options
+}
+function grpcCase(random: Random, frames: H2Seeds) {
+    let held = Held { responders: [] }
+    let limits = grpc.defaults()
+    if random.chance(3) { limits.maxMessageBytes = 1024; limits.streamBufferBytes = 1024 }
+    let connection = grpc.connection(services(held), limits, 0)
+    let input = h2Input(random, frames)
+    let at = 0
+    let now = 0
+    while at < input.length {
+        let size = min(input.length - at, 1 + random.below(300))
+        grpc.receive(connection, input.slice(at, at + size), now)
+        at += size
+        if random.chance(4) { settle(random, held) }
+        if random.chance(2) { grpc.takeOutgoing(connection, 1 + random.below(40000)) }
+        if random.chance(6) { now += random.below(9000); grpc.tick(connection, now) }
+        require(grpc.bufferedOutput(connection) <= 1048576 && grpc.retainedCalls(connection) <= 64, "gRPC connection state exceeds its limit")
+    }
+    settle(random, held)
+    grpc.finish(connection, now)
+    grpc.takeOutgoing(connection, 1048576)
+}
+function connectH2Case(random: Random, frames: H2Seeds) {
+    let held = Held { responders: [] }
+    let connection = connecth2.connection(connect.server(services(held), connectOptions(random)), 0)
+    let input = h2Input(random, frames)
+    let at = 0
+    let now = 0
+    while at < input.length {
+        let size = min(input.length - at, 1 + random.below(300))
+        connecth2.receive(connection, input.slice(at, at + size), now)
+        at += size
+        if random.chance(4) { settle(random, held) }
+        if random.chance(2) { connecth2.takeOutgoing(connection, 1 + random.below(40000)) }
+        if random.chance(6) { now += random.below(9000); connecth2.tick(connection, now) }
+        require(connecth2.bufferedOutput(connection) <= 1048576 && connecth2.activeCalls(connection) <= 64, "Connect HTTP/2 state exceeds its limit")
+    }
+    settle(random, held)
+    connecth2.finish(connection, now)
+    connecth2.takeOutgoing(connection, 1048576)
+    connecth2.closed(connection)
+}
+
+// ---- Connect requests as an HTTP server hands them over
+
+function text(random: Random, seeds: List<Text>): Text {
+    let chosen = Bytes(seeds[random.below(seeds.length)])
+    if random.chance(3) { chosen = mutate(random, chosen, Bytes(seeds[random.below(seeds.length)])) }
+    // Header values and targets reach Connect as Text, so only as valid UTF-8.
+    let safe = Bytes()
+    for byte in chosen { if byte < 128 { safe.add(byte) } else { safe.add(63) } }
+    return match textOf(safe) {
+        Some(value) { value }
+        None { "" }
+    }
+}
+function textOf(data: Bytes): Maybe<Text> {
+    let reader = protobuf.reader(envelopeOf(data))
+    reader.readTag()
+    let value = reader.readText()
+    if reader.failed() { return None }
+    return Some(value)
+}
+// One protobuf string field, so that readText does the UTF-8 conversion.
+function envelopeOf(data: Bytes): Bytes {
+    let out = Bytes()
+    protobuf.writeTag(out, 1, protobuf.LENGTH_DELIMITED)
+    protobuf.writeDelimited(out, data)
+    return out
+}
+function connectCase(random: Random) {
+    let held = Held { responders: [] }
+    let server = connect.server(services(held), connectOptions(random))
+    let targets = ["/t.v1.S/Say", "/t.v1.S/Later", "/t.v1.S/Many", "/t.v1.S/Count", "/t.v1.S/Echo", "/t.v1.S/Missing",
+        "/t.v1.S/Say?encoding=json&message=%7B%22a%22%3A1%7D&connect=v1", "/t.v1.S/Say?encoding=proto&base64=1&message=CgA&compression=flip",
+        "/t.v1.S/Say?message=%&encoding=%zz&&=&a", "*", ""]
+    let methods = ["POST", "GET", "post", "OPTIONS", "PUT", ""]
+    let names = ["content-type", "content-encoding", "connect-content-encoding", "connect-accept-encoding", "accept-encoding", "connect-protocol-version",
+        "connect-timeout-ms", "idempotency-key", "authorization", "origin", "access-control-request-method", "access-control-request-headers", "X-Mixed"]
+    let values = ["application/json", "application/proto", "application/connect+json", "application/connect+proto", "application/json; charset=utf-8",
+        "application/json;charset=\"utf-8\";;x", "application/grpc", "flip", "identity", "gzip, flip", "1", "2", "0", "99999999999", "5", "k1", "k2",
+        "Bearer a", "https://a.example", "null", "POST", "", " \t "]
+    let bodies = [Bytes("{}"), Bytes("{\"a\":[1,2,{\"b\":null}]}"), envelope(0, Bytes("{}")), envelope(1, Bytes("}{")), envelope(2, Bytes("{}")), envelope(128, Bytes("x")),
+        numbers([0, 255, 255, 255, 255, 1]), numbers([0, 0, 0, 0]), Bytes()]
+    for round in 0..1 + random.below(4) {
+        let headers: List<rpc.Header> = []
+        let body = pick(random, bodies)
+        let request = connect.Request { method: "POST"; target: targets[random.below(5)]; headers: headers; body: body }
+        // Half the requests start as a well-formed call of the method's kind.
+        if random.chance(2) {
+            let streaming = request.target != "/t.v1.S/Say" && request.target != "/t.v1.S/Later"
+            let codec = "json"
+            if random.chance(2) { codec = "proto" }
+            let type = "application/" + codec
+            if streaming { type = "application/connect+" + codec }
+            headers.add(rpc.Header { name: "Content-Type"; value: type })
+            if streaming {
+                request.body = envelope(0, body)
+                if request.target != "/t.v1.S/Many" { for index in 0..random.below(5) { request.body.addBytes(envelope(random.below(2), pick(random, bodies))) } }
+                if random.chance(2) { headers.add(rpc.Header { name: "connect-content-encoding"; value: "flip" }) }
+            } else if random.chance(3) { headers.add(rpc.Header { name: "content-encoding"; value: "flip" }) }
+            if random.chance(3) { headers.add(rpc.Header { name: "idempotency-key"; value: "k" + Text(random.below(3)) }) }
+            if random.chance(3) { headers.add(rpc.Header { name: "connect-accept-encoding"; value: "flip" }) }
+            if random.chance(3) { headers.add(rpc.Header { name: "accept-encoding"; value: "gzip, flip" }) }
+            if random.chance(4) { headers.add(rpc.Header { name: "connect-protocol-version"; value: "1" }) }
+            if random.chance(4) { headers.add(rpc.Header { name: "origin"; value: "https://a.example" }) }
+            if random.chance(8) { request.body = mutate(random, request.body, body) }
+        } else {
+            for index in 0..random.below(6) { headers.add(rpc.Header { name: text(random, names); value: text(random, values) }) }
+            if random.chance(4) { for index in 0..random.below(6) { body.addBytes(pick(random, bodies)) } }
+            request = connect.Request { method: text(random, methods); target: text(random, targets); headers: headers; body: body }
+        }
+        if random.chance(2) {
+            let response = server.handle(request)
+            require(response.status >= 100 && response.status <= 599, "Connect answered with an impossible status")
+            if response.status == 200 { reach.connectAnswers += 1 }
+        } else {
+            let exchange = server.begin(connect.Request { method: request.method; target: request.target; headers: headers; body: Bytes() })
+            let at = 0
+            while at < body.length {
+                let size = min(body.length - at, 1 + random.below(9))
+                exchange.receive(body.slice(at, at + size))
+                at += size
+                if random.chance(4) { exchange.step() }
+            }
+            if random.chance(8) { exchange.cancel() } else { exchange.closeInput() }
+            settle(random, held)
+            for turn in 0..40 {
+                if exchange.finished() { break }
+                match exchange.step() {
+                    Waiting { exchange.cancel() }
+                    Respond(response) {}
+                    Start(head) {}
+                    Write(piece) {}
+                    End(piece) {}
+                }
+            }
+        }
+    }
+}
+
+// ---- Protobuf wire format, generated readers and the JSON mapping
+
+function descriptorSeed(): Bytes {
+    // A FileDescriptorSet with a nested message, a field with options and an
+    // enum, written by hand so the seed does not depend on the code it tests.
+    let field = Bytes()
+    protobuf.writeTag(field, 1, protobuf.LENGTH_DELIMITED); protobuf.writeText(field, "id")
+    protobuf.writeTag(field, 3, protobuf.VARINT); protobuf.writeVarint(field, 1)
+    protobuf.writeTag(field, 4, protobuf.VARINT); protobuf.writeVarint(field, 1)
+    protobuf.writeTag(field, 5, protobuf.VARINT); protobuf.writeVarint(field, 3)
+    protobuf.writeTag(field, 10, protobuf.LENGTH_DELIMITED); protobuf.writeText(field, "id")
+    let nested = Bytes()
+    protobuf.writeTag(nested, 1, protobuf.LENGTH_DELIMITED); protobuf.writeText(nested, "Inner")
+    protobuf.writeTag(nested, 2, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(nested, field)
+    let message = Bytes()
+    protobuf.writeTag(message, 1, protobuf.LENGTH_DELIMITED); protobuf.writeText(message, "Outer")
+    protobuf.writeTag(message, 2, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(message, field)
+    protobuf.writeTag(message, 3, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(message, nested)
+    protobuf.writeTag(message, 9, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(message, numbers([8, 1, 16, 5]))
+    protobuf.writeTag(message, 99, protobuf.START_GROUP); protobuf.writeTag(message, 1, protobuf.VARINT); protobuf.writeVarint(message, -1)
+    protobuf.writeTag(message, 99, protobuf.END_GROUP)
+    let file = Bytes()
+    protobuf.writeTag(file, 1, protobuf.LENGTH_DELIMITED); protobuf.writeText(file, "a.proto")
+    protobuf.writeTag(file, 2, protobuf.LENGTH_DELIMITED); protobuf.writeText(file, "t.v1")
+    protobuf.writeTag(file, 4, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(file, message)
+    protobuf.writeTag(file, 10, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(file, numbers([0, 1, 127, 255, 255, 255, 255, 15]))
+    protobuf.writeTag(file, 12, protobuf.LENGTH_DELIMITED); protobuf.writeText(file, "proto3")
+    let set = Bytes()
+    protobuf.writeTag(set, 1, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(set, file)
+    protobuf.writeTag(set, 1, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(set, file)
+    return set
+}
+function nestedSeed(depth: Integer, group: Boolean): Bytes {
+    let out = Bytes()
+    if group {
+        for index in 0..depth { protobuf.writeTag(out, 5, protobuf.START_GROUP) }
+        for index in 0..depth { protobuf.writeTag(out, 5, protobuf.END_GROUP) }
+        return out
+    }
+    // google.protobuf.Value: list_value { values { list_value { ... } } }
+    for index in 0..depth {
+        let wrapped = Bytes()
+        protobuf.writeTag(wrapped, 1, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(wrapped, out)
+        out = Bytes()
+        protobuf.writeTag(out, 6, protobuf.LENGTH_DELIMITED); protobuf.writeDelimited(out, wrapped)
+    }
+    return out
+}
+function protobufSeeds(): List<Bytes> {
+    return [descriptorSeed(), nestedSeed(30, false), nestedSeed(120, false), nestedSeed(40, true), nestedSeed(130, true),
+        numbers([9, 0, 0, 0, 0, 0, 0, 240, 63, 18, 3, 97, 98, 99, 24, 255, 255, 255, 255, 255, 255, 255, 255, 255, 1, 32, 1]),
+        numbers([42, 9, 10, 7, 10, 1, 107, 18, 2, 32, 1, 50, 6, 10, 4, 26, 2, 104, 105])]
+}
+function walk(reader: protobuf.Reader, random: Random, depth: Integer) {
+    let unknown = Bytes()
+    while reader.more() {
+        let tag = reader.readTag()
+        if reader.failed() { return }
+        let wire = tag & 7
+        let choice = random.below(4)
+        if wire == protobuf.LENGTH_DELIMITED && choice == 0 && depth < 200 {
+            let outer = reader.enter()
+            walk(reader, random, depth + 1)
+            reader.leave(outer)
+        } else if wire == protobuf.START_GROUP && choice == 0 && depth < 200 {
+            let outer = reader.startGroup(tag)
+            walk(reader, random, depth + 1)
+            reader.endGroup(outer)
+        } else if wire == protobuf.LENGTH_DELIMITED && choice == 1 { reader.readText() }
+        else if wire == protobuf.VARINT && choice == 1 { reader.readSint32(); }
+        else if wire == protobuf.FIXED64 && choice == 1 { reader.readDouble() }
+        else if wire == protobuf.FIXED32 && choice == 1 { reader.readFloat() }
+        else if choice == 2 { reader.keep(tag, unknown) }
+        else { reader.skip(tag) }
+    }
+}
+function protobufCase(random: Random, seeds: List<Bytes>) {
+    let input = pick(random, seeds)
+    walk(protobuf.reader(input), random, 0)
+    match descriptor.decodeFileDescriptorSet(input) {
+        Ok(set) {
+            reach.descriptors += 1
+            // What was accepted is written and read back without loss.
+            let written = set.encode()
+            match descriptor.decodeFileDescriptorSet(written) {
+                Ok(again) { require(sameBytes(again.encode(), written), "FileDescriptorSet changed when written and read back") }
+                Err(problem) { fail("protocol-fuzz: an encoded FileDescriptorSet was rejected: " + problem.describe()) }
+            }
+        }
+        Err(problem) {}
+    }
+    let options = protobuf.jsonOptions(protobuf.registry())
+    match structs.decodeValue(input) {
+        Ok(value) {
+            match value.toJson(options) {
+                Ok(rendered) { match structs.decodeJsonValue(rendered, options) { Ok(again) {} Err(problem) {} } }
+                Err(problem) {}
+            }
+        }
+        Err(problem) {}
+    }
+}
+function sameBytes(left: Bytes, right: Bytes): Boolean {
+    if left.length != right.length { return false }
+    for index in 0..left.length { if left[index] != right[index] { return false } }
+    return true
+}
+function jsonSeeds(): List<Bytes> {
+    let deep = Bytes()
+    for index in 0..300 { deep.add(91) }
+    let wide = Bytes("[")
+    for index in 0..200 { wide.addBytes(Bytes("{\"k\":1e308,\"k\":-0.0},")) }
+    wide.addBytes(Bytes("null]"))
+    return [Bytes("{\"a\":[1,2.5e-3,-0,true,false,null,\"x\\u00e9\\ud83d\\ude00\\n\"],\"b\":{\"c\":{}}}"), Bytes("[1e400,-1E-400,0.1e+9999999999,123456789012345678901234567890]"),
+        Bytes("\"\\ud800\\u0000\\/\\b\""), Bytes(" \t\r\n[ ] "), deep, wide, Bytes("{\"struct\":{\"list\":[{\"n\":1.5},\"s\",null,[true]]}}")]
+}
+function jsonCase(random: Random, seeds: List<Bytes>) {
+    let input = pick(random, seeds)
+    let limit = input.length + 1
+    if random.chance(4) { limit = random.below(input.length + 2) }
+    match json.decodeBytes(input, limit) {
+        Ok(value) {
+            reach.documents += 1
+            let rendered = value.compact()
+            match json.decode(rendered) {
+                Ok(again) { require(again.compact() == rendered, "JSON changed when written and read back") }
+                Err(problem) { fail("protocol-fuzz: written JSON was rejected: " + problem.describe()) }
+            }
+            value.pretty("  ")
+        }
+        Err(problem) {}
+    }
+    match json.decodeUniqueBytesWithin(input, limit, 1 + random.below(64), 1 + random.below(16)) { Ok(value) {} Err(problem) {} }
+    match connect.parseErrorJson(input) { Some(error) { connect.errorJson(error) } None {} }
+    let options = protobuf.jsonOptions(protobuf.registry())
+    match textOf(input) {
+        Some(source) {
+            match structs.decodeJsonValue(source, options) { Ok(value) { value.encode() } Err(problem) {} }
+            match descriptor.decodeJsonFileDescriptorSet(source, options) { Ok(set) { set.encode() } Err(problem) {} }
+        }
+        None {}
+    }
+}
+
+// ---- Smaller framings: RESP2, yamux, the peer wire and PEM
+
+function framingSeeds(): List<Bytes> {
+    let yamuxOpen = numbers([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 3, 97, 98, 99, 0, 1, 0, 2, 0, 0, 0, 1, 0, 0, 1, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+    let wire = Bytes("HPW1")
+    wire.addBytes(numbers([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 123, 125]))
+    wire.addBytes(Bytes("HPW1"))
+    wire.addBytes(numbers([3, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 3, 97, 98, 99]))
+    return [Bytes("*3\r\n$3\r\nSET\r\n$1\r\nk\r\n:-12\r\n+OK\r\n-ERR x\r\n$-1\r\n*-1\r\n"), Bytes("*2\r\n*1\r\n*1\r\n$0\r\n\r\n:9223372036854775807\r\n"),
+        Bytes("$1048577\r\n"), Bytes(":99999999999999999999\r\n"), yamuxOpen, wire,
+        Bytes("x\n-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\r\nMAMC\r\nAQA=\r\n-----END CERTIFICATE-----\n")]
+}
+function framingCase(random: Random, seeds: List<Bytes>) {
+    let input = pick(random, seeds)
+    let at = 0
+    for turn in 0..64 {
+        let parsed = resp2.parseFrom(input, at)
+        if !resp2.ok(parsed) || resp2.incomplete(parsed) || resp2.consumed(parsed) == 0 { break }
+        require(resp2.consumed(parsed) <= input.length - at, "RESP consumed more than its input")
+        at += resp2.consumed(parsed)
+        reach.replies += 1
+    }
+    match pem.certificates(input) { Ok(found) { require(found.length > 0, "PEM returned no certificates"); reach.certificates += found.length } Err(problem) {} }
+    let session = yamux.create(random.chance(2))
+    let decoder = peerwire.create()
+    at = 0
+    while at < input.length {
+        let size = min(input.length - at, 1 + random.below(40))
+        let piece = input.slice(at, at + size)
+        at += size
+        yamux.receive(session, piece)
+        for id in 0..6 {
+            if random.chance(3) {
+                let read = yamux.read(session, id)
+                if errors.bytesOk(read) { reach.yamuxBytes += errors.bytesValue(read).length }
+            }
+        }
+        if random.chance(4) { yamux.write(session, random.below(6), noise(random, 64), random.chance(2)) }
+        if random.chance(4) { yamux.cancel(session, random.below(6)) }
+        if random.chance(3) { require(yamux.takeOutgoing(session).length <= 1048576, "yamux queued more than its limit") }
+        peerwire.feed(decoder, piece)
+        for turn in 0..8 {
+            let taken = peerwire.take(decoder)
+            if !peerwire.frameOk(taken) { break }
+            reach.wireFrames += 1
+            peerwire.parseOpen(taken); peerwire.parseStatus(taken); peerwire.parseHeartbeat(taken); peerwire.parseStart(taken)
+        }
+        require(peerwire.bufferedBytes(decoder) <= 1048576, "peer wire buffered more than its limit")
+    }
+    yamux.endInput(session)
+    peerwire.finish(decoder)
+    peerwire.take(decoder)
+}
+
+// ---- TLS 1.3 handshake messages, before either side is authenticated
+
+function fixedEntropy(): Bytes {
+    let out = Bytes()
+    for index in 0..64 { out.add((index * 37 + 11) & 255) }
+    return out
+}
+function tlsRecord(type: Integer, body: Bytes): Bytes {
+    let out = numbers([type, 3, 3, body.length >> 8, body.length & 255])
+    out.addBytes(body)
+    return out
+}
+record TlsSeeds { entropy: Bytes; clientHello: Bytes; serverFlights: List<Bytes> }
+// The client's own ClientHello, and a ServerHello that answers it. Neither
+// side holds a usable certificate, so every case ends at the first signature
+// or the first protected record: what runs is what an unauthenticated peer
+// can reach.
+function tlsSeeds(): TlsSeeds {
+    let entropy = fixedEntropy()
+    let client = tls.client("fuzz.example", entropy)
+    let hello = tls.takeOutgoing(client)
+    require(hello.length > 60 && hello[0] == 22 && hello[5] == 1, "the TLS client wrote no ClientHello")
+    let idLength = hello[43]
+    let body = numbers([3, 3])
+    for index in 0..32 { body.add(200 - index) }
+    body.add(idLength)
+    body.addBytes(hello.slice(44, 44 + idLength))
+    body.addBytes(numbers([0x13, 0x03, 0, 0, 46, 0, 43, 0, 2, 3, 4, 0, 51, 0, 36, 0, 0x1d, 0, 32]))
+    for index in 0..32 { body.add(index * 7 + 9) }
+    let message = numbers([2, 0, 0, body.length])
+    message.addBytes(body)
+    let flight = tlsRecord(22, message)
+    let longer = flight.slice(0, flight.length)
+    longer.addBytes(numbers([20, 3, 3, 0, 1, 1]))
+    longer.addBytes(tlsRecord(23, noiseOf(48)))
+    let retry = numbers([3, 3, 0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C])
+    retry.add(idLength)
+    retry.addBytes(hello.slice(44, 44 + idLength))
+    retry.addBytes(numbers([0x13, 0x01, 0, 0, 12, 0, 43, 0, 2, 3, 4, 0, 51, 0, 2, 0, 0x17]))
+    let retryMessage = numbers([2, 0, 0, retry.length])
+    retryMessage.addBytes(retry)
+    return TlsSeeds { entropy: entropy; clientHello: hello; serverFlights: [flight, longer, tlsRecord(22, retryMessage), tlsRecord(21, numbers([2, 40]))] }
+}
+function noiseOf(count: Integer): Bytes {
+    let out = Bytes()
+    for index in 0..count { out.add((index * 151 + 3) & 255) }
+    return out
+}
+function tlsCase(random: Random, seeds: TlsSeeds) {
+    let server = tlsserver.server(seeds.entropy, "http/1.1", [Bytes("not a certificate")], Bytes("not a key"), [], random.chance(4))
+    if random.chance(6) { tlsserver.setCipherSuites(server, [0x1303]) }
+    let input = seeds.clientHello.slice(0, seeds.clientHello.length)
+    if !random.chance(6) { input = mutate(random, input, seeds.serverFlights[random.below(seeds.serverFlights.length)]) }
+    if random.chance(4) { input.addBytes(pick(random, seeds.serverFlights)) }
+    let at = 0
+    while at < input.length {
+        let size = min(input.length - at, 1 + random.below(700))
+        tlsserver.receive(server, input.slice(at, at + size))
+        at += size
+        require(tlsserver.takeOutgoing(server).length <= 131072 && tlsserver.takeIncoming(server).length == 0, "an unauthenticated TLS client produced output or application data")
+    }
+    // The hello was read to the end when the only thing left to fail was the signature.
+    if server.error == "server certificate/private key has no supported matching signature" { reach.serverHellos += 1 }
+    require(server.state != tlsserver.ESTABLISHED, "a TLS server without an identity finished a handshake")
+    tlsserver.endInput(server)
+
+    let client = tls.client("fuzz.example", seeds.entropy)
+    tls.takeOutgoing(client)
+    let reply = pick(random, seeds.serverFlights)
+    at = 0
+    let advanced = false
+    while at < reply.length {
+        let size = min(reply.length - at, 1 + random.below(300))
+        tls.receive(client, reply.slice(at, at + size))
+        at += size
+        if client.state == tls.HANDSHAKE { advanced = true }
+        tls.takeOutgoing(client)
+        require(tls.takeIncoming(client).length == 0 && !tls.established(client), "an unauthenticated TLS server was trusted")
+    }
+    if advanced { reach.clientHellos += 1 }
+    tls.endInput(client)
+}
+
+// ---- QUIC packet payloads and transport parameters (RFC 9000)
+
+function quicSeeds(): List<Bytes> {
+    let frames = numbers([1, 0, 0, 0, 2, 20, 0, 1, 3, 1, 2, 6, 0, 4, 1, 2, 3, 4, 15, 4, 2, 3, 97, 98, 99, 16, 0x40, 200, 17, 4, 50, 18, 9, 20, 7, 21, 4, 9, 26, 1, 2, 3, 4, 5, 6, 7, 8])
+    let more = numbers([24, 1, 0, 4, 1, 2, 3, 4])
+    more.addBytes(noiseOf(16))
+    more.addBytes(numbers([25, 0, 7, 2, 1, 2, 3, 30, 0, 9, 1, 28, 1, 6, 2, 104, 105, 29, 0, 0, 30, 4, 1, 2, 3, 5, 1, 2, 11, 4, 120]))
+    let parameters = numbers([0, 4, 1, 2, 3, 4, 1, 1, 30, 3, 2, 0x45, 0xAC, 4, 4, 0x80, 1, 0, 0, 5, 1, 50, 6, 1, 50, 7, 1, 50, 8, 1, 9, 9, 1, 3, 10, 1, 3, 11, 1, 25, 12, 0, 14, 1, 2, 15, 4, 5, 6, 7, 8, 2, 16])
+    parameters.addBytes(noiseOf(16))
+    let initial = numbers([0xC3, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 4, 9, 9, 9, 9, 2, 7, 7, 0x40, 30])
+    initial.addBytes(noiseOf(30))
+    let short = numbers([0x43, 1, 2, 3, 4, 5, 6, 7, 8])
+    short.addBytes(noiseOf(24))
+    let unknown = numbers([0xC0, 0x1A, 0x2A, 0x3A, 0x4A, 4, 1, 2, 3, 4, 4, 5, 6, 7, 8])
+    unknown.addBytes(Bytes(1200))
+    return [frames, more, parameters, initial, short, unknown]
+}
+function quicCase(random: Random, seeds: List<Bytes>) {
+    let input = pick(random, seeds)
+    let parsed = quic.frames(input)
+    if parsed.valid {
+        for frame in parsed.frames {
+            require(frame.start <= frame.end && frame.end <= input.length, "a QUIC frame lies outside its packet")
+            quic.allowed(frame, random.below(6), random.chance(2))
+            reach.quicFrames += 1
+        }
+    }
+    let parameters = quic.parameters(input, random.chance(2))
+    if parameters.valid { reach.quicParameters += 1 }
+    let header = quic.header(input, random.below(4), random.below(22))
+    if header.valid { require(header.end <= input.length && header.numberOffset <= input.length, "a QUIC header ends outside its datagram") }
+    quic.varint(input, random.below(input.length + 3) - 1)
+    quic.destinationId(input, random.below(23) - 1)
+    let negotiated = quic.negotiateVersion(input)
+    if errors.bytesOk(negotiated) { require(errors.bytesValue(negotiated).length <= 64, "a version negotiation reply is larger than its request allows") }
+}
+
+// ---- Driver
+
+let seed = 20261110
+let iterations = 300
+let only = -1
+let trace = false
+let wanted = ""
+let argument = 0
+while argument < processInfo.argumentCount() {
+    let name = processInfo.argument(argument)
+    if name == "--trace" { trace = true; argument += 1; continue }
+    require(argument + 1 < processInfo.argumentCount(), "missing value for " + name)
+    let value = processInfo.argument(argument + 1)
+    if name == "--seed" { seed = Integer(value) }
+    else if name == "--iterations" { iterations = Integer(value) }
+    else if name == "--only" { only = Integer(value) }
+    else if name == "--target" { wanted = value }
+    else { fail("protocol-fuzz: unknown option " + name) }
+    argument += 2
+}
+let targets = ["http1", "http2", "grpc", "connect-http2", "connect", "protobuf", "json", "framing", "tls", "quic-wire"]
+let known = wanted == ""
+for name in targets { if name == wanted { known = true } }
+require(known, "unknown target " + wanted)
+let http = httpSeeds()
+let frames = h2Frames()
+let wire = protobufSeeds()
+let documents = jsonSeeds()
+let framings = framingSeeds()
+let handshakes = tlsSeeds()
+let packets = quicSeeds()
+for target in 0..targets.length {
+    if wanted != "" && wanted != targets[target] { continue }
+    for number in 0..iterations {
+        if only >= 0 && number != only { continue }
+        if trace { print(targets[target] + " case " + Text(number)) }
+        let random = seeded(seed, target, number)
+        if target == 0 { httpCase(random, http) }
+        else if target == 1 { h2Case(random, frames) }
+        else if target == 2 { grpcCase(random, frames) }
+        else if target == 3 { connectH2Case(random, frames) }
+        else if target == 4 { connectCase(random) }
+        else if target == 5 { protobufCase(random, wire) }
+        else if target == 6 { jsonCase(random, documents) }
+        else if target == 7 { framingCase(random, framings) }
+        else if target == 8 { tlsCase(random, handshakes) }
+        else { quicCase(random, packets) }
+    }
+}
+if only < 0 && iterations >= 100 {
+    let all = wanted == ""
+    require((!all && wanted != "http1") || reach.httpRequests > 0, "no HTTP/1.1 request reached the application")
+    require((!all && wanted != "http2") || reach.h2Requests > 0, "no HTTP/2 request reached the application")
+    require((!all && wanted != "grpc" && wanted != "connect-http2" && wanted != "connect") || reach.handlerCalls > 0, "no call reached an rpc handler")
+    require((!all && wanted != "connect") || reach.connectAnswers > 0, "Connect answered no call")
+    require((!all && wanted != "protobuf") || reach.descriptors > 0, "no FileDescriptorSet was accepted")
+    require((!all && wanted != "json") || reach.documents > 0, "no JSON document was accepted")
+    require((!all && wanted != "framing") || (reach.replies > 0 && reach.certificates > 0 && reach.wireFrames > 0 && reach.yamuxBytes > 0), "a framing parser accepted nothing")
+    require((!all && wanted != "tls") || (reach.serverHellos > 0 && reach.clientHellos > 0), "no TLS hello was read to its end")
+    require((!all && wanted != "quic-wire") || (reach.quicFrames > 0 && reach.quicParameters > 0), "no QUIC frame or transport parameter was accepted")
+}
+if trace {
+    print("reach: http requests " + Text(reach.httpRequests) + ", h2 requests " + Text(reach.h2Requests) + ", handler calls " + Text(reach.handlerCalls) +
+        ", connect answers " + Text(reach.connectAnswers) + ", descriptors " + Text(reach.descriptors) + ", documents " + Text(reach.documents) +
+        ", replies " + Text(reach.replies) + ", certificates " + Text(reach.certificates) + ", wire frames " + Text(reach.wireFrames) + ", yamux bytes " + Text(reach.yamuxBytes) +
+        ", tls server hellos " + Text(reach.serverHellos) + ", tls client hellos " + Text(reach.clientHellos) + ", quic frames " + Text(reach.quicFrames) + ", quic parameters " + Text(reach.quicParameters))
+}
+print("protocol-fuzz: ok")
