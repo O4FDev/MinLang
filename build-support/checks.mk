@@ -229,7 +229,7 @@ check-budget-functional: build/tooling/tests/self-compile-budget
 	./build/tooling/tests/self-compile-budget --functional
 
 check check-portable: check-budget-functional
-ifeq ($(shell uname -s),Darwin)
+ifeq ($(MINYAR_HOST_SYSTEM),Darwin)
 check: check-budget
 endif
 

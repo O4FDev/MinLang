@@ -19,7 +19,7 @@ check-toolchain-install: build/tooling/tools/registry-cli
 check-project-diagnostics: build/tooling/tools/project-cli
 	python3 "tests/project-diagnostics.py" "$(CURDIR)/build/tooling/tools/project-cli"
 
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-package-git check-registry check-toolchain-install check-project-diagnostics
 endif
 

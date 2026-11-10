@@ -36,7 +36,7 @@ check-collections-integration-sanitize: build/minyarc-sanitize build/minyarc-cal
 check check-portable: check-collections-integration
 check-sanitize: check-collections-integration-sanitize
 
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 .PHONY: check-feature-declarations-incremental check-feature-declarations-incremental-sanitize
 check-feature-declarations-incremental: build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/tooling/tests/feature-declarations-incremental
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/feature-declarations-incremental

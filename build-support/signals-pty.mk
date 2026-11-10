@@ -8,7 +8,7 @@ check-signals-pty-sanitize: build/minyarc $(SIGNALS_PTY_SOURCES) build/tooling/t
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/signals-pty --sanitize
 
 # Signals and PTYs are POSIX services; the Windows backend reports -ENOTSUP.
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-signals-pty
 check-sanitize: check-signals-pty-sanitize
 endif

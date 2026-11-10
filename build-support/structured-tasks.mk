@@ -1,6 +1,6 @@
 .PHONY: check-structured-tasks check-structured-tasks-sanitize
 
-ifneq ($(filter Darwin Linux,$(shell uname -s)),)
+ifneq ($(filter Darwin Linux,$(MINYAR_HOST_SYSTEM)),)
 check-structured-tasks: build/minyarc build/minyar-runtime.o build/tooling/tests/structured-tasks
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) "./build/tooling/tests/structured-tasks"
 

@@ -1,7 +1,7 @@
 .PHONY: check-completionio check-completionio-native check-completionio-kernel check-completionio-sanitize
 
 COMPLETIONIO_INPUTS = runtime/native/completionio.c runtime/minyar_native.h
-COMPLETIONIO_MOCK = $(if $(filter Linux,$(shell uname -s)),1,0)
+COMPLETIONIO_MOCK = $(if $(filter Linux,$(MINYAR_HOST_SYSTEM)),1,0)
 
 build/completionio/unit: tests/completionio-unit.c $(COMPLETIONIO_INPUTS) | build
 	@mkdir -p "$(@D)"

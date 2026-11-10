@@ -9,7 +9,7 @@ check-files-sanitize: build/minyarc $(FILES_TEST_SOURCES) build/tooling/tests/fi
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/files-focused --sanitize
 
 # The files backend is POSIX-only for now; tests/files-focused.min refuses Windows.
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-files
 check-sanitize: check-files-sanitize
 endif

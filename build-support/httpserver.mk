@@ -13,7 +13,7 @@ check-httpserver-tls: build/minyarc build/minyar-default-runtime.o build/tooling
 
 check-httpserver: check-httpserver-tls
 
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-httpserver
 endif
 
@@ -25,7 +25,7 @@ check-httpserver-tls-sanitize: build/minyarc build/tooling/tests/httpserver-tls-
 
 check-httpserver-sanitize: check-httpserver-tls-sanitize
 
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check-sanitize: check-httpserver-sanitize
 endif
 
@@ -34,7 +34,7 @@ endif
 check-httpserver-idle-memory: build/minyarc build/minyar-default-runtime.o
 	MINYAR_CLANG="$(LLVM_CC)" python3 tests/httpserver-idle-memory.py "$(CURDIR)/minyar"
 
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-httpserver-idle-memory
 endif
 
@@ -44,7 +44,7 @@ build/tooling/tests/httpserver-front-test: runtime/native/net.c tests/net-wire-n
 check-httpserver-front: build/minyarc build/minyar-default-runtime-release.ll build/tooling/tests/httpserver-front-test
 	MINYAR_CLANG="$(LLVM_CC)" MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/httpserver-front-test
 
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-httpserver-front
 endif
 

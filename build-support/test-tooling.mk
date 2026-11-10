@@ -1,7 +1,8 @@
 MINYAR_TOOL_NATIVE = runtime/native/system.c runtime/native/files.c tools/testing-host.c
 MINYAR_TOOL_NATIVE_OBJECTS = $(addprefix build/tooling/,$(MINYAR_TOOL_NATIVE:.c=.o))
 TOOL_RUNTIME = build/minyar-runtime.o
-TOOL_CRYPTO := $(shell pkg-config --cflags --libs libcrypto 2>/dev/null || echo -lcrypto)
+# Asked once, and only by a recipe that links libcrypto.
+TOOL_CRYPTO = $(eval TOOL_CRYPTO := $$(shell pkg-config --cflags --libs libcrypto 2>/dev/null || echo -lcrypto))$(TOOL_CRYPTO)
 
 # All tooling uses the same native services and compiler flags. Compile these
 # once, tracking their actual headers and publishing only complete artifacts.

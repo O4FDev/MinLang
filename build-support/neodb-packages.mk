@@ -18,7 +18,7 @@ check-files-system-sanitize: build/minyarc build/tooling/tests/neodb-packages
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/neodb-packages --suite files-system --mode sanitize
 
 check check-portable: check-net-additions
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-files-system check-neodb-review
 check-sanitize: check-files-system-sanitize check-net-additions-sanitize check-neodb-review-sanitize
 endif

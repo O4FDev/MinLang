@@ -21,8 +21,11 @@ build/connect-node/.ready: tests/interop/connect-node/package.json tests/interop
 check-connect-node: build/minyarc build/minyar-default-runtime.o build/connect-node/.ready
 	MINYAR_CLANG="$(LLVM_CC)" $(LIMITED) python3 tests/connect-node.py "$(CURDIR)/minyar" "$(CURDIR)/build/connect-node"
 
+# The Node probe only decides check membership; artifact-only runs skip it.
+ifneq ($(MINYAR_ARTIFACT_GOALS),1)
 ifeq ($(shell node -e 'process.exit(Number(process.versions.node.split(".")[0]) < 22 ? 1 : 0)' 2>/dev/null && echo yes),yes)
 check check-portable: check-connect-node
+endif
 endif
 
 # The official Connect conformance suite (connectrpc/conformance, pinned by

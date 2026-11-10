@@ -54,7 +54,7 @@ check-io-lines-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o 
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) sh -c './build/tooling/tests/io-lines < build/io-lines-input.bin'
 
 # The files backend and these calls are POSIX-only, like check-files.
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-sys-native check-sys-files check-checksums-encoding check-time-civil check-io-lines
 check-sanitize: check-sys-native-sanitize check-sys-files-sanitize check-checksums-encoding-sanitize check-time-civil-sanitize check-io-lines-sanitize
 endif

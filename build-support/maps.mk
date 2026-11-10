@@ -2,7 +2,7 @@
 MAP_FRONTENDS = build/minyarc build/minyarc-modules build/minyarc-callbacks build/minyarc-errors
 MAP_SANITIZED_FRONTENDS = $(addsuffix -sanitize,$(MAP_FRONTENDS))
 # The cache driver is POSIX-only, as in managed-graphs.mk.
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check-maps: build/minyar-module-build
 check-maps: map-module-cache
 .PHONY: map-module-cache

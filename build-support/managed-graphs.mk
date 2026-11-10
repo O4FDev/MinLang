@@ -50,7 +50,7 @@ check-callback-domains: build/tooling/tests/callback-domains
 # Incremental fallback uses the POSIX-only module build driver; the native
 # Windows launcher still exercises debug/release profiles and callbacks.
 MANAGED_GRAPH_LAUNCHER_ARTIFACTS = build/minyarc build/minyarc-callbacks
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 MANAGED_GRAPH_LAUNCHER_ARTIFACTS += build/minyarc-modules build/minyar-module-build
 endif
 

@@ -11,7 +11,7 @@ QUIC_OFFICIAL_INPUTS = tests/quic-official-adapter.min tests/quic-official-suppo
     tests/quic-simulator-shutdown.min tests/interop/qns/simulator-shutdown.sh \
     tests/quic-qns-endpoint-lifecycle.min tests/interop/qns/endpoint.min
 QUIC_OFFICIAL_RUNNER_BOOTSTRAP = $(if $(filter $(abspath build)/quic-interop-runner-740c05a.git,$(QUIC_OFFICIAL_RUNNER)),build/quic-interop-runner-740c05a.git/.ready.json)
-QUIC_OFFICIAL_HOST := $(if $(filter Windows_NT,$(OS)),unsupported,$(shell uname -s))
+QUIC_OFFICIAL_HOST := $(if $(filter Windows_NT,$(OS)),unsupported,$(MINYAR_HOST_SYSTEM))
 .PHONY: check-quic-official-adapter check-quic-simulator-shutdown check-quic-qns-endpoint-lifecycle
 
 $(QUIC_OFFICIAL_TOOLS:%=%.ll): $(QUIC_OFFICIAL_MODULES)

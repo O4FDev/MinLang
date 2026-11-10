@@ -40,7 +40,7 @@ check-mobile-android-java:
 
 # SDK work only; run through the coordination lx wrapper on shared machines.
 # This target never boots a Simulator or installs an application.
-ifeq ($(shell uname -s),Darwin)
+ifeq ($(MINYAR_HOST_SYSTEM),Darwin)
 check-mobile-ios-provider:
 	"$(LLVM_CC)" -target arm64-apple-ios16.0-simulator -isysroot "$$(xcrun --sdk iphonesimulator --show-sdk-path)" -fobjc-arc -fsyntax-only runtime/native/mobileios.m tests/mobile-ios.m
 	"$(LLVM_CC)" -target arm64-apple-ios16.0 -isysroot "$$(xcrun --sdk iphoneos --show-sdk-path)" -fobjc-arc -fsyntax-only runtime/native/mobileios.m

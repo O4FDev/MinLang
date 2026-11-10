@@ -29,7 +29,7 @@ check-swiftui: build/tooling/tests/swiftui build/tooling/scripts/native-swift
 check-native-syntax: build/tooling/scripts/native-syntax-check
 	./build/tooling/scripts/native-syntax-check
 
-MINYAR_NATIVE_HOST := $(if $(filter Linux,$(shell uname -s)),linux,macosx)
+MINYAR_NATIVE_HOST := $(if $(filter Linux,$(MINYAR_HOST_SYSTEM)),linux,macosx)
 MINYAR_NATIVE_SWIFTC ?= build/native-toolchain/build/Ninja-ReleaseAssert/swift-$(MINYAR_NATIVE_HOST)-$(shell uname -m)/bin/swiftc
 .PHONY: check-native-compiler
 check-native-compiler: check-native-project build/tooling/tests/native-swift/compiler build/tooling/scripts/native-frontend

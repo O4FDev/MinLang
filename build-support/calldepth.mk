@@ -60,7 +60,7 @@ check-calldepth-hooks-sanitize: build/minyarc build/minyarc-modules build/minyar
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/calldepth-hooks --sanitize --evidence build/calldepth-hook-sanitize-evidence
 
 # Recovery is qualified on Linux and macOS; native Windows linking of the test hooks is not yet.
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-calldepth check-calldepth-launcher check-calldepth-reporting check-calldepth-hooks
 check-sanitize: check-calldepth-sanitize check-calldepth-reporting-sanitize check-calldepth-hooks-sanitize
 endif
@@ -73,7 +73,7 @@ check-boundary: build/minyarc build/tooling/tests/boundary-test
 check-boundary-sanitize: build/minyarc build/tooling/tests/boundary-test
 	MINYAR_CLANG="$(LLVM_CC)" $(SANITIZER_LIMITED) ./build/tooling/tests/boundary-test --sanitize
 
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-boundary
 check-sanitize: check-boundary-sanitize
 endif

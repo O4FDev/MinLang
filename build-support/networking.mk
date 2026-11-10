@@ -37,13 +37,13 @@ check-errors-values: build/minyarc build/minyar-runtime.o build/tooling/tests/er
 check-net: build/minyarc build/tooling/tests/net-native-test build/tooling/tests/soak-observer-test
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/soak-observer-test
 	@set -eu; rm -rf -- build/net-native.*; evidence=$$(mktemp -d "$(abspath build)/net-native.XXXXXX"); echo "Network native evidence: $$evidence"; MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/net-native-test --mode native --evidence "$$evidence"
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 	@set -eu; rm -rf -- build/net-native-sanitize.*; evidence=$$(mktemp -d "$(abspath build)/net-native-sanitize.XXXXXX"); echo "Network sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/net-native-test --mode sanitize --evidence "$$evidence"
 endif
 
 check-net-loop: build/minyarc build/tooling/tests/net-loop-test
 	@set -eu; rm -rf -- build/net-loop.*; evidence=$$(mktemp -d "$(abspath build)/net-loop.XXXXXX"); echo "Event-loop native evidence: $$evidence"; MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/net-loop-test --mode native --evidence "$$evidence"
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 	@set -eu; rm -rf -- build/net-loop-sanitize.*; evidence=$$(mktemp -d "$(abspath build)/net-loop-sanitize.XXXXXX"); echo "Event-loop sanitizer evidence: $$evidence"; MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/net-loop-test --mode sanitize --evidence "$$evidence"
 endif
 
@@ -63,7 +63,7 @@ check-net-paths-sanitize: build/minyarc tools/toolchain.sh build/tooling/tests/n
 check: check-errors-values check-net check-net-loop check-net-connect
 check-portable: check-errors-values check-net check-net-loop check-net-connect
 check-sanitize: check-net-connect-sanitize
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-net-paths
 check-sanitize: check-net-paths-sanitize
 endif
@@ -108,7 +108,7 @@ check-os-providers-sanitize: build/minyarc build/tooling/tests/os-providers
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(SANITIZER_LIMITED) ./build/tooling/tests/os-providers --sanitize
 
 # The executable vector and inet_pton oracle route is a Linux ELF host gate.
-ifeq ($(shell uname -s),Linux)
+ifeq ($(MINYAR_HOST_SYSTEM),Linux)
 check check-portable: check-os-providers
 check-sanitize: check-os-providers-sanitize
 endif

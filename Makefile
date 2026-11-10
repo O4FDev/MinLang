@@ -2,9 +2,20 @@
 CC ?= cc
 CPPFLAGS ?= -isystem vendor
 CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Werror
-LLVM_CC ?= $(shell sh tools/toolchain.sh default-clang)
-ifeq ($(shell uname -s),Darwin)
-SDKROOT ?= $(shell sh tools/toolchain.sh sdkroot)
+# Every launcher call parses these rules to check its artifacts, so parse-time
+# commands are paid per compile. Discovered values are computed once (`:=`):
+# a `?=` default would run its command again at every expansion.
+ifeq ($(origin LLVM_CC),undefined)
+LLVM_CC := $(shell sh tools/toolchain.sh default-clang)
+endif
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+# 1 when every goal is a build/ artifact (a launcher bootstrap): probes that
+# only choose which checks join check/check-portable can be skipped.
+MINYAR_ARTIFACT_GOALS := $(if $(MAKECMDGOALS),$(if $(filter-out build/%,$(MAKECMDGOALS)),,1),1)
+ifeq ($(MINYAR_HOST_SYSTEM),Darwin)
+ifeq ($(origin SDKROOT),undefined)
+SDKROOT := $(shell sh tools/toolchain.sh sdkroot)
+endif
 export SDKROOT
 # The linker must come from the developer directory that ships SDKROOT.
 ifeq ($(origin DEVELOPER_DIR),undefined)
@@ -29,7 +40,11 @@ TOOLCHAIN_QUOTE = '$(subst ','"'"',$(1))'
 # build; an empty shell result would silently bypass that validation.
 # On Darwin it adds the CPU Clang compiles C for, which Apple's linkers do not
 # pass to the LTO backend (see lto_flags in tools/toolchain.sh).
-COMPILER_LTO_FLAGS ?= $(if $(filter Linux Darwin,$(shell uname -s)),$(shell LLVM_CC=$(call TOOLCHAIN_QUOTE,$(LLVM_CC)) LLVM_FLAGS=$(call TOOLCHAIN_QUOTE,$(LLVM_FLAGS)) COMPILER_LTO_CACHE_DIR=$(call TOOLCHAIN_QUOTE,$(COMPILER_LTO_CACHE_DIR)) COMPILER_LTO_CACHE_POLICY=$(call TOOLCHAIN_QUOTE,$(COMPILER_LTO_CACHE_POLICY)) sh tools/toolchain.sh compiler-lto-flags || printf '%s\n' '-flto=thin'),-flto=thin)
+# Computed once: it is exported, so a recursive default would run the probe
+# again for every recipe.
+ifeq ($(origin COMPILER_LTO_FLAGS),undefined)
+COMPILER_LTO_FLAGS := $(if $(filter Linux Darwin,$(MINYAR_HOST_SYSTEM)),$(shell LLVM_CC=$(call TOOLCHAIN_QUOTE,$(LLVM_CC)) LLVM_FLAGS=$(call TOOLCHAIN_QUOTE,$(LLVM_FLAGS)) COMPILER_LTO_CACHE_DIR=$(call TOOLCHAIN_QUOTE,$(COMPILER_LTO_CACHE_DIR)) COMPILER_LTO_CACHE_POLICY=$(call TOOLCHAIN_QUOTE,$(COMPILER_LTO_CACHE_POLICY)) sh tools/toolchain.sh compiler-lto-flags || printf '%s\n' '-flto=thin'),-flto=thin)
+endif
 PROGRAM_RUNTIME_FLAGS ?= -DMINYAR_SYSTEM_HEAP=1
 BOUNDED_FLAGS ?= -DMINYAR_BOUNDED_HEAP=1
 RUNTIME_HEADERS = $(wildcard runtime/minyar_*.h) build/.toolchain.json
@@ -62,7 +77,7 @@ endif
 # (scripts/needs-command.sh; MINYAR_REQUIRE_LAB_TOOLS=1 makes a missing server a failure).
 NEEDS_REDIS = sh scripts/needs-command.sh redis-server $@ "these labs run a real Redis (Debian/Ubuntu: apt-get install redis-server)"
 # Native LSan is available on Linux; Windows/macOS retain ASan and UBSan.
-NATIVE_SANITIZER_LEAKS = $(if $(filter Windows_NT,$(OS)),0,$(if $(filter Linux,$(shell uname -s)),1,0))
+NATIVE_SANITIZER_LEAKS = $(if $(filter Windows_NT,$(OS)),0,$(if $(filter Linux,$(MINYAR_HOST_SYSTEM)),1,0))
 NATIVE_SANITIZER_ENV = ASAN_OPTIONS=detect_leaks=$(NATIVE_SANITIZER_LEAKS) UBSAN_OPTIONS=halt_on_error=1
 MIN_COMPILER_EDGE_COVERAGE ?= 79
 MIN_RUNTIME_LINE_COVERAGE ?= 72

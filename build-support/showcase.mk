@@ -14,6 +14,6 @@ check-showcase-tideboard: $(SHOWCASE_DEPS)
 check-showcase-lantern-trail: $(SHOWCASE_DEPS)
 	MINYAR_CLANG="$(LLVM_CC)" python3 "tests/showcase.py" --only lantern-trail
 
-ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
+ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(MINYAR_HOST_SYSTEM)),)
 check check-portable: check-showcase
 endif

@@ -2,7 +2,7 @@ build/tooling/tools/live-build-cli build/tooling/tests/live-transform: TOOL_NATI
 build/tooling/tools/live-build-cli build/tooling/tests/live-transform: tools/clang-driver-host.c
 
 build/tooling/tools/repl-cli: build/tooling/tools/repl-cli.ll build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c tools/repl-host.c
-	"$(LLVM_CC)" $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c tools/repl-host.c -pthread -lm $(if $(filter Linux,$(shell uname -s)),-Wl$(comma)--export-dynamic -ldl,-Wl$(comma)-export_dynamic) -o $@
+	"$(LLVM_CC)" $(LLVM_FLAGS) $< build/minyar-runtime.o $(MINYAR_TOOL_NATIVE_OBJECTS) tools/clang-driver-host.c tools/repl-host.c -pthread -lm $(if $(filter Linux,$(MINYAR_HOST_SYSTEM)),-Wl$(comma)--export-dynamic -ldl,-Wl$(comma)-export_dynamic) -o $@
 
 comma := ,
 

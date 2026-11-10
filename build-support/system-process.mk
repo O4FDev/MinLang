@@ -7,7 +7,7 @@ build/tooling/tests/system-process-boundary: tests/sha256-test-native.c tests/sy
 check-system-process-boundary: build/tooling/tests/system-process-boundary
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) ./build/tooling/tests/system-process-boundary
 
-ifeq ($(shell uname -s),Linux)
+ifeq ($(MINYAR_HOST_SYSTEM),Linux)
 check-system-process check-system-process-sanitize: check-system-process-boundary
 endif
 build/tooling/tests/system-services-test: TOOL_NATIVE = tests/system-test-path-native.c tests/sha256-test-native.c

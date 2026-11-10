@@ -17,7 +17,7 @@ build/completionio/neodb-kernel-sanitize: tests/completionio-kernel.c runtime/na
 	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -std=c11 -Wall -Wextra -Werror "$<" -o "$@"
 
 completionio-neodb-linux:
-	@test "$(shell uname -s)" = Linux || { echo 'NeoDB completion proof requires Linux; unsupported is failure' >&2; exit 1; }
+	@test "$(MINYAR_HOST_SYSTEM)" = Linux || { echo 'NeoDB completion proof requires Linux; unsupported is failure' >&2; exit 1; }
 
 # Both targets intentionally stay outside check/check-portable/check-sanitize.
 # First require the existing strict C provider + public API/gallery kernel proof.
