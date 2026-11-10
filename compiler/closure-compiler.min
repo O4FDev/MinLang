@@ -57,6 +57,14 @@ function comparatorIndexes(kinds: List<Integer>, texts: List<Text>, start: Integ
     return false
 }
 
+function closureSortDirectMarker(symbol: Text): Text { return "; minyar-sort-direct: " + symbol + "\n" }
+
+// The unchecked body's symbol: a suffix inside the quotes of a quoted name.
+function closureUncheckedSymbol(symbol: Text): Text {
+    if symbol.byteLength > 1 && symbol[0] == '"' { return symbol.slice(0, symbol.length - 1) + ".unchecked\"" }
+    return symbol + ".unchecked"
+}
+
 function closureSortMerge(names: List<Text>, type: Integer, element: Integer, globals: List<Text>, direct: Text, checked: Boolean, site: Text): Text {
     closureSortComparatorThunk(names, type, element, globals)
     let pendingDeclaration = "declare i32 @minyar_sort_pending()\n"
@@ -64,8 +72,18 @@ function closureSortMerge(names: List<Text>, type: Integer, element: Integer, gl
     let id = site + "." + Text(globals.length)
     let compare = "@.minyar.sort.direct." + id
     let code = "define internal i64 " + compare + "(ptr %callback, i64 %left.slot, i64 %right.slot) {\nentry:\n"
-    code = code + "  %env.slot = call i64 @minyar_record_get(ptr %callback, i64 1)\n  %env = inttoptr i64 %env.slot to ptr\n"
     let target = "@" + direct
+    if direct != "" {
+        // The literal's unchecked body (compileClosureBodies emits it for this
+        // marker): the runtime checked the callback's domain before the merge.
+        // A callback record always has three slots, so its environment slot is
+        // read in place.
+        if findText(globals, closureSortDirectMarker(direct)) < 0 { globals.add(closureSortDirectMarker(direct)) }
+        target = "@" + closureUncheckedSymbol(direct)
+        code = code + "  %env.at = getelementptr inbounds i8, ptr %callback, i64 16\n  %env = load ptr, ptr %env.at\n"
+    } else {
+        code = code + "  %env.slot = call i64 @minyar_record_get(ptr %callback, i64 1)\n  %env = inttoptr i64 %env.slot to ptr\n"
+    }
     if direct == "" {
         code = code + "  %code.slot = call i64 @minyar_record_get(ptr %callback, i64 0)\n  %code = inttoptr i64 %code.slot to ptr\n"
         target = "%code"
@@ -824,21 +842,36 @@ function compileClosureBodies(context: CompilerContext, output: List<Text>, glob
             let localLengths: List<Integer> = []
             let pendingDebugTypes: List<Integer> = []
             context.debugTypes = pendingDebugTypes
-            recordRuntimeTrace(context, closureSymbol(context, start), "anonymous function", start, false)
+            let symbol = closureSymbol(context, start)
+            // A literal that a sort merge calls directly (see closureSortMerge)
+            // is emitted as an unchecked body plus a checked entry: the sort
+            // checks the callback's domain once, and the environment's domain
+            // was recorded with the callback's, so the merge skips the check on
+            // every comparison. Every other caller goes through the entry.
+            let sortDirect = findText(globals, closureSortDirectMarker(symbol)) >= 0
+            let bodySymbol = symbol
+            if sortDirect {
+                bodySymbol = closureUncheckedSymbol(symbol)
+                recordRuntimeTrace(context, bodySymbol, "anonymous function", start, false)
+            }
+            recordRuntimeTrace(context, symbol, "anonymous function", start, false)
             emitDebugOrigin(output, tokenLines, start, "function")
-            output.add("define " + llvmReturnType(result) + " @" + closureSymbol(context, start) + "(ptr %environment")
+            output.add("define " + llvmReturnType(result) + " @" + bodySymbol + "(ptr %environment")
+            let entryParameters = "ptr %environment"
             let parameter = 0
             while parameter < parameters.length {
                 output.add(", " + llvmType(parameterTypes[parameter]) + " %argument." + Text(parameter))
+                entryParameters = entryParameters + ", " + llvmType(parameterTypes[parameter]) + " %argument." + Text(parameter)
                 parameter = parameter + 1
             }
             let definitionTailSlot = output.length
             output.add(") uwtable {\nentry:\n")
+            if sortDirect { output[definitionTailSlot] = ") alwaysinline uwtable {\nentry:\n" }
             // Capture reads can inline checks that split the entry block.
             let parameterStorageSlot = output.length
             output.add("")
             let parameterStorage: List<Text> = []
-            output.add("  call void @minyar_callback_check_environment(ptr %environment)\n")
+            if !sortDirect { output.add("  call void @minyar_callback_check_environment(ptr %environment)\n") }
             let entry = output.length
             output.add("")
             let first = functionParameterOffset(functionParameterCounts, environment)
@@ -880,6 +913,16 @@ function compileClosureBodies(context: CompilerContext, output: List<Text>, glob
             }
             context.syntax.active = 0
             output.add("}\n\n")
+            if sortDirect {
+                let returned = llvmReturnType(result)
+                output.add("define " + returned + " @" + symbol + "(" + entryParameters + ") uwtable {\nentry:\n")
+                output.add("  call void @minyar_callback_check_environment(ptr %environment)\n")
+                if result == 5 {
+                    output.add("  call void @" + bodySymbol + "(" + entryParameters + ")\n  ret void\n}\n\n")
+                } else {
+                    output.add("  %result = call " + returned + " @" + bodySymbol + "(" + entryParameters + ")\n  ret " + llvmType(result) + " %result\n}\n\n")
+                }
+            }
         }
     }
     let declarationStart = output.length
