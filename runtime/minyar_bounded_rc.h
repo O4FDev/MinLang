@@ -1091,11 +1091,36 @@ static int rc_bounded_step_chunks(RcFrame *frame) {
     return 1;
 }
 
+/* A release from generated code is where a short-lived aggregate dies. When
+ * it drops the last owner of a small record or small reference List, retire
+ * it here with the same constant-work unit the scheduler would spend on it
+ * later, instead of linking it into the recent queue and visiting it at a
+ * service point. That unit counts against this release's K units, so the
+ * service bound is unchanged; it only shortens the queue. Every other object
+ * takes the ordinary drop. The scheduler's own drops keep rc_drop_in. */
+RC_QUEUE_INLINE unsigned rc_drop_eager(void *value) {
+    if (!value) return 0;
+    RcObject *object = (RcObject *)value - 1;
+    size_t ownership = object->ownership;
+    /* Last owner of a references List or a record (adjacent kinds). */
+    if ((size_t)(ownership - (8 + RC_REFERENCES)) <= 1) {
+        int record = (ownership & 4) != 0;
+        const long long *payload = (const long long *)(object + 1) + (record ? 0 : 1);
+        size_t slots = (size_t)*payload;
+        if (slots && slots <= (record ? RC_SMALL_RECORD_SLOTS : RC_SMALL_LIST_SLOTS)) {
+            object->ownership = ownership & 7;
+            rc_bounded_retire_small_in(&rc_objects, &rc_pending_count, object);
+            return 1;
+        }
+    }
+    return rc_drop_loaded_in(&rc_objects, &rc_pending_count, object, ownership);
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((noinline))
 #endif
 static void rc_bounded_release(void *value) {
-    unsigned immediate = rc_drop(value);
+    unsigned immediate = rc_drop_eager(value);
     rc_service_pending(immediate < MINYAR_RC_POLL_BUDGET
                        ? MINYAR_RC_POLL_BUDGET - immediate : 0);
 #ifdef MINYAR_RC_TESTING

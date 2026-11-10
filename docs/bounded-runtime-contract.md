@@ -96,8 +96,12 @@ An aggregate whose count reaches zero joins a retirement queue. Its header
 holds the queue link, and its outgoing references keep children alive until
 cleanup visits them. Text, scalar Lists and records, empty reference
 aggregates, and Lists containing only immortal references can be freed
-immediately. Once a List receives a mortal reference, it permanently switches
-to ordinary reference traversal.
+immediately. A small reference aggregate — a record or reference List of at
+most eight slots that loses its last owner — is retired by the release itself,
+within that release's K units, instead of joining the queue; it retires up to
+the same eight-aggregate allowance a unit has, which only shortens the queue.
+Once a List receives a mortal reference, it permanently switches to ordinary
+reference traversal.
 
 Destroying a Text view frees its own header/index and drops its reference to
 the owning Text. If that drop makes the owner unreachable, the owner joins the

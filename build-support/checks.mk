@@ -447,6 +447,14 @@ check-recursive-data: build/minyarc build/minyarc-sanitize build/minyar-runtime.
 	$(LIMITED) ./build/tooling/experiments/memory/production-contract-model
 	$(SANITIZER_LIMITED) ./build/tooling/tests/recursive-mutation
 
+.PHONY: check-eager-retirement
+check check-portable: check-eager-retirement
+check-eager-retirement: tests/eager-retirement.c runtime/minyar_runtime.c $(RUNTIME_HEADERS) | build
+	$(LIMITED) "$(LLVM_CC)" $(CFLAGS) -DMINYAR_RC_POLL_BUDGET=1 tests/eager-retirement.c $(LDLIBS) -o build/eager-retirement
+	$(LIMITED) ./build/eager-retirement
+	$(SANITIZER_LIMITED) "$(LLVM_CC)" $(SANITIZER_FLAGS) -DMINYAR_RC_POLL_BUDGET=1 tests/eager-retirement.c $(LDLIBS) -o build/eager-retirement-sanitize
+	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/eager-retirement-sanitize
+
 # Direct frame-exit/statement service must reproduce the scheduler exactly,
 # with and without an old-object backlog, at several cleanup budgets.
 DIRECT_SERVICE_BUDGETS = 1 2 4 7 32 1024
