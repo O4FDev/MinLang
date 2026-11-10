@@ -8,7 +8,9 @@
 int main(int argc,char **argv) {
     MinyarRecord *scalar=minyar_record_new_scalar(3);
     if(argc>1){minyar_record_set_scalar(scalar,!strcmp(argv[1],"negative")?-1:3,0);return 2;}
-    MinyarRecord *older=minyar_record_new(4096);
+    /* More than one budget of pending work: a record unit examines up to
+     * RC_RECORD_UNIT_FIELDS fields (docs/bounded-runtime-contract.md). */
+    MinyarRecord *older=minyar_record_new(2*RC_RECORD_UNIT_FIELDS*MINYAR_RC_POLL_BUDGET);
     rc_drop(older);minyar_rc_poll(1);
     size_t cursor=rc_bounded_cursor;
     minyar_record_set_scalar(scalar,0,LLONG_MIN);
