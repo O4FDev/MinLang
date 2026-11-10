@@ -149,6 +149,13 @@ check-in-parallel-tool: build/tooling/tools/check-in-parallel build/tooling/test
 
 check check-portable: check-in-parallel-tool
 
+# No two checks of a gate may run the same command line: a repeat is wasted gate time or a shared-file race.
+.PHONY: check-gate-duplicates
+check-gate-duplicates:
+	python3 tests/gate-duplicates.py check-portable check check-sanitize
+
+check check-portable: check-gate-duplicates
+
 # The harness LLVM rule above lists exactly the modules a compilation loads.
 .PHONY: check-harness-dependencies
 check-harness-dependencies: build/tooling/tests/harness-dependencies build/tooling/tests/harness-dependency-fixture/app/main.ll build/minyarc-modules
