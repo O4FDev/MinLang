@@ -16,8 +16,8 @@ git push origin main v0.1.0
 minyar publish --registry ../public
 ```
 
-`publish` requires a clean Git tree, a library export and a `v` + `package.version`
-tag at HEAD. The release is named after the origin remote (`https://`, `ssh://` or
+`publish` requires a clean Git tree, a library export, Git sources for every
+dependency and a `v` + `package.version` tag at HEAD. The release is named after the origin remote (`https://`, `ssh://` or
 `git@host:owner/repo` URLs); pass `HOST/OWNER/REPO` when the origin is something
 else. It reads committed blobs, applies the source security policy, then downloads
 that tag from the host exactly as `minyar add` would and refuses unless the host

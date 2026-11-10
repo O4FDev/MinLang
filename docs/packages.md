@@ -16,6 +16,29 @@ The repository needs `src/<package-name>.min` and a three-part package version.
 Relative imports inside the package work normally. Git packages may depend on
 other Git packages; editable local projects may also use path dependencies.
 
+## The whole path
+
+Write a library, share it, and use it from another project:
+
+```sh
+minyar new geometry --lib && cd geometry       # src/geometry.min, tests/, Minyar.toml
+minyar test
+git init && git add -A && git commit -m "feat: areas"
+git remote add origin https://example.com/me/geometry.git
+git tag v0.1.0 && git push origin main v0.1.0  # the tag matches package.version
+minyar publish --registry ~/minyar-index       # fetches the tag back, then records it
+
+cd .. && minyar new app && cd app
+minyar add geometry --registry ~/minyar-index  # or: minyar add example.com/me/geometry
+minyar run                                     # use "geometry" as geometry
+minyar update                                  # later: newest v0.x.y release
+minyar build --release && minyar install --release
+```
+
+Commit `Minyar.toml` and `Minyar.lock` in the application. The lock pins every
+package's commit and source checksum; `--locked --offline` rebuilds exactly that.
+A package index is optional: `add HOST/OWNER/REPO` works with any public Git host.
+
 ## Choose a version
 
 ```sh

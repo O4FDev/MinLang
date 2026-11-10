@@ -191,6 +191,12 @@ def check_share_workflow(launcher, base_env, root):
     git("add", ".")
     git("commit", "--quiet", "-m", "feat(geometry): areas")
     run([launcher, "publish", "--registry", public], env, library, "origin remote is not an HTTPS or SSH Git URL")
+    helper = work / "helper"
+    run([launcher, "new", helper, "--lib"], env, work)
+    manifest = (library / "Minyar.toml").read_text()
+    (library / "Minyar.toml").write_text(manifest + '\n[dependencies]\nhelper = { path = "../helper" }\n')
+    run([launcher, "publish", "--registry", public], env, library, "helper is a local path dependency")
+    (library / "Minyar.toml").write_text(manifest)
     git("remote", "add", "origin", "git@example.com:shapes/geometry.git")
     run([launcher, "publish", "--registry", public], env, library, "git tag v0.1.0")
     git("tag", "v0.1.0")
