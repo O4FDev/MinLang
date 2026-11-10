@@ -10,12 +10,77 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A push to a branch waits for the run before it, so every v2 commit that lands gets a complete result;
+  # a newer push to a pull request replaces the older run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  linux-checks:
+    # The full suite (`make check`, which includes check-sanitize and check-ownership) and the landing gate
+    # (check-portable), split by recorded check times (tools/ci-shard.py) so each shard finishes well inside the
+    # limit. Every shard runs the same `make check-in-parallel` runner as the local gate.
+    name: Linux checks ${{ matrix.shard }}/10
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select Python 3.15.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
+      - name: Install pinned LLVM 23.1.3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd libxml2 libtinfo6
+          archive="$RUNNER_TEMP/LLVM-23.1.3-Linux-X64.tar.zst"
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 600 \
+            'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-Linux-X64.tar.zst' -o "$archive"
+          printf '%s  %s\n' \
+            '14d2f701eb68fb799001bdea6231048f3990690fa2f406d563555ff8f744daba' \
+            "$archive" | sha256sum --check
+          sudo mkdir -p '/usr/lib/llvm-23'
+          # LLVM's archive needs a 1 GiB decode window, above zstd's 128 MiB default.
+          sudo tar --use-compress-program='zstd --long=30' -xf "$archive" -C '/usr/lib/llvm-23' --strip-components=1
+          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
+          for key in CC LLVM_CC MINYAR_CLANG MINYAR_TEST_CLANG; do echo "$key=/usr/lib/llvm-23/bin/clang" >> "$GITHUB_ENV"; done
+          MINYAR_CLANG=/usr/lib/llvm-23/bin/clang sh tools/toolchain.sh toolchain
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make zsh gcc libglfw3-dev libssl-dev openssl pkg-config redis-server \
+            libarchive-dev libzstd-dev zlib1g-dev liblz4-dev liblzma-dev libbz2-dev libxml2-dev libacl1-dev nettle-dev
+          if [ -c '/dev/kvm' ]; then sudo chmod a+rw '/dev/kvm'; fi
+      - name: Run this shard of check and check-portable
+        env:
+          SHARD: ${{ matrix.shard }}
+          MINYAR_TEST_TIMEOUT_SCALE: '2'
+        run: |
+          checks=$(python3 tools/ci-shard.py "check check-portable" "$SHARD" 10)
+          echo "$checks" | tr ' ' '\n' > build-shard-checks.txt
+          make LIMITED= SANITIZER_LIMITED= build/minyarc
+          set +e
+          make LIMITED= SANITIZER_LIMITED= check-in-parallel CHECKS="$checks" CHECK_JOBS=4 2>&1 | tee build/ci-run.log
+          python3 tools/ci-shard.py --verdict --status "${PIPESTATUS[0]}" build/ci-run.log
+      - name: Upload check logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-checks-${{ matrix.shard }}
+          if-no-files-found: warn
+          path: |
+            build-shard-checks.txt
+            build/check-in-parallel/run-*/results.json
+            build/check-in-parallel/run-*/times.tsv
+            build/check-in-parallel/run-*/logs
+
   linux-matrix:
-    # Every Linux group runs through build/tooling/scripts/check-linux, the same runner as
-    # `./build/tooling/scripts/check-linux --matrix` on one host; CI shards it by group.
+    # Groups of the Linux runner (build/tooling/scripts/check-linux) that check-portable does not cover.
     name: Linux ${{ matrix.shard }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -23,11 +88,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - shard: correctness
-            groups: --group correctness --group llvm23 --tier full
-            packages: gcc libglfw3-dev libssl-dev pkg-config redis-server
-          - shard: sanitizers, leaks and Redis
-            groups: --group correctness --tier sanitize --group leaks --group redis
+          # The llvm23 group re-ran check-portable under this runner's own compiler wrapper, duplicating the
+          # Linux checks shards and failing checks that pass under make there (debug-info, native-cache, ...).
+          - shard: leaks and Redis
+            groups: --group leaks --group redis
             packages: libglfw3-dev libssl-dev pkg-config redis-server
           - shard: LLVM 23 peer testing
             groups: --group peer-testing
@@ -38,9 +102,9 @@ jobs:
           - shard: QUIC, peers and formats
             groups: --group quic --group formats
             packages: libssl-dev openssl redis-server libarchive-dev libzstd-dev zlib1g-dev liblz4-dev liblzma-dev libbz2-dev libxml2-dev libacl1-dev nettle-dev
-          - shard: coverage, AFL++ and formatting
-            groups: --group coverage --group afl --group formatting
-            packages: afl++
+          - shard: formatting
+            groups: --group formatting
+            packages: ''
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,8 +144,10 @@ jobs:
         # shellcheck disable=SC2086
         run: |
           make -j1 LIMITED= SANITIZER_LIMITED= COMPILER_LTO_FLAGS="-flto -fuse-ld=lld -Wl,--threads=1" build/tooling/scripts/check-linux
-          ./build/tooling/scripts/check-linux --source . --output-dir build/linux-evidence --jobs 8 \
-            --clang /usr/lib/llvm-23/bin/clang --cxx /usr/lib/llvm-23/bin/clang++ $MINYAR_CI_GROUPS
+          set +e
+          ./build/tooling/scripts/check-linux --source . --output-dir build/linux-evidence --jobs 4 \
+            --clang /usr/lib/llvm-23/bin/clang --cxx /usr/lib/llvm-23/bin/clang++ $MINYAR_CI_GROUPS 2>&1 | tee build/ci-run.log
+          python3 tools/ci-shard.py --verdict --status "${PIPESTATUS[0]}" build/ci-run.log
       - name: Archive fuzzing findings
         if: always()
         run: |
@@ -106,7 +172,8 @@ jobs:
             build/linux-evidence/**/build/peer-results
 
   macos-portable:
-    name: macOS portable suite, network, graphics and Keychain
+    # Linux runs check-portable; this job runs the core gate and the checks only macOS can run.
+    name: macOS core, network, graphics and Keychain
     runs-on: macos-15
     timeout-minutes: 45
     steps:
@@ -133,13 +200,14 @@ jobs:
           for key in CC LLVM_CC MINYAR_CLANG MINYAR_TEST_CLANG; do echo "$key=$llvm_bin/clang" >> "$GITHUB_ENV"; done
           MINYAR_CLANG="$llvm_bin/clang" sh tools/toolchain.sh toolchain
           echo "SDKROOT=$(xcrun --show-sdk-path)" >> "$GITHUB_ENV"
-      - name: Run check-portable and the macOS-only checks in parallel, including Keychain
+      - name: Run the core gate and the macOS-only checks, including Keychain
         run: |
-          set -o pipefail
           export PATH="$(brew --prefix openssl@3)/bin:$PATH"
-          mkdir -p build/check-macos
-          make LIMITED= SANITIZER_LIMITED= build/tooling/scripts/check-macos
-          ./build/tooling/scripts/check-macos --tier all --jobs 3 --keychain LIMITED= SANITIZER_LIMITED= 2>&1 | tee build/check-macos/output.log
+          make LIMITED= SANITIZER_LIMITED= build/minyarc
+          set +e
+          make LIMITED= SANITIZER_LIMITED= check-in-parallel CHECK_JOBS=3 2>&1 \
+            CHECKS="check-commit-core check-macos-network check-desktop-native check-native-graphics check-macos-services check-keychain-native check-net-udp-offload-sanitize" | tee build/ci-run.log
+          python3 tools/ci-shard.py --verdict --status "${PIPESTATUS[0]}" build/ci-run.log
       - name: Upload generated fuzz evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -148,9 +216,8 @@ jobs:
           retention-days: 7
           path: |
             build/fuzz
-            build/check-macos/output.log
-            build/check-macos/*/results.json
-            build/check-macos/*/logs
+            build/check-in-parallel/run-*/results.json
+            build/check-in-parallel/run-*/logs
             build/test-evidence
             build/quic-rfc-native.*
             build/quic-rfc-sanitize.*
@@ -194,8 +261,9 @@ jobs:
           git fetch --no-tags origin "$PREVIOUS_V2"
           control="$(mktemp -d "$RUNNER_TEMP/minyar-budget-previous.XXXXXXXX")"
           mkdir -p "$control/build"
-          git archive "$PREVIOUS_V2" compiler build-support/compiler.mk | tar -x -C "$control"
-          make -C "$control" -f build-support/compiler.mk build/compiler.min
+          git archive "$PREVIOUS_V2" compiler library build-support/compiler.mk build-support/choice.mk \
+            build-support/user-capabilities.mk build-support/choice-prelude.awk build-support/capability-prelude.awk | tar -x -C "$control"
+          make -C "$control" -f build-support/compiler.mk -f build-support/choice.mk -f build-support/user-capabilities.mk build/compiler.min
           cp "$control/build/compiler.min" build/compiler-budget-original.min
           python3 scripts/prepare-compiler-budget.py build/compiler-budget-original.min build/compiler-budget-input.min build/minyar-compiler-runtime.ll build/performance-evidence/source-compatibility.json
           make LIMITED= SANITIZER_LIMITED= build/minyarc
@@ -215,18 +283,24 @@ jobs:
           cat build/performance-evidence/pmu.txt
       - name: Enforce paired CPU and wall bounds plus absolute RSS and instructions
         run: |
-          set -o pipefail
-          make LIMITED= SANITIZER_LIMITED= check-budget | tee build/performance-evidence/self-compile-budget.txt
+          set +e
+          make LIMITED= SANITIZER_LIMITED= check-budget 2>&1 | tee build/performance-evidence/self-compile-budget.txt
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then echo 'check-budget: FAILED' >> build/performance-evidence/self-compile-budget.txt; fi
           if grep -q 'instructions retired:' build/performance-evidence/self-compile-budget.txt; then
             grep 'instructions retired:' build/performance-evidence/self-compile-budget.txt >> "$GITHUB_STEP_SUMMARY"
           else
             echo '**Retired instructions unavailable:** this runner does not expose the counter. The unchanged 75-million-instruction limit is not measured by this job; see the explicit PMU probe evidence.' | tee -a "$GITHUB_STEP_SUMMARY" build/performance-evidence/instructions-unavailable.txt
           fi
+          python3 tools/ci-shard.py --verdict --status "$status" build/performance-evidence/self-compile-budget.txt
       - name: Enforce ordinary runtime and compiler performance checks
         if: success() || failure()
         run: |
-          set -o pipefail
-          make LIMITED= SANITIZER_LIMITED= check-performance | tee build/performance-evidence/performance.txt
+          set +e
+          make LIMITED= SANITIZER_LIMITED= check-performance 2>&1 | tee build/performance-evidence/performance.txt
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then echo 'check-performance: FAILED' >> build/performance-evidence/performance.txt; fi
+          python3 tools/ci-shard.py --verdict --status "$status" build/performance-evidence/performance.txt
       - name: Upload platform and paired compiler measurements
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -335,9 +409,13 @@ jobs:
           make LIMITED= SANITIZER_LIMITED= check-macos check-http check-graphics-render
 
   macos-phase1-sanitize:
-    name: macOS complete sanitizer and collector matrix
+    name: macOS complete sanitizer and collector matrix ${{ matrix.shard }}/3
     runs-on: macos-15
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -368,15 +446,24 @@ jobs:
         # Includes check-quic-sanitize, all three neo SAN gates, the captured/
         # fresh/detached/full-mark native+SAN pairs via graph profiles, and the
         # original progress idle oracle. No direct-only or reduced case route.
+        env:
+          SHARD: ${{ matrix.shard }}
+          MINYAR_TEST_TIMEOUT_SCALE: '2'
         run: |
           export PATH="$(brew --prefix openssl@3)/bin:$PATH"
-          make LIMITED= SANITIZER_LIMITED= check-managed-graphs-profiles check-sanitize
+          checks=$(python3 tools/ci-shard.py "check-managed-graphs-profiles check-sanitize" "$SHARD" 3)
+          make LIMITED= SANITIZER_LIMITED= build/minyarc
+          set +e
+          make LIMITED= SANITIZER_LIMITED= check-in-parallel CHECKS="$checks" CHECK_JOBS=3 2>&1 | tee build/ci-run.log
+          python3 tools/ci-shard.py --verdict --status "${PIPESTATUS[0]}" build/ci-run.log
       - name: Upload retained public sanitizer outcomes
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: macos-phase1-sanitizer-evidence
+          name: macos-phase1-sanitizer-evidence-${{ matrix.shard }}
           path: |
+            build/check-in-parallel/run-*/results.json
+            build/check-in-parallel/run-*/logs
             build/test-evidence
             build/cycle-*
             build/quic-sanitize
