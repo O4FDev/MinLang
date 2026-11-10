@@ -40,14 +40,17 @@ check-time-civil-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.
 # The reader's input is a pipe the runner writes, so the fixture is a filter
 # script rather than a source file: CRLF, LF, an empty line, an over-long line,
 # a final line without a newline and an invalid UTF-8 line.
-check-io-lines: build/minyarc build/minyar-runtime.o build/tooling/tests/io-lines tests/io-lines.min
-	printf 'alpha\r\nbeta\n\nomega\n' > build/io-lines-input.bin
-	python3 -c 'import sys; sys.stdout.buffer.write(b"x" * (1048576 + 1) + b"\nafter\n\xff\xfe\n")' >> build/io-lines-input.bin
+# One shared input, written once and renamed into place, so check-io-lines and its sanitizer variant can run
+# side by side without rewriting each other's stdin.
+build/io-lines-input.bin: build-support/systems.mk | build
+	printf 'alpha\r\nbeta\n\nomega\n' > $@.tmp
+	python3 -c 'import sys; sys.stdout.buffer.write(b"x" * (1048576 + 1) + b"\nafter\n\xff\xfe\n")' >> $@.tmp
+	mv -f $@.tmp $@
+
+check-io-lines: build/minyarc build/minyar-runtime.o build/tooling/tests/io-lines tests/io-lines.min build/io-lines-input.bin
 	MINYAR_TEST_CLANG="$(TEST_CLANG)" $(LIMITED) sh -c './build/tooling/tests/io-lines < build/io-lines-input.bin'
 
-check-io-lines-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/io-lines
-	printf 'alpha\r\nbeta\n\nomega\n' > build/io-lines-input.bin
-	python3 -c 'import sys; sys.stdout.buffer.write(b"x" * (1048576 + 1) + b"\nafter\n\xff\xfe\n")' >> build/io-lines-input.bin
+check-io-lines-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/io-lines build/io-lines-input.bin
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_CLANG="$(TEST_CLANG)" MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) sh -c './build/tooling/tests/io-lines < build/io-lines-input.bin'
 
 # The files backend and these calls are POSIX-only, like check-files.
