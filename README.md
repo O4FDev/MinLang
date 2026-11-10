@@ -175,6 +175,7 @@ remain unfinished.
 
 - [Minyar for people who have never programmed](docs/book/README.md)
 - [Minyar for Rust](docs/from-rust.md), [C++](docs/from-cpp.md) and [Swift programmers](docs/from-swift.md)
+- [Writing Minyar with a coding agent](docs/agents.md): the check/explain/doc/test loop and the shapes that differ
 - [Language guide](docs/language.md)
 - [Installation and toolchain versions](docs/install.md)
 - [Project CLI](docs/cli.md), [packages](docs/packages.md) and [hosting an index](docs/registry.md)
