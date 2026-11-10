@@ -1,0 +1,66 @@
+// Many small envelopes in one piece of input cost time in proportion to the
+// input. Splitting each envelope off the front of the buffer copied the rest
+// once per message, and the client's reply queue was re-sliced per reply:
+// 400,000 empty envelopes in one request body (2 MB) took over twenty seconds
+// of processor time and 200,000 replies in one response chunk about as long,
+// past this check's run limit, where a cursor needs a fraction of a second.
+use "connect" as connect
+use "rpc" as rpc
+
+function clock(): Integer { return 0 }
+function header(name: Text, value: Text): rpc.Header { return rpc.Header { name: name; value: value } }
+constant REQUESTS = 400000
+constant REPLIES = 200000
+function emptyEnvelopes(count: Integer): Bytes {
+    let body = Bytes()
+    for index in 0..count { body.add(0); body.add(0); body.add(0); body.add(0); body.add(0) }
+    return body
+}
+
+// A client stream whose whole request body arrives at once.
+let seen: List<Integer> = [0]
+let services = rpc.services()
+services.addClientStream("/t.v1.S/Count", function(call: rpc.Call, responder: rpc.Responder): Result<rpc.Receiver, rpc.Error> {
+    return Ok(rpc.Receiver {
+        message: function(data: Bytes): Result<Nothing, rpc.Error> { seen[0] += 1; return Ok() }
+        end: function(error: Maybe<rpc.Error>): Result<Nothing, rpc.Error> {
+            responder.send(Bytes("{\"count\":" + Text(seen[0]) + "}"))
+            return Ok()
+        }
+    })
+})
+let server = connect.server(services, connect.defaults(clock))
+let response = server.handle(connect.Request { method: "POST"; target: "/t.v1.S/Count"
+    headers: [header("content-type", "application/connect+json")]; body: emptyEnvelopes(REQUESTS) })
+print("server " + Text(response.status) + " handled " + Text(seen[0]) + " messages")
+
+// A server stream whose replies arrive in one chunk, then the end message.
+let arrivals: List<connect.Arrival> = []
+let chunk = emptyEnvelopes(REPLIES)
+chunk.addBytes(connect.envelope(2, Bytes("{}")))
+arrivals.add(connect.Arrival.Ended([]))
+arrivals.add(connect.Arrival.Data(chunk))
+arrivals.add(connect.Arrival.Head(200, [header("content-type", "application/connect+json")]))
+let client = connect.streamingClient("", "json", function(request: connect.Request, timeout: Integer): Result<connect.Wire, rpc.Error> {
+    return Ok(connect.Wire {
+        write: function(data: Bytes): Boolean { return true }
+        close: function() {}
+        cancel: function() {}
+        read: function(): connect.Arrival {
+            if arrivals.length == 0 { return connect.Arrival.Pending }
+            return arrivals.pop()
+        }
+    })
+}, "k")
+let stream = client.stream("/t.v1.S/Many", rpc.SERVER_STREAM, connect.callOptions())
+let replies = 0
+let outcome = "running"
+while outcome == "running" {
+    match stream.receive() {
+        Message(message) { replies += 1 }
+        Waiting { outcome = "waiting" }
+        Finished { outcome = "finished" }
+        Failed(failure) { outcome = "failed " + failure.error.message }
+    }
+}
+print("client " + outcome + " after " + Text(replies) + " replies")

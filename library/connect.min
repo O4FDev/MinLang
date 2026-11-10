@@ -532,14 +532,18 @@ public function Exchange.closeInput() {
 // Hands complete request envelopes to the receiver.
 function Exchange.messages() {
     let limit = self.server.options.maxRequestBytes
-    while self.input.length >= 5 && self.outcome.isNone() && !self.done {
-        let flags = self.input[0]
-        let length = (self.input[1] << 24) | (self.input[2] << 16) | (self.input[3] << 8) | self.input[4]
-        if length > limit { self.fail(rpc.failure(rpc.RESOURCE_EXHAUSTED, "request message is larger than " + Text(limit) + " bytes")); return }
-        if (flags & 254) != 0 { self.fail(rpc.failure(rpc.INVALID_ARGUMENT, "unexpected envelope flags")); return }
-        if self.input.length < 5 + length { return }
-        let data = self.input.slice(5, 5 + length)
-        self.input = self.input.slice(5 + length, self.input.length)
+    // A cursor, and one copy of the unread tail at the end: taking each
+    // envelope off the front would copy the rest of the input once per message.
+    let input = self.input
+    let at = 0
+    while input.length - at >= 5 && self.outcome.isNone() && !self.done {
+        let flags = input[at]
+        let length = (input[at + 1] << 24) | (input[at + 2] << 16) | (input[at + 3] << 8) | input[at + 4]
+        if length > limit { self.fail(rpc.failure(rpc.RESOURCE_EXHAUSTED, "request message is larger than " + Text(limit) + " bytes")); break }
+        if (flags & 254) != 0 { self.fail(rpc.failure(rpc.INVALID_ARGUMENT, "unexpected envelope flags")); break }
+        if input.length - at < 5 + length { break }
+        let data = input.slice(at + 5, at + 5 + length)
+        at += 5 + length
         if (flags & 1) == 1 {
             match self.inputCompressor {
                 Some(compressor) {
@@ -549,11 +553,11 @@ function Exchange.messages() {
                             let code = rpc.INVALID_ARGUMENT
                             if errors.code(problem) == errors.overflowCode() { code = rpc.RESOURCE_EXHAUSTED }
                             self.fail(rpc.failure(code, "cannot decompress request: " + problem.message()))
-                            return
+                            break
                         }
                     }
                 }
-                None { self.fail(rpc.failure(rpc.INTERNAL, "compressed message without connect-content-encoding")); return }
+                None { self.fail(rpc.failure(rpc.INTERNAL, "compressed message without connect-content-encoding")); break }
             }
         }
         match self.receiver.unwrap().message(data) {
@@ -561,6 +565,7 @@ function Exchange.messages() {
             Err(problem) { self.responder.finish(Some(problem)) }
         }
     }
+    if at > 0 { self.input = input.slice(at, input.length) }
 }
 // Ends the call with an error the handler did not choose.
 function Exchange.fail(error: rpc.Error) {
@@ -1440,6 +1445,8 @@ public record Stream {
     private trailers: List<rpc.Header>
     private input: Bytes
     private replies: List<Bytes>
+    // Replies before this index were returned; the list is reset once all are.
+    private replyAt: Integer
     private received: Integer
     private decompressor: Maybe<Compressor>
     // Connect: the end-of-stream message arrived.
@@ -1461,7 +1468,7 @@ public function Stream.active(): Boolean { return !self.finished && self.failure
 public function Client.stream(procedure: Text, kind: Integer, options: CallOptions): Stream {
     let stream = Stream { client: self; wire: None; grpc: self.protocol == "grpc"; plain: self.protocol != "grpc" && kind == rpc.UNARY
         httpStatus: 0; kind: kind; sendClosed: false; headSeen: false
-        headers: []; trailers: []; input: Bytes(); replies: []; received: 0; decompressor: None; endSeen: false; status: None
+        headers: []; trailers: []; input: Bytes(); replies: []; replyAt: 0; received: 0; decompressor: None; endSeen: false; status: None
         finished: false; failure: None }
     match self.opener {
         Some(opener) {
@@ -1555,7 +1562,7 @@ public function Stream.closeSend() {
 public function Stream.cancel() {
     if !self.active() { return }
     match self.wire { Some(wire) { wire.cancel() } None {} }
-    self.replies = []
+    self.replies = []; self.replyAt = 0
     self.fail(rpc.failure(rpc.CANCELED, "the call was canceled"))
 }
 function Stream.fail(error: rpc.Error) {
@@ -1567,9 +1574,10 @@ function Stream.fail(error: rpc.Error) {
 /// The next reply, or why there are no more.
 public function Stream.receive(): Received<Bytes> {
     while true {
-        if self.replies.length > 0 {
-            let reply = self.replies[0]
-            self.replies = self.replies.slice(1, self.replies.length)
+        if self.replyAt < self.replies.length {
+            let reply = self.replies[self.replyAt]
+            self.replyAt += 1
+            if self.replyAt == self.replies.length { self.replies = []; self.replyAt = 0 }
             return Message(reply)
         }
         match self.failure { Some(failure) { return Failed(failure) } None {} }
@@ -1640,16 +1648,20 @@ function Stream.head(status: Integer, headers: List<rpc.Header>) {
 }
 // Splits complete envelopes off the input into replies or the end message.
 function Stream.messages() {
-    while self.input.length >= 5 && self.active() && !self.endSeen {
-        let flags = self.input[0]
-        let length = (self.input[1] << 24) | (self.input[2] << 16) | (self.input[3] << 8) | self.input[4]
+    // A cursor, and one copy of the unread tail at the end: taking each
+    // envelope off the front would copy the rest of the input once per message.
+    let input = self.input
+    let at = 0
+    while input.length - at >= 5 && self.active() && !self.endSeen {
+        let flags = input[at]
+        let length = (input[at + 1] << 24) | (input[at + 2] << 16) | (input[at + 3] << 8) | input[at + 4]
         if length > self.client.maxResponseBytes {
             self.fail(rpc.failure(rpc.RESOURCE_EXHAUSTED, "response message is larger than " + Text(self.client.maxResponseBytes) + " bytes"))
-            return
+            break
         }
-        if self.input.length < 5 + length { return }
-        let data = self.input.slice(5, 5 + length)
-        self.input = self.input.slice(5 + length, self.input.length)
+        if input.length - at < 5 + length { break }
+        let data = input.slice(at + 5, at + 5 + length)
+        at += 5 + length
         let ending = !self.grpc && (flags & 2) == 2
         if (flags & 1) == 1 {
             match self.decompressor {
@@ -1660,32 +1672,34 @@ function Stream.messages() {
                             let code = rpc.INTERNAL
                             if errors.code(problem) == errors.overflowCode() { code = rpc.RESOURCE_EXHAUSTED }
                             self.fail(rpc.failure(code, "cannot decompress response: " + problem.message()))
-                            return
+                            break
                         }
                     }
                 }
                 None {
                     self.fail(rpc.failure(rpc.INTERNAL, "compressed response message without an encoding"))
-                    return
+                    break
                 }
             }
         }
         if ending {
             self.endSeen = true
+            self.input = input.slice(at, input.length)
             self.endMessage(data)
             return
         }
         if (flags & 254) != 0 {
             self.fail(rpc.failure(rpc.INTERNAL, "unexpected envelope flags " + Text(flags)))
-            return
+            break
         }
         self.received += 1
         if (self.kind == rpc.UNARY || self.kind == rpc.CLIENT_STREAM) && self.received > 1 {
             self.fail(rpc.failure(rpc.UNIMPLEMENTED, "more than one response message"))
-            return
+            break
         }
         self.replies.add(data)
     }
+    if at > 0 { self.input = input.slice(at, input.length) }
 }
 // A Connect end-of-stream message: an optional error and the trailers.
 function Stream.endMessage(data: Bytes) {
@@ -1763,7 +1777,7 @@ function Stream.end(trailers: List<rpc.Header>) {
     match self.status {
         Some(error) {
             if error.code != rpc.OK {
-                self.replies = []
+                self.replies = []; self.replyAt = 0
                 self.fail(error)
                 return
             }
