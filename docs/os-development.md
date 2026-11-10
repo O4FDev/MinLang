@@ -89,6 +89,18 @@ python3 tools/osdev.py test --arch arm64 \
   --expect 'OSDEV FIELDS PASS' --timeout 30
 ```
 
+A kernel test can live anywhere; pass its absolute path. The starter
+[examples/kernel/frames-kernel.min](../examples/kernel/frames-kernel.min) is a
+bitmap physical-frame allocator with contracts and a 16-byte `c_packed`
+descriptor ring driven by a small device model. It uses ordinary Minyar, so the
+same file also runs as a hosted program, which is the fast way to iterate:
+
+```sh
+minyar examples/kernel/frames-kernel.min -o frames && ./frames
+python3 tools/osdev.py test --arch arm64 \
+  --kernel-source "$PWD/examples/kernel/frames-kernel.min" --expect 'FRAMES KERNEL PASS'
+```
+
 `make check-osdev-qemu` runs this Arm test; `OSDEV_ARCH=x86_64` selects the
 PC boot path. Both guests exercise PCI discovery, the real e1000 driver's
 packed descriptors and checked TCTL fields, then exit. The legacy QEMU e1000

@@ -1,0 +1,162 @@
+// A physical frame allocator and a descriptor ring driven by a device model.
+// Runs as a finite kernel test: prints FRAMES KERNEL PASS and exits.
+use "text" as text
+
+constant PAGE = 4096
+constant RING_SLOTS = 8
+constant FLAG_DEVICE_OWNS = 1
+constant FLAG_DONE = 2
+
+/// Tracks free 4 KiB frames in a bitmap, one bit per frame.
+record FrameAllocator {
+    base: Integer
+    frames: Integer
+    bitmap: Bytes
+    free: Integer
+}
+
+function newAllocator(base: Integer, frames: Integer): FrameAllocator
+    requires(base % PAGE == 0)
+    requires(frames > 0) {
+    return FrameAllocator { base: base; frames: frames; bitmap: Bytes((frames + 7) / 8); free: frames }
+}
+
+function FrameAllocator.used(frame: Integer): Boolean {
+    return (self.bitmap[frame / 8] >> (frame % 8)) & 1 == 1
+}
+
+function FrameAllocator.mark(frame: Integer, used: Boolean) {
+    let bit = 1 << (frame % 8)
+    if used { self.bitmap[frame / 8] = self.bitmap[frame / 8] | bit }
+    else { self.bitmap[frame / 8] = self.bitmap[frame / 8] & ~bit }
+}
+
+/// Allocates `count` contiguous frames and returns the physical address of the first.
+function FrameAllocator.allocate(count: Integer): Maybe<Integer>
+    requires(count > 0)
+    invariant(self.free >= 0 && self.free <= self.frames) {
+    let run = 0
+    for frame in 0..self.frames {
+        if self.used(frame) { run = 0; continue }
+        run += 1
+        if run == count {
+            let first = frame - count + 1
+            for taken in first..frame + 1 { self.mark(taken, true) }
+            self.free -= count
+            return Some(self.base + first * PAGE)
+        }
+    }
+    return None
+}
+
+function FrameAllocator.release(address: Integer, count: Integer)
+    invariant(self.free >= 0 && self.free <= self.frames) {
+    let first = (address - self.base) / PAGE
+    if address % PAGE != 0 || first < 0 || first + count > self.frames {
+        fail("release of \(text.hex(address)) is outside the allocator")
+    }
+    for frame in first..first + count {
+        if !self.used(frame) { fail("double free of frame \(frame)") }
+        self.mark(frame, false)
+    }
+    self.free += count
+}
+
+/// One 16-byte descriptor, laid out as the device reads it.
+record Descriptor native "c_packed" {
+    address: UInt64
+    length: UInt32
+    flags: UInt16
+    id: UInt16
+}
+
+record Ring {
+    memory: Bytes
+    head: Integer      // next slot the driver fills
+    tail: Integer      // next slot the driver reclaims
+    inFlight: Integer
+    nextId: Integer
+}
+
+function newRing(): Ring {
+    return Ring { memory: Bytes(RING_SLOTS * sizeOf(Descriptor)); head: 0; tail: 0; inFlight: 0; nextId: 1 }
+}
+
+function Ring.slot(index: Integer): Descriptor {
+    return cView(Descriptor, self.memory, (index % RING_SLOTS) * sizeOf(Descriptor))
+}
+
+function Ring.post(address: Integer, length: Integer): Maybe<Integer> {
+    if self.inFlight == RING_SLOTS { return None }
+    let descriptor = self.slot(self.head)
+    let id = self.nextId
+    descriptor.address = address
+    descriptor.length = length
+    descriptor.id = id
+    descriptor.flags = FLAG_DEVICE_OWNS
+    self.nextId = self.nextId % 65535 + 1
+    self.head += 1
+    self.inFlight += 1
+    return Some(id)
+}
+
+/// Returns the next completed descriptor's buffer address, if the device finished it.
+function Ring.reclaim(): Maybe<Integer> {
+    if self.inFlight == 0 { return None }
+    let descriptor = self.slot(self.tail)
+    if descriptor.flags & FLAG_DONE == 0 { return None }
+    descriptor.flags = 0
+    self.tail += 1
+    self.inFlight -= 1
+    return Some(descriptor.address)
+}
+
+/// The device side: completes up to `budget` owned descriptors in ring order.
+function deviceComplete(ring: Ring, budget: Integer): Integer {
+    let done = 0
+    for offset in 0..RING_SLOTS {
+        if done == budget { break }
+        let descriptor = ring.slot(ring.tail + offset)
+        if descriptor.flags == FLAG_DEVICE_OWNS {
+            descriptor.length = descriptor.length / 2
+            descriptor.flags = FLAG_DEVICE_OWNS | FLAG_DONE
+            done += 1
+        }
+    }
+    return done
+}
+
+function main(): Integer {
+    print("FRAMES KERNEL START")
+    let frames = newAllocator(0x40000000, 64)
+    let a = frames.allocate(4).unwrap()
+    let b = frames.allocate(1).unwrap()
+    frames.release(a, 4)
+    let c = frames.allocate(2).unwrap()
+    if c != a { fail("first fit should reuse the freed run") }
+    if frames.allocate(100).isSome() { fail("an impossible run succeeded") }
+
+    let ring = newRing()
+    let posted = 0
+    let reclaimed = 0
+    for round in 0..40 {
+        while true {
+            match frames.allocate(1) {
+                Some(page) {
+                    if ring.post(page, PAGE).isNone() { frames.release(page, 1); break }
+                    posted += 1
+                }
+                None { break }
+            }
+        }
+        deviceComplete(ring, round % 3 + 1)
+        while ring.reclaim() is Some(page) {
+            frames.release(page, 1)
+            reclaimed += 1
+        }
+    }
+    print("posted \(posted), reclaimed \(reclaimed), in flight \(ring.inFlight), free \(frames.free)")
+    if posted != reclaimed + ring.inFlight { fail("lost a descriptor") }
+    print("FRAMES KERNEL PASS")
+    return 0
+}

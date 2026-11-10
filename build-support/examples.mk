@@ -87,3 +87,9 @@ emit: build/hello.ll
 
 run: build/hello
 	./build/hello
+
+.PHONY: check-example-programs
+check-example-programs: build/minyarc build/minyar-default-runtime.o build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
+	MINYAR_CLANG="$(LLVM_CC)" python3 "tests/example-programs.py"
+
+check check-portable: check-example-programs

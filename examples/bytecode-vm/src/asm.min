@@ -1,0 +1,98 @@
+use "text" as text
+use "./opcodes.min" as op
+
+record Fixup { position: Integer; label: Text; line: Integer }
+
+public function assemble(source: Text): Result<Bytes, Text> {
+    let code = Bytes()
+    let labels: Map<Text, Integer> = Map()
+    let fixups: List<Fixup> = []
+    let lineNumber = 0
+    for raw in source.split("\n") {
+        lineNumber += 1
+        let line = raw
+        let comment = line.find(";")
+        if comment >= 0 { line = line.slice(0, comment) }
+        line = line.trim()
+        if line.length == 0 { continue }
+        if line.endsWith(":") {
+            let name = line.slice(0, line.length - 1)
+            if labels.has(name) { return Err("line \(lineNumber): label '\(name)' defined twice") }
+            labels[name] = code.length
+            continue
+        }
+        let words = line.split(" ")
+        let mnemonic = words[0]
+        let opcode = try lookup(mnemonic, lineNumber)
+        code.add(opcode)
+        let width = op.operandBytes(opcode)
+        if width == 0 {
+            if words.length != 1 { return Err("line \(lineNumber): '\(mnemonic)' takes no operand") }
+            continue
+        }
+        if words.length != 2 { return Err("line \(lineNumber): '\(mnemonic)' needs one operand") }
+        let operand = words[1]
+        if width == 8 {
+            match text.integer(operand) {
+                Ok(value) { code.addInt64(value) }
+                Err(_) { return Err("line \(lineNumber): '\(operand)' is not an integer") }
+            }
+        } else if width == 4 {
+            fixups.add(Fixup { position: code.length; label: operand; line: lineNumber })
+            code.addInt32(0)
+        } else {
+            match text.integer(operand) {
+                Ok(slot) where slot >= 0 && slot < 256 { code.add(slot) }
+                _ { return Err("line \(lineNumber): slot '\(operand)' must be 0..255") }
+            }
+        }
+    }
+    for fix in fixups {
+        if !labels.has(fix.label) { return Err("line \(fix.line): unknown label '\(fix.label)'") }
+        code.setInt32(fix.position, labels[fix.label])
+    }
+    return Ok(code)
+}
+
+function lookup(mnemonic: Text, line: Integer): Result<Integer, Text> {
+    return match mnemonic {
+        "halt" { Ok(op.HALT) }
+        "push" { Ok(op.PUSH) }
+        "pop" { Ok(op.POP) }
+        "add" { Ok(op.ADD) }
+        "sub" { Ok(op.SUB) }
+        "mul" { Ok(op.MUL) }
+        "div" { Ok(op.DIV) }
+        "dup" { Ok(op.DUP) }
+        "swap" { Ok(op.SWAP) }
+        "jmp" { Ok(op.JMP) }
+        "jz" { Ok(op.JZ) }
+        "call" { Ok(op.CALL) }
+        "ret" { Ok(op.RET) }
+        "load" { Ok(op.LOAD) }
+        "store" { Ok(op.STORE) }
+        "print" { Ok(op.PRINT) }
+        "lt" { Ok(op.LT) }
+        "eq" { Ok(op.EQ) }
+        _ { Err("line \(line): unknown instruction '\(mnemonic)'") }
+    }
+}
+
+test "assembles a loop with a forward label" {
+    let code = assemble("""
+        push 3
+        top:
+        jz done
+        push 1
+        sub
+        jmp top
+        done:
+        halt
+        """).unwrap()
+    expect(code[0] == op.PUSH)
+    expect(code.length == 1 + 8 + 5 + 9 + 1 + 5 + 1)
+}
+
+test "rejects an unknown label" {
+    expect(assemble("jmp nowhere").isErr())
+}

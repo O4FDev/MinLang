@@ -1,0 +1,110 @@
+use "./opcodes.min" as op
+use "./asm.min" as asm
+
+public record State {
+    stack: List<Integer>
+    frames: List<Integer>
+    locals: List<Integer>
+    pc: Integer
+    steps: Integer
+}
+
+public function run(code: Bytes, budget: Integer): Result<State, Text> {
+    let state = State { stack: []; frames: []; locals: []; pc: 0; steps: 0 }
+    for i in 0..256 { state.locals.add(0) }
+    while true {
+        if state.steps >= budget { return Err("step budget of \(budget) exhausted at pc \(state.pc)") }
+        if state.pc < 0 || state.pc >= code.length { return Err("pc \(state.pc) is outside the program") }
+        state.steps += 1
+        let opcode = code[state.pc]
+        state.pc += 1
+        if opcode == op.HALT { return Ok(state) }
+        else if opcode == op.PUSH {
+            state.stack.add(code.getInt64(state.pc))
+            state.pc += 8
+        } else if opcode == op.POP { try pop(state) }
+        else if opcode == op.ADD {
+            let b = try pop(state)
+            let a = try pop(state)
+            state.stack.add(a + b)
+        } else if opcode == op.SUB {
+            let b = try pop(state)
+            let a = try pop(state)
+            state.stack.add(a - b)
+        } else if opcode == op.MUL {
+            let b = try pop(state)
+            let a = try pop(state)
+            state.stack.add(a * b)
+        } else if opcode == op.DIV {
+            let b = try pop(state)
+            let a = try pop(state)
+            if b == 0 { return Err("division by zero at pc \(state.pc - 1)") }
+            state.stack.add(a / b)
+        } else if opcode == op.DUP {
+            let a = try pop(state)
+            state.stack.add(a)
+            state.stack.add(a)
+        } else if opcode == op.SWAP {
+            let b = try pop(state)
+            let a = try pop(state)
+            state.stack.add(b)
+            state.stack.add(a)
+        } else if opcode == op.JMP {
+            state.pc = code.getInt32(state.pc)
+        } else if opcode == op.JZ {
+            let target = code.getInt32(state.pc)
+            state.pc += 4
+            if try pop(state) == 0 { state.pc = target }
+        } else if opcode == op.CALL {
+            state.frames.add(state.pc + 4)
+            state.pc = code.getInt32(state.pc)
+        } else if opcode == op.RET {
+            if state.frames.length == 0 { return Err("ret with an empty call stack") }
+            state.pc = state.frames.pop()
+        } else if opcode == op.LOAD {
+            state.stack.add(state.locals[code[state.pc]])
+            state.pc += 1
+        } else if opcode == op.STORE {
+            state.locals[code[state.pc]] = try pop(state)
+            state.pc += 1
+        } else if opcode == op.PRINT {
+            print(try pop(state))
+        } else if opcode == op.LT {
+            let b = try pop(state)
+            let a = try pop(state)
+            state.stack.add(match a < b { true { 1 } false { 0 } })
+        } else if opcode == op.EQ {
+            let b = try pop(state)
+            let a = try pop(state)
+            state.stack.add(match a == b { true { 1 } false { 0 } })
+        } else {
+            return Err("bad opcode \(opcode) at pc \(state.pc - 1)")
+        }
+    }
+}
+
+function pop(state: State): Result<Integer, Text> {
+    if state.stack.length == 0 { return Err("stack underflow at pc \(state.pc)") }
+    return Ok(state.stack.pop())
+}
+
+test "call and ret return to the caller" {
+    let code = asm.assemble("""
+        push 7
+        call square
+        print
+        halt
+        square:
+        dup
+        mul
+        ret
+        """).unwrap()
+    let state = run(code, 100).unwrap()
+    expect(state.frames.length == 0)
+    expect(state.steps == 7)
+}
+
+test "a runaway loop stops at its step budget" {
+    let code = asm.assemble("top:\njmp top").unwrap()
+    expect(run(code, 50).isErr())
+}
