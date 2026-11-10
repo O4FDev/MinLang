@@ -39,7 +39,7 @@ That unchanged exception is not a three/four-unit service guarantee. Captured
 object predecessors are finite.
 Progress requires continued service points; K bounds cleanup units, not allocator
 latency, copying, page faults, OS scheduling, or elapsed operation time. See
-[the complete operation table](../bounded-runtime-contract.md#the-work-budget).
+[the complete operation table](../../bounded-runtime-contract.md#the-work-budget).
 
 The memory lane's October 20 default self-compile observation reports 11.2M
 frames, 30.9M keeps, 77.7M steps, and 14.5M chunks, with 9.13B retired user

@@ -6,9 +6,9 @@ OS and format parsers, or package and release tooling) and writes findings as
 they are found. Each report records the input an attacker controls, the exact
 code path, impact, a safe reproduction, whether the behavior was reproduced or
 inferred, and the regression that will close it. Keep unverified suspicions in
-a separate section. The dated audit in `docs/security-audit-2026-10-19.md`
+a separate section. The dated audit in `docs/records/2026-10-19-security/audit.md`
 tracks the earlier review and its remaining gaps. The current scan categories
-and threat boundaries are in `docs/security-review-plan-2026-10-19.md`.
+and threat boundaries are in `docs/records/2026-10-19-security/review-plan.md`.
 
 ## Gates and timing
 

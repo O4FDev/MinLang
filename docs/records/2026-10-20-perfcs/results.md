@@ -29,9 +29,9 @@ emit identical 17,171,630-byte LLVM:
 The matching first-pair arena median is 2,409,033,972. Default remains over 6x that
 arena control; the 1.2x target is unmet. Eager is unchanged within measurement
 variation. The isolated frame screen saves 0.780% beyond the first candidate.
-Raw observations and identities are in [first-self.json](../../experiments/perfcs/results/first-self.json),
-[combined-self.json](../../experiments/perfcs/results/combined-self.json) and
-[frame-screen.json](../../experiments/perfcs/results/frame-screen.json).
+Raw observations and identities are in [first-self.json](../../../experiments/perfcs/results/first-self.json),
+[combined-self.json](../../../experiments/perfcs/results/combined-self.json) and
+[frame-screen.json](../../../experiments/perfcs/results/frame-screen.json).
 
 ## Complete first-candidate product campaign
 
@@ -63,7 +63,7 @@ save and compare complete decoded bytes across roles/profiles; JPEG's C-referenc
 tolerance does not weaken exact candidate/control equality. Jsmn additionally
 passes unchanged upstream, compatibility and thread clients in all four parser
 modes for each runtime/profile. JS requires shipping and instrumented checksum
-stdout to agree. [first-products.json](../../experiments/perfcs/results/first-products.json)
+stdout to agree. [first-products.json](../../../experiments/perfcs/results/first-products.json)
 retains every observation and oracle hash; full raw decoded bytes, objects,
 manifests and source snapshots are in the coordination archive.
 
@@ -101,7 +101,7 @@ Accounting labels and exact-byte oracles above remain unchanged.
 All 272 executions and 12 complete codec-byte oracles pass. Eager, zlib and PNG
 remain unchanged within measurement variation. Default JS improves 2.710%,
 JPEG 1.444% (instrumented), and the three jsmn sizes 3.161%, 6.771%, 6.842%.
-[combined-products.json](../../experiments/perfcs/results/combined-products.json)
+[combined-products.json](../../../experiments/perfcs/results/combined-products.json)
 retains every observation. This follows the directly measured 3.849% default
 self-compiler improvement above; no arena-target or general 2x claim is made.
 
@@ -123,7 +123,7 @@ frames of eight scalar owners:
 All 64 executions emit checksum 1279999200000; separate 32-frame same-object
 instrumented links require 32640 and zero ownership/tasks/caches/backing.
 These microbenchmarks justify the restricted path, without product inference.
-[cycle-owner data](../../experiments/perfcs/results/cycle-owners.json) and the
+[cycle-owner data](../../../experiments/perfcs/results/cycle-owners.json) and the
 `experiments/perfcs/cycle-owners/` sources preserve its method. The exact
 K-unit/queue equivalence proof is in [bounded-ownership.md](bounded-ownership.md).
 
@@ -141,8 +141,8 @@ read-guard retain/releases. At 2048 historic entries the complete empty workload
 falls 28,713,066→1,414,227 instructions (-95.075%); nonempty sparse control changes
 28,919,525→28,922,068 (+2543 instructions). This includes unchanged population,
 removal and cleanup; sparse nonempty traversal remains capacity-linear. Raw
-[empty-map.json](../../experiments/perfcs/results/empty-map.json) and
-[large-alias.json](../../experiments/perfcs/results/large-alias.json) retain samples.
+[empty-map.json](../../../experiments/perfcs/results/empty-map.json) and
+[large-alias.json](../../../experiments/perfcs/results/large-alias.json) retain samples.
 
 ## Qualification and reproduction
 
@@ -168,7 +168,7 @@ every calibrated allocation refusal/retry, output ownership and three omission
 mutants. The product checkout was not edited; its complete product adoption
 qualification remains separate.
 
-See [the reproduction guide](../../experiments/perfcs/README.md). Complete frozen
+See [the reproduction guide](../../../experiments/perfcs/README.md). Complete frozen
 inputs, executables, LLVM, raw logs/counters and failed preparations are retained
 under the 2026-10-20 perfcs coordination archive. JSON paths identify the original
 remote artifacts; they are not executable laptop instructions.
@@ -207,10 +207,10 @@ JS/jsmn accounting remains disabled, separate same-object ownership links pass,
 and safelibs still requires instrumented accounting. Eager/PNG/zlib changes are
 small measurement variation, not exact instruction equality or claimed gains.
 Raw reports and complete build manifests are
-[current-self.json](../../experiments/perfcs/results/current-self.json),
-[current-self-manifest.json](../../experiments/perfcs/results/current-self-manifest.json),
-[current-products.json](../../experiments/perfcs/results/current-products.json) and
-[current-products-manifest.json](../../experiments/perfcs/results/current-products-manifest.json).
+[current-self.json](../../../experiments/perfcs/results/current-self.json),
+[current-self-manifest.json](../../../experiments/perfcs/results/current-self-manifest.json),
+[current-products.json](../../../experiments/perfcs/results/current-products.json) and
+[current-products-manifest.json](../../../experiments/perfcs/results/current-products-manifest.json).
 
 A separate [source/data audit](current-data-audit.md) independently recomputes
 all 16 rows, all 304 counters, sample/order/output/accounting assertions, shared
@@ -219,7 +219,7 @@ accounting error; accepted selection-count/general-dispatch wording refinements
 are reflected in the design. It did not rerun workloads or qualify the final
 gates. The parent separately verified all 773 immutable manifest files against
 the downloaded measured-artifact archive; its
-[coverage receipt](../../experiments/perfcs/results/current-archive-coverage.json)
+[coverage receipt](../../../experiments/perfcs/results/current-archive-coverage.json)
 and coordination archive index identify that byte audit. Measured binaries,
 LLVM, inputs and raw output are retained offbox; proof-source/log archives
 explicitly omit reproducible ELF/object files.
@@ -255,17 +255,17 @@ pass. Safelibs remains instrumented for its frozen live-object API.
 | zlib default, instrumented | 5,310,824,019 | 5,310,812,869 | unchanged |
 | zlib eager, instrumented | 4,747,509,798 | 4,747,510,164 | unchanged |
 
-Raw data/build manifests: [self](../../experiments/perfcs/results/postfix-self.json),
-[self manifest](../../experiments/perfcs/results/postfix-self-manifest.json),
-[products](../../experiments/perfcs/results/postfix-products.json) and
-[product manifest](../../experiments/perfcs/results/postfix-products-manifest.json).
+Raw data/build manifests: [self](../../../experiments/perfcs/results/postfix-self.json),
+[self manifest](../../../experiments/perfcs/results/postfix-self-manifest.json),
+[products](../../../experiments/perfcs/results/postfix-products.json) and
+[product manifest](../../../experiments/perfcs/results/postfix-products-manifest.json).
 The [independent final-source audit](postfix-data-audit.md) recomputes all 304
 counters/16 medians and checks sample/output/accounting/link/helper identities,
 every runtime Git blob, and unchanged frozen compiler, 103 product input files
 and 78 library files. No discrepancy was found; it does not certify a landing.
 The parent separately verifies all 773 immutable files plus 12 complete decoded
 codec files against the downloaded archive, with a
-[byte receipt](../../experiments/perfcs/results/postfix-archive-coverage.json).
+[byte receipt](../../../experiments/perfcs/results/postfix-archive-coverage.json).
 Full ELF/LLVM/input/raw artifacts are retained in the coordination archive
 `postfix-artifacts.tar.gz`, 58,335,565 bytes, SHA-256
 `502e2a9a81d984f63800b2ea5f2c9165992ef80100902c2825d12e0837f22458`.

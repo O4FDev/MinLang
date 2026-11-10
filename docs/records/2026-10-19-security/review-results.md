@@ -4,7 +4,7 @@ Date: 2026-10-19. All commands, builds, fuzzing, and probes in this review ran o
 
 ## Scope and triage plan
 
-The review followed `docs/security-review-plan-2026-10-19.md` and covered ten areas:
+The review followed `docs/records/2026-10-19-security/review-plan.md` and covered ten areas:
 
 | Area | Main attack surfaces |
 | --- | --- |
@@ -19,7 +19,7 @@ The review followed `docs/security-review-plan-2026-10-19.md` and covered ten ar
 | CI and dependencies | pinned tools, Go/Cargo/npm advisories, sanitizer gates |
 | Resource budgets | CPU, memory, file size, record counts, fuzzing oracles |
 
-The initial baseline and prior fixes are documented in `docs/security-audit-2026-10-19.md`. This file records the additional late-pass findings and tests.
+The initial baseline and prior fixes are documented in `docs/records/2026-10-19-security/audit.md`. This file records the additional late-pass findings and tests.
 
 ## Confirmed issues fixed
 

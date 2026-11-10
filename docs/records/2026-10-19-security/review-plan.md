@@ -1,6 +1,6 @@
 # Security review plan — 19 October 2026
 
-This pass builds on `security-audit-2026-10-19.md`. It treats source files,
+This pass builds on `audit.md`. It treats source files,
 package repositories, network peers, update metadata, disk images, editor
 messages, and CI event data as hostile at their respective boundaries. A
 finding needs an attacker-controlled input, a reachable code path, an impact,

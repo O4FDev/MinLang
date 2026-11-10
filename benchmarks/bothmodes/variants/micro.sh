@@ -1,5 +1,5 @@
 #!/bin/sh
-# Micro-measures for reports/serial-and-parallel.md (Linux, valgrind on PATH):
+# Micro-measures for docs/records/2026-10-30-goal-run/serial-and-parallel.md (Linux, valgrind on PATH):
 # thread-share.min (copying a List into threads vs FrozenBytes; a typed channel
 # vs local calls) and parallel-dispatch.min (one small parallel for). Run from
 # the repository root after building build/minyarc.

@@ -329,7 +329,7 @@ frames/chunks are outside this cache cap.
 Native integrations that manually discard private ownership roots must also
 discard the chunk-cache root. Normal numeric thread-domain disposal frees it.
 The cache invariant and amortized cost are in
-[the temporary-storage design](perfcs/temporary-cache.md).
+[the temporary-storage design](records/2026-10-20-perfcs/temporary-cache.md).
 
 There is no full cleanup drain at process exit. Measurements of complete
 reclamation must add one to their harness.
