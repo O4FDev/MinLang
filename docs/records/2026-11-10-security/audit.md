@@ -89,11 +89,23 @@ maintainer can decide.
    in the build's state directory or by `MINYAR_LIVE_STATE`. It is a
    development feature with the trust of the user who runs the program; a
    production build should not include it.
-6. **Unmerged branches.** WebSocket (`goal/websocket`) and the PostgreSQL client
-   (`goal/postgres`) are not in `v2` and were read but not tested here beyond
-   the one check below. For the branch owners: WebSocket pong replies are queued
+6. **`protoc-gen-minyar` writes descriptor names into comments unescaped.**
+   `tools/protoc-gen-minyar/generator.min` quotes every string it emits as a
+   literal, but the file name in the `// source:` header and the full names in
+   `///` comments are written as they arrive. protoc only produces identifier
+   characters in type names, so this needs a hand-made `CodeGeneratorRequest`
+   or a `.proto` file whose own name contains a line break; the text after the
+   break would then be compiled as code. It was read, not reproduced. Proposed
+   fix: refuse a request whose file, package, type, field, oneof, service or
+   method name contains a control character, in `generate`, with a test that
+   feeds the plugin such a request.
+7. **Unmerged branches.** WebSocket (`goal/websocket`) and the PostgreSQL client
+   (`goal/postgres`) are not in `v2` and were read but not tested here, apart from
+   the one reproduction noted. For the branch owners: WebSocket pong replies are queued
    without regard to `maxPendingBytes`, so a peer that sends pings and reads
-   nothing grows the output buffer until the write deadline; SCRAM accepts up to
+   nothing grows the output buffer until the write deadline (reproduced against
+   the branch's `websocket.min`: 13.1 MB of pings left 12.7 MB queued under a
+   1 MiB limit); SCRAM accepts up to
    ten million iterations from the server, which is seconds of work per
    connection attempt; and with `TLS_PREFER` or `TLS_DISABLE` a server chooses
    the authentication method, including a cleartext password, as in libpq. The
