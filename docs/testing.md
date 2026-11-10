@@ -1366,7 +1366,10 @@ isolated correctness/sanitizer evidence harness, macOS runs the portable
 compiler/runtime/module suite, and Windows runs that portable suite under
 UCRT64. The portable gate includes the byte-identical compiler fixed point,
 feature conformance, exact diagnostic snapshots, deterministic grammar fuzzing,
-and graceful compiler/program stack exhaustion. Windows selects the portable
+graceful compiler/program stack exhaustion, the core ownership assertions
+(`check-ownership-core`: generated ownership graphs natively and under
+ASan/UBSan, and the shared memory suite) and the regression suite under
+ASan/UBSan (`check-regressions-sanitize`). Windows selects the portable
 `peer-regressions.min` suite; the extended peer suites include POSIX-only allocator
 and incremental-driver probes and run in the Linux matrix and macOS gate.
 

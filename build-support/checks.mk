@@ -270,11 +270,17 @@ check-sanitized-fixed-point: build/minyarc-sanitize build/compiler-stage3.ll bui
 .PHONY: check-sanitize-core
 check-sanitize: check-generated-sanitizer check-sanitized-fixed-point check-stack-overflow-sanitize check-sanitize-core
 
-check-sanitize-core: build/tooling/tests/memory build/minyarc-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions build/tooling/tools/clang-driver build/tooling/tests/ownership build/tooling/tests/fuzz
+# The regression suite under ASan/UBSan is a piece of its own so check-portable can run it on every commit.
+.PHONY: check-regressions-sanitize
+check-regressions-sanitize: build/minyarc-sanitize build/minyar-runtime-sanitize.o build/tooling/tests/regressions
+	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/regressions
+
+check-portable: check-regressions-sanitize
+
+check-sanitize-core: check-regressions-sanitize build/tooling/tests/memory build/minyarc-sanitize build/minyar-runtime.o build/minyar-runtime-sanitize.o build/runtime-unit-sanitize build/tooling/tests/regressions build/tooling/tools/clang-driver build/tooling/tests/ownership build/tooling/tests/fuzz
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize $(SANITIZER_LIMITED) sh tests/run-module-tests.sh
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/tooling/tests/fuzz --compiler build/minyarc-sanitize --cases 100 --hostile-timeout 15
 	ASAN_OPTIONS=detect_leaks=0 $(SANITIZER_LIMITED) ./build/runtime-unit-sanitize
-	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/regressions
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/ownership
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
 
@@ -346,7 +352,12 @@ check-examples: build/stage0 build/minyarc build/compiler-stage3.ll build/hello 
 build/tooling/tests/ownership: TOOL_NATIVE = tests/sha256-test-native.c
 build/tooling/tests/ownership: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/ownership: tests/sha256-test-native.c
-check-ownership: build/minyarc build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/memory build/tooling/tests/ownership
+# Generated ownership graphs natively and under ASan/UBSan with the ownership runtime, and the shared memory suite: the
+# core ownership assertions. They gate every commit; the rest of check-ownership (58 checks) runs in make check.
+.PHONY: check-ownership-core
+check-ownership: check-ownership-core
+check-portable: check-ownership-core
+check-ownership-core: build/minyarc build/minyar-runtime.o build/ownership-runtime.o build/tooling/tests/memory build/tooling/tests/ownership
 	$(LIMITED) ./build/tooling/tests/ownership
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/ownership
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED) ./build/tooling/tests/memory --shared
