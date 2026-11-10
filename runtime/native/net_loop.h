@@ -24,9 +24,9 @@ enum {
     NET_LOOP_MAX_BATCH = 65536,
     NET_LOOP_REGISTRATION_SLOT_BITS = 23
 };
-#define NET_LOOP_REGISTRATION_SLOT_LIMIT                                                      \
+#define NET_LOOP_REGISTRATION_SLOT_LIMIT                                                           \
     ((UINT32_C(1) << NET_LOOP_REGISTRATION_SLOT_BITS) - UINT32_C(1))
-#define NET_LOOP_REGISTRATION_GENERATION_LIMIT                                                \
+#define NET_LOOP_REGISTRATION_GENERATION_LIMIT                                                     \
     ((UINT64_C(1) << (63 - NET_LOOP_REGISTRATION_SLOT_BITS)) - UINT64_C(1))
 typedef struct {
     socket_t socket;
@@ -263,8 +263,7 @@ static void net_loop_hash_insert(NetLoop *loop, socket_t socket, uint32_t slot) 
 }
 static int net_loop_entry_capacity_error(NetLoop *loop) {
     return net_loop_registration_generation == NET_LOOP_REGISTRATION_GENERATION_LIMIT ||
-                   (!loop->free_entry &&
-                    loop->entry_count == NET_LOOP_REGISTRATION_SLOT_LIMIT)
+                   (!loop->free_entry && loop->entry_count == NET_LOOP_REGISTRATION_SLOT_LIMIT)
                ? EOVERFLOW
                : 0;
 }
@@ -517,8 +516,7 @@ MinyarBytes *minyar_net_loopWatch(long long handle, long long connection, long l
     }
     net_loop_hash_insert(loop, socket, index);
     NET_APP_CHANGED(handle);
-    return net_loop_result(0,
-                           (long long)net_loop_registration_handle(index, entry->generation));
+    return net_loop_result(0, (long long)net_loop_registration_handle(index, entry->generation));
 }
 static int net_loop_update(long long handle, long long registration, long long interest,
                            long long token) {
@@ -619,8 +617,7 @@ MinyarBytes *minyar_net_loopTimer(long long handle, long long delay, long long p
     loop->timers[loop->timer_count++] = index;
     net_loop_heap_up(loop, entry->heap_index);
     NET_APP_CHANGED(handle);
-    return net_loop_result(0,
-                           (long long)net_loop_registration_handle(index, entry->generation));
+    return net_loop_result(0, (long long)net_loop_registration_handle(index, entry->generation));
 }
 static void net_loop_event(MinyarBytes *result, uint64_t identity, long long token, unsigned flags,
                            int code, unsigned kind) {

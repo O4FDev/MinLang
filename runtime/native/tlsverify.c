@@ -78,7 +78,8 @@ static bool exact_der(const unsigned char *p, size_t n) {
 }
 
 /* Count (out == NULL) or unpack at most `limit` CertificateEntry records. */
-static int unpack_entries(const MinyarBytes *bytes, CertBytes *out, int limit, long long max_bytes) {
+static int unpack_entries(const MinyarBytes *bytes, CertBytes *out, int limit,
+                          long long max_bytes) {
     if (bytes->byte_length < 0 || bytes->byte_length > max_bytes)
         return -1;
     size_t n = (size_t)bytes->byte_length, at = 0;

@@ -30,6 +30,7 @@ int main(int argc, char **argv) {
     FILE *output = argc == 3 ? fopen(argv[2], "wb") : stdout;
     assert(output);
     assert(fwrite(signature, 1, sizeof(signature), output) == sizeof(signature));
-    if (argc == 3) assert(fclose(output) == 0);
+    if (argc == 3)
+        assert(fclose(output) == 0);
     return 0;
 }

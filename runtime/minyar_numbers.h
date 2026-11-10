@@ -44,7 +44,8 @@ void minyar_check_integer_division(long long left, long long right) {
 static size_t float_copy_spelling(char *out, size_t capacity, const char *text, size_t length) {
     if (capacity) {
         size_t copied = length < capacity ? length : capacity - 1;
-        if (copied) memcpy(out, text, copied);
+        if (copied)
+            memcpy(out, text, copied);
         out[copied] = 0;
     }
     return length;
@@ -54,9 +55,11 @@ static size_t format_float(double value, char *out, size_t capacity) {
     if (isnan(value))
         return float_copy_spelling(out, capacity, "NaN", 3);
     if (isinf(value))
-        return float_copy_spelling(out, capacity, value < 0 ? "-Infinity" : "Infinity", value < 0 ? 9 : 8);
+        return float_copy_spelling(out, capacity, value < 0 ? "-Infinity" : "Infinity",
+                                   value < 0 ? 9 : 8);
     if (value == 0)
-        return float_copy_spelling(out, capacity, signbit(value) ? "-0.0" : "0.0", signbit(value) ? 4 : 3);
+        return float_copy_spelling(out, capacity, signbit(value) ? "-0.0" : "0.0",
+                                   signbit(value) ? 4 : 3);
     /* Every integer strictly inside +/-2^53 is exact and its decimal integer
      * spelling already has the fewest significant digits. All are within our
      * plain-notation range; avoid scientific formatting and reparsing. */
@@ -156,7 +159,7 @@ long long minyar_float_integer(double value) {
     /* Both bounds are exact powers of two, so the comparison is exact. */
     if (!(value >= -9223372036854775808.0 && value < 9223372036854775808.0))
         minyar_stop_program(isnan(value) ? "NaN cannot be converted to an Integer."
-                                 : "this Float is outside the Integer range.");
+                                         : "this Float is outside the Integer range.");
     return (long long)value;
 }
 
