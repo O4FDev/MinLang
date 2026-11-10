@@ -546,6 +546,26 @@ and verifies exact baseline/candidate output and live-object cleanup. Those
 timings include the existing Python wrapper, copies, allocations and guards;
 they must not be substituted for a native decoder-throughput measurement.
 
+## Numeric text and Text search
+
+Float printing and short JSON decimals use integer-only unrounded scaling
+(`runtime/minyar_float_scale.h`; see [language](language.md) and
+[JSON numbers](json-numbers.md)). On an Apple arm64 laptop, linking the same
+program IR against the previous and current runtime, formatting 600,000
+Floats fell from 10.33 G to 0.60 G retired instructions, and parsing a
+200,000-number JSON array end to end from 1.50 G to 0.66 G, with identical
+output.
+
+`find`, `contains`, `split` and `replace` with a needle of 2 to 16 bytes test
+sixteen text positions per step against the needle's first and last bytes
+(SSE2 on x86-64, NEON on arm64, no CPU dispatch) and compare only the
+positions that pass ([Muła](http://0x80.pl/notesen/2016-11-28-simd-strfind.html)).
+Each text byte still costs at most sixteen comparisons. Other targets keep the
+scalar first-byte scan. On 64 MiB of log-shaped text the search part retired
+1.6–4.7 times fewer instructions (2.3–9 times fewer cycles), from frequent
+`status=ok` matches to an absent `timeout`. `check-runtime-unit` compares the
+search with a naive oracle on small alphabets across the 16-byte steps.
+
 ## Compiler profile guidance
 
 On native Linux, `make compiler-pgo` builds an isolated compiler using LLVM IR

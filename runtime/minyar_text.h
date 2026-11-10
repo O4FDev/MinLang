@@ -1,5 +1,7 @@
 #if defined(__SSE2__)
 #include <emmintrin.h>
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 /* Text operations use validated UTF-8 and scalar positions. Every public
  * entry validates all Text operands before taking empty/length shortcuts. */
@@ -143,6 +145,56 @@ static inline void text_search_free(long long *table, const long long *small) {
     free(table);
 #endif
 }
+/* Candidates for a needle of 2..TEXT_SEARCH_SHORT bytes, sixteen positions per
+ * step: a position survives only when both its first and its last byte match
+ * the needle's (Mula, "SIMD-friendly algorithms for substring searching",
+ * http://0x80.pl/notesen/2016-11-28-simd-strfind.html; the prefilter of Rust's
+ * memchr::memmem), and each survivor is compared in place. Every text byte
+ * still costs at most TEXT_SEARCH_SHORT comparisons, so the search stays
+ * linear. Returns -1 - p for a match at p, or the first position the vector
+ * loop did not cover, for the scalar loop to finish. */
+static inline long long text_search_short_vector(const unsigned char *bytes,
+                                                 const unsigned char *wanted, long long length,
+                                                 long long i, long long last) {
+#if defined(__SSE2__)
+    const __m128i first = _mm_set1_epi8((char)wanted[0]);
+    const __m128i ending = _mm_set1_epi8((char)wanted[length - 1]);
+    /* Both loads of a step end inside the text: i + 15 <= last. */
+    for (; last - i >= 15; i += 16) {
+        __m128i head = _mm_loadu_si128((const __m128i *)(const void *)(bytes + i));
+        __m128i tail = _mm_loadu_si128((const __m128i *)(const void *)(bytes + i + length - 1));
+        unsigned mask = (unsigned)_mm_movemask_epi8(
+            _mm_and_si128(_mm_cmpeq_epi8(head, first), _mm_cmpeq_epi8(tail, ending)));
+        while (mask) {
+            long long at = i + __builtin_ctz(mask);
+            if (bytes_are_equal(bytes + at + 1, wanted + 1, (size_t)(length - 2))) return -1 - at;
+            mask &= mask - 1;
+        }
+    }
+#elif defined(__ARM_NEON) && defined(__aarch64__)
+    const uint8x16_t first = vdupq_n_u8(wanted[0]);
+    const uint8x16_t ending = vdupq_n_u8(wanted[length - 1]);
+    for (; last - i >= 15; i += 16) {
+        uint8x16_t head = vld1q_u8(bytes + i);
+        uint8x16_t tail = vld1q_u8(bytes + i + length - 1);
+        uint8x16_t both = vandq_u8(vceqq_u8(head, first), vceqq_u8(tail, ending));
+        /* Four mask bits per position. */
+        uint64_t mask =
+            vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(both), 4)), 0);
+        while (mask) {
+            long long at = i + (__builtin_ctzll(mask) >> 2);
+            if (bytes_are_equal(bytes + at + 1, wanted + 1, (size_t)(length - 2))) return -1 - at;
+            mask &= ~(UINT64_C(0xf) << (__builtin_ctzll(mask) & ~3));
+        }
+    }
+#else
+    (void)bytes;
+    (void)wanted;
+    (void)length;
+    (void)last;
+#endif
+    return i;
+}
 static long long text_search_next(const MinyarText *text, const MinyarText *needle,
                                   long long start, const long long *table) {
     if (needle->byte_length > text->byte_length - start) return -1;
@@ -154,7 +206,9 @@ static long long text_search_next(const MinyarText *text, const MinyarText *need
     if (needle->byte_length <= TEXT_SEARCH_SHORT) {
         const unsigned char *bytes = text->bytes, *wanted = needle->bytes;
         long long rest = needle->byte_length - 1, last = text->byte_length - needle->byte_length;
-        for (long long i = start; i <= last;) {
+        long long i = text_search_short_vector(bytes, wanted, needle->byte_length, start, last);
+        if (i < 0) return -1 - i;
+        for (; i <= last;) {
             long long at = text_byte_find(bytes, i, last + 1, wanted[0]);
             if (at > last) return -1;
             if (bytes_are_equal(bytes + at + 1, wanted + 1, (size_t)rest)) return at;

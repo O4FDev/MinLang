@@ -207,7 +207,52 @@ static void mixed_ascii_index_blocks(void) {
     }
 }
 
+/* Text search against a naive oracle: small alphabets make many partial and
+   overlapping candidates, lengths cross the 16-byte vector steps, and needles
+   cover the vector/short path (2..16 bytes) and the table path above it. */
+static void text_search_oracle(void) {
+    unsigned char hay[96], wanted[24];
+    uint64_t state = 0x9e3779b97f4a7c15u;
+    unsigned long long searches = 0;
+    for (int round = 0; round < 20000; round++) {
+        state = state * 6364136223846793005u + 1442695040888963407u;
+        unsigned alphabet = 2 + (unsigned)(state >> 61) % 3;
+        long long length = (long long)((state >> 33) % sizeof(hay));
+        long long size = 2 + (long long)((state >> 20) % 19);
+        for (long long i = 0; i < length; i++) {
+            state = state * 6364136223846793005u + 1442695040888963407u;
+            hay[i] = (unsigned char)('a' + (state >> 59) % alphabet);
+        }
+        state = state * 6364136223846793005u + 1442695040888963407u;
+        if (length >= size && (state >> 63)) {
+            memcpy(wanted, hay + (long long)((state >> 7) % (unsigned long long)(length - size + 1)), (size_t)size);
+        } else {
+            for (long long i = 0; i < size; i++) wanted[i] = (unsigned char)('a' + (state >> (i % 50)) % alphabet);
+        }
+        MinyarText text = {0}, needle = {0};
+        text.bytes = hay;
+        text.byte_length = length;
+        needle.bytes = wanted;
+        needle.byte_length = size;
+        long long small[TEXT_SEARCH_SMALL];
+        long long *table = text_search_table(&needle, length, small);
+        for (long long start = 0; start <= length; start++) {
+            long long expected = -1;
+            for (long long i = start; i + size <= length; i++)
+                if (!memcmp(hay + i, wanted, (size_t)size)) {
+                    expected = i;
+                    break;
+                }
+            assert(text_search_next(&text, &needle, start, table) == expected);
+            searches++;
+        }
+        text_search_free(table, small);
+    }
+    assert(searches > 500000);
+}
+
 int main(void) {
+    text_search_oracle();
     scope_release_paths();
     minyar_rc_release(NULL);
     minyar_rc_enter(3);
