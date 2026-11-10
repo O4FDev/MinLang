@@ -6,6 +6,8 @@ work=$PWD/build/erofs-utils-1.8.10
 mkdir -p "$work"
 if ! test -f "$work/VERSION"; then
     curl -fL --retry 2 https://github.com/erofs/erofs-utils/archive/refs/tags/v1.8.10.tar.gz -o "$work/source.tar.gz"
+    # Tag v1.8.10 is commit 95c4a7ace29b4a03f39d351390c110dfc874fac3; build nothing that does not match it.
+    echo "05eb4edebe11decce6ecb34e98d2f80c8cd283c2f2967d8ba7efd58418570514  $work/source.tar.gz" | sha256sum --check
     tar -xzf "$work/source.tar.gz" --strip-components=1 -C "$work"
 fi
 cd "$work"
