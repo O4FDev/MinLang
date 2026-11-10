@@ -286,6 +286,29 @@ sys.exit(subprocess.run(["make", "-s", "-C", sys.argv[2]] + sys.argv[3:]).return
         self.assertFalse((self.work / "qemu.json").exists())
         self.assertFalse((self.work / "bootstrap.json").exists())
 
+    def test_pinned_toolchain_is_preferred_to_clang_on_path(self):
+        version = OSDEV.re.search(r"^llvm_version=([0-9.]+)$", (ROOT / "tools/toolchain.sh").read_text(), OSDEV.re.M).group(1)
+        home = self.work / "home"
+        pinned = home / ".cache/minyar/toolchains" / f"llvm-{version}" / "bin"
+        pinned.mkdir(parents=True)
+        for name in ("clang", "ld.lld", "llvm-objcopy"):
+            (pinned / name).write_text("#!/bin/sh\n")
+            (pinned / name).chmod(0o755)
+        command = [sys.executable, str(DRIVER), "test", "--root", str(self.root), "--log", str(self.log),
+                   "--qemu", str(self.qemu), "--make", str(self.make), "--dry-run",
+                   "--expect", "kernel checks passed"]
+        env = dict(self.env, HOME=str(home))
+        env.pop("LLVM_BIN", None)
+        result = subprocess.run(command, env=env, capture_output=True, timeout=12)
+        self.assertEqual(result.returncode, 0, result.stdout.decode() + result.stderr.decode())
+        def selected(output):
+            words = [word for line in output.decode().splitlines() if line.startswith("+ ") for word in shlex.split(line[2:])]
+            return [word for word in words if word.startswith("LLVM_BIN=")]
+        self.assertEqual(selected(result.stderr), [f"LLVM_BIN={pinned}"])
+        (pinned / "ld.lld").unlink()
+        result = subprocess.run(command, env=env, capture_output=True, timeout=12)
+        self.assertNotIn(f"LLVM_BIN={pinned}", selected(result.stderr))
+
     def test_log_cannot_destroy_artifacts(self):
         self.invoke("test", "--log", str(self.output / "kernel.elf"), expected=2)
         alias = self.work / "kernel hard link"

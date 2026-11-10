@@ -85,9 +85,25 @@ def build(command, timeout, environment=None):
         stop(process)
 
 
+def pinned_llvm_directory():
+    """The cached LLVM the launcher prefers, when it holds the tools a kernel needs."""
+    match = re.search(r"^llvm_version=([0-9.]+)$", (Path(__file__).resolve().parent / "toolchain.sh").read_text(), re.M)
+    if not match:
+        return None
+    directory = Path.home() / ".cache/minyar/toolchains" / f"llvm-{match.group(1)}" / "bin"
+    if all(os.access(directory / name, os.X_OK) for name in ("clang", "ld.lld", "llvm-objcopy")):
+        return directory
+    return None
+
+
 def llvm_directory(args):
     if args.llvm_bin:
         return Path(args.llvm_bin).expanduser().resolve()
+    # Match the launcher: the pinned toolchain first, then clang on PATH, which
+    # may be a compiler cache shim directory without ld.lld or llvm-objcopy.
+    pinned = pinned_llvm_directory()
+    if pinned:
+        return pinned
     clang = shutil.which("clang")
     return Path(clang).parent if clang else Path("/missing-llvm/bin")
 
