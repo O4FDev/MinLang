@@ -94,8 +94,34 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install AFL++ and LLVM
-        run: sudo apt-get update && sudo apt-get install -y afl++ clang lld make zsh
+      - name: Install pinned LLVM 23.1.3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd libxml2 libtinfo6
+          archive="$RUNNER_TEMP/LLVM-23.1.3-Linux-X64.tar.zst"
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 600 \
+            'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-Linux-X64.tar.zst' -o "$archive"
+          printf '%s  %s\n' \
+            '14d2f701eb68fb799001bdea6231048f3990690fa2f406d563555ff8f744daba' \
+            "$archive" | sha256sum --check
+          sudo mkdir -p '/usr/lib/llvm-23'
+          # LLVM's archive needs a 1 GiB decode window, above zstd's 128 MiB default.
+          sudo tar --use-compress-program='zstd --long=30' -xf "$archive" -C '/usr/lib/llvm-23' --strip-components=1
+          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
+          for key in CC LLVM_CC MINYAR_CLANG MINYAR_TEST_CLANG; do echo "$key=/usr/lib/llvm-23/bin/clang" >> "$GITHUB_ENV"; done
+          MINYAR_CLANG=/usr/lib/llvm-23/bin/clang sh tools/toolchain.sh toolchain
+      - name: Build AFL++ against the pinned LLVM
+        # Ubuntu's afl++ instruments with clang 18, which cannot read the LLVM 23 IR the compiler emits.
+        run: |
+          sudo apt-get update && sudo apt-get install -y make zsh
+          # Release 4.40c stops at LLVM 22; this dev commit (2026-11-08) is the first to accept LLVM 23.
+          git init --quiet "$RUNNER_TEMP/aflpp"
+          git -C "$RUNNER_TEMP/aflpp" fetch --quiet --depth 1 https://github.com/AFLplusplus/AFLplusplus.git 24f7f9768b4290a39382ac8c7b101b60306015c3
+          git -C "$RUNNER_TEMP/aflpp" checkout --quiet FETCH_HEAD
+          make -C "$RUNNER_TEMP/aflpp" -j4 all LLVM_CONFIG=/usr/lib/llvm-23/bin/llvm-config \
+            CC=/usr/lib/llvm-23/bin/clang CXX=/usr/lib/llvm-23/bin/clang++ NO_PYTHON=1
+          test -x "$RUNNER_TEMP/aflpp/afl-clang-fast"
+          echo "$RUNNER_TEMP/aflpp" >> "$GITHUB_PATH"
       - name: Configure direct crash reporting for AFL++
         run: sudo sysctl -w kernel.core_pattern=core
       - name: Restore evolving AFL++ corpus
@@ -108,7 +134,7 @@ jobs:
       - name: Run coverage-guided compiler fuzzing
         env:
           MINYAR_AFL_SECONDS: ${{ inputs.seconds || '3600' }}
-        run: make LIMITED= SANITIZER_LIMITED= CC=clang LLVM_CC=clang COMPILER_LTO_FLAGS='-flto -fuse-ld=lld' check-fuzz-coverage
+        run: make LIMITED= SANITIZER_LIMITED= check-fuzz-coverage
       - name: Save evolving AFL++ corpus
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
