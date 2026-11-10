@@ -1867,7 +1867,10 @@ match net.openConnectionPair() {
 
 Worker messages distinguish `Some(Bytes())` from EOF `None`; a timeout is a
 would-block error. `currentMode` returns None outside a worker, and
-`readRequest`/`replyMessage` return an error there. TLS methods operate on the
+`readRequest`/`replyMessage` return an error there. `Worker.close()` kills the
+worker immediately with SIGKILL (TerminateProcess on Windows) and reaps it, so
+a worker started with `startSelf` can stand in for a process that crashes in
+the middle of a write; [examples/kvstore](../examples/kvstore) uses this. TLS methods operate on the
 existing caller-driven state machine and never open sockets. `Session.read`
 drains authenticated plaintext before reporting a later sticky failure;
 closed input yields None, and pending input is a would-block error. Managed
