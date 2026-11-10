@@ -1138,12 +1138,117 @@ static long long utf8_sequence_width(const unsigned char *bytes, long long remai
     return 0;
 }
 
+#if defined(__ARM_NEON) && defined(__aarch64__)
+#include <arm_neon.h>
+/* Whether bytes[0..length) is valid UTF-8, sixteen bytes per step, by the
+ * Keiser-Lemire lookup algorithm ("Validating UTF-8 In Less Than One
+ * Instruction Per Byte", Software: Practice and Experience 51(5), 2021,
+ * https://arxiv.org/abs/2010.03090; the tables of simdjson's
+ * utf8_lookup4_algorithm.h). Three 16-entry table lookups on the high and low
+ * nibbles of each byte and the high nibble of its successor classify every
+ * two-byte window; the bytes two and three back decide where a continuation
+ * is required. bytes[-1] must not leave a sequence open (the caller starts at
+ * a lead byte after ASCII). */
+static __attribute__((noinline)) int utf8_valid_vector(const unsigned char *bytes, size_t length) {
+    enum {
+        TOO_SHORT = 1 << 0, TOO_LONG = 1 << 1, OVERLONG_3 = 1 << 2, TOO_LARGE = 1 << 3,
+        SURROGATE = 1 << 4, OVERLONG_2 = 1 << 5, TOO_LARGE_1000 = 1 << 6, OVERLONG_4 = 1 << 6,
+        TWO_CONTS = 1 << 7, CARRY = TOO_SHORT | TOO_LONG | TWO_CONTS
+    };
+    static const uint8_t first_high[16] = {
+        TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG, TOO_LONG,
+        TWO_CONTS, TWO_CONTS, TWO_CONTS, TWO_CONTS, TOO_SHORT | OVERLONG_2, TOO_SHORT,
+        TOO_SHORT | OVERLONG_3 | SURROGATE, TOO_SHORT | TOO_LARGE | TOO_LARGE_1000 | OVERLONG_4};
+    static const uint8_t first_low[16] = {
+        CARRY | OVERLONG_3 | OVERLONG_2 | OVERLONG_4, CARRY | OVERLONG_2, CARRY, CARRY,
+        CARRY | TOO_LARGE, CARRY | TOO_LARGE | TOO_LARGE_1000, CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000, CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000, CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000, CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000 | SURROGATE, CARRY | TOO_LARGE | TOO_LARGE_1000,
+        CARRY | TOO_LARGE | TOO_LARGE_1000};
+    static const uint8_t second_high[16] = {
+        TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT,
+        TOO_LONG | OVERLONG_2 | TWO_CONTS | OVERLONG_3 | TOO_LARGE_1000 | OVERLONG_4,
+        TOO_LONG | OVERLONG_2 | TWO_CONTS | OVERLONG_3 | TOO_LARGE,
+        TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE,
+        TOO_LONG | OVERLONG_2 | TWO_CONTS | SURROGATE | TOO_LARGE,
+        TOO_SHORT, TOO_SHORT, TOO_SHORT, TOO_SHORT};
+    /* A lead byte in the last three positions that its block cannot finish. */
+    static const uint8_t open_limit[16] = {255, 255, 255, 255, 255, 255, 255, 255,
+                                           255, 255, 255, 255, 255, 0xef, 0xdf, 0xbf};
+    const uint8x16_t high1 = vld1q_u8(first_high), low1 = vld1q_u8(first_low),
+                     high2 = vld1q_u8(second_high), limit = vld1q_u8(open_limit);
+    uint8x16_t previous = vdupq_n_u8(0), error = vdupq_n_u8(0), open = vdupq_n_u8(0);
+#define UTF8_CHECK(input, before)                                                                 \
+    do {                                                                                          \
+        uint8x16_t prev1 = vextq_u8((before), (input), 15);                                      \
+        uint8x16_t prev2 = vextq_u8((before), (input), 14);                                      \
+        uint8x16_t prev3 = vextq_u8((before), (input), 13);                                      \
+        uint8x16_t special = vandq_u8(                                                            \
+            vandq_u8(vqtbl1q_u8(high1, vshrq_n_u8(prev1, 4)),                                     \
+                     vqtbl1q_u8(low1, vandq_u8(prev1, vdupq_n_u8(0x0f)))),                        \
+            vqtbl1q_u8(high2, vshrq_n_u8((input), 4)));                                           \
+        uint8x16_t continuation = vandq_u8(                                                       \
+            vorrq_u8(vcgeq_u8(prev2, vdupq_n_u8(0xe0)), vcgeq_u8(prev3, vdupq_n_u8(0xf0))),      \
+            vdupq_n_u8(0x80));                                                                    \
+        error = vorrq_u8(error, veorq_u8(continuation, special));                                 \
+    } while (0)
+    size_t at = 0;
+    /* Sixty-four bytes per step: an all-ASCII step only has to close any
+     * sequence the previous step left open. */
+    for (; length - at >= 64; at += 64) {
+        uint8x16_t a = vld1q_u8(bytes + at), b = vld1q_u8(bytes + at + 16),
+                   c = vld1q_u8(bytes + at + 32), d = vld1q_u8(bytes + at + 48);
+        if (vmaxvq_u8(vorrq_u8(vorrq_u8(a, b), vorrq_u8(c, d))) < 0x80) {
+            error = vorrq_u8(error, open);
+            open = vdupq_n_u8(0);
+        } else {
+            UTF8_CHECK(a, previous);
+            UTF8_CHECK(b, a);
+            UTF8_CHECK(c, b);
+            UTF8_CHECK(d, c);
+            open = vcgtq_u8(d, limit);
+        }
+        previous = d;
+    }
+    /* The rest, sixteen bytes at a time; zero padding is ASCII, so a sequence
+     * cut off by the end of the Text fails as too short. */
+    unsigned char padded[16];
+    for (; at < length; at += 16) {
+        uint8x16_t input;
+        if (length - at >= 16) {
+            input = vld1q_u8(bytes + at);
+        } else {
+            memset(padded, 0, sizeof(padded));
+            memcpy(padded, bytes + at, length - at);
+            input = vld1q_u8(padded);
+        }
+        UTF8_CHECK(input, previous);
+        open = vcgtq_u8(input, limit);
+        previous = input;
+    }
+#undef UTF8_CHECK
+    error = vorrq_u8(error, open);
+    return vmaxvq_u8(error) == 0;
+}
+#endif
+
 /* Scan foreign bytes once, skipping ASCII a word at a time: 1 when every byte
  * is ASCII, 0 for other valid UTF-8, -1 for invalid UTF-8. */
 static int utf8_scan(const unsigned char *bytes, long long length) {
     long long position = 0;
     int ascii = 1;
     while (position < length) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+        /* Sixty-four bytes at a time: one OR and one maximum across lanes. */
+        while (length - position >= 64) {
+            uint8x16_t a = vld1q_u8(bytes + position), b = vld1q_u8(bytes + position + 16),
+                       c = vld1q_u8(bytes + position + 32), d = vld1q_u8(bytes + position + 48);
+            if (vmaxvq_u8(vorrq_u8(vorrq_u8(a, b), vorrq_u8(c, d))) >= 0x80) break;
+            position += 64;
+        }
+#endif
         /* Four words at a time: the whole scan is one OR of the top bits, so
            a large ASCII file (the usual Text from outside) is read four
            times faster than a word at a time. */
@@ -1166,12 +1271,21 @@ static int utf8_scan(const unsigned char *bytes, long long length) {
         if (bytes[position] < 0x80) {
             position++;
         } else {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+            /* Non-ASCII text: the vector validator below takes the rest. */
+            if (length - position >= 64)
+                break;
+#endif
             long long width = utf8_sequence_width(bytes + position, length - position);
             if (!width) return -1;
             position += width;
             ascii = 0;
         }
     }
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    if (position < length)
+        return utf8_valid_vector(bytes + position, (size_t)(length - position)) ? 0 : -1;
+#endif
     return ascii;
 }
 

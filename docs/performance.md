@@ -566,6 +566,17 @@ scalar first-byte scan. On 64 MiB of log-shaped text the search part retired
 `status=ok` matches to an absent `timeout`. `check-runtime-unit` compares the
 search with a naive oracle on small alphabets across the 16-byte steps.
 
+UTF-8 validation of Text from outside (files, native buffers, Bytes) skips
+ASCII 64 bytes at a time on arm64 and validates the rest from the first
+non-ASCII byte with the Keiser–Lemire lookup algorithm
+([SPE 2021](https://arxiv.org/abs/2010.03090)), 64 bytes per step. On an Apple
+arm64 laptop it validated CJK and emoji text in 0.31–0.37 cycles per byte
+instead of 2.5–2.7, and accented Latin text in 1.33 instead of 3.80; ASCII is
+unchanged. x86-64 keeps the scalar validator: the table lookups need SSSE3,
+which is outside the x86-64 baseline. `check-runtime-unit` compares the
+vector path with the byte-at-a-time decoder for every lead and second byte at
+16-byte step boundaries and at the end of the Text.
+
 ## Compiler profile guidance
 
 On native Linux, `make compiler-pgo` builds an isolated compiler using LLVM IR

@@ -251,8 +251,56 @@ static void text_search_oracle(void) {
     assert(searches > 500000);
 }
 
+/* UTF-8 validation against the byte-at-a-time decoder: every lead byte with
+   every second byte and boundary third and fourth bytes, placed mid-Text and
+   cut off at its end, in Texts long enough for the vector path, at offsets
+   on both sides of a 16-byte step. */
+static int utf8_scan_reference(const unsigned char *bytes, long long length) {
+    int ascii = 1;
+    for (long long i = 0; i < length;) {
+        if (bytes[i] < 0x80) {
+            i++;
+            continue;
+        }
+        long long width = utf8_sequence_width(bytes + i, length - i);
+        if (!width) return -1;
+        i += width;
+        ascii = 0;
+    }
+    return ascii;
+}
+static void utf8_scan_oracle(void) {
+    static const unsigned char tails[] = {0x00, 0x41, 0x7f, 0x80, 0x8f, 0x90, 0x9f,
+                                          0xa0, 0xbf, 0xc0, 0xc2, 0xe0, 0xf0, 0xff};
+    unsigned char buffer[128];
+    unsigned long long checks = 0;
+    for (unsigned first = 0x80; first < 0x100; first++)
+        for (unsigned second = 0; second < 0x100; second++)
+            for (size_t t = 0; t < sizeof(tails); t++)
+                for (long long offset = 13; offset <= 16; offset++) {
+                    unsigned char sequence[4] = {(unsigned char)first, (unsigned char)second, tails[t],
+                                                 tails[(t + second) % sizeof(tails)]};
+                    long long length = 80 + offset;
+                    long long places[3] = {2 + offset, length - 4, length - 2};
+                    for (int p = 0; p < 3; p++) {
+                        memset(buffer, 'a', sizeof(buffer));
+                        buffer[0] = 0xc3;
+                        buffer[1] = 0xa9;
+                        long long room = length - places[p];
+                        memcpy(buffer + places[p], sequence, (size_t)(room < 4 ? room : 4));
+                        assert(utf8_scan(buffer, length) == utf8_scan_reference(buffer, length));
+                        checks++;
+                    }
+                }
+    /* All-ASCII Texts of every length near the 64-byte steps stay ASCII. */
+    memset(buffer, 'a', sizeof(buffer));
+    for (long long length = 0; length <= 128; length++) assert(utf8_scan(buffer, length) == 1);
+    assert(checks > 1000000);
+}
+
 int main(void) {
     text_search_oracle();
+    utf8_scan_oracle();
     scope_release_paths();
     minyar_rc_release(NULL);
     minyar_rc_enter(3);
