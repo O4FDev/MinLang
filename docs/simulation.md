@@ -297,6 +297,45 @@ consume memory proportional to the scenario. Keep worlds bounded and create
 fresh worlds for independent seeds. These are explicit testing costs, with no
 runtime cost in applications that do not call the simulator.
 
+## One storage engine, two disks
+
+Import `disk` to write storage code once and run it on either disk. `Disk` is
+a capability with `open`, `size`, `read`, `write`, `resize`, `sync`, `close`,
+`rename`, `remove`, `exists`, `syncDirectory` and `createDirectory`, each
+returning a `Result` with an `errors.Error`. `disk.host()` implements it with
+`files`; `disk.simulated(world)` implements it with this module's World, so
+unsynced writes and unsynced names are lost in `crash`, and
+`persistSectors` tears them. Make the engine generic over the disk:
+
+```minyar
+use "disk" as disk
+use "errors" as errors
+use "simulation" as sim
+
+function save<D: disk.Disk>(storage: D, path: Text, data: Bytes): Result<Nothing, errors.Error> {
+    let file = try storage.open(path, true)
+    try storage.write(file, 0, data)
+    try storage.sync(file)
+    return storage.syncDirectory("/db")
+}
+
+let world = sim.create(7)
+let storage = disk.simulated(world)
+save(storage, "/db/state", Bytes("kept")).unwrap()
+sim.crash(world)
+print(storage.exists("/db/state"))   // true: the file and its name were synced
+```
+
+Each generic call is specialized for its disk, so the simulated build reaches
+no host I/O and passes the `minyar sim` determinism proof, while production
+calls `files` directly. File handles are Integers; after `crash`, open files
+again as a restarted process would. The simulated disk's directories are
+lexical, so `createDirectory` succeeds without recording anything.
+[examples/kvstore](../examples/kvstore) is a complete write-ahead-logged
+store on this interface, with a `minyar sim` universe that tears its log and
+a SIGKILL test on the real file system; `make check-example-kvstore` also
+checks that the simulation catches a planted missing directory sync.
+
 ## The database proof
 
 `make check-simulation` checks replay, ordering, faults, durability and the

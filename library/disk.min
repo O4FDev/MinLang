@@ -1,0 +1,174 @@
+// One storage interface for a database's real files and its simulated disk.
+//
+// Write a storage engine once against `Disk`, run it on `host()` in
+// production, and run the same code on `simulated(world)` under `minyar sim`,
+// where the World tears unsynced writes and crashes between any two steps.
+// Calls go straight to the chosen record's methods: generic code is
+// specialized per disk, so the simulated build reaches no host I/O and the
+// host build does no simulation work.
+use "errors" as errors
+use "files" as files
+use "simulation" as simulation
+
+/// The file operations a durable engine needs. A file is an Integer handle
+/// returned by `open`; contents are durable only after `sync`, and a new or
+/// renamed name only after `syncDirectory` of its parent directory.
+public capability Disk {
+    /// Opens a file for reading and writing, creating it when `create` is true.
+    function open(path: Text, create: Boolean): Result<Integer, errors.Error>
+    /// The file's current length in bytes.
+    function size(file: Integer): Result<Integer, errors.Error>
+    /// Up to `length` bytes starting at `position`; fewer at the end of the file.
+    function read(file: Integer, position: Integer, length: Integer): Result<Bytes, errors.Error>
+    /// Writes all of `data` at `position`, extending the file when needed.
+    function write(file: Integer, position: Integer, data: Bytes): Result<Nothing, errors.Error>
+    /// Truncates or zero-extends the file.
+    function resize(file: Integer, length: Integer): Result<Nothing, errors.Error>
+    /// Makes the file's contents durable.
+    function sync(file: Integer): Result<Nothing, errors.Error>
+    function close(file: Integer): Result<Nothing, errors.Error>
+    /// Replaces `to` with `from` in one step.
+    function rename(from: Text, to: Text): Result<Nothing, errors.Error>
+    function remove(path: Text): Result<Nothing, errors.Error>
+    function exists(path: Text): Boolean
+    /// Makes the names in a directory durable: creations, renames and removals.
+    function syncDirectory(path: Text): Result<Nothing, errors.Error>
+    function createDirectory(path: Text): Result<Nothing, errors.Error>
+}
+
+/// The machine's file system, through the `files` module.
+public record HostDisk { private opened: Integer }
+
+public function host(): HostDisk { return HostDisk { opened: 0 } }
+
+public function HostDisk.open(path: Text, create: Boolean): Result<Integer, errors.Error> {
+    let flags = files.WRITE
+    if create { flags = flags | files.CREATE }
+    let file = try files.openFile(path, flags)
+    self.opened += 1
+    return Ok(file)
+}
+public function HostDisk.size(file: Integer): Result<Integer, errors.Error> { return files.fileSize(file) }
+public function HostDisk.read(file: Integer, position: Integer, length: Integer): Result<Bytes, errors.Error> {
+    return files.readBytesAt(file, position, length)
+}
+public function HostDisk.write(file: Integer, position: Integer, data: Bytes): Result<Nothing, errors.Error> {
+    let done = 0
+    while done < data.length {
+        let count = try files.writeBytesAt(file, data, done, data.length - done, position + done)
+        if count <= 0 { return Err(errors.make(errors.systemCode(), 0, "the file accepted no bytes")) }
+        done += count
+    }
+    return Ok()
+}
+public function HostDisk.resize(file: Integer, length: Integer): Result<Nothing, errors.Error> { return files.resize(file, length) }
+public function HostDisk.sync(file: Integer): Result<Nothing, errors.Error> { return files.flushData(file) }
+public function HostDisk.close(file: Integer): Result<Nothing, errors.Error> { return files.closeFile(file) }
+public function HostDisk.rename(from: Text, to: Text): Result<Nothing, errors.Error> { return files.move(from, to) }
+public function HostDisk.remove(path: Text): Result<Nothing, errors.Error> { return files.deleteFile(path) }
+public function HostDisk.exists(path: Text): Boolean { return files.pathSize(path) >= 0 }
+public function HostDisk.syncDirectory(path: Text): Result<Nothing, errors.Error> { return files.flushDirectory(path) }
+public function HostDisk.createDirectory(path: Text): Result<Nothing, errors.Error> { return files.createDirectory(path) }
+conform HostDisk to Disk
+
+/// A simulation World's disk: unsynced writes and unsynced names are lost
+/// when the World crashes, and `simulation.persistSectors` tears them.
+/// Directories are lexical, so `createDirectory` only records nothing.
+public record SimulatedDisk { world: simulation.World }
+
+public function simulated(world: simulation.World): SimulatedDisk { return SimulatedDisk { world: world } }
+
+function simulatedFailure(operation: Text, code: Integer): errors.Error {
+    return errors.make(errors.systemCode(), -code, "simulated disk: " + operation + " failed with " + Text(code))
+}
+function simulatedStatus(operation: Text, code: Integer): Result<Nothing, errors.Error> {
+    if code < 0 { return Err(simulatedFailure(operation, code)) }
+    return Ok()
+}
+
+public function SimulatedDisk.open(path: Text, create: Boolean): Result<Integer, errors.Error> {
+    let file = simulation.openFile(self.world, path, create)
+    if file < 0 { return Err(simulatedFailure("opening " + path, file)) }
+    return Ok(file)
+}
+public function SimulatedDisk.size(file: Integer): Result<Integer, errors.Error> {
+    let length = simulation.size(self.world, file)
+    if length < 0 { return Err(simulatedFailure("measuring a file", length)) }
+    return Ok(length)
+}
+public function SimulatedDisk.read(file: Integer, position: Integer, length: Integer): Result<Bytes, errors.Error> {
+    let data = simulation.read(self.world, file, position, length)
+    let code = simulation.lastError(self.world)
+    if code < 0 { return Err(simulatedFailure("reading a file", code)) }
+    return Ok(data)
+}
+public function SimulatedDisk.write(file: Integer, position: Integer, data: Bytes): Result<Nothing, errors.Error> {
+    return simulatedStatus("writing a file", simulation.write(self.world, file, position, data))
+}
+public function SimulatedDisk.resize(file: Integer, length: Integer): Result<Nothing, errors.Error> {
+    return simulatedStatus("resizing a file", simulation.resize(self.world, file, length))
+}
+public function SimulatedDisk.sync(file: Integer): Result<Nothing, errors.Error> {
+    return simulatedStatus("syncing a file", simulation.syncFile(self.world, file))
+}
+public function SimulatedDisk.close(file: Integer): Result<Nothing, errors.Error> { return Ok() }
+public function SimulatedDisk.rename(from: Text, to: Text): Result<Nothing, errors.Error> {
+    return simulatedStatus("moving " + from + " to " + to, simulation.rename(self.world, from, to))
+}
+public function SimulatedDisk.remove(path: Text): Result<Nothing, errors.Error> {
+    return simulatedStatus("removing " + path, simulation.remove(self.world, path))
+}
+public function SimulatedDisk.exists(path: Text): Boolean {
+    for name in simulation.names(self.world, directoryOf(path)) {
+        if name == nameOf(path) { return true }
+    }
+    return false
+}
+public function SimulatedDisk.syncDirectory(path: Text): Result<Nothing, errors.Error> {
+    return simulatedStatus("syncing directory " + path, simulation.syncDirectory(self.world, path))
+}
+public function SimulatedDisk.createDirectory(path: Text): Result<Nothing, errors.Error> { return Ok() }
+conform SimulatedDisk to Disk
+
+function directoryOf(path: Text): Text {
+    let at = path.length - 1
+    while at >= 0 {
+        if path[at] == '/' { return path.slice(0, at) }
+        at -= 1
+    }
+    return ""
+}
+
+function nameOf(path: Text): Text {
+    let at = path.length - 1
+    while at >= 0 {
+        if path[at] == '/' { return path.slice(at + 1, path.length) }
+        at -= 1
+    }
+    return path
+}
+
+test "a write survives a crash only after sync" {
+    let world = simulation.create(7)
+    let disk = simulated(world)
+    let file = disk.open("/db/log", true).unwrap()
+    disk.syncDirectory("/db").unwrap()
+    disk.write(file, 0, Bytes("kept")).unwrap()
+    disk.sync(file).unwrap()
+    disk.write(file, 4, Bytes(" lost")).unwrap()
+    simulation.crash(world)
+    let reopened = disk.open("/db/log", false).unwrap()
+    expect(disk.size(reopened).unwrap() == 4)
+    expect(disk.exists("/db/log"))
+}
+
+test "an unsynced name is lost in a crash" {
+    let world = simulation.create(7)
+    let disk = simulated(world)
+    let file = disk.open("/db/fresh", true).unwrap()
+    disk.write(file, 0, Bytes("data")).unwrap()
+    disk.sync(file).unwrap()
+    simulation.crash(world)
+    expect(!disk.exists("/db/fresh"))
+    expect(disk.open("/db/fresh", false).isErr())
+}
