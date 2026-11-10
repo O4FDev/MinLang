@@ -547,8 +547,15 @@ and at most one fully finalized eight-owner temporary chunk share the same byte
 cap. Reusing the empty chunk changes no counts, service points, or cleanup units.
 
 Single-threaded eager and system profiles serve allocations up to 1008 bytes
-from a small-object heap: 4 KiB pages divided into 64, 128, 256, 512 or
-1024-byte slots, each with a 16-byte slot header. A page returns to the system
+from a small-object heap: 4 KiB pages divided into equal slots of one of 18
+strides (48 to 128 bytes in 16-byte steps, then four strides per doubling up to
+1024), each with a 16-byte slot header. A slot wastes at most about a quarter
+of its payload: a four-field record (52 bytes) takes an 80-byte slot, where
+power-of-two strides gave it 128, and fewer touched pages cost fewer page
+faults. While other small objects live, a class's last available page stays
+when it empties, and its slots simply return to its free list, so a loop
+whose temporaries alone occupy a class neither frees nor resets a page per
+iteration. A page returns to the system
 allocator once its last slot is freed. Larger allocations, threaded runtimes
 and AddressSanitizer builds use the system allocator directly. Eager objects
 die as soon as their last owner releases them, so this heap reuses a dying
