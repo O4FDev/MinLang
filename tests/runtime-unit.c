@@ -288,13 +288,13 @@ static void utf8_scan_oracle(void) {
                         buffer[1] = 0xa9;
                         long long room = length - places[p];
                         memcpy(buffer + places[p], sequence, (size_t)(room < 4 ? room : 4));
-                        assert(utf8_scan(buffer, length) == utf8_scan_reference(buffer, length));
+                        assert(utf8_scan_bulk(buffer, length) == utf8_scan_reference(buffer, length));
                         checks++;
                     }
                 }
     /* All-ASCII Texts of every length near the 64-byte steps stay ASCII. */
     memset(buffer, 'a', sizeof(buffer));
-    for (long long length = 0; length <= 128; length++) assert(utf8_scan(buffer, length) == 1);
+    for (long long length = 0; length <= 128; length++) assert(utf8_scan_bulk(buffer, length) == 1);
     assert(checks > 1000000);
 }
 

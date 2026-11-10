@@ -272,7 +272,7 @@ MinyarText *minyar_runtime_frozenText(const RcThreadLeaf *frozen, long long star
         minyar_stop_program("a FrozenBytes range must stay within the buffer and end after it starts.");
     long long length = end - start;
     const unsigned char *bytes = (const unsigned char *)(b.data + 1) + start;
-    int status = utf8_scan(bytes, length);
+    int status = utf8_scan_bulk(bytes, length);
     if (status < 0) return NULL;
     MinyarText *view = new_text(bytes, length, status ? length : -1);
     view->backing = (MinyarText *)(void *)frozen;

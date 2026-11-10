@@ -799,6 +799,7 @@ MinyarRecord *minyar_choice_box(long long tag, long long slot, long long slots, 
 }
 
 static _Bool validate_text_bytes(const unsigned char *bytes, long long length);
+static _Bool validate_bulk_text_bytes(const unsigned char *bytes, long long length);
 
 static MinyarText *copy_c_text(const char *source) {
     size_t length = strlen(source);
@@ -811,7 +812,7 @@ static MinyarText *copy_c_text(const char *source) {
 MinyarText *minyar_native_copy_text(const unsigned char *source, long long length) {
     if (length < 0 || (!source && length != 0))
         minyar_stop("a native Text buffer is invalid.");
-    _Bool ascii = validate_text_bytes(source, length);
+    _Bool ascii = validate_bulk_text_bytes(source, length);
     MinyarText *text = new_text_storage(length, ascii ? length : -1);
     unsigned char *bytes = (unsigned char *)text->bytes;
     if (length) memcpy(bytes, source, (size_t)length);
@@ -1240,15 +1241,6 @@ static int utf8_scan(const unsigned char *bytes, long long length) {
     long long position = 0;
     int ascii = 1;
     while (position < length) {
-#if defined(__ARM_NEON) && defined(__aarch64__)
-        /* Sixty-four bytes at a time: one OR and one maximum across lanes. */
-        while (length - position >= 64) {
-            uint8x16_t a = vld1q_u8(bytes + position), b = vld1q_u8(bytes + position + 16),
-                       c = vld1q_u8(bytes + position + 32), d = vld1q_u8(bytes + position + 48);
-            if (vmaxvq_u8(vorrq_u8(vorrq_u8(a, b), vorrq_u8(c, d))) >= 0x80) break;
-            position += 64;
-        }
-#endif
         /* Four words at a time: the whole scan is one OR of the top bits, so
            a large ASCII file (the usual Text from outside) is read four
            times faster than a word at a time. */
@@ -1271,22 +1263,35 @@ static int utf8_scan(const unsigned char *bytes, long long length) {
         if (bytes[position] < 0x80) {
             position++;
         } else {
-#if defined(__ARM_NEON) && defined(__aarch64__)
-            /* Non-ASCII text: the vector validator below takes the rest. */
-            if (length - position >= 64)
-                break;
-#endif
             long long width = utf8_sequence_width(bytes + position, length - position);
             if (!width) return -1;
             position += width;
             ascii = 0;
         }
     }
-#if defined(__ARM_NEON) && defined(__aarch64__)
-    if (position < length)
-        return utf8_valid_vector(bytes + position, (size_t)(length - position)) ? 0 : -1;
-#endif
     return ascii;
+}
+
+/* utf8_scan for bulk foreign bytes (files, native buffers, Bytes): on arm64,
+ * skip ASCII sixty-four bytes at a time and validate the rest with the vector
+ * validator. Short strings the runtime copies from C (arguments, environment,
+ * messages) keep the scalar scan, so programs that never take in bulk text do
+ * not carry the vector code. */
+static int utf8_scan_bulk(const unsigned char *bytes, long long length) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    long long position = 0;
+    while (length - position >= 64) {
+        uint8x16_t a = vld1q_u8(bytes + position), b = vld1q_u8(bytes + position + 16),
+                   c = vld1q_u8(bytes + position + 32), d = vld1q_u8(bytes + position + 48);
+        if (vmaxvq_u8(vorrq_u8(vorrq_u8(a, b), vorrq_u8(c, d))) >= 0x80)
+            /* The bytes before this step are ASCII, so no sequence is open. */
+            return utf8_valid_vector(bytes + position, (size_t)(length - position)) ? 0 : -1;
+        position += 64;
+    }
+    return utf8_scan(bytes + position, length - position);
+#else
+    return utf8_scan(bytes, length);
+#endif
 }
 
 /* Validate at foreign-byte boundaries. ASCII Text needs no character-offset
@@ -1294,6 +1299,11 @@ static int utf8_scan(const unsigned char *bytes, long long length) {
  * remain lazy. Returns whether every byte was ASCII; invalid UTF-8 stops. */
 static _Bool validate_text_bytes(const unsigned char *bytes, long long length) {
     int status = utf8_scan(bytes, length);
+    if (status < 0) invalid_utf8();
+    return status == 1;
+}
+static _Bool validate_bulk_text_bytes(const unsigned char *bytes, long long length) {
+    int status = utf8_scan_bulk(bytes, length);
     if (status < 0) invalid_utf8();
     return status == 1;
 }
