@@ -342,6 +342,25 @@ server for diagnostics, completion, navigation, rename, type hints, quick fixes
 and formatting; the
 [editor guide](editor.md) describes client setup and current navigation limits.
 
+## Looking up the standard library
+
+`minyar doc QUERY` prints the standard library's public API in the terminal,
+in any directory and without a network:
+
+```sh
+minyar doc files             # the module's import line and every public signature
+minyar doc files.openFile    # one declaration with its /// documentation
+minyar doc disk.Disk.sync    # one member of a record or capability
+minyar doc spawn             # every public name containing "spawn", in any module
+```
+
+A query that is not a module name, or a name a module does not declare,
+searches every module's public declarations and members without regard to
+case, printing `module.name` and its `file:line`. The command exits 1 when
+nothing matches. Signatures and comments come from the compiler's
+`--doc-json` reader, so they are the spellings the compiler accepts. Without
+a query, `minyar doc` builds a project's HTML reference as described above.
+
 ## Package discovery and release records
 
 ```sh

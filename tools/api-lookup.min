@@ -1,0 +1,152 @@
+// `minyar doc QUERY`: the standard library's public API in the terminal.
+//
+// QUERY is a module (`files`), one of its declarations or members
+// (`files.openFile`, `json.Value.get`), or a word to search for in every
+// module's public names (`spawn`). Signatures and `///` comments come from the
+// compiler's --doc-json reader, so they match what the compiler accepts.
+use "./driver-support.min" as host
+use "json" as json
+use "io" as io
+use "files" as files
+
+record Entry { module: Text; path: Text; declaration: json.Value }
+
+function declarations(launcher: Text, path: Text): List<json.Value> {
+    let run = host.capture([launcher, "--doc-json", path], 120)
+    if run.status != 0 { host.stop("cannot read the documentation of " + path + "\n" + run.errors) }
+    let api = json.parse(run.output)
+    if api.kind != json.OBJECT || api.member("declarations").kind != json.ARRAY { host.stop("the compiler returned invalid documentation for " + path) }
+    return api.member("declarations").items
+}
+
+function indented(text: Text, prefix: Text): Text {
+    let lines: List<Text> = []
+    for line in text.split("\n") {
+        if line == "" { lines.add("") } else { lines.add(prefix + line) }
+    }
+    return joinText(lines, "\n")
+}
+
+function location(path: Text, declaration: json.Value): Text {
+    return path + ":" + json.string(declaration.member("span"), "line")
+}
+
+function showDeclaration(module: Text, path: Text, declaration: json.Value, members: Boolean) {
+    print(module + "." + json.string(declaration, "name") + "    " + location(path, declaration))
+    print("    " + json.string(declaration, "signature"))
+    let documentation = json.string(declaration, "documentation")
+    if documentation != "" { print(indented(documentation, "    ")) }
+    if members {
+        for member in declaration.member("members").items {
+            print("        " + json.string(member, "signature"))
+            let note = json.string(member, "documentation")
+            if note != "" { print(indented(note, "            ")) }
+        }
+    }
+}
+
+function showModule(module: Text, path: Text, items: List<json.Value>) {
+    print("module " + module + "    " + path)
+    print("use \"" + module + "\" as " + module)
+    print("")
+    for declaration in items {
+        print(json.string(declaration, "signature"))
+        for member in declaration.member("members").items { print("    " + json.string(member, "signature")) }
+    }
+    print("")
+    print("Run `minyar doc " + module + ".NAME` for one declaration with its documentation.")
+}
+
+function lowered(value: Text): Text { return value.asciiLowercased() }
+
+// A declaration's own name, or a record method's `Record.name` spelling.
+function matches(declaration: json.Value, wanted: Text): Boolean {
+    let name = json.string(declaration, "name")
+    if name == wanted { return true }
+    let dot = name.find(".")
+    return dot >= 0 && name.slice(dot + 1, name.length) == wanted
+}
+
+function moduleNames(library: Text): List<Text> {
+    let names: List<Text> = []
+    for entry in files.list(library) {
+        if entry.endsWith(".min") { names.add(entry.slice(0, entry.length - 4)) }
+    }
+    names.sort()
+    return names
+}
+
+/// Prints what QUERY names in the library directory. Returns false when nothing matched.
+public function show(launcher: Text, library: Text, query: Text): Boolean {
+    if query == "" { host.stop("usage: minyar doc [MODULE | MODULE.NAME | WORD]") }
+    let dot = query.find(".")
+    let module = query
+    let member = ""
+    if dot >= 0 {
+        module = query.slice(0, dot)
+        member = query.slice(dot + 1, query.length)
+    }
+    let path = library + "/" + module + ".min"
+    if host.isFile(path) {
+        let items = declarations(launcher, path)
+        if member == "" {
+            showModule(module, path, items)
+            return true
+        }
+        let found = false
+        for declaration in items {
+            if matches(declaration, member) {
+                if found { print("") }
+                showDeclaration(module, path, declaration, true)
+                found = true
+            }
+            // `json.Value.get` names a member of a record or capability.
+            let name = json.string(declaration, "name")
+            if member.startsWith(name + ".") {
+                let inner = member.slice(name.length + 1, member.length)
+                for item in declaration.member("members").items {
+                    if json.string(item, "name") == inner {
+                        if found { print("") }
+                        print(module + "." + member + "    " + location(path, declaration))
+                        print("    " + json.string(item, "signature"))
+                        let note = json.string(item, "documentation")
+                        if note != "" { print(indented(note, "    ")) }
+                        found = true
+                    }
+                }
+            }
+        }
+        if found { return true }
+        print("module " + module + " has no public declaration named " + member + "; nearby names:")
+        query = member
+    } else if dot >= 0 {
+        print("there is no standard module named " + module + "; searching every module for " + member)
+        query = member
+    }
+    // Search: public names containing the word, without regard to case.
+    let word = lowered(query)
+    let hits = 0
+    for name in moduleNames(library) {
+        let source = library + "/" + name + ".min"
+        let text = io.readText(source)
+        if text is Ok(contents) {
+            if lowered(contents).contains(word) {
+                for declaration in declarations(launcher, source) {
+                    let names = [json.string(declaration, "name")]
+                    for item in declaration.member("members").items { names.add(json.string(declaration, "name") + "." + json.string(item, "name")) }
+                    for candidate in names {
+                        if lowered(candidate).contains(word) {
+                            print(name + "." + candidate + "    " + location(source, declaration))
+                            hits += 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if hits == 0 {
+        print("no public standard-library name contains " + query)
+        return false
+    }
+    return true
+}
