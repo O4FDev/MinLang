@@ -168,7 +168,8 @@ void minyar_list_add_take(MinyarList *list, long long value) {
  * reference elements gain a count. `list` may be `other`. */
 void minyar_list_add_all(MinyarList *list, const MinyarList *other) {
     long long count = other->length;
-    if (count <= 0) return;
+    if (count <= 0)
+        return;
     if (list->length < 0 || count > LLONG_MAX - list->length ||
         (unsigned long long)(list->length + count) > SIZE_MAX / sizeof(*list->values))
         minyar_stop("this List became too large.");
@@ -178,9 +179,12 @@ void minyar_list_add_all(MinyarList *list, const MinyarList *other) {
 #ifndef MINYAR_COMPILER_ARENA
     unsigned kind = ((RcObject *)list - 1)->ownership & 7;
     if (kind != RC_LIST) {
-        if (kind == RC_REFERENCES_IMMORTAL && (((RcObject *)other - 1)->ownership & 7) != RC_REFERENCES_IMMORTAL)
-            ((RcObject *)list - 1)->ownership = (((RcObject *)list - 1)->ownership & ~(size_t)7) | RC_REFERENCES;
-        for (long long i = list->length; i < length; ++i) minyar_rc_retain((void *)(uintptr_t)list->values[i]);
+        if (kind == RC_REFERENCES_IMMORTAL &&
+            (((RcObject *)other - 1)->ownership & 7) != RC_REFERENCES_IMMORTAL)
+            ((RcObject *)list - 1)->ownership =
+                (((RcObject *)list - 1)->ownership & ~(size_t)7) | RC_REFERENCES;
+        for (long long i = list->length; i < length; ++i)
+            minyar_rc_retain((void *)(uintptr_t)list->values[i]);
     }
 #endif
     list->length = length;
@@ -206,7 +210,8 @@ void minyar_list_add_all_take(MinyarList *list, MinyarList *other) {
         memcpy(list->values + list->length, other->values, (size_t)count * sizeof(*list->values));
         unsigned kind = ((RcObject *)list - 1)->ownership & 7;
         if (kind == RC_REFERENCES_IMMORTAL && (object->ownership & 7) != RC_REFERENCES_IMMORTAL)
-            ((RcObject *)list - 1)->ownership = (((RcObject *)list - 1)->ownership & ~(size_t)7) | RC_REFERENCES;
+            ((RcObject *)list - 1)->ownership =
+                (((RcObject *)list - 1)->ownership & ~(size_t)7) | RC_REFERENCES;
         list->length = length;
         other->length = 0;
         minyar_rc_release(other);
@@ -463,13 +468,14 @@ MinyarRecord *minyar_record_new_unzeroed_scalar(long long field_count) {
 #ifdef MINYAR_COMPILER_ARENA
     if ((unsigned long long)field_count > (SIZE_MAX - sizeof(MinyarRecord)) / sizeof(long long))
         out_of_memory();
-    MinyarRecord *record = object_allocate(sizeof(*record) + (size_t)field_count * sizeof(*record->values), 2);
+    MinyarRecord *record =
+        object_allocate(sizeof(*record) + (size_t)field_count * sizeof(*record->values), 2);
 #else
     if ((unsigned long long)field_count >
         (SIZE_MAX - sizeof(RcObject) - sizeof(MinyarRecord)) / sizeof(long long))
         out_of_memory();
-    MinyarRecord *record = rc_allocate_object(sizeof(*record) + (size_t)field_count * sizeof(long long),
-                                              RC_SCALAR_RECORD);
+    MinyarRecord *record = rc_allocate_object(
+        sizeof(*record) + (size_t)field_count * sizeof(long long), RC_SCALAR_RECORD);
 #endif
     record->length = field_count;
     return record;
@@ -501,7 +507,8 @@ MinyarRecord *minyar_record_reuse_scalar_take(MinyarRecord *record, long long fi
         return record;
     }
     MinyarRecord *result = minyar_record_new_scalar(field_count);
-    if (record) minyar_rc_release(record);
+    if (record)
+        minyar_rc_release(record);
     return result;
 #endif
 }
@@ -575,7 +582,8 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
 #ifdef MINYAR_BOUNDED_RC
         /* The map's byte stores may alias the length: read it once. */
         long long fields = record->length, scan = 0;
-        while (scan < fields && !references[scan]) scan++;
+        while (scan < fields && !references[scan])
+            scan++;
         if (scan == fields) {
             RC_FINISH_RECORD_FAST(object, RC_RECORD);
             return value;
@@ -584,7 +592,8 @@ long long minyar_record_take_field(MinyarRecord *record, long long field) {
     } else if ((object->ownership & 7) != RC_SCALAR_RECORD) {
         /* Shared: the caller needs its own count. A scalar record has no map. */
         unsigned char *references = (unsigned char *)(record->values + record->length);
-        if (references[field]) minyar_rc_retain((void *)(uintptr_t)value);
+        if (references[field])
+            minyar_rc_retain((void *)(uintptr_t)value);
     }
     minyar_rc_release(record);
 #endif

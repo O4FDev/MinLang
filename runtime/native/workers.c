@@ -43,7 +43,7 @@ static MinyarBytes *worker_data(unsigned status, int code, const void *data, siz
     return result;
 }
 static MinyarBytes *worker_readiness(unsigned status, int code, long long reading,
-                                    long long writing, long long pending) {
+                                     long long writing, long long pending) {
     MinyarBytes *result = minyar_bytes_new(32);
     unsigned char *out = (unsigned char *)result->bytes;
     worker_put32(out, status);

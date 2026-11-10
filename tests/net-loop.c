@@ -423,6 +423,7 @@ int main(void) {
     thousands_of_sockets_and_timer_fairness();
     idle_blocking_and_interrupted_deadline();
     registration_generation_boundaries();
-    puts("event loop: timers, 40-bit generation safety, 2048 sockets, fairness, idle deadlines verified");
+    puts(
+        "event loop: timers, 40-bit generation safety, 2048 sockets, fairness, idle deadlines verified");
     return 0;
 }

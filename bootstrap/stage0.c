@@ -323,24 +323,25 @@ static Token generated_token(int kind, const char *text, int line, int column) {
 }
 
 static int text_delimiter_at(const char *cursor, int multiline, int raw) {
-    if (*cursor != '"') return 0;
+    if (*cursor != '"')
+        return 0;
     cursor++;
     if (multiline) {
-        if (cursor[0] != '"' || cursor[1] != '"') return 0;
+        if (cursor[0] != '"' || cursor[1] != '"')
+            return 0;
         cursor += 2;
     }
     return !raw || *cursor == '#';
 }
 
-static void append_text_part(Token **tokens, TextPart **parts, const char *start,
-                             const char *end, int line, int column) {
+static void append_text_part(Token **tokens, TextPart **parts, const char *start, const char *end,
+                             int line, int column) {
     TextPart part = {(int)arrlen(*tokens), start, end, line, column};
     arrput(*tokens, generated_token(TOKEN_TEXT, NULL, line, column));
     arrput(*parts, part);
 }
 
-static void decode_text_part(Token *token, TextPart part, int indentation,
-                             int multiline, int raw) {
+static void decode_text_part(Token *token, TextPart part, int indentation, int multiline, int raw) {
     Lexer decoder = {0};
     char *text = NULL;
     decoder.cursor = part.start;
@@ -349,19 +350,23 @@ static void decode_text_part(Token *token, TextPart part, int indentation,
     while (decoder.cursor < part.end) {
         if (multiline && decoder.column == 1) {
             const char *whitespace = decoder.cursor;
-            while (whitespace < part.end && (*whitespace == ' ' || *whitespace == '\t')) whitespace++;
+            while (whitespace < part.end && (*whitespace == ' ' || *whitespace == '\t'))
+                whitespace++;
             int blank = !*whitespace || *whitespace == '\n' ||
                         (*whitespace == '\r' && whitespace[1] == '\n');
             if (whitespace - decoder.cursor < indentation && !blank)
-                fail_at(decoder.line, 1, "multi-line Text has less indentation than its closing delimiter");
-            for (int removed = 0; removed < indentation && decoder.cursor < whitespace; removed++) take(&decoder);
+                fail_at(decoder.line, 1,
+                        "multi-line Text has less indentation than its closing delimiter");
+            for (int removed = 0; removed < indentation && decoder.cursor < whitespace; removed++)
+                take(&decoder);
         }
         if (decoder.cursor < part.end) {
             int c = take(&decoder);
             if (!raw && c == '\\') {
                 if (multiline && (peek(&decoder) == '\n' ||
-                    (peek(&decoder) == '\r' && decoder.cursor[1] == '\n'))) {
-                    if (peek(&decoder) == '\r') take(&decoder);
+                                  (peek(&decoder) == '\r' && decoder.cursor[1] == '\n'))) {
+                    if (peek(&decoder) == '\r')
+                        take(&decoder);
                     take(&decoder);
                     continue;
                 }
@@ -381,15 +386,18 @@ static void decode_text_part(Token *token, TextPart part, int indentation,
 static Token text_token(Lexer *lexer) {
     int line = lexer->line, column = lexer->column;
     int raw = peek(lexer) == '#';
-    if (raw) take(lexer);
+    if (raw)
+        take(lexer);
     int multiline = lexer->cursor[0] == '"' && lexer->cursor[1] == '"' && lexer->cursor[2] == '"';
     take(lexer);
     if (multiline) {
         take(lexer);
         take(lexer);
-        if (peek(lexer) == '\r') take(lexer);
+        if (peek(lexer) == '\r')
+            take(lexer);
         if (peek(lexer) != '\n')
-            fail_at(line, column, "multi-line Text must begin on a new line after its opening delimiter");
+            fail_at(line, column,
+                    "multi-line Text must begin on a new line after its opening delimiter");
         take(lexer);
     }
     const char *body = lexer->cursor, *start = body;
@@ -411,7 +419,8 @@ static Token text_token(Lexer *lexer) {
                 }
                 append_text_part(&tokens, &parts, start, escape_start, start_line, start_column);
                 arrput(tokens, generated_token(',', NULL, escape_line, escape_column));
-                arrput(tokens, generated_token(TOKEN_NAME, "text interpolation", escape_line, escape_column));
+                arrput(tokens, generated_token(TOKEN_NAME, "text interpolation", escape_line,
+                                               escape_column));
                 arrput(tokens, generated_token('(', NULL, escape_line, escape_column + 1));
                 take(lexer);
                 int round_depth = lexer->round_depth, square_depth = lexer->square_depth;
@@ -420,10 +429,14 @@ static Token text_token(Lexer *lexer) {
                 while (depth) {
                     Token expression = next_token(lexer);
                     if (expression.kind == TOKEN_EOF)
-                        fail_at(escape_line, escape_column, "text interpolation is missing its closing ')'");
-                    if (expression.kind == '(') depth++;
-                    if (expression.kind == ')') depth--;
-                    if (depth) arrput(tokens, expression);
+                        fail_at(escape_line, escape_column,
+                                "text interpolation is missing its closing ')'");
+                    if (expression.kind == '(')
+                        depth++;
+                    if (expression.kind == ')')
+                        depth--;
+                    if (depth)
+                        arrput(tokens, expression);
                 }
                 lexer->round_depth = round_depth;
                 lexer->square_depth = square_depth;
@@ -438,24 +451,30 @@ static Token text_token(Lexer *lexer) {
         }
     }
     if (!peek(lexer)) {
-        if (raw) fail_at(line, column, "raw Text is missing its closing delimiter");
-        if (multiline) fail_at(line, column, "multi-line Text is missing its closing delimiter");
+        if (raw)
+            fail_at(line, column, "raw Text is missing its closing delimiter");
+        if (multiline)
+            fail_at(line, column, "multi-line Text is missing its closing delimiter");
         fail_at(line, column, "this text literal is never closed");
     }
     const char *end = lexer->cursor;
     int indentation = 0;
     if (multiline) {
         const char *closing_line = lexer->cursor;
-        while (closing_line > body && closing_line[-1] != '\n') closing_line--;
+        while (closing_line > body && closing_line[-1] != '\n')
+            closing_line--;
         const char *scan = closing_line;
-        while (scan < lexer->cursor && (*scan == ' ' || *scan == '\t')) scan++;
+        while (scan < lexer->cursor && (*scan == ' ' || *scan == '\t'))
+            scan++;
         if (scan != lexer->cursor)
-            fail_at(lexer->line, lexer->column, "the closing delimiter for multi-line Text must be on its own line");
+            fail_at(lexer->line, lexer->column,
+                    "the closing delimiter for multi-line Text must be on its own line");
         indentation = (int)(lexer->cursor - closing_line);
         end = closing_line;
         if (end > body) {
             end--;
-            if (end > body && end[-1] == '\r') end--;
+            if (end > body && end[-1] == '\r')
+                end--;
         }
     }
     append_text_part(&tokens, &parts, start, end < start ? start : end, start_line, start_column);
@@ -470,8 +489,12 @@ static Token text_token(Lexer *lexer) {
         arrput(tokens, generated_token(')', NULL, lexer->line, lexer->column));
     }
     take(lexer);
-    if (multiline) { take(lexer); take(lexer); }
-    if (raw) take(lexer);
+    if (multiline) {
+        take(lexer);
+        take(lexer);
+    }
+    if (raw)
+        take(lexer);
     lexer->pending = tokens;
     lexer->pending_index = 0;
     return next_token(lexer);
@@ -661,7 +684,9 @@ static void enter_parse(Parser *parser) {
                 "bootstrap syntax exceeds the 256-level nesting limit");
     parser->parse_depth++;
 }
-static void leave_parse(Parser *parser) { parser->parse_depth--; }
+static void leave_parse(Parser *parser) {
+    parser->parse_depth--;
+}
 
 static Type parse_type(Parser *parser) {
     Type type = TYPE_UNKNOWN;
@@ -761,17 +786,24 @@ static Expression *parse_atom(Parser *parser) {
         expression = new_expression(parser, EXPRESSION_NAME);
         expression->text = take_name(parser, "a name");
         if (parser->token.kind == '.') {
-            for (size_t imported = 0; imported < (size_t)arrlen(parser->program.import_aliases); imported++) {
-                if (strcmp(expression->text, parser->program.import_aliases[imported])) continue;
+            for (size_t imported = 0; imported < (size_t)arrlen(parser->program.import_aliases);
+                 imported++) {
+                if (strcmp(expression->text, parser->program.import_aliases[imported]))
+                    continue;
                 advance(parser);
                 free(expression->text);
                 expression->text = take_name(parser, "an imported function name");
                 const char *package = parser->program.import_packages[imported];
-                int allowed = !strcmp(package, "io") ?
-                    (!strcmp(expression->text, "readTextFile") || !strcmp(expression->text, "writeTextFile") ||
-                     !strcmp(expression->text, "writeTextParts") || !strcmp(expression->text, "fileExists")) :
-                    (!strcmp(expression->text, "argument") || !strcmp(expression->text, "argumentCount"));
-                if (!allowed) fail_at(expression->line, expression->column, "unsupported bootstrap module function");
+                int allowed = !strcmp(package, "io")
+                                  ? (!strcmp(expression->text, "readTextFile") ||
+                                     !strcmp(expression->text, "writeTextFile") ||
+                                     !strcmp(expression->text, "writeTextParts") ||
+                                     !strcmp(expression->text, "fileExists"))
+                                  : (!strcmp(expression->text, "argument") ||
+                                     !strcmp(expression->text, "argumentCount"));
+                if (!allowed)
+                    fail_at(expression->line, expression->column,
+                            "unsupported bootstrap module function");
                 if (!strcmp(expression->text, "writeTextParts")) {
                     free(expression->text);
                     expression->text = copy_text("writeTextFile", strlen("writeTextFile"));
@@ -1103,7 +1135,8 @@ static Function parse_function(Parser *parser) {
     }
     if (native_body) {
         advance(parser);
-        if (parser->token.kind != TOKEN_TEXT || (strcmp(parser->token.text, "runtime") && strcmp(parser->token.text, "diagnostics")))
+        if (parser->token.kind != TOKEN_TEXT ||
+            (strcmp(parser->token.text, "runtime") && strcmp(parser->token.text, "diagnostics")))
             fail_at(parser->token.line, parser->token.column,
                     "bootstrap native functions use the runtime library");
         if (!strcmp(function.name, "main"))
@@ -1115,7 +1148,8 @@ static Function parse_function(Parser *parser) {
     } else {
         while (parser->token.kind != '}') {
             if (parser->token.kind == TOKEN_EOF)
-                fail_at(parser->token.line, parser->token.column, "this block needs a closing brace");
+                fail_at(parser->token.line, parser->token.column,
+                        "this block needs a closing brace");
             arrput(function.body, parse_statement(parser));
             skip_separators(parser);
         }
@@ -1178,8 +1212,10 @@ static Program parse_program(char *source) {
             advance(&parser);
             if (parser.token.kind != TOKEN_TEXT ||
                 (strcmp(parser.token.text, "io") && strcmp(parser.token.text, "process")))
-                fail_at(parser.token.line, parser.token.column, "bootstrap imports only io and process");
-            arrput(parser.program.import_packages, copy_text(parser.token.text, parser.token.text_length));
+                fail_at(parser.token.line, parser.token.column,
+                        "bootstrap imports only io and process");
+            arrput(parser.program.import_packages,
+                   copy_text(parser.token.text, parser.token.text_length));
             advance(&parser);
             expect_word(&parser, "as");
             arrput(parser.program.import_aliases, take_name(&parser, "a module alias"));
@@ -1202,7 +1238,8 @@ static Program parse_program(char *source) {
 }
 
 static const char *type_name(Type type) {
-    if (type >= 100000) return "a List";
+    if (type >= 100000)
+        return "a List";
     switch (type) {
     case TYPE_INTEGER:
         return "Integer";
@@ -1287,7 +1324,8 @@ static void require_type(Expression *expression, Type actual, Type expected, con
 }
 
 static void bootstrap_context(Expression *expression, Type expected) {
-    if (expression->kind != EXPRESSION_LIST || !bootstrap_is_list(expected)) return;
+    if (expression->kind != EXPRESSION_LIST || !bootstrap_is_list(expected))
+        return;
     expression->type = expected;
     for (int index = 0; index < arrlen(expression->arguments); index++)
         bootstrap_context(expression->arguments[index], bootstrap_list_element(expected));
@@ -1344,11 +1382,13 @@ static Type check_expression(Program *program, Function *function, Expression *e
     case EXPRESSION_CALL:
         if (!strcmp(expression->text, "text interpolation")) {
             if (arrlen(expression->arguments) != 1)
-                fail_at(expression->line, expression->column, "text interpolation needs one printable expression");
+                fail_at(expression->line, expression->column,
+                        "text interpolation needs one printable expression");
             left = check_expression(program, function, expression->arguments[0]);
             if (left < TYPE_INTEGER || left > TYPE_BOOLEAN)
-                fail_at(expression->arguments[0]->line, expression->arguments[0]->column,
-                        "text interpolation needs Integer, Boolean, Character, or Text; convert this value to Text explicitly");
+                fail_at(
+                    expression->arguments[0]->line, expression->arguments[0]->column,
+                    "text interpolation needs Integer, Boolean, Character, or Text; convert this value to Text explicitly");
             free(expression->text);
             expression->text = copy_text("Text", 4);
             return expression->type = TYPE_TEXT;
@@ -1473,7 +1513,8 @@ static Type check_expression(Program *program, Function *function, Expression *e
                     "%s expects %td arguments, but this call provides %td", expression->text,
                     arrlen(expression->function->parameters), arrlen(expression->arguments));
         for (index = 0; index < (size_t)arrlen(expression->arguments); index++) {
-            bootstrap_context(expression->arguments[index], expression->function->parameters[index].type);
+            bootstrap_context(expression->arguments[index],
+                              expression->function->parameters[index].type);
             left = check_expression(program, function, expression->arguments[index]);
             require_type(expression->arguments[index], left,
                          expression->function->parameters[index].type, "this function argument");
@@ -1532,8 +1573,7 @@ static Type check_expression(Program *program, Function *function, Expression *e
         }
         if (left == TYPE_TEXT && strcmp(expression->text, "byteLength") == 0)
             return expression->type = TYPE_INTEGER;
-        if ((left == TYPE_TEXT || left == TYPE_BYTES ||
-             bootstrap_is_list(left)) &&
+        if ((left == TYPE_TEXT || left == TYPE_BYTES || bootstrap_is_list(left)) &&
             strcmp(expression->text, "length") == 0)
             return expression->type = TYPE_INTEGER;
         fail_at(expression->line, expression->column, "%s does not have a property named '%s'",
@@ -1625,8 +1665,10 @@ static Type check_expression(Program *program, Function *function, Expression *e
             fail_at(expression->line, expression->column, "%s does not provide the '%s' operation",
                     type_name(left), expression->text);
         if (!strcmp(expression->text, "sort") || !strcmp(expression->text, "sorted")) {
-            if (bootstrap_list_element(left) < TYPE_INTEGER || bootstrap_list_element(left) > TYPE_BOOLEAN)
-                fail_at(expression->line, expression->column, "this bootstrap List element type has no natural order");
+            if (bootstrap_list_element(left) < TYPE_INTEGER ||
+                bootstrap_list_element(left) > TYPE_BOOLEAN)
+                fail_at(expression->line, expression->column,
+                        "this bootstrap List element type has no natural order");
             if (arrlen(expression->arguments) != 0)
                 fail_at(expression->line, expression->column, "List.%s expects no arguments",
                         expression->text);
@@ -1705,7 +1747,8 @@ static void check_statements(Program *program, Function *function, Statement *st
             break;
         case STATEMENT_FIELD_ASSIGN: {
             Type target = check_expression(program, function, statement->target);
-            if (statement->target->left->type < TYPE_RECORD_START || bootstrap_is_list(statement->target->left->type))
+            if (statement->target->left->type < TYPE_RECORD_START ||
+                bootstrap_is_list(statement->target->left->type))
                 fail_at(statement->line, statement->column,
                         "only record fields can receive a new value");
             type = check_expression(program, function, statement->expression);
@@ -1729,7 +1772,8 @@ static void check_statements(Program *program, Function *function, Statement *st
             check_expression(program, function, statement->expression);
             break;
         case STATEMENT_RETURN:
-            if (statement->expression) bootstrap_context(statement->expression, function->return_type);
+            if (statement->expression)
+                bootstrap_context(statement->expression, function->return_type);
             type = statement->expression
                        ? check_expression(program, function, statement->expression)
                        : TYPE_NOTHING;
@@ -1780,15 +1824,18 @@ static void check_program(Program *program) {
         if (function->native_library && !strcmp(function->native_library, "diagnostics")) {
             Function *callback = find_function(program, "diagnosticCompileJob");
             if (strcmp(function->name, "diagnosticRun") || function->return_type != TYPE_BOOLEAN ||
-                arrlen(function->parameters) != 1 || function->parameters[0].type < TYPE_RECORD_START ||
+                arrlen(function->parameters) != 1 ||
+                function->parameters[0].type < TYPE_RECORD_START ||
                 bootstrap_is_list(function->parameters[0].type) || !callback ||
                 callback->return_type != TYPE_NOTHING || arrlen(callback->parameters) != 1 ||
                 callback->parameters[0].type != function->parameters[0].type)
-                fail_at(function->line, function->column,
-                        "compiler diagnostics require diagnosticRun(Job): Boolean and diagnosticCompileJob(Job)");
+                fail_at(
+                    function->line, function->column,
+                    "compiler diagnostics require diagnosticRun(Job): Boolean and diagnosticCompileJob(Job)");
         }
         check_statements(program, function, function->body, 0);
-        if (!function->native_library && function->return_type != TYPE_NOTHING && strcmp(function->name, "main") != 0 &&
+        if (!function->native_library && function->return_type != TYPE_NOTHING &&
+            strcmp(function->name, "main") != 0 &&
             (!arrlen(function->body) || !statement_guarantees_return(&arrlast(function->body))))
             fail_at(function->line, function->column, "'%s' promises to return %s on every path",
                     function->name, type_name(function->return_type));
@@ -2020,7 +2067,8 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
     case EXPRESSION_MEMBER:
         left = emit_expression(emitter, expression->left);
         temporary = new_temporary(emitter);
-        if (expression->left->type >= TYPE_RECORD_START && !bootstrap_is_list(expression->left->type)) {
+        if (expression->left->type >= TYPE_RECORD_START &&
+            !bootstrap_is_list(expression->left->type)) {
             int raw = temporary;
             fprintf(output, "  %%value.%d = call i64 @minyar_record_get(ptr %s, i64 %lld)\n", raw,
                     left.name, expression->integer);
@@ -2077,8 +2125,8 @@ static Value emit_expression(Emitter *emitter, Expression *expression) {
             if (right.type != TYPE_INTEGER) {
                 temporary = new_temporary(emitter);
                 fprintf(output, "  %%value.%d = %s %s %s to i64\n", temporary,
-                        !strcmp(llvm_type(right.type), "ptr") ? "ptrtoint" : "zext", llvm_type(right.type),
-                        right.name);
+                        !strcmp(llvm_type(right.type), "ptr") ? "ptrtoint" : "zext",
+                        llvm_type(right.type), right.name);
                 right = make_value(TYPE_INTEGER, "%%value.%d", temporary);
             }
             fprintf(output, "  call void @minyar_list_add(ptr %%value.%d, i64 %s)\n", object,
@@ -2419,56 +2467,57 @@ static void emit_program(FILE *output, Program *program) {
                 "@.text.data.%zu, i64 %zu, i64 -1, ptr null }\n",
                 index, index, text->text_length);
     }
-    fputs("\ndeclare void @minyar_print_integer(i64)\n"
-          "declare void @minyar_print_text(ptr)\n"
-          "declare void @minyar_print_character(i32)\n"
-          "declare void @minyar_print_boolean(i1 zeroext)\n"
-          "declare void @minyar_fail(ptr) cold noreturn\n"
-          "declare void @minyar_exit(i64) noreturn\n"
-          "declare zeroext i1 @minyar_texts_are_equal(ptr nonnull captures(none) dereferenceable(16), ptr nonnull captures(none) dereferenceable(16)) nofree nosync nounwind willreturn memory(read)\n"
-          "declare ptr @minyar_join_text(ptr, ptr)\n"
-          "declare ptr @minyar_join_texts(ptr)\n"
-          "declare i64 @minyar_text_length(ptr)\n"
-          "declare i64 @minyar_text_byte_length(ptr nonnull captures(none) dereferenceable(16)) nofree nosync nounwind willreturn memory(argmem: read)\n"
-          "declare i32 @minyar_text_character_at(ptr, i64)\n"
-          "declare ptr @minyar_text_slice(ptr, i64, i64)\n"
-          "declare ptr @minyar_integer_text(i64)\n"
-          "declare ptr @minyar_character_text(i32)\n"
-          "declare i32 @minyar_integer_character(i64)\n"
-          "declare ptr @minyar_boolean_text(i1 zeroext)\n"
-          "declare void @minyar_initialize_arguments(i32, ptr)\n"
-          "declare i64 @minyar_argument_count()\n"
-          "declare ptr @minyar_argument(i64)\n"
-          "declare ptr @minyar_read_text_file(ptr)\n"
-          "declare zeroext i1 @minyar_file_exists(ptr)\n"
-          "declare void @minyar_write_text_file(ptr, ptr)\n"
-          "declare void @minyar_write_text_parts(ptr, ptr)\n"
-          "declare nonnull ptr @minyar_bytes_new(i64)\n"
-          "declare ptr @minyar_text_bytes(ptr)\n"
-          "declare ptr @minyar_bytes_text(ptr)\n"
-          "declare i64 @minyar_bytes_length(ptr nonnull captures(none) dereferenceable(16)) nofree nosync nounwind willreturn memory(argmem: read)\n"
-          "declare i64 @minyar_bytes_get(ptr, i64)\n"
-          "declare i64 @minyar_bytes_get_int64(ptr, i64)\n"
-          "declare void @minyar_bytes_add_int64(ptr, i64)\n"
-          "declare void @minyar_bytes_set_int64(ptr, i64, i64)\n"
-          "declare nonnull ptr @minyar_list_new()\n"
-          "declare void @minyar_list_add(ptr, i64)\n"
-          "declare i64 @minyar_list_length(ptr nonnull captures(none) dereferenceable(16)) nofree nosync nounwind willreturn memory(argmem: read)\n"
-          "declare i64 @minyar_list_get(ptr, i64)\n"
-          "declare void @minyar_list_set(ptr, i64, i64)\n"
-          "declare nonnull ptr @minyar_record_new(i64)\n"
-          "declare i64 @minyar_record_get(ptr, i64)\n"
-          "declare void @minyar_record_set(ptr, i64, i64)\n"
-          "declare void @minyar_record_set_reference(ptr, i64, i64)\n"
-          "declare void @minyar_record_replace(ptr, i64, i64, i64)\n"
-          "declare void @minyar_check_integer_overflow(i1 zeroext)\n"
-          "declare void @minyar_check_integer_division(i64, i64)\n"
-          "declare void @minyar_fail_integer_overflow() cold noreturn\n"
-          "declare void @minyar_fail_integer_division(i64) cold noreturn\n"
-          "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n"
-          "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n"
-          "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n\n",
-          output);
+    fputs(
+        "\ndeclare void @minyar_print_integer(i64)\n"
+        "declare void @minyar_print_text(ptr)\n"
+        "declare void @minyar_print_character(i32)\n"
+        "declare void @minyar_print_boolean(i1 zeroext)\n"
+        "declare void @minyar_fail(ptr) cold noreturn\n"
+        "declare void @minyar_exit(i64) noreturn\n"
+        "declare zeroext i1 @minyar_texts_are_equal(ptr nonnull captures(none) dereferenceable(16), ptr nonnull captures(none) dereferenceable(16)) nofree nosync nounwind willreturn memory(read)\n"
+        "declare ptr @minyar_join_text(ptr, ptr)\n"
+        "declare ptr @minyar_join_texts(ptr)\n"
+        "declare i64 @minyar_text_length(ptr)\n"
+        "declare i64 @minyar_text_byte_length(ptr nonnull captures(none) dereferenceable(16)) nofree nosync nounwind willreturn memory(argmem: read)\n"
+        "declare i32 @minyar_text_character_at(ptr, i64)\n"
+        "declare ptr @minyar_text_slice(ptr, i64, i64)\n"
+        "declare ptr @minyar_integer_text(i64)\n"
+        "declare ptr @minyar_character_text(i32)\n"
+        "declare i32 @minyar_integer_character(i64)\n"
+        "declare ptr @minyar_boolean_text(i1 zeroext)\n"
+        "declare void @minyar_initialize_arguments(i32, ptr)\n"
+        "declare i64 @minyar_argument_count()\n"
+        "declare ptr @minyar_argument(i64)\n"
+        "declare ptr @minyar_read_text_file(ptr)\n"
+        "declare zeroext i1 @minyar_file_exists(ptr)\n"
+        "declare void @minyar_write_text_file(ptr, ptr)\n"
+        "declare void @minyar_write_text_parts(ptr, ptr)\n"
+        "declare nonnull ptr @minyar_bytes_new(i64)\n"
+        "declare ptr @minyar_text_bytes(ptr)\n"
+        "declare ptr @minyar_bytes_text(ptr)\n"
+        "declare i64 @minyar_bytes_length(ptr nonnull captures(none) dereferenceable(16)) nofree nosync nounwind willreturn memory(argmem: read)\n"
+        "declare i64 @minyar_bytes_get(ptr, i64)\n"
+        "declare i64 @minyar_bytes_get_int64(ptr, i64)\n"
+        "declare void @minyar_bytes_add_int64(ptr, i64)\n"
+        "declare void @minyar_bytes_set_int64(ptr, i64, i64)\n"
+        "declare nonnull ptr @minyar_list_new()\n"
+        "declare void @minyar_list_add(ptr, i64)\n"
+        "declare i64 @minyar_list_length(ptr nonnull captures(none) dereferenceable(16)) nofree nosync nounwind willreturn memory(argmem: read)\n"
+        "declare i64 @minyar_list_get(ptr, i64)\n"
+        "declare void @minyar_list_set(ptr, i64, i64)\n"
+        "declare nonnull ptr @minyar_record_new(i64)\n"
+        "declare i64 @minyar_record_get(ptr, i64)\n"
+        "declare void @minyar_record_set(ptr, i64, i64)\n"
+        "declare void @minyar_record_set_reference(ptr, i64, i64)\n"
+        "declare void @minyar_record_replace(ptr, i64, i64, i64)\n"
+        "declare void @minyar_check_integer_overflow(i1 zeroext)\n"
+        "declare void @minyar_check_integer_division(i64, i64)\n"
+        "declare void @minyar_fail_integer_overflow() cold noreturn\n"
+        "declare void @minyar_fail_integer_division(i64) cold noreturn\n"
+        "declare { i64, i1 } @llvm.sadd.with.overflow.i64(i64, i64)\n"
+        "declare { i64, i1 } @llvm.ssub.with.overflow.i64(i64, i64)\n"
+        "declare { i64, i1 } @llvm.smul.with.overflow.i64(i64, i64)\n\n",
+        output);
     fputs("define internal void @.minyar.integer.overflow.checked(i1 %overflow) alwaysinline {\n"
           "entry:\n"
           "  br i1 %overflow, label %bad, label %good\n"
@@ -2515,35 +2564,49 @@ static void emit_program(FILE *output, Program *program) {
     for (index = 0; index < (size_t)arrlen(program->functions); index++) {
         Function *function = &program->functions[index];
         if (function->native_library && !strcmp(function->native_library, "diagnostics")) {
-            fputs("declare zeroext i1 @minyar_compiler_try(ptr, ptr)\n"
-                  "define zeroext i1 @.minyar.fn.diagnosticRun(ptr %argument.0) {\nentry:\n"
-                  "  %native.result = call zeroext i1 @minyar_compiler_try(ptr @.minyar.fn.diagnosticCompileJob, ptr %argument.0)\n"
-                  "  ret i1 %native.result\n}\n\n", output);
+            fputs(
+                "declare zeroext i1 @minyar_compiler_try(ptr, ptr)\n"
+                "define zeroext i1 @.minyar.fn.diagnosticRun(ptr %argument.0) {\nentry:\n"
+                "  %native.result = call zeroext i1 @minyar_compiler_try(ptr @.minyar.fn.diagnosticCompileJob, ptr %argument.0)\n"
+                "  ret i1 %native.result\n}\n\n",
+                output);
             continue;
         }
         if (function->native_library) {
-            const char *result = function->return_type == TYPE_BOOLEAN ? "zeroext i1" : llvm_type(function->return_type);
+            const char *result = function->return_type == TYPE_BOOLEAN
+                                     ? "zeroext i1"
+                                     : llvm_type(function->return_type);
             fprintf(output, "declare %s @minyar_runtime_%s(", result, function->name);
-            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters); parameter_index++) {
-                if (parameter_index) fputs(", ", output);
+            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters);
+                 parameter_index++) {
+                if (parameter_index)
+                    fputs(", ", output);
                 Type type = function->parameters[parameter_index].type;
                 fputs(type == TYPE_BOOLEAN ? "i1 zeroext" : llvm_type(type), output);
             }
             fprintf(output, ")\ndefine %s @.minyar.fn.%s(", result, function->name);
-            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters); parameter_index++) {
-                if (parameter_index) fputs(", ", output);
-                fprintf(output, "%s %%argument.%zu", llvm_type(function->parameters[parameter_index].type), parameter_index);
+            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters);
+                 parameter_index++) {
+                if (parameter_index)
+                    fputs(", ", output);
+                fprintf(output, "%s %%argument.%zu",
+                        llvm_type(function->parameters[parameter_index].type), parameter_index);
             }
             fputs(") {\nentry:\n  ", output);
-            if (function->return_type != TYPE_NOTHING) fputs("%native.result = ", output);
+            if (function->return_type != TYPE_NOTHING)
+                fputs("%native.result = ", output);
             fprintf(output, "call %s @minyar_runtime_%s(", result, function->name);
-            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters); parameter_index++) {
-                if (parameter_index) fputs(", ", output);
+            for (parameter_index = 0; parameter_index < (size_t)arrlen(function->parameters);
+                 parameter_index++) {
+                if (parameter_index)
+                    fputs(", ", output);
                 Type type = function->parameters[parameter_index].type;
-                fprintf(output, "%s %%argument.%zu", type == TYPE_BOOLEAN ? "i1 zeroext" : llvm_type(type), parameter_index);
+                fprintf(output, "%s %%argument.%zu",
+                        type == TYPE_BOOLEAN ? "i1 zeroext" : llvm_type(type), parameter_index);
             }
             fprintf(output, ")\n  ret %s", llvm_type(function->return_type));
-            if (function->return_type != TYPE_NOTHING) fputs(" %native.result", output);
+            if (function->return_type != TYPE_NOTHING)
+                fputs(" %native.result", output);
             fputs("\n}\n\n", output);
             continue;
         }
@@ -2553,7 +2616,8 @@ static void emit_program(FILE *output, Program *program) {
         emitter.next_temporary = 0;
         emitter.next_label = 0;
         snprintf(emitter.current_block, sizeof(emitter.current_block), "entry");
-        /* Boolean definitions promise zeroext, matching the Minyar compiler's ABI for Boolean returns. */
+        /* Boolean definitions promise zeroext, matching the Minyar compiler's ABI for Boolean
+         * returns. */
         fprintf(output, "define %s%s @%s%s(", emitted_return == TYPE_BOOLEAN ? "zeroext " : "",
                 emitted_return == TYPE_UNKNOWN ? "i32" : llvm_type(emitted_return),
                 strcmp(function->name, "main") == 0 ? "" : ".minyar.fn.", function->name);

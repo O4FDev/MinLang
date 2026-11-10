@@ -400,7 +400,11 @@ static HRESULT prune_pending(unsigned *remaining) {
 // A callback must match both app identity and the persisted notification allowlist.
 // Consumption and queue insertion share a lock, so duplicates and close races cannot dispatch.
 static HRESULT activate_notice(const wchar_t *app, const wchar_t *argument, ULONG inputs) {
-    enum { TOKEN_LENGTH = 32, ACTION_LENGTH = 64, ARGUMENT_CAPACITY = TOKEN_LENGTH + 1 + ACTION_LENGTH + 1 };
+    enum {
+        TOKEN_LENGTH = 32,
+        ACTION_LENGTH = 64,
+        ARGUMENT_CAPACITY = TOKEN_LENGTH + 1 + ACTION_LENGTH + 1
+    };
     if (!app || !argument || inputs || wcsnlen(app, 129) >= 129)
         return E_INVALIDARG;
     size_t argument_length = wcsnlen(argument, ARGUMENT_CAPACITY);

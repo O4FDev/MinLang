@@ -560,10 +560,11 @@ int main(int argc, char **argv) {
         next += 2;
     }
     if (argc < 5 || next != argc) {
-        fputs("usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS] [--bounded-owners "
-              "BUDGET] [--scope-owners] [--library DIRECTORY]... [--error-format text|json] [--release] "
-              "[--export-modules]\n",
-              stderr);
+        fputs(
+            "usage: module-build COMPILER SOURCE LLVM CACHE_DIRECTORY [STATS] [--bounded-owners "
+            "BUDGET] [--scope-owners] [--library DIRECTORY]... [--error-format text|json] [--release] "
+            "[--export-modules]\n",
+            stderr);
         return 2;
     }
     unsigned long scope_budget = scope_owners && budget ? cleanup_budget_value(budget) : 0;
@@ -581,7 +582,8 @@ int main(int argc, char **argv) {
     if (scope_budget) {
         size_t length = strlen(compiler_hex);
         char *identity = allocate(length + 48);
-        snprintf(identity, length + 48, "%s:scope-bounded-owners-v1:%lu", compiler_hex, scope_budget);
+        snprintf(identity, length + 48, "%s:scope-bounded-owners-v1:%lu", compiler_hex,
+                 scope_budget);
         free(compiler_hex);
         compiler_hex = identity;
     } else if (owner_limit) {
@@ -626,11 +628,13 @@ int main(int argc, char **argv) {
     char key[96];
     uint64_t entry_hash = artifact_hash((const unsigned char *)entry, strlen(entry));
     if (scope_budget)
-        snprintf(key, sizeof key, "%016" PRIx64 "-scope-bounded-owners-v1-%lu%s%s.cache", entry_hash,
-                 scope_budget, release ? "-release-v1" : "", export_modules ? "-export-modules-v1" : "");
+        snprintf(key, sizeof key, "%016" PRIx64 "-scope-bounded-owners-v1-%lu%s%s.cache",
+                 entry_hash, scope_budget, release ? "-release-v1" : "",
+                 export_modules ? "-export-modules-v1" : "");
     else if (owner_limit)
         snprintf(key, sizeof key, "%016" PRIx64 "-stack-owners-v1-%u%s%s.cache", entry_hash,
-                 owner_limit, release ? "-release-v1" : "", export_modules ? "-export-modules-v1" : "");
+                 owner_limit, release ? "-release-v1" : "",
+                 export_modules ? "-export-modules-v1" : "");
     else if (scope_owners)
         snprintf(key, sizeof key, "%016" PRIx64 "-scope-owners-v1%s%s.cache", entry_hash,
                  release ? "-release-v1" : "", export_modules ? "-export-modules-v1" : "");
@@ -705,11 +709,13 @@ int main(int argc, char **argv) {
             stop("cache plan descriptors");
         input_fd = plan_fd;
     }
-    int result = compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget,
-                              scope_owners, libraries, library_count, error_format, release, export_modules);
+    int result =
+        compiler_run(snapshot, entry, output, input_fd, state, stats, error, budget, scope_owners,
+                     libraries, library_count, error_format, release, export_modules);
     if (result && cache_valid)
         result = compiler_run(snapshot, entry, output, empty_fd, state, stats, error, budget,
-                              scope_owners, libraries, library_count, error_format, release, export_modules);
+                              scope_owners, libraries, library_count, error_format, release,
+                              export_modules);
     if (!result) {
         Bytes diagnostic = read_path(stats, 4096);
         struct stat state_stat;
