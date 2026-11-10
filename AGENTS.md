@@ -22,10 +22,23 @@
   O0/O2 execution, rejection diagnostics and ownership assertions for language
   changes. Never substitute a smoke pass for the required landing gate.
 - Follow the active run's coordination charter for build hosts, status and
-  landing. During the 2026-10-20 moonshot, all builds/suites run through `bx`
-  (macOS-only lanes have an explicit exception); use `gate.sh` then `land.sh`.
-  The inherited pre-commit hook builds locally. Under a remote-only charter,
-  commit after remote checks with `git -c core.hooksPath=/dev/null commit ...`;
-  this one-command override still requires the complete remote landing gate.
+  landing. The inherited pre-commit hook builds locally. When a charter keeps
+  builds off this machine, commit with `git -c core.hooksPath=/dev/null commit`
+  after its checks; the override still requires the charter's landing gate.
 - Use one-line Conventional Commits: `type(scope): short plain message`, with
   no body or trailers. Do not push unless the user explicitly authorizes it.
+
+## Leave the repository better than you found it
+
+- Run `make garden` (see `docs/garden.md`) before you finish. Do not raise any
+  count on its summary line. Fix any drift your change causes.
+- If a doc, example or check misled you, fix it in the same change. A wrong
+  example misleads the next agent too.
+- Keep run artefacts out of the tree: logs, notes, scratch programs, saves and
+  per-agent reports go in the run's own folder. A record worth keeping goes in
+  `docs/records/YYYY-MM-DD-topic/`. Living docs describe the current tree.
+- Delete what you can prove dead with `git grep`, such as unused scripts,
+  targets and files. Git history keeps them. Removing a check needs a test
+  review.
+- Give every TODO a date, as `TODO(YYYY-MM-DD)`. Write placeholders in docs as
+  `check-NAME` or `<name>`.

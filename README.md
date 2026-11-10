@@ -179,6 +179,7 @@ remain unfinished.
 - [Runtime ownership](docs/runtime-memory.md) and [runtime profiles](docs/bounded-runtime-contract.md)
 - [Performance testing](docs/performance.md)
 - [Testing strategy](docs/testing.md)
+- [Gardening: keeping the tree healthy](docs/garden.md)
 - [Linux testing](experiments/linux/README.md)
 
 ## A note from the developer 
