@@ -413,6 +413,35 @@ public function remember(store: Text, requested: Text, source: Source) {
     }
     publishReference(reference(store, source.repository, requested), content)
 }
+// Where a repository path is fetched from: its public HTTPS URL, or the test mirror's bare repository.
+function location(repository: Text): Text {
+    let mirror = system.getenv("MINYAR_GIT_MIRROR")
+    if mirror != "" { return host.resolveName(mirror) + "/" + repository + ".git" }
+    return "https://" + repository + ".git"
+}
+function transport(): List<Text> {
+    let arguments: List<Text> = []
+    if system.getenv("MINYAR_GIT_MIRROR") != "" { arguments.add("-c"); arguments.add("protocol.file.allow=always") }
+    return arguments
+}
+public record Release { tag: Text; commit: Text }
+// The repository's stable semver release tags, read from the host without downloading any source.
+public function releases(repository: Text): List<Release> {
+    let store = cache()
+    let scratch = host.temporaryDirectory(store, ".fetch-")
+    let bare = scratch + "/repository"
+    git("", ["init", "--bare", "--quiet", "--template=", bare], scratch)
+    let result: List<Release> = []
+    let remote = git(bare, host.extended(transport(), ["ls-remote", "--tags", "--refs", "--", location(repository)]), scratch)
+    for line in host.lines(remote) {
+        let fields = host.words(line)
+        if fields.length != 2 || !fields[1].startsWith("refs/tags/") || !hexadecimal(fields[0], 40) { continue }
+        let tag = host.textAfter(fields[1], "refs/tags/")
+        if semver(tag) { result.add(Release { tag: tag; commit: fields[0] }) }
+    }
+    host.release(scratch)
+    return result
+}
 public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pinnedHash: Text, offline: Boolean): Source {
     if hexadecimal(requested, 40) && pinnedCommit != "" && pinnedCommit != requested { host.stop("exact Git commit " + requested + " disagrees with Minyar.lock; review the lock, then repeat minyar add " + repository + "@" + requested) }
     if requested != "" && requested.byteLength < 40 && hexadecimal(requested, requested.byteLength) { host.stop("abbreviated Git commit IDs are not supported; use the full 40-character commit ID") }
@@ -435,13 +464,8 @@ public function fetch(repository: Text, requested: Text, pinnedCommit: Text, pin
     let scratch = host.temporaryDirectory(store, ".fetch-")
     let bare = scratch + "/repository"
     git("", ["init", "--bare", "--quiet", "--template=", bare], scratch)
-    let url = "https://" + repository + ".git"
-    let arguments: List<Text> = []
-    let mirror = system.getenv("MINYAR_GIT_MIRROR")
-    if mirror != "" {
-        url = host.resolveName(mirror) + "/" + repository + ".git"
-        arguments.add("-c"); arguments.add("protocol.file.allow=always")
-    }
+    let url = location(repository)
+    let arguments = transport()
     let revision = source.revision
     let discovered = ""
     let wanted = source.commit

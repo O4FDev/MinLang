@@ -5,27 +5,37 @@ and a SHA-256 root embedded in the index. Both can be served from any HTTPS stat
 host, alongside the installer and release artifacts. There is no public Minyar
 registry deployed yet.
 
-## Prepare a package record
+## Publish a release
 
-Commit a source library and tag its exact version, for example `v0.1.0`.
-From that repository root:
+Commit a source library, tag its exact version (for example `v0.1.0`) and push
+the tag to the Git host consumers fetch from. Then, from the repository root:
 
 ```sh
-mkdir -p ../release-records
-minyar publish github.com/O4FDev/paint --dry-run \
-  --description "A small vector studio for paths, light and Minyar." \
-  > ../release-records/paint-0.1.0.json
+git tag v0.1.0
+git push origin main v0.1.0
+minyar publish --registry ../public
 ```
 
-`publish` is always a dry run in this version, including when `--dry-run` is
-omitted. It requires a clean Git tree, a library export and a version tag at HEAD.
-It reads committed blobs, applies the source security policy and emits metadata.
-It does not upload, create a repository, change remotes or execute package code.
-Git clean, smudge and process filters are disabled during the working-tree
-check, and the Git index remains unchanged.
-Keep redirected output outside the package so it does not make the tree dirty.
+`publish` requires a clean Git tree, a library export and a `v` + `package.version`
+tag at HEAD. The release is named after the origin remote (`https://`, `ssh://` or
+`git@host:owner/repo` URLs); pass `HOST/OWNER/REPO` when the origin is something
+else. It reads committed blobs, applies the source security policy, then downloads
+that tag from the host exactly as `minyar add` would and refuses unless the host
+serves the same commit and source checksum. Only then is the record merged into the
+index directory, which is created if needed. The description comes from
+`package.description` in `Minyar.toml`, or `--description TEXT`. Publishing
+the same release again changes nothing; a different record for a published version
+is refused. `publish` does not upload, create a repository, change remotes or
+execute package code. Git clean, smudge and process filters are disabled during the
+working-tree check, and the Git index remains unchanged. `MINYAR_REGISTRY` may name
+the index directory instead of `--registry`.
+
+`--dry-run` prints the release record without downloading or writing anything; so
+does `publish` when the configured index is an HTTPS URL. An index operator can
+merge saved records in bulk:
 
 ```sh
+minyar publish --dry-run > ../release-records/paint-0.1.0.json
 minyar registry build ../release-records ./public
 minyar registry serve ./public 8080
 ```
@@ -52,12 +62,16 @@ outside the public directory. No deployment is performed by these tools.
 export MINYAR_REGISTRY=https://YOUR-HOST
 minyar search paint
 minyar info paint
-minyar add github.com/O4FDev/paint
+minyar add paint                   # or minyar add github.com/O4FDev/paint
 minyar build --locked --offline
 ```
 
-`--registry URL_OR_DIRECTORY` selects an index for `search` and `info` without
-changing the environment. A local public directory also works. HTTP is allowed
+`add NAME` adds the newest release of the one repository publishing NAME;
+`add NAME@0.2.0` picks a release. When more than one repository publishes a name,
+`add` refuses and lists them; add the one you trust by its repository path.
+
+`--registry URL_OR_DIRECTORY` selects an index for `search`, `info`, `add` and
+`publish` without changing the environment. A local public directory also works. HTTP is allowed
 only for loopback testing. Search folds ASCII case and searches names, repository
 paths and descriptions; it displays the highest stable version of each repository.
 `info` lists that repository's releases in numeric order, newest first. A previous
@@ -90,7 +104,8 @@ trust comes from the configured HTTPS host or local index, plus reviewed locks.
 ## Test without the internet
 
 `make check-registry` creates local source/bare repositories, generates dry-run
-records and checksums, runs the real Minyar server on an ephemeral loopback port,
+records and checksums, publishes to a local index, adds by name and updates within
+a major version, runs the real Minyar server on an ephemeral loopback port,
 and tests discovery, Git source verification, offline index reuse, mutation
 rejection, HTTP methods and path policy. Neither GitHub nor a hosted registry is
 required. See [installation](install.md) to prepare signed toolchain artifacts in

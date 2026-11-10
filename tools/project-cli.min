@@ -38,13 +38,16 @@ function help() {
 
     Packages
       add HOST/OWNER/REPO[@REV]   Add a verified Git source package
+      add NAME[@VERSION]          Add a package from the package index by name
       add NAME --path PATH        Add an editable local library
       remove NAME                 Remove a dependency
       tree                        Show the resolved dependency graph
       metadata                    Print project and dependency metadata as JSON
       search [QUERY]              Search a configured package index
       info NAME                   Show releases, commits and checksums
-      publish REPO                Prepare release metadata (always a dry run)
+      update [NAME]               Move Git dependencies to their newest compatible release
+      publish [REPO]              Record a tagged release in a local package index
+                                  (--dry-run prints the record instead)
       registry build|serve        Build or serve a local package index
       install                     Build and install this project's binary
       uninstall NAME              Remove a binary installed by Minyar
@@ -72,7 +75,7 @@ function help() {
       --root DIR                  Install in $MINYAR_HOME or ~/.minyar by default
       --force                     Replace a binary during install
       --registry URL              Use a package index URL or local directory
-      --dry-run                   Prepare release metadata without uploading
+      --dry-run                   Print the release record without writing an index
       --description TEXT          Describe a release on one line
       --seeds COUNT               Universes per scenario for sim (default 10000)
       --first SEED                First seed for sim (default 0)
@@ -87,7 +90,7 @@ function help() {
     """)
 }
 function parse(): Options {
-    let options = Options { command: processInfo.argument(0); manifest: ""; path: ""; name: ""; extension: ""; root: ""; registry: ""; description: "Minyar source library."; errorFormat: ""; release: false; library: false; locked: false; offline: false; force: false; incremental: true; watch: false; hot: false; undo: false; dryRun: false; seeds: 10000; first: 0; jobs: 1; seed: -1; explore: false; replay: ""; positionals: []; arguments: [] }
+    let options = Options { command: processInfo.argument(0); manifest: ""; path: ""; name: ""; extension: ""; root: ""; registry: ""; description: ""; errorFormat: ""; release: false; library: false; locked: false; offline: false; force: false; incremental: true; watch: false; hot: false; undo: false; dryRun: false; seeds: 10000; first: 0; jobs: 1; seed: -1; explore: false; replay: ""; positionals: []; arguments: [] }
     let seen: List<Text> = []
     let index = 1
     while index < processInfo.argumentCount() {
@@ -155,7 +158,7 @@ function parse(): Options {
         else if option == "--force" { allowed = options.command == "install" }
         else if option == "--dry-run" { allowed = options.command == "publish" || options.command == "patch" }
         else if option == "--description" { allowed = options.command == "publish" }
-        else if option == "--registry" { allowed = options.command == "search" || options.command == "info" }
+        else if option == "--registry" { allowed = host.listed(["search", "info", "add", "publish"], options.command) }
         else if option == "--watch" { allowed = options.command == "run" }
         else if option == "--hot" { allowed = options.command == "run" || options.command == "build" }
         else if option == "--undo" { allowed = options.command == "patch" }
@@ -525,12 +528,25 @@ function modify(package: project.Manifest, options: Options) {
     let fetched = git.Source { repository: ""; revision: ""; commit: ""; checksum: ""; root: "" }
     if options.command == "add" && options.path == "" {
         let pieces = name.split("@")
-        if pieces.length > 2 { host.stop("usage: minyar add github.com/owner/package[@revision]") }
-        repository = git.repository(pieces[0])
+        if pieces.length > 2 { host.stop("usage: minyar add HOST/OWNER/PACKAGE[@revision], NAME[@version] or NAME --path DIR") }
         revision = "latest"
         if pieces.length == 2 { revision = pieces[1] }
         if !git.validRevision(revision) { host.stop("invalid Git revision: " + revision) }
+        let index = registry.Index { entries: []; origin: "" }
+        if !host.hasText(pieces[0], "/") {
+            // A bare name comes from the package index; the manifest and lock still record its Git source.
+            let location = options.registry
+            if location == "" { location = system.getenv("MINYAR_REGISTRY") }
+            if location == "" { host.stop(pieces[0] + " is not a Git package path; use minyar add HOST/OWNER/" + pieces[0] + ", minyar add " + pieces[0] + " --path DIR for a local library, or set MINYAR_REGISTRY to a package index to add packages by name") }
+            index = registry.loadWith(location, options.offline)
+            let version = ""
+            if pieces.length == 2 { version = revision }
+            let release = registry.lookup(index, pieces[0], version)
+            repository = release.repository
+            revision = "v" + release.version
+        } else { repository = git.repository(pieces[0]) }
         fetched = git.fetch(repository, revision, "", "", options.offline)
+        registry.verify(index, fetched)
         let source = fetched
         let dependency = project.read(source.root)
         name = dependency.name
@@ -570,18 +586,69 @@ function modify(package: project.Manifest, options: Options) {
     else { graph = project.resolveModified(package, name, options.offline) }
     let updateLock = project.hasGitLock(package.root)
     for dependency in graph.packages { if dependency.source != "" { updateLock = true } }
-    project.atomicWrite(package.root + "/Minyar.toml", project.render(package))
+    project.save(package)
     if updateLock { project.lock(graph, false) }
     let action = "     Added  "
     if options.command == "remove" { action = "   Removed  " }
     let message = action + name
-    if repository != "" { message += " " + revision }
+    if repository != "" { message += " " + revision + " from " + repository }
     if updateLock {
         let count = graph.packages.length - 1
         message += "\n    Locked  " + Text(count) + " source package"
         if count != 1 { message += "s" }
     }
     print(message)
+}
+// minyar update [NAME]: move Git dependencies to the newest release with the same major version (a branch
+// to its current commit), rewrite the manifest's minimums and the lock. Crossing a major version stays an
+// explicit `minyar add`, which update names when one is available. Exact commit pins never move.
+function update(package: project.Manifest, options: Options) {
+    if options.positionals.length > 1 { host.stop("usage: minyar update [NAME]") }
+    let only = ""
+    if options.positionals.length == 1 { only = options.positionals[0] }
+    if only != "" && !host.listed(package.dependencies, only) { host.stop("dependency not found: " + only) }
+    let names: List<Text> = []
+    let sources: List<git.Source> = []
+    let report: List<Text> = []
+    let notes: List<Text> = []
+    for index in 0..package.dependencies.length {
+        let name = package.dependencies[index]
+        let repository = package.repositories[index]
+        if only != "" && name != only { continue }
+        if repository == "" {
+            if only != "" { host.stop(name + " is a local path dependency; its source is used as it is") }
+            continue
+        }
+        let current = package.revisions[index]
+        let chosen = current
+        if git.semver(current) {
+            let newest = current
+            for release in git.releases(repository) {
+                if git.compare(release.tag, newest) > 0 { newest = release.tag }
+                if git.compatible(release.tag, current) && git.compare(release.tag, chosen) > 0 { chosen = release.tag }
+            }
+            if git.compare(newest, chosen) > 0 { notes.add("      Note  " + name + " " + newest + " is a new major version and may break this project: minyar add " + repository + "@" + newest) }
+        } else if git.hexadecimal(current, 40) {
+            if only != "" { host.stop(name + " is pinned to commit " + current + "; choose a release or branch with minyar add " + repository + "@REVISION") }
+            continue
+        }
+        let source = git.fetch(repository, chosen, "", "", false)
+        package.revisions[index] = source.revision
+        names.add(name)
+        sources.add(source)
+        if source.revision != current { report.add("   Updated  " + name + " " + current + " -> " + source.revision) }
+        else { report.add("   Current  " + name + " " + current) }
+    }
+    if names.length == 0 { print("No Git dependencies to update"); return }
+    let graph = project.resolveUpdated(package, sources, names)
+    project.save(package)
+    project.lock(graph, false)
+    for line in report { print(line) }
+    let count = graph.packages.length - 1
+    let plural = "s"
+    if count == 1 { plural = "" }
+    print("    Locked  " + Text(count) + " source package" + plural)
+    for line in notes { print(line) }
 }
 function metadata(graph: project.Graph) {
     let packages: List<Text> = []
@@ -594,7 +661,7 @@ function dispatch() {
     if processInfo.argumentCount() == 0 { help(); return }
     if processInfo.argument(0) == "help" { help(); return }
     let options = parse()
-    if !host.listed(["new", "init", "build", "run", "patch", "check", "test", "bench", "sim", "doc", "clean", "add", "remove", "tree", "metadata", "install", "uninstall", "search", "info", "publish"], options.command) { host.stop("unknown command: " + options.command) }
+    if !host.listed(["new", "init", "build", "run", "patch", "check", "test", "bench", "sim", "doc", "clean", "add", "remove", "update", "tree", "metadata", "install", "uninstall", "search", "info", "publish"], options.command) { host.stop("unknown command: " + options.command) }
     if options.command == "search" || options.command == "info" {
         let location = options.registry
         if location == "" { location = system.getenv("MINYAR_REGISTRY") }
@@ -629,13 +696,30 @@ function dispatch() {
     else { root = project.find(".") }
     let package = project.read(root)
     if options.command == "publish" {
-        if options.positionals.length != 1 { host.stop("usage: minyar publish HOST/OWNER/PACKAGE [--dry-run] [--description TEXT]") }
-        let entry = publish.prepare(package, options.positionals[0], options.description)
-        print(registry.renderEntry(entry))
-        system.writeStandardError("   Dry run  " + entry.name + " v" + entry.version + " · " + entry.checksum + "\nNothing was published. Save this record for minyar registry build.\n")
+        if options.positionals.length > 1 { host.stop("usage: minyar publish [HOST/OWNER/PACKAGE] [--registry DIRECTORY] [--dry-run] [--description TEXT]") }
+        let repository = ""
+        if options.positionals.length == 1 { repository = options.positionals[0] }
+        let location = options.registry
+        if location == "" { location = system.getenv("MINYAR_REGISTRY") }
+        let localIndex = location != "" && !host.hasText(location, "://")
+        let entry = publish.prepare(package, repository, options.description)
+        if options.dryRun || !localIndex {
+            print(registry.renderEntry(entry))
+            let next = "Add it to a local package index with minyar publish --registry DIRECTORY, or save this record for minyar registry build."
+            if location != "" && !localIndex { next = "This toolchain cannot write to the hosted index " + location + "; give this record to its operator for minyar registry build." }
+            system.writeStandardError("   Dry run  " + entry.name + " v" + entry.version + " · " + entry.checksum + "\nNothing was published. " + next + "\n")
+            return
+        }
+        publish.confirmHosted(entry)
+        let directory = host.resolveName(location)
+        let added = registry.publish(directory, [entry])
+        let verb = " Published"
+        if added == 0 { verb = " Unchanged" }
+        print(verb + "  " + entry.name + " v" + entry.version + " from " + entry.repository + "\n     Index  " + directory + "/index.json\n  Checksum  sha256:" + entry.checksum)
         return
     }
     if options.command == "add" || options.command == "remove" { modify(package, options); return }
+    if options.command == "update" { update(package, options); return }
     if options.command != "test" && options.command != "bench" && options.command != "sim" && options.positionals.length != 0 { host.stop("unexpected positional argument for " + options.command) }
     if (options.command == "test" || options.command == "bench" || options.command == "sim") && options.positionals.length > 1 { host.stop(options.command + " accepts at most one filename filter") }
     if options.command == "clean" {

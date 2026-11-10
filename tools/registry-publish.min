@@ -31,20 +31,59 @@ function cleanStatus(root: Text, scratch: Text): Text {
     }
     return text(root, host.extended(arguments, ["status", "--porcelain", "--untracked-files=normal"]), scratch)
 }
+// The public repository a release is recorded under: named on the command line, or read from the
+// origin remote when it is an HTTPS or SSH URL of a Git host (git@host:owner/repo, ssh://, https://).
+public function origin(root: Text, scratch: Text): Text {
+    if command(root, ["remote", "get-url", "origin"], scratch + "/out", scratch + "/err") != 0 { return "" }
+    let url = host.strip(host.readText(scratch + "/out"))
+    if url.startsWith("https://") { url = host.textAfter(url, "https://") }
+    else if url.startsWith("ssh://") {
+        url = host.textAfter(url, "ssh://")
+        let at = host.findText(url, "@", 0)
+        let slash = host.findText(url, "/", 0)
+        if at >= 0 && (slash < 0 || at < slash) { url = host.textSlice(url, at + 1, url.byteLength) }
+        let colon = host.findText(url, ":", 0)
+        slash = host.findText(url, "/", 0)
+        if colon >= 0 && colon < slash { url = host.textSlice(url, 0, colon) + host.textSlice(url, slash, url.byteLength) }
+    } else if host.hasText(url, "@") && host.hasText(url, ":") && !host.hasText(url, "://") {
+        url = host.textSlice(url, host.findText(url, "@", 0) + 1, url.byteLength)
+        let colon = host.findText(url, ":", 0)
+        url = host.textSlice(url, 0, colon) + "/" + host.textSlice(url, colon + 1, url.byteLength)
+    } else { return "" }
+    if host.hasText(url, "@") { return "" }
+    return url
+}
 public function prepare(package: project.Manifest, repository: Text, description: Text): registry.Entry {
     if !project.hasLibrary(package) { host.stop("publish requires a source library at src/" + package.name + ".min") }
-    let source = git.repository(repository)
     let temporary = host.temporaryDirectory("", "minyar-publish-")
     let scratch = host.resolveName(temporary)
     if host.strip(text(package.root, ["rev-parse", "--show-toplevel"], scratch)) != package.root { host.stop("publish requires the package manifest at the Git repository root") }
-    if cleanStatus(package.root, scratch) != "" { host.stop("package has uncommitted files; commit the release before minyar publish --dry-run") }
+    let named = repository
+    if named == "" { named = origin(package.root, scratch) }
+    if named == "" { host.stop("cannot tell where consumers fetch this package: its origin remote is not an HTTPS or SSH Git URL; name it: minyar publish HOST/OWNER/" + package.name) }
+    let source = git.repository(named)
+    if cleanStatus(package.root, scratch) != "" { host.stop("package has uncommitted files; commit the release before minyar publish") }
     let commit = host.strip(text(package.root, ["rev-parse", "--verify", "HEAD^{commit}"], scratch))
-    let tagged = host.strip(text(package.root, ["rev-parse", "--verify", "refs/tags/v" + package.version + "^{commit}"], scratch))
-    if commit != tagged { host.stop("v" + package.version + " does not point to HEAD; tag the reviewed release commit first") }
+    let tag = "v" + package.version
+    if command(package.root, ["rev-parse", "--verify", "--quiet", "refs/tags/" + tag + "^{commit}"], scratch + "/out", scratch + "/err") != 0 { host.stop("package.version is " + package.version + " but there is no tag " + tag + "; tag the reviewed release commit: git tag " + tag) }
+    if host.strip(host.readText(scratch + "/out")) != commit { host.stop(tag + " does not point to HEAD; check out the tagged commit, or set a new package.version for this commit and tag it") }
     let directory = host.strip(text(package.root, ["rev-parse", "--absolute-git-dir"], scratch))
     let exported = git.exportTree(directory, commit, scratch)
     let checksum = git.treeHash(exported)
-    let result = registry.Entry { name: package.name; repository: source; version: package.version; description: description; commit: commit; checksum: checksum }
+    let summary = description
+    if summary == "" { summary = package.description }
+    if summary == "" { summary = "Minyar source library." }
+    let result = registry.Entry { name: package.name; repository: source; version: package.version; description: summary; commit: commit; checksum: checksum }
     host.release(temporary)
     return registry.entry(json.parseUnique(registry.renderEntry(result)))
+}
+// Fetch the release the way a consumer will, and require the host to serve exactly the prepared commit and
+// source tree. An index never records a release that consumers cannot download or that differs from review.
+public function confirmHosted(entry: registry.Entry) {
+    let tag = "v" + entry.version
+    let served = false
+    for release in git.releases(entry.repository) { if release.tag == tag { served = true } }
+    if !served { host.stop(entry.repository + " does not serve the tag " + tag + " yet; push it (git push origin " + tag + ") before minyar publish") }
+    let hosted = git.fetch(entry.repository, tag, "", "", false)
+    if hosted.commit != entry.commit || hosted.checksum != entry.checksum { host.stop(entry.repository + " serves v" + entry.version + " at commit " + hosted.commit + ", not the local release " + entry.commit + "; push the reviewed tag (git push origin v" + entry.version + ") before minyar publish") }
 }

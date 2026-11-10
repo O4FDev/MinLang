@@ -69,6 +69,44 @@ public function decode(source: Bytes, origin: Text): Index {
     if string(value, "checksum_root") != host.hashBytes(Bytes(sums(entries))) { host.stop("registry checksum root does not match its release records") }
     return Index { entries: entries; origin: origin }
 }
+function atomic(path: Text, content: Text) {
+    let staging = host.temporaryDirectory(host.parentPath(path), ".minyar-registry-")
+    let temporary = staging + "/" + host.baseName(path)
+    let data = Bytes(content)
+    let output = files.open(temporary, files.WRITE | files.CREATE | files.EXCLUSIVE)
+    if output < 0 { host.stop(host.osError(output, temporary)) }
+    let written = files.write(output, data, 0, data.length)
+    let closed = files.close(output)
+    if written != data.length { host.stop("cannot write registry staging file: " + temporary) }
+    if closed != 0 { host.stop(host.osError(closed, temporary)) }
+    if files.rename(temporary, path) != 0 { host.stop("cannot publish registry file: " + path) }
+    host.release(staging)
+}
+// Merge release records into the index directory at destination, creating it if needed. A published
+// repository@version is immutable: an identical record is accepted again, a different one is refused.
+// Returns how many records were new.
+public function publish(destination: Text, additions: List<Entry>): Integer {
+    let entries: List<Entry> = []
+    if host.isFile(destination + "/index.json") { entries = load(destination).entries }
+    let added = 0
+    for entry in additions {
+        let found = false
+        for previous in entries {
+            if previous.repository == entry.repository && previous.version == entry.version {
+                if renderEntry(previous) != renderEntry(entry) { host.stop("release metadata is immutable: " + entry.repository + "@" + entry.version + " is already in " + destination + "/index.json with different contents; publish a new version instead") }
+                found = true
+            }
+        }
+        if !found { entries.add(entry); added += 1 }
+    }
+    if entries.length > 10000 { host.stop("registry exceeds the 10000-release limit") }
+    let index = render(entries)
+    if index.byteLength > 4194304 { host.stop("registry index exceeds 4 MiB") }
+    host.makeDirectories(destination)
+    atomic(destination + "/checksums.txt", sums(entries))
+    atomic(destination + "/index.json", index)
+    return added
+}
 function remoteLocation(location: Text): Boolean {
     if location.startsWith("https://") { return true }
     if !location.startsWith("http://") { return false }
@@ -95,6 +133,7 @@ function fetch(location: Text): Bytes {
     if host.hasText(location, "://") { host.stop("package indexes require HTTPS (HTTP is allowed only on loopback)") }
     let path = host.resolveName(location)
     if host.isDirectory(path) { path += "/index.json" }
+    if !host.isFile(path) { host.stop("no package index at " + location + "; create one with minyar publish --registry " + location + " from a tagged library, or check MINYAR_REGISTRY") }
     if files.pathSize(path) > 4194304 { host.stop("registry index exceeds 4 MiB") }
     return host.readBytes(path)
 }
@@ -230,6 +269,30 @@ public function verify(index: Index, source: git.Source) {
         }
     }
     host.stop("release is absent from the configured package index: " + source.repository + "@" + source.revision)
+}
+// The release `minyar add NAME[@VERSION]` means: the repository that publishes NAME (refused when several
+// repositories claim it, so a look-alike cannot win silently) and its newest or named version.
+public function lookup(index: Index, name: Text, version: Text): Entry {
+    let repositories: List<Text> = []
+    for value in index.entries { if value.name == name && !host.listed(repositories, value.repository) { repositories.add(value.repository) } }
+    if repositories.length == 0 { host.stop("no package named " + name + " in the package index " + index.origin + "; try minyar search " + name) }
+    if repositories.length > 1 {
+        repositories.sort()
+        host.stop("more than one repository publishes a package named " + name + ": " + host.joined(repositories, ", ") + "; add the one you trust by its path, for example minyar add " + repositories[0])
+    }
+    let wanted = version
+    if wanted.startsWith("v") { wanted = host.textAfter(wanted, "v") }
+    let chosen = -1
+    let available: List<Text> = []
+    for position in 0..index.entries.length {
+        let value = index.entries[position]
+        if value.repository != repositories[0] { continue }
+        available.add("v" + value.version)
+        if wanted != "" { if value.version == wanted { chosen = position } }
+        else if chosen < 0 || git.compare(value.version, index.entries[chosen].version) > 0 { chosen = position }
+    }
+    if chosen < 0 { host.stop(name + " has no release " + version + " in the package index; it has " + host.joined(available, ", ")) }
+    return index.entries[chosen]
 }
 function lowercase(value: Text): Text {
     let raw = Bytes(value)

@@ -6,14 +6,14 @@ use "files" as files
 use "system" as system
 use "text" as utf8
 
-public record Manifest { root: Text; name: Text; version: Text; kind: Text; memory: Text; cpu: Text; dependencies: List<Text>; paths: List<Text>; repositories: List<Text>; revisions: List<Text>; source: Text; revision: Text; commit: Text; checksum: Text }
+public record Manifest { root: Text; name: Text; version: Text; description: Text; kind: Text; memory: Text; cpu: Text; dependencies: List<Text>; paths: List<Text>; repositories: List<Text>; revisions: List<Text>; source: Text; revision: Text; commit: Text; checksum: Text }
 public record Graph { packages: List<Manifest>; active: List<Text> }
 record Pin { name: Text; repository: Text; revision: Text; commit: Text; checksum: Text }
 record Selection { name: Text; repository: Text; revision: Text }
 record Resolution { pins: List<Pin>; selections: List<Selection>; changed: Boolean; locked: Boolean; offline: Boolean; index: registry.Index; indexLoaded: Boolean }
 
 public function manifest(root: Text, name: Text, version: Text, kind: Text): Manifest {
-    return Manifest { root: root; name: name; version: version; kind: kind; memory: ""; cpu: ""; dependencies: []; paths: []; repositories: []; revisions: []; source: ""; revision: ""; commit: ""; checksum: "" }
+    return Manifest { root: root; name: name; version: version; description: ""; kind: kind; memory: ""; cpu: ""; dependencies: []; paths: []; repositories: []; revisions: []; source: ""; revision: ""; commit: ""; checksum: "" }
 }
 
 public function validName(name: Text): Boolean {
@@ -110,6 +110,10 @@ public function read(root: Text): Manifest {
             let parsed = unquote(value, location)
             if key == "name" { result.name = parsed }
             else if key == "version" { result.version = parsed }
+            else if key == "description" {
+                if parsed.byteLength > 512 || host.terminalText(parsed) != parsed { host.stop(location + ": package.description must be one line of at most 512 bytes without terminal controls") }
+                result.description = parsed
+            }
             else if key == "kind" {
                 if parsed != "bin" && parsed != "lib" { host.stop(location + ": package.kind must be bin or lib") }
                 result.kind = parsed
@@ -317,6 +321,16 @@ public function resolveFetched(package: Manifest, name: Text, source: git.Source
     pins.add(Pin { name: name; repository: source.repository; revision: source.revision; commit: source.commit; checksum: source.checksum })
     return resolvePins(package, false, offline, pins)
 }
+// Re-resolve after `minyar update`: the given sources replace their dependencies' previous lock entries.
+public function resolveUpdated(package: Manifest, sources: List<git.Source>, names: List<Text>): Graph {
+    let pins: List<Pin> = []
+    for pin in readPins(package.root, "") { if !host.listed(names, pin.name) { pins.add(pin) } }
+    for index in 0..sources.length {
+        let source = sources[index]
+        pins.add(Pin { name: names[index]; repository: source.repository; revision: source.revision; commit: source.commit; checksum: source.checksum })
+    }
+    return resolvePins(package, false, false, pins)
+}
 public function resolvePackage(package: Manifest): Graph { return resolved(package, false, false, "") }
 public function resolveModified(package: Manifest, name: Text, offline: Boolean): Graph { return resolved(package, false, offline, name) }
 public function resolve(root: Text): Graph { return resolvePackage(read(root)) }
@@ -364,8 +378,56 @@ public function lock(graph: Graph, locked: Boolean) {
     if locked { host.stop("Minyar.lock is missing or out of date; run minyar build without --locked") }
     atomicWrite(path, content)
 }
+function dependencyLine(package: Manifest, index: Integer): Text {
+    let result = package.dependencies[index] + " = { "
+    if package.repositories[index] == "" { result += "path = " + host.jsonText(package.paths[index]) }
+    else { result += "git = " + host.jsonText(package.repositories[index]) + ", rev = " + host.jsonText(package.revisions[index]) }
+    return result + " }"
+}
+// Write the manifest after add, remove or update: dependency lines are replaced, removed or appended to
+// [dependencies]; every other line, including comments and blank lines, is kept as it was.
+public function save(package: Manifest) {
+    let path = package.root + "/Minyar.toml"
+    let output: List<Text> = []
+    let written: List<Text> = []
+    let section = ""
+    let insertAt = -1
+    for original in host.lines(host.readText(path)) {
+        let line = host.strip(withoutComment(original))
+        if line.startsWith("[") {
+            section = line
+            output.add(original)
+            if section == "[dependencies]" { insertAt = output.length }
+            continue
+        }
+        if section == "[dependencies]" && line != "" {
+            let key = host.strip(host.textSlice(line, 0, host.findText(line, "=", 0)))
+            for index in 0..package.dependencies.length {
+                if package.dependencies[index] == key && !host.listed(written, key) { output.add(dependencyLine(package, index)); written.add(key) }
+            }
+            insertAt = output.length
+            continue
+        }
+        output.add(original)
+    }
+    let missing: List<Text> = []
+    for index in 0..package.dependencies.length { if !host.listed(written, package.dependencies[index]) { missing.add(dependencyLine(package, index)) } }
+    if insertAt < 0 {
+        if output.length > 0 && output[output.length - 1] != "" { output.add("") }
+        output.add("[dependencies]")
+        insertAt = output.length
+    }
+    let result: List<Text> = []
+    for index in 0..output.length {
+        if index == insertAt { for line in missing { result.add(line) } }
+        result.add(output[index])
+    }
+    if insertAt == output.length { for line in missing { result.add(line) } }
+    atomicWrite(path, host.joined(result, "\n") + "\n")
+}
 public function render(package: Manifest): Text {
     let result = "[package]\nname = " + host.jsonText(package.name) + "\nversion = " + host.jsonText(package.version) + "\n"
+    if package.description != "" { result += "description = " + host.jsonText(package.description) + "\n" }
     if package.kind != "" { result += "kind = " + host.jsonText(package.kind) + "\n" }
     if package.memory != "" { result += "memory = " + host.jsonText(package.memory) + "\n" }
     if package.cpu != "" { result += "cpu = " + host.jsonText(package.cpu) + "\n" }

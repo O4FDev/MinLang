@@ -75,6 +75,7 @@ field and the same repair note in `help`.
 [package]
 name = "hello"
 version = "0.1.0"
+description = "Greets the harbour."
 kind = "bin"
 
 [dependencies]
@@ -87,7 +88,8 @@ escaped quotes and backslashes; blank lines, CRLF and `#` comments are accepted.
 Versions have three numeric components. Unknown keys, duplicates and unsupported
 TOML constructs produce an error rather than being ignored.
 
-`package.kind` is optional and accepts `"bin"` or `"lib"`. Scaffolding writes
+`package.description` is optional: one line of at most 512 bytes, used when the
+package is published to an index. `package.kind` is optional and accepts `"bin"` or `"lib"`. Scaffolding writes
 it explicitly. Older manifests without it keep source-layout inference:
 `src/main.min` means a binary, otherwise `src/<package-name>.min` means a
 library. Thus `minyar new main` creates a runnable binary, while
@@ -113,8 +115,8 @@ the current working directory, then writes a path relative to the package's
 manifest directory. This keeps sibling-package trees usable after relocation,
 including when `add` was invoked from a nested directory. Handwritten absolute
 paths are still accepted; relative paths always resolve from the manifest
-directory. `add` and `remove` rewrite the supported manifest fields and remove
-comments.
+directory. `add`, `remove` and `update` replace, delete or append only the
+dependency's own line; comments, blank lines and every other line stay as written.
 
 Add Git packages by their repository path. An omitted revision chooses the latest
 stable semver tag; a tag, branch or commit can be selected explicitly:
@@ -123,7 +125,21 @@ stable semver tag; a tag, branch or commit can be selected explicitly:
 minyar add github.com/O4FDev/paint
 minyar add github.com/O4FDev/paint@v0.1.0
 minyar build --locked --offline
+minyar update                  # newest release within each dependency's major version
 ```
+
+`update [NAME]` moves Git dependencies to their newest release with the same major
+version (a branch dependency to its current commit), rewrites their minimum in
+`Minyar.toml` and the lock, and names any newer major version together with the
+`minyar add HOST/OWNER/REPO@vX.0.0` command that would adopt it. Crossing a major
+version is always that explicit `add`; exact commit pins never move.
+
+With a [package index](registry.md) configured, `minyar add NAME` and
+`minyar add NAME@VERSION` find the one repository that publishes NAME and add its
+newest (or named) release, verified against the index. The manifest and lock
+record the Git repository, as if you had typed its path. When several repositories
+publish the same name, `add` refuses and lists them, so a look-alike never wins
+silently.
 
 `Minyar.lock` records the resolved graph, relative local locations, versions and
 manifest hashes. Git entries also pin an exact commit and SHA-256 source-tree
@@ -320,20 +336,25 @@ and formatting; the
 ## Package discovery and release records
 
 ```sh
+git tag v0.1.0 && git push origin main v0.1.0
+minyar publish --registry ./public        # from the library's repository
 minyar search paint --registry ./public
+minyar add paint --registry ./public
 minyar info paint --registry https://YOUR-HOST
-minyar publish github.com/O4FDev/paint --dry-run --description "A vector studio."
-minyar registry build ./release-records ./public
 minyar registry serve ./public 8080
 ```
 
-`MINYAR_REGISTRY` selects a static package index for discovery and optional Git
-release checksum verification. Remote indexes have a verified local cache for
-`--offline`; previously witnessed releases cannot change or disappear. There is
-no default public registry deployed yet. `publish` emits metadata only and is a
-dry run even without the flag. It requires a clean committed library and a version
-tag at HEAD. See [the registry guide](registry.md) for records, checksums, local
-testing and static hosting.
+`MINYAR_REGISTRY` selects a static package index for discovery, `add NAME`,
+`publish` and Git release checksum verification; `--registry` does the same for one
+command. Remote indexes have a verified local cache for `--offline`; previously
+witnessed releases cannot change or disappear. There is no default public registry
+deployed yet. `publish` requires a clean committed library whose `v` + version tag
+is at HEAD. It names the release after the origin remote (or the `HOST/OWNER/REPO`
+argument), downloads the tag from that host exactly as a consumer would, and
+records it in a local index directory only if the host serves the same commit and
+source. `--dry-run`, or an HTTPS index, prints the record instead. See
+[the registry guide](registry.md) for records, checksums, local testing and static
+hosting.
 
 ## Live programming
 

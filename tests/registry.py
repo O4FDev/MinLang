@@ -160,6 +160,85 @@ def check_credential_isolation(launcher, env, root, application):
     assert not problems, "; ".join(problems)
 
 
+def check_share_workflow(launcher, base_env, root):
+    """Author publishes to a local index; a consumer adds by name, updates within a major and is told about the next."""
+    work = root / "share"
+    mirror = work / "mirror"
+    public = work / "public index"
+    env = dict(base_env, MINYAR_HOME=str(work / "home"), MINYAR_GIT_MIRROR=str(mirror))
+    env.pop("MINYAR_REGISTRY", None)
+    library = work / "geometry"
+    (library / "src").mkdir(parents=True)
+    (library / "Minyar.toml").write_text('[package]\nname = "geometry"\nversion = "0.1.0"\ndescription = "Areas of shapes."\nkind = "lib"\n')
+    (library / "src/geometry.min").write_text("public function area(width: Integer, height: Integer): Integer { return width * height }\n")
+    hosted = mirror / "example.com/shapes/geometry.git"
+
+    def git(*arguments):
+        return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Minyar tests", "-c", "user.email=tests@example.invalid", "-C", library, *arguments], env, root)
+
+    def release(version, source):
+        manifest = library / "Minyar.toml"
+        manifest.write_text(manifest.read_text().replace('version = "' + previous[0] + '"', 'version = "' + version + '"'))
+        (library / "src/geometry.min").write_text(source)
+        git("commit", "--quiet", "--all", "-m", "feat(geometry): release " + version)
+        git("tag", "v" + version)
+        git("push", "--quiet", "origin", "main", "v" + version)
+        previous[0] = version
+        return run([launcher, "publish", "--registry", public], env, library)
+
+    previous = ["0.1.0"]
+    git("init", "--quiet", "--initial-branch=main")
+    git("add", ".")
+    git("commit", "--quiet", "-m", "feat(geometry): areas")
+    run([launcher, "publish", "--registry", public], env, library, "origin remote is not an HTTPS or SSH Git URL")
+    git("remote", "add", "origin", "git@example.com:shapes/geometry.git")
+    run([launcher, "publish", "--registry", public], env, library, "git tag v0.1.0")
+    git("tag", "v0.1.0")
+    hosted.parent.mkdir(parents=True)
+    run(["git", "init", "--quiet", "--bare", hosted], env, root)
+    git("config", "remote.origin.pushurl", str(hosted))
+    git("push", "--quiet", "origin", "main")
+    run([launcher, "publish", "--registry", public], env, library, "git push origin v0.1.0")
+    assert not (public / "index.json").exists(), "a release the host does not serve was recorded"
+    dry = json.loads(run([launcher, "publish", "--registry", public, "--dry-run"], env, library))
+    assert dry["repository"] == "example.com/shapes/geometry" and dry["description"] == "Areas of shapes.", dry
+    assert not (public / "index.json").exists(), "a dry run wrote the index"
+    git("push", "--quiet", "origin", "v0.1.0")
+    published = run([launcher, "publish", "--registry", public], env, library)
+    assert "Published  geometry v0.1.0 from example.com/shapes/geometry" in published, published
+    index = json.loads((public / "index.json").read_text())
+    assert [entry["version"] for entry in index["packages"]] == ["0.1.0"] and index["packages"][0] == dry
+    assert "Unchanged" in run([launcher, "publish", "--registry", public], env, library), "republishing an identical release is idempotent"
+    run([launcher, "publish", "--registry", public, "--description", "Different words."], env, library, "immutable")
+    assert json.loads((public / "index.json").read_text()) == index, "a refused publish changed the index"
+
+    consumer = work / "consumer"
+    run([launcher, "new", consumer], env, work)
+    run([launcher, "add", "geometry"], env, consumer, "set MINYAR_REGISTRY")
+    shared = dict(env, MINYAR_REGISTRY=str(public))
+    added = run([launcher, "add", "geometry"], shared, consumer)
+    assert "Added  geometry v0.1.0 from example.com/shapes/geometry" in added, added
+    assert 'geometry = { git = "example.com/shapes/geometry", rev = "v0.1.0" }' in (consumer / "Minyar.toml").read_text()
+    assert dry["checksum"] in (consumer / "Minyar.lock").read_text()
+    run([launcher, "add", "missing"], shared, consumer, "no package named missing")
+    run([launcher, "add", "geometry@0.9.0"], shared, consumer, "has no release 0.9.0")
+
+    release("0.1.1", "public function area(width: Integer, height: Integer): Integer { return width * height }\npublic function square(side: Integer): Integer { return area(side, side) }\n")
+    release("1.0.0", "public function surface(width: Integer, height: Integer): Integer { return width * height }\n")
+    (consumer / "src/main.min").write_text('use "geometry" as geometry\nprint(geometry.square(3))\n')
+    updated = run([launcher, "update"], shared, consumer)
+    assert "Updated  geometry v0.1.0 -> v0.1.1" in updated and "minyar add example.com/shapes/geometry@v1.0.0" in updated, updated
+    assert 'rev = "v0.1.1"' in (consumer / "Minyar.toml").read_text()
+    assert "9\n" in run([launcher, "run", "--locked"], shared, consumer)
+    assert "Current  geometry v0.1.1" in run([launcher, "update", "geometry"], shared, consumer)
+    run([launcher, "update", "absent"], shared, consumer, "dependency not found")
+    assert "Added  geometry v1.0.0" in run([launcher, "add", "geometry@1.0.0"], shared, consumer)
+
+    impostor = dict(index["packages"][0], repository="example.com/impostor/geometry")
+    write_index(public / "index.json", {"schema": 1, "packages": [index["packages"][0], impostor]})
+    run([launcher, "add", "geometry"], shared, consumer, "more than one repository publishes a package named geometry")
+
+
 def main():
     launcher, registry_cli, project_root = map(lambda value: Path(value).resolve(), sys.argv[1:4])
     with tempfile.TemporaryDirectory(prefix="minyar registry ' ") as temporary:
@@ -441,7 +520,8 @@ os.execv(os.environ['MINYAR_TEST_REAL_CURL'], [os.environ['MINYAR_TEST_REAL_CURL
             server.wait(timeout=10)
         assert "lumen" in run([launcher, "search", "--registry", url, "--offline"], env, root)
         check_credential_isolation(launcher, env, root, application)
-        print("Registry: dry runs, batched raw blobs, immutable sums, Git verification, discovery, HTTP, concurrent offline witnesses, paths and credential isolation passed")
+        check_share_workflow(launcher, env, root)
+        print("Registry: dry runs, local publish, add by name, update, batched raw blobs, immutable sums, Git verification, discovery, HTTP, concurrent offline witnesses, paths and credential isolation passed")
 
 
 if __name__ == "__main__":

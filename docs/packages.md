@@ -5,6 +5,7 @@ any HTTPS Git host. Import the package by its manifest name:
 
 ```sh
 minyar add github.com/O4FDev/paint
+minyar add paint                    # by name, from a configured package index
 ```
 
 ```minyar
@@ -59,8 +60,10 @@ proof. Version zero follows the same major rule; authors must manage its API
 compatibility deliberately.
 
 Ordinary builds retain exact commits from the lock, even when a branch moves.
-Repeat `add ...@main` to deliberately refresh a branch. Repeat a bare `add` to
-discover the latest release. Locked tags remain immutable in the local cache.
+`minyar update` deliberately moves each Git dependency to its newest release within
+the same major version, or a branch to its current commit, and says when a new major
+version exists; adopt that with `add ...@vX.0.0`. Repeating a bare `add` discovers
+the latest release of any major version. Locked tags remain immutable in the local cache.
 Discovery is reused throughout the same `add`, including branch pins; it does
 not download the same source again during graph resolution. A discovered stable
 release is also cached under its tag for later offline additions. If a host moves
@@ -68,8 +71,8 @@ an already cached release tag, fresh latest discovery rejects the changed releas
 Edits to a Git dependency graph update its lock immediately, including removing
 its final Git source or adding/removing a local wrapper around Git dependencies.
 The result is ready for `--locked --offline`. Local-only path dependencies remain
-editable and retain their existing graph-lock behavior. `add` and `remove`
-rewrite supported manifest fields and comments.
+editable and retain their existing graph-lock behavior. `add`, `remove` and
+`update` change only the affected dependency lines and keep comments.
 
 ## Reproduce a build
 
