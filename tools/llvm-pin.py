@@ -23,6 +23,7 @@ History: records of past runs, measurement write-ups that say which LLVM produce
 their numbers (docs/performance.md, docs/iteration.md, docs/research), benchmarks, experiments and the
 third-party corpora in tests/data.
 """
+import collections
 import os
 import re
 import subprocess
@@ -44,7 +45,7 @@ ARCHIVES = {  # archive name suffix -> pin key
     "Linux-ARM64.tar.zst": "llvm_sha256_linux_arm64",
     ".src.tar.xz": "llvm_sha256_source",
 }
-VERSION = re.compile(r"(?<![\w.])(\d{2})\.(\d+)\.(\d+)(?!\d|\.\d)")
+VERSION = re.compile(r"(?<![\d.])(\d{2})\.(\d+)\.(\d+)(?!\d|\.\d)")
 LLVM_WORD = re.compile(r"llvm|clang|lld", re.I)
 MAJOR_NAME = re.compile(r"(?<![\w-])((?:clang|llvm|lld)-)(\d{2})(?![\w.])", re.I)
 DIGEST = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
@@ -117,20 +118,30 @@ def main():
     if sys.argv[1:] not in ([], ["--write"]):
         sys.exit("usage: tools/llvm-pin.py [--write]")
     values = pin()
-    failures = 0
+    report = {path: (text.split("\n"), problems(path, text.split("\n"), values)) for path, text in files()}
+    report = {path: entry for path, entry in report.items() if entry[1]}
     changed = []
-    for path, text in files():
-        lines = text.split("\n")
-        found = problems(path, lines, values)
-        if not found:
-            continue
-        if write:
+    if write:
+        # Rewrite only the previous pin (the version most copies still name), its major in clang-NN names, and
+        # archive digests. Any other disagreement is left for a person: it may be a deliberate other version.
+        stale = collections.Counter(old for lines, found in report.values() for _, kind, old, _ in found if kind == "version")
+        previous = stale.most_common(1)[0][0] if stale else None
+        previous_major = previous.split(".")[0] if previous else None
+        for path, (lines, found) in report.items():
+            touched = False
             for index, kind, old, new in found:
-                if new is not None:
-                    lines[index] = re.sub(r"(?<![\w.])" + re.escape(old) + r"(?!\d|\.\d)", new, lines[index])
-            open(os.path.join(ROOT, path), "w", encoding="utf-8").write("\n".join(lines))
-            changed.append(path)
-            found = problems(path, lines, values)
+                fix = (kind == "version" and old == previous) or kind.startswith("digest") or \
+                    (kind == "major" and previous_major and old.endswith("-" + previous_major))
+                if fix and new is not None:
+                    lines[index] = re.sub(r"(?<![\d.\w-])" + re.escape(old) + r"(?!\d|\.\d)" if kind == "major"
+                                          else r"(?<![\d.])" + re.escape(old) + r"(?!\d|\.\d)", new, lines[index])
+                    touched = True
+            if touched:
+                open(os.path.join(ROOT, path), "w", encoding="utf-8").write("\n".join(lines))
+                changed.append(path)
+                report[path] = (lines, problems(path, lines, values))
+    failures = 0
+    for path, (lines, found) in report.items():
         for index, kind, old, new in found:
             failures += 1
             expected = f" (pin: {new})" if new else ""
@@ -139,8 +150,8 @@ def main():
         print(f"rewrote {path}")
     if failures:
         print(f"llvm-pin: {failures} copies disagree with the pin in {SOURCE} (LLVM {values['llvm_version']}); "
-              "run `python3 tools/llvm-pin.py --write`, or mark a deliberate other version with "
-              f"`{MARKER}`")
+              + ("rewrite them with `python3 tools/llvm-pin.py --write`, or " if not write else "") +
+              f"mark a deliberate other version with `{MARKER}`")
         return 1
     print(f"llvm-pin: every copy matches LLVM {values['llvm_version']} in {SOURCE}")
     return 0
