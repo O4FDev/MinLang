@@ -34,6 +34,56 @@ jobs:
       - name: Fail on docs drift or tracked leftovers
         run: make check-garden
 
+  coverage:
+    # The compiler edge and runtime line/branch coverage floors (Makefile MIN_*_COVERAGE). Nightly rather than per
+    # push: they have been below their floors since 2026-10 (docs/records, garden lane report), and a per-push gate
+    # that is always red hides every other result.
+    name: Coverage floors
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select Python 3.15.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
+      - name: Install pinned LLVM 23.1.3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd libxml2 libtinfo6
+          archive="$RUNNER_TEMP/LLVM-23.1.3-Linux-X64.tar.zst"
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 600 \
+            'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-Linux-X64.tar.zst' -o "$archive"
+          printf '%s  %s\n' \
+            '14d2f701eb68fb799001bdea6231048f3990690fa2f406d563555ff8f744daba' \
+            "$archive" | sha256sum --check
+          sudo mkdir -p '/usr/lib/llvm-23'
+          # LLVM's archive needs a 1 GiB decode window, above zstd's 128 MiB default.
+          sudo tar --use-compress-program='zstd --long=30' -xf "$archive" -C '/usr/lib/llvm-23' --strip-components=1
+          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
+          for key in CC LLVM_CC MINYAR_CLANG MINYAR_TEST_CLANG; do echo "$key=/usr/lib/llvm-23/bin/clang" >> "$GITHUB_ENV"; done
+          MINYAR_CLANG=/usr/lib/llvm-23/bin/clang sh tools/toolchain.sh toolchain
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y make zsh
+      - name: Measure coverage against the floors
+        run: |
+          make -j1 LIMITED= SANITIZER_LIMITED= build/tooling/scripts/check-linux
+          ./build/tooling/scripts/check-linux --source . --output-dir build/linux-evidence --jobs 4 \
+            --clang /usr/lib/llvm-23/bin/clang --cxx /usr/lib/llvm-23/bin/clang++ --group coverage
+      - name: Upload coverage evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-evidence
+          if-no-files-found: warn
+          path: |
+            build/linux-evidence/*/results.json
+            build/linux-evidence/*/logs
+            build/linux-evidence/**/build/coverage
+            build/linux-evidence/**/build/mutation-score.json
+
   afl:
     name: Persistent AFL++ sanitizer campaign
     runs-on: ubuntu-24.04
