@@ -316,6 +316,67 @@ POLICIES = {
         "Newlines inside an expression", "42\nready\n",
         "The two literal List values add to 42. Its length is two rather than zero, so the else branch prints ready.",
     ),
+    "88fb0d831303": standalone(
+        "Text searching and shaping", "true\n3\na::b::c\nababab\n007\nid...\ncontent-type\na, b\n",
+        "Each print comment states its value: contains finds the dot, the first comma at or after position 2 is at 3, and the padding, repetition, replacement, lowercasing and join results are spelled out.",
+    ),
+    "cb9fae602010": standalone(
+        "Decoding bytes as text", "5\nh\n",
+        "héllo is five characters in six UTF-8 bytes, so the Ok arm prints 5; the one-byte slice is the ASCII h. Both values are stated in the comments.",
+    ),
+    "ddfcdf3d0de2": contextual(
+        "A contained List failure", "unsupported-host",
+        "This example imports boundary, which the browser bundle (PLAYGROUND_LIBRARY in build-support/wasm.mk) does not include.",
+    ),
+    "25d312fb7eb8": contextual(
+        "Passing a socket over a socket", "unsupported-host",
+        "This example imports net and passes operating-system descriptors; the browser bundle has no net module.",
+    ),
+    "741dcba33d83": standalone(
+        "Functions as values", "42\n3\n",
+        "apply calls double on 21, giving 42; sorting [3, 1, 2] in descending order puts 3 first. Both are stated in the comments.",
+    ),
+    "6ac95487ff92": contextual(
+        "A thread that owns a socket", "unsupported-host",
+        "This example starts a managed thread and imports net; docs/wasm.md lists managed threads as needing a separate port, and the browser bundle has no net module.",
+    ),
+    "e97a23190d3c": contextual(
+        "Threads sharing work over channels", "unsupported-host",
+        "This example starts managed threads and imports channels; docs/wasm.md lists managed threads as needing a separate port, and the browser bundle has no channels module.",
+    ),
+    "d5cf37294736": contextual(
+        "Threads counting with an atomic", "unsupported-host",
+        "This example starts managed threads; docs/wasm.md lists managed threads as needing a separate port.",
+    ),
+    "159dc1b4ca32": standalone(
+        "Records and Text inside a parallel range", "3\n",
+        "values[0] is 3, so its label is the two-character Text 3! and the one-element List adds one: 3, as the comment states.",
+        note="The browser target runs parallel work through its sequential backend (docs/wasm.md). This run does not demonstrate native parallel speedup.",
+    ),
+    "bfe5bed196e0": standalone(
+        "Disjoint windows in a parallel range", "42\n",
+        "Segment 1 holds 42 at byte 8, which its window copies to scores[1 * 3 + 1] = scores[4]; the comment states 42.",
+        note="The browser target runs parallel work through its sequential backend (docs/wasm.md). This run does not demonstrate native parallel speedup.",
+    ),
+    "8e75b76145bc": standalone(
+        "A parallel function", "",
+        "The block only declares the parallel function ones and calls nothing, so the program prints nothing.",
+    ),
+    "d5c204d7a35b": standalone(
+        "Fork-join recursion", "832040\n4999950000\n",
+        "fib(30) is 832040 and the sum of 0 through 99999 is 4999950000; both are stated in the comments.",
+        note="The browser target runs parallel work through its sequential backend (docs/wasm.md). This run does not demonstrate native parallel speedup.",
+    ),
+    "c10b8187acc6": standalone(
+        "A fork-join quicksort", "1\n9\n",
+        "Sorting [5, 3, 9, 1, 7] puts 1 first and 9 last, as the comments state.",
+        note="The browser target runs parallel work through its sequential backend (docs/wasm.md). This run does not demonstrate native parallel speedup.",
+    ),
+    "f7233e4f9a00": standalone(
+        "Fork-join list building", "10000\nr3\n",
+        "buildAll covers ids 0 through 9999, so the List has 10000 Sales and id 9999 is in region r(9999 % 4) = r3, as the comments state.",
+        note="The browser target runs parallel work through its sequential backend (docs/wasm.md). This run does not demonstrate native parallel speedup.",
+    ),
 }
 
 
