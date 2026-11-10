@@ -5,6 +5,30 @@ the [book](book/README.md) for a slower introduction, or the
 [language guide](language.md) for the full contract. Each program below is
 independent and its following output is checked by `make check-book`.
 
+## Spellings at a glance
+
+| Rust | Minyar |
+| --- | --- |
+| `fn f(x: i64) -> i64` | `function f(x: Integer): Integer` |
+| `struct P { x: i64 }`, `impl P { fn m(&self) }` | `record P { x: Integer }`, `function P.m()` with `self` |
+| `enum E { A, B(i64) }` | `choice E { A; B(value: Integer) }` |
+| `trait T` / `impl T for P` | `capability T` / `conform P to T` |
+| `let mut x = 1` | `let x = 1` (always reassignable); `constant` cannot be |
+| `i8`..`u64`, `usize` | `Integer` (signed 64-bit, overflow-checked); fixed widths only in [C-layout records](language.md#c-layout-records) |
+| `f64`, `bool`, `char`, `String` | `Float`, `Boolean`, `Character`, `Text` |
+| `Vec<T>`, `HashMap<K, V>`, `HashSet<T>`, `Vec<u8>` | `List<T>`, `Map<K, V>`, `Set<T>`, `Bytes` |
+| `Option<T>`: `Some(x)`, `None` | `Maybe<T>`: `Some(x)`, `None` |
+| `v.len()`, `v.push(x)` | `v.length`, `v.add(x)` |
+| `for (k, v) in &map` | `for key in map { let value = map[key] }` |
+| `x?` | `try x` (same error type; add context with `try x else "doing what"`) |
+| `if c { a } else { b }` as a value | `match c { true { a } false { b } }` |
+| `let Ok(v) = r else { return 1 };` | `if r is Err(e) { return 1 }` then `let v = r.unwrap()` |
+| `panic!("..")`, `assert!(c)` | `fail("..")`; `expect(c)` inside a `test` block |
+| `use std::fs;` | `use "files" as files` (every module is imported by name) |
+
+The compiler recognises most of the left-hand spellings and names the
+Minyar form in its `help` line, so an error is usually one edit away.
+
 ## Bindings and shared objects
 
 Minyar's `let` can be reassigned without a `mut` marker. Inside a block,

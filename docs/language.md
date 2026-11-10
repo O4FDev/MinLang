@@ -618,7 +618,17 @@ print("7".padStart(3, "0"))           // 007
 print("id".padEnd(5, "."))            // id...
 print("Content-Type".asciiLowercased()) // content-type
 print(joinText(["a", "b"], ", "))     // a, b
+print("a,b,,c".split(",").length)     // 4: "a", "b", "", "c"
+print("  push 3 \n".trim())           // push 3
+print("label:".endsWith(":"))         // true
+print("#include".startsWith("#"))     // true
 ```
+
+`split(separator)` returns a `List<Text>` of the pieces between matches, keeping
+empty pieces, so joining them with the separator restores the original; an
+empty separator splits into single characters. `trim()` removes Unicode white
+space (spaces, tabs, line breaks and the other `White_Space` characters) from
+both ends. `startsWith(prefix)` and `endsWith(suffix)` compare exact bytes.
 
 `find(needle)` returns the first position of `needle` or -1; `find(needle,
 start)` starts searching at `start`, which may be the Text's length and stops
@@ -1315,6 +1325,20 @@ key and reports whether it was present, and `map.clear()` empties the Map.
 `map.getOr(key, fallback)` looks the key up once and returns its value, or the
 fallback when it is absent, so `counts[word] = counts.getOr(word, 0) + 1` counts
 without a separate `has`. The fallback is evaluated before the lookup.
+`map.length` counts its keys. A Map has no `keys()` or `entries()` method:
+`for key in map { ... }` visits a snapshot of its keys in unspecified order,
+and the body reads each value with `map[key]`. Sort the keys first when the
+output order matters:
+
+```minyar
+let stock: Map<Text, Integer> = Map()
+stock["pears"] = 3
+stock["apples"] = 5
+let names: List<Text> = []
+for name in stock { names.add(name) }
+names.sort()
+for name in names { print("\(name): \(stock[name])") } // apples: 5, pears: 3
+```
 
 `Set<Item>` holds distinct Hashable values:
 
@@ -2443,6 +2467,52 @@ adopts with the result. Programs that use the cycle collector copy a result
 from another worker once instead. Each call is checked like a thread entry: it cannot reach module
 globals holding managed values, `exit`, or native code that threads may not
 use. A program with such a join links the thread runtime.
+
+## C-layout records
+
+A record marked `native "c"` has the memory layout a C compiler gives the
+same struct: fields in declaration order, each at its natural alignment.
+`native "c_packed"` removes the padding. Use them for on-disk formats, wire
+headers, DMA descriptors and C interoperation:
+
+```minyar
+record Header native "c" {
+    kind: UInt8
+    length: UInt32
+    flags: UInt16
+    name: Bytes[4]
+}
+
+print(sizeOf(Header))              // 16
+print(alignOf(Header))             // 4
+print(offsetOf(Header, "length"))  // 4
+
+let storage = Bytes(2 * sizeOf(Header))
+let second = cView(Header, storage, sizeOf(Header))
+second.length = 70000
+second.name[0] = 65
+print(storage.getUInt32(sizeOf(Header) + 4))   // 70000
+```
+
+Fields use the fixed-width types `Int8`, `UInt8`, `Int16`, `UInt16`, `Int32`,
+`UInt32`, `Int64` (or `Integer`), `UInt64` (or `Pointer`), `Float32`, `Float64`
+(or `Float`), `Boolean` (one byte) and `Character` (four bytes); a fixed byte
+array `Bytes[N]` with a constant length; or another C-layout record, stored
+inline. Managed records, Lists and Text cannot be fields. Integer fields read
+as `Integer` and Float fields as `Float`. Storing a value that does not fit its
+field stops the program with `an Integer does not fit in its C-layout field.`
+
+`cView(Record, bytes, offset)` views the record at a byte offset inside existing
+Bytes: reads and writes go straight to that storage, and other aliases of the
+Bytes observe them. Bytes with a live view cannot grow. A `Bytes[N]` field reads
+as Bytes sharing the record's storage, and `cBytes(view)` returns the whole
+record's bytes the same way. `cAt(Record, address)` views raw memory at an
+Integer address, for kernels and native buffers; the program is responsible for
+that memory. A record literal such as `Header { ... }` also works and allocates
+its own storage. `sizeOf`, `alignOf` and `offsetOf(Record, "field")` are
+compile-time constants and need no value. All values are little-endian on the
+supported targets. Record patterns, derived equality and hashing are not
+available for C-layout records; compare their fields explicitly.
 
 ## Hardware register fields
 
