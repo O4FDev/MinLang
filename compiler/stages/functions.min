@@ -515,7 +515,7 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
             if parameter > 0 {
                 output.add(", ")
             }
-            output.add(llvmType(parameterTypes[parameter]))
+            output.add(llvmType(parameterTypes[parameter]) + parameterFacts(context, parameterTypes[parameter]))
             output.add(" ")
             let id = parameter
             if parameterTypes[parameterNames.length + parameter] == 0 {
@@ -703,6 +703,32 @@ function compileFunctionDiagnosticJob(job: DiagnosticJob) {
 }
 
 // Whole-program names start with their module tag: minyar_module_<16 hex digits>_<name>.
+// What LLVM may assume about a parameter's pointer: a List or record value is
+// always a live object whose header is readable, never null. Saying so lets
+// LLVM load a field or a List's length and buffer before the branch that uses
+// it, for example once before a loop instead of in every `match` arm. Only
+// layouts whose header size is known qualify; niche and scalar choices,
+// callbacks and C records keep a plain `ptr`.
+function parameterFacts(context: CompilerContext, type: Integer): Text {
+    let bytes = parameterHeaderBytes(context, type)
+    if bytes == 0 { return "" }
+    return " nonnull align 8 dereferenceable(" + Text(bytes) + ")"
+}
+
+// The header bytes behind a List or record pointer, or 0 when not known:
+// a List is {values, length, capacity}; a record or tagged choice is its slot
+// count followed by one word per slot.
+function parameterHeaderBytes(context: CompilerContext, type: Integer): Integer {
+    if isListType(type) { return 24 }
+    if !isRecordType(type) || isScalarChoiceType(type) { return 0 }
+    let layout = choiceLayoutKind(context, type)
+    if layout != 0 && layout != 2 { return 0 }
+    if isCallbackType(type, context.functionNames) || isCRecord(context, type) { return 0 }
+    let slots = context.functionParameterCounts[type - 1000]
+    if layout == 2 { slots = choiceStorageCount(context, type) }
+    return 8 + 8 * slots
+}
+
 function internalModuleFunction(internalModules: GenericIndex, name: Text): Boolean {
     let tag = "minyar_module_".length + 16
     if internalModules.keys.length == 0 || name.length <= tag || name[tag] != '_' || !name.startsWith("minyar_module_") { return false }

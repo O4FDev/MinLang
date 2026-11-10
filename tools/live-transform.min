@@ -235,6 +235,13 @@ function escaped(value: Text): Text {
 }
 function failed(message: Text): Image { return Image { llvm: ""; names: []; symbols: []; signature: ""; digests: ""; exports: ""; cells: ""; shapes: ""; added: []; error: message } }
 function scalar(value: Text): Boolean { return host.listed(["void", "i64", "i32", "i1", "double", "ptr"], value) }
+// Between a parameter's type and its name only the facts the compiler puts on
+// record and List pointers may appear: `ptr nonnull align 8 dereferenceable(N)`.
+function parameterFacts(words: List<Text>): Boolean {
+    if words.length == 2 { return true }
+    if words.length != 6 || words[0] != "ptr" || words[1] != "nonnull" || words[2] != "align" || words[3] != "8" { return false }
+    return words[4].startsWith("dereferenceable(") && words[4].endsWith(")")
+}
 function definition(line: Text, generation: Integer, index: Integer, initial: Boolean): Function {
     let found = Function { name: ""; raw: ""; wrapper: ""; body: ""; language: false; result: ""; returned: ""; parameters: ""; arguments: ""; signature: ""; error: "" }
     let at = host.findText(line, "@", 0)
@@ -261,7 +268,16 @@ function definition(line: Text, generation: Integer, index: Integer, initial: Bo
     let data = Bytes(line)
     while begin < data.length && host.isSpace(data[begin]) { begin += 1 }
     if begin >= data.length || data[begin] != 40 { found.error = "generated LLVM function is missing its parameter list"; return found }
-    let end = host.findText(line, ")", begin + 1)
+    // The list ends at its matching parenthesis: a parameter fact such as
+    // `dereferenceable(24)` holds a pair of its own.
+    let end = -1
+    let depth = 0
+    let cursor = begin + 1
+    while cursor < data.length && end < 0 {
+        if data[cursor] == 40 { depth += 1 }
+        if data[cursor] == 41 { if depth == 0 { end = cursor } else { depth -= 1 } }
+        cursor += 1
+    }
     if end < 0 || !host.strip(line).endsWith("{") { found.error = "live functions require a complete single-line LLVM header"; return found }
     let parameters = host.strip(host.textSlice(line, begin + 1, end))
     let declarations: List<Text> = []
@@ -272,10 +288,13 @@ function definition(line: Text, generation: Integer, index: Integer, initial: Bo
     if parameters != "" {
         for parameter in parameters.split(",") {
             let words = host.words(parameter)
-            if words.length != 2 { found.error = "unsupported live function parameter attributes"; return found }
-            if !scalar(words[0]) || words[0] == "void" || !words[1].startsWith("%") { found.error = "unsupported live function parameter ABI"; return found }
-            declarations.add(words[0] + " " + words[1])
-            arguments.add(words[0] + " " + words[1])
+            if words.length < 2 || !parameterFacts(words) { found.error = "unsupported live function parameter attributes"; return found }
+            let name = words[words.length - 1]
+            if !scalar(words[0]) || words[0] == "void" || !name.startsWith("%") { found.error = "unsupported live function parameter ABI"; return found }
+            // The wrapper forwards the plain type: the facts belong to the body
+            // and are not part of the image signature.
+            declarations.add(words[0] + " " + name)
+            arguments.add(words[0] + " " + name)
             field(signature, words[0])
         }
     }

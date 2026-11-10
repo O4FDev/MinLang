@@ -273,6 +273,31 @@ for failure in [["print(probe([7, 8, 9], 2, 1))", "List position 3 is outside it
     }
 }
 
+// Record, tagged-choice and List parameters are live objects, so their
+// definitions tell LLVM the header is readable and the pointer never null; a
+// niche choice (here Maybe<Text>) may be a scalar code and stays a plain ptr.
+let facts = #"""
+record Point { x: Integer; y: Integer }
+choice Shape { Dot(size: Integer) Box(corner: Point, label: Text) }
+function total(point: Point, values: List<Integer>, label: Maybe<Text>): Integer {
+    let sum = point.x + point.y
+    for value in values { sum += value }
+    match label { Some(text) { sum += text.byteLength } None { } }
+    return sum
+}
+function area(shape: Shape): Integer { return match shape { Dot(size) { size } Box(corner, label) { corner.x * corner.y + label.byteLength } } }
+print(total(Point { x: 1; y: 2 }, [3, 4], Some("ab")))
+print(total(Point { x: 1; y: 2 }, [], None))
+print(area(Box(Point { x: 2; y: 5 }, "z")))
+print(area(Dot(7)))
+"""#
+test.executes(compiler, facts, "12\n3\n11\n7\n")
+let factsIr = io.readTextFile(compiler.directory + "/case" + Text(compiler.serial) + ".ll")
+let totalDefinition = test.lines(body(factsIr, ".minyar.fn.total"))[0]
+test.check(test.contains(totalDefinition, "(ptr nonnull align 8 dereferenceable(24) %argument.0, ptr nonnull align 8 dereferenceable(24) %argument.1, ptr %argument.2)"), "record and List parameters must be dereferenceable, a niche choice plain: " + totalDefinition)
+let areaDefinition = test.lines(body(factsIr, ".minyar.fn.area"))[0]
+test.check(test.contains(areaDefinition, "(ptr nonnull align 8 dereferenceable("), "a tagged choice parameter must be dereferenceable: " + areaDefinition)
+
 // Verify the actual emitted module independently of execution and optimization.
 test.require(test.run([compiler.clang, "-Wno-override-module", "-c", path + ".ll", "-o", path + ".verify.o"], system.environment(), "", path + ".verify", compiler.linkTimeout), "verify helper attributes and metadata")
 test.removeTree(compiler.directory)

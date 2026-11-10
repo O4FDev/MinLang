@@ -20,6 +20,17 @@ function after(source: Text, marker: Text): Text {
     }
     fail("missing LLVM marker: " + marker)
 }
+// The module text from NAME's definition on. Record and List parameters carry
+// attributes (`ptr nonnull align 8 dereferenceable(24) %argument.0`), so the
+// definition is found by its `define` line, not by its parameter text.
+function definitionFrom(code: Text, name: Text): Text {
+    for line in test.lines(code) {
+        if startsWith(line, "define ") && test.contains(line, name + "(ptr ") && test.contains(line, " %argument.0") {
+            return code.slice(code.find(line), code.length)
+        }
+    }
+    fail("missing LLVM definition: " + name)
+}
 function elementOwners(llvm: Text, name: Text): Integer {
     let body = after(llvm, "define i64 @.minyar.fn." + name + "(")
     body = utf8.decodeOrStop(Bytes(body).slice(0, body.find("\n}\n")))
@@ -245,17 +256,17 @@ test.check(keepsProtectingCount(mixed), "a List append whose argument calls a fu
 // can replace the row keeps it alive until the store completes.
 test.executes(compiler, "record Row { cells: List<Integer>; total: Integer }\nrecord Key { id: Integer; lists: List<List<Boolean>> }\nfunction Key.equal(other: Key): Boolean { self.lists[0] = [false]; return self.id == other.id }\nconform Key to Equatable\nfunction scale(grid: List<List<Float>>, rows: List<Row>, factor: Float) { for i in 0..grid.length { for j in 0..grid[i].length { grid[i][j] = grid[i][j] * factor }; rows[i].total = rows[i].total + 1; rows[i].cells[0] = 5 } }\nfunction shrink(grid: List<List<Float>>): Float { grid[0] = [0.0]; return 2.0 }\nfunction swap(grid: List<List<Float>>) { grid[0][0] = shrink(grid) }\nlet grid = [[1.0, 2.0], [3.0, 4.0]]\nlet rows = [Row { cells: [1]; total: 0 }, Row { cells: [2]; total: 0 }]\nscale(grid, rows, 2.0)\nprint(grid[1][1])\nprint(rows[1].total)\nprint(rows[0].cells[0])\nswap(grid)\nprint(grid[0][0])\nprint(grid[0].length)\nlet lists: List<List<Boolean>> = [[true, true]]\nlet key = Key { id: 1; lists: lists }\nlists[0][1] = key == key\nprint(lists[0].length)\n", "8.0\n1\n5\n0.0\n1\n1\n")
 let nested = generated(compiler)
-let scale = nested.slice(nested.find("scale(ptr %argument.0"), nested.length)
+let scale = definitionFrom(nested, "scale")
 scale = scale.slice(0, scale.find("\n}\n"))
 test.check(!test.contains(scale, "@minyar_rc_borrow(") && !test.contains(scale, "@minyar_rc_keep("), "call-free nested stores kept a temporary owner")
-let swap = nested.slice(nested.find("swap(ptr %argument.0"), nested.length)
+let swap = definitionFrom(nested, "swap")
 swap = swap.slice(0, swap.find("\n}\n"))
 test.check(keepsProtectingCount(swap), "a nested store whose value calls a function must keep its row owner")
 // An ordered Text comparison keeps its left operand alive through a right
 // operand that replaces its holder, and takes no extra count when it cannot.
 test.executes(compiler, "record Box { label: Text }\nfunction swap(box: Box): Text { box.label = \"zz\" + Text(7); return \"m\" }\nfunction early(box: Box): Boolean { return box.label < swap(box) }\nfunction plain(a: Box, b: Box): Boolean { return a.label < b.label }\nlet box = Box { label: \"a\" + Text(1) }\nprint(early(box))\nprint(box.label)\nprint(plain(Box { label: \"b\" }, Box { label: \"c\" }))\n", "true\nzz7\ntrue\n")
 let compared = generated(compiler)
-let plain = compared.slice(compared.find("plain(ptr %argument.0"), compared.length)
+let plain = definitionFrom(compared, "plain")
 plain = plain.slice(0, plain.find("\n}\n"))
 let plainBorrows = 0
 for line in test.lines(plain) { if test.contains(line, "call void @minyar_rc_borrow(") { plainBorrows += 1 } }
@@ -265,23 +276,23 @@ test.check(plainBorrows <= 2, "a call-free Text comparison borrowed its left ope
 // loop that calls the runtime keeps a service point on every iteration.
 test.executes(compiler, "function pureSum(values: List<Integer>): Integer { let label = Text(values.length); let total = 0; for i in 0..values.length { if values[i] < 0 { continue }; if values[i] > 100 { break }; total += values[i] }; return total + label.length }\nfunction scalarSum(values: List<Integer>): Integer { let total = 0; for value in values { total += value }; return total }\nfunction busy(values: List<Integer>): Integer { let total = 0; for i in 0..values.length { total += Text(values[i]).length }; return total }\nfunction pureWhile(values: List<Integer>): Integer { let label = Text(values.length); let i = 0; let total = 0; while i < values.length { if values[i] < 0 { i += 1; continue }; if values[i] > 100 { break }; total += values[i]; i += 1 }; return total + label.length }\nlet values = [1, -2, 3, 200, 5]\nlet dropped = [Text(1), Text(2), Text(3)]\ndropped = []\nprint(pureSum(values))\nprint(scalarSum(values))\nprint(busy(values))\nprint(pureWhile(values))\nlet spin = 0\nfor round in 0..1000 { spin += values[round % 5] }\nprint(spin + dropped.length)\n", "5\n207\n8\n5\n41400\n")
 let versioned = generated(compiler)
-let pureBody = versioned.slice(versioned.find("pureSum(ptr %argument.0"), versioned.length)
+let pureBody = definitionFrom(versioned, "pureSum")
 pureBody = pureBody.slice(0, pureBody.find("\n}\n"))
 test.check(test.contains(pureBody, "call i1 @minyar_rc_idle()") && test.contains(pureBody, "call void @minyar_rc_step()"), "a call-free loop with owners must test the runtime and keep its service point")
-let whileBody = versioned.slice(versioned.find("pureWhile(ptr %argument.0"), versioned.length)
+let whileBody = definitionFrom(versioned, "pureWhile")
 whileBody = whileBody.slice(0, whileBody.find("\n}\n"))
 test.check(test.contains(whileBody, "call i1 @minyar_rc_idle()") && test.contains(whileBody, "while.strip."), "a call-free while loop with owners must test the runtime")
-let scalarBody = versioned.slice(versioned.find("scalarSum(ptr %argument.0"), versioned.length)
+let scalarBody = definitionFrom(versioned, "scalarSum")
 scalarBody = scalarBody.slice(0, scalarBody.find("\n}\n"))
 test.check(!test.contains(scalarBody, "@minyar_rc_idle(") && !test.contains(scalarBody, "@minyar_rc_step("), "a frame-free loop must not query or service the runtime")
-let busyBody = versioned.slice(versioned.find("busy(ptr %argument.0"), versioned.length)
+let busyBody = definitionFrom(versioned, "busy")
 busyBody = busyBody.slice(0, busyBody.find("\n}\n"))
 test.check(!test.contains(busyBody, "@minyar_rc_idle(") && test.contains(busyBody, "call void @minyar_rc_step()"), "a loop that calls the runtime must service every iteration")
 // A Map operation with plain keys takes no count on its receiver or key; a key
 // expression that can replace the holder keeps them.
 test.executes(compiler, "record Holder { table: Map<Text, Integer> }\nfunction swap(holder: Holder): Text { holder.table = Map(); return \"b\" }\nfunction count(words: List<Text>): Integer { let counts: Map<Text, Integer> = Map(); for word in words { if counts.has(word) { counts[word] += 1 } else { counts[word] = 1 } }; return counts[\"a\"] * 10 + counts.length }\nlet holder = Holder { table: Map() }\nholder.table[\"a\"] = 1\nholder.table[\"b\"] = 2\nprint(holder.table.has(swap(holder)))\nholder.table[\"b\"] = 3\nprint(holder.table[swap(holder)] + holder.table.length)\nprint(count([\"a\", \"b\", \"a\", \"c\", \"a\"]))\n", "true\n3\n33\n")
 let mapped = generated(compiler)
-let counting = mapped.slice(mapped.find("count(ptr %argument.0"), mapped.length)
+let counting = definitionFrom(mapped, "count")
 counting = counting.slice(0, counting.find("\n}\n"))
 test.check(!test.contains(counting, "call void @minyar_rc_borrow("), "Map operations on plain keys took a temporary count")
 // A readonly parameter source needs no loop count, even across Map stores: its
@@ -295,14 +306,14 @@ let deferred = generated(compiler)
 // A match arm can replace the holder of its input while a payload binding is
 // still in use, so a statement with nested statements keeps its counts.
 test.executes(compiler, "choice Label { Named(text: Text)\n Empty }\nrecord Box { label: Label }\nfunction show(box: Box): Text { match box.label { Named(text) { box.label = Empty; return text + \"!\" } Empty { return \"none\" } } }\nlet box = Box { label: Named(\"a\" + Text(1)) }\nprint(show(box))\nprint(show(box))\n", "a1!\nnone\n")
-let parsing = deferred.slice(deferred.find("parse(ptr %argument.0"), deferred.length)
+let parsing = definitionFrom(deferred, "parse")
 parsing = parsing.slice(0, parsing.find("\n}\n"))
 test.check(!test.contains(parsing, "call void @minyar_rc_borrow("), "element values passed to builtins took a temporary count")
 // A count taken only when the statement settles is still released at the end
 // of that statement (minyar_rc_step), not held to a later one or frame exit.
 test.executes(compiler, "record Holder { name: Text; parts: List<Text> }\nfunction touch(holder: Holder): Integer { holder.name = \"y\" + Text(2); return 1 }\nfunction measure(name: Text, extra: Integer): Integer { return name.length + extra }\nfunction probe(holder: Holder): Integer { let n = measure(holder.name, touch(holder))\n let m = n + 1\n return m }\nlet holder = Holder { name: \"x\" + Text(1); parts: [] }\nprint(probe(holder))\nprint(holder.name)\n", "4\ny2\n")
 let settledLate = generated(compiler)
-let probing = settledLate.slice(settledLate.find("probe(ptr %argument.0"), settledLate.length)
+let probing = definitionFrom(settledLate, "probe")
 probing = probing.slice(0, probing.find("\n}\n"))
 test.check(keepsProtectingCount(probing), "a field read before a user call that can replace it took no count")
 // In a function that owns nothing else the count is a retain whose release
@@ -316,14 +327,14 @@ test.check(test.contains(afterBorrow, "call void @minyar_rc_step()") || test.con
 // element makes the hidden guard keep it alive.
 test.executes(compiler, "record Body { x: Float; v: Float }\nparallel function half(value: Float): Float { return value / 2.0 }\nfunction advance(bodies: List<Body>) { for i in 0..bodies.length { let b = bodies[i]; b.x = half(b.x) + b.v } }\nfunction swap(bodies: List<Body>): Float { let b = bodies[0]; bodies[0] = Body { x: 9.0; v: 0.0 }; return b.x }\nlet bodies = [Body { x: 4.0; v: 1.0 }, Body { x: 2.0; v: 1.0 }]\nadvance(bodies)\nprint(bodies[0].x)\nprint(swap(bodies))\nprint(bodies[0].x)\n", "3.0\n3.0\n9.0\n")
 let guarded = generated(compiler)
-let advancing = guarded.slice(guarded.find("advance(ptr %argument.0"), guarded.length)
+let advancing = definitionFrom(guarded, "advance")
 advancing = advancing.slice(0, advancing.find("\n}\n"))
 let advanceOwners = 0
 for line in test.lines(advancing) { if test.contains(line, "call void @minyar_rc_local(i64 ") && !test.contains(line, ", ptr null)") { advanceOwners += 1 } }
 // With no owner slot written, the function needs no frame either; its pure
 // loop's idle test is then settled to true rather than asked at run time.
 test.check(advanceOwners == 0 && test.contains(advancing, "%loop.idle.") && !test.contains(advancing, "@minyar_rc_enter("), "an unreleased element binding must borrow, its loop must stay call-free, and the function needs no frame")
-let swapping = guarded.slice(guarded.find("swap(ptr %argument.0"), guarded.length)
+let swapping = definitionFrom(guarded, "swap")
 swapping = swapping.slice(0, swapping.find("\n}\n"))
 test.check(test.contains(swapping, "call void @minyar_rc_local(i64 "), "a binding whose element is replaced must keep a guard count")
 // The same for field paths and Map values: `let x = h.f` borrows unless the

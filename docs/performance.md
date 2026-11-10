@@ -331,6 +331,20 @@ instructions on call-heavy programs (sortrows -11.9%, treewalk -4.4%, orders
 helper functions. Programs that use `calldepth.run`, and WebAssembly and
 freestanding builds, still count calls.
 
+## Parameter facts
+
+A record, tagged-choice or List value is always a live object, so a function
+definition marks such a parameter `nonnull align 8 dereferenceable(N)`, where N
+is the header the compiler knows: 24 bytes for a List, eight bytes plus one word
+per slot for a record. LLVM may then load a field, or a List's length and
+buffer, before the branch that uses it; a `while true { match op { ... } }`
+interpreter loop loads `self.stack` once instead of in every arm. Niche and
+scalar choices, callbacks and C-layout records stay plain `ptr`. On Apple arm64
+(retired instructions) this cut the bytecode benchmark by 3.3% and grid by 2.6%;
+no compare program changed by more than noise otherwise. LLVM drops such facts
+from a load it hoists, so only parameters carry them: a List read from a field
+still reloads its header inside each arm.
+
 ## Function linkage
 
 A whole-program build defines every function of an imported module (a package
