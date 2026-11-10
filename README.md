@@ -31,6 +31,11 @@ minyar test
 minyar build --release
 ```
 
+Share a library or a program by tagging it, pushing the tag and running
+`minyar publish --registry DIR`; others then `minyar add NAME` or
+`minyar install NAME`. [The whole path](docs/packages.md#the-whole-path) fits on
+one screen.
+
 Single-file programs also work directly:
 
 ```sh
