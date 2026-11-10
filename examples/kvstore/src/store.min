@@ -1,0 +1,183 @@
+// A write-ahead-logged key-value store, written once against disk.Disk.
+//
+// Log record: [payload length: UInt32][CRC-32C of payload: UInt32][payload]
+// Payload:    [operation: UInt8][key length: UInt32][key][value length: UInt32][value]
+//
+// A write is acknowledged only after its record is synced. Recovery replays
+// complete records with a valid checksum and cuts the log at the first torn
+// or damaged one. Compaction writes a snapshot beside the log, syncs it,
+// renames it into place and syncs the directory before emptying the log.
+use "disk" as disk
+use "errors" as errors
+use "checksum" as checksum
+use "text" as text
+
+public constant PUT = 1
+public constant DELETE = 2
+constant HEADER = 8
+
+public record Store<D: disk.Disk> {
+    storage: D
+    directory: Text
+    log: Integer
+    logSize: Integer
+    entries: Map<Text, Text>
+    /// Bytes cut from the end of the log during recovery.
+    recoveredTail: Integer
+}
+
+public function logPath(directory: Text): Text { return directory + "/wal.log" }
+public function snapshotPath(directory: Text): Text { return directory + "/snapshot.db" }
+
+/// Opens or recovers the store in `directory`.
+public function open<D: disk.Disk>(storage: D, directory: Text): Result<Store<D>, errors.Error> {
+    try storage.createDirectory(directory) else ("creating " + directory)
+    let entries: Map<Text, Text> = Map()
+    let snapshot = snapshotPath(directory)
+    if storage.exists(snapshot) {
+        let file = try storage.open(snapshot, false)
+        let image = try storage.read(file, 0, try storage.size(file))
+        try storage.close(file)
+        let applied = replay(image, entries)
+        if applied != image.length {
+            return Err(errors.make(errors.invalidDataCode(), 0, "snapshot " + snapshot + " is damaged at byte " + Text(applied)))
+        }
+    }
+    let path = logPath(directory)
+    let created = !storage.exists(path)
+    let log = try storage.open(path, true) else ("opening " + path)
+    // A new name is durable only once its directory is synced.
+    if created { try storage.syncDirectory(directory) }
+    let size = try storage.size(log)
+    let image = try storage.read(log, 0, size)
+    let valid = replay(image, entries)
+    if valid != size {
+        try storage.resize(log, valid)
+        try storage.sync(log)
+    }
+    return Ok(Store { storage: storage; directory: directory; log: log; logSize: valid; entries: entries; recoveredTail: size - valid })
+}
+
+/// Applies complete, checksummed records to `entries` and returns the length
+/// of the valid prefix.
+public function replay(image: Bytes, entries: Map<Text, Text>): Integer {
+    let position = 0
+    while position + HEADER <= image.length {
+        let length = image.getUInt32(position)
+        let start = position + HEADER
+        if length < 9 || length > image.length - start { return position }
+        if checksum.crc32c(0, image, start, length) != image.getUInt32(position + 4) { return position }
+        let keyLength = image.getUInt32(start + 1)
+        if keyLength > length - 9 { return position }
+        let valueAt = start + 5 + keyLength
+        let valueLength = image.getUInt32(valueAt)
+        if 9 + keyLength + valueLength != length { return position }
+        let key = text.decode(image.slice(start + 5, valueAt))
+        let value = text.decode(image.slice(valueAt + 4, valueAt + 4 + valueLength))
+        if key is Err(problem) { return position }
+        if value is Err(problem) { return position }
+        let operation = image[start]
+        if operation == PUT { entries[key.unwrap()] = value.unwrap() }
+        else if operation == DELETE { entries.remove(key.unwrap()) }
+        else { return position }
+        position = start + length
+    }
+    return position
+}
+
+/// One log record.
+public function encode(operation: Integer, key: Text, value: Text): Bytes {
+    let keyBytes = Bytes(key)
+    let valueBytes = Bytes(value)
+    let payload = Bytes()
+    payload.add(operation)
+    payload.addUInt32(keyBytes.length)
+    payload.addBytes(keyBytes)
+    payload.addUInt32(valueBytes.length)
+    payload.addBytes(valueBytes)
+    let record = Bytes()
+    record.addUInt32(payload.length)
+    record.addUInt32(checksum.crc32c(0, payload, 0, payload.length))
+    record.addBytes(payload)
+    return record
+}
+
+function append<D: disk.Disk>(store: Store<D>, record: Bytes): Result<Nothing, errors.Error> {
+    try store.storage.write(store.log, store.logSize, record)
+    try store.storage.sync(store.log)
+    store.logSize += record.length
+    return Ok()
+}
+
+/// Durably stores `value` under `key`. On success the write survives a crash.
+public function put<D: disk.Disk>(store: Store<D>, key: Text, value: Text): Result<Nothing, errors.Error> {
+    try append(store, encode(PUT, key, value)) else ("storing " + key)
+    store.entries[key] = value
+    return Ok()
+}
+
+/// Durably removes `key`, reporting whether it was present.
+public function delete<D: disk.Disk>(store: Store<D>, key: Text): Result<Boolean, errors.Error> {
+    if !store.entries.has(key) { return Ok(false) }
+    try append(store, encode(DELETE, key, "")) else ("deleting " + key)
+    store.entries.remove(key)
+    return Ok(true)
+}
+
+public function get<D: disk.Disk>(store: Store<D>, key: Text): Maybe<Text> {
+    if store.entries.has(key) { return Some(store.entries[key]) }
+    return None
+}
+
+/// Every key, in sorted order.
+public function keys<D: disk.Disk>(store: Store<D>): List<Text> {
+    let names: List<Text> = []
+    for key in store.entries { names.add(key) }
+    names.sort()
+    return names
+}
+
+/// Writes every live entry to a new snapshot, then empties the log.
+public function compact<D: disk.Disk>(store: Store<D>): Result<Nothing, errors.Error> {
+    let image = Bytes()
+    for key in keys(store) { image.addBytes(encode(PUT, key, store.entries[key])) }
+    let temporary = snapshotPath(store.directory) + ".tmp"
+    let file = try store.storage.open(temporary, true)
+    try store.storage.resize(file, 0)
+    try store.storage.write(file, 0, image)
+    try store.storage.sync(file)
+    try store.storage.close(file)
+    try store.storage.rename(temporary, snapshotPath(store.directory))
+    try store.storage.syncDirectory(store.directory)
+    try store.storage.resize(store.log, 0)
+    try store.storage.sync(store.log)
+    store.logSize = 0
+    return Ok()
+}
+
+public function close<D: disk.Disk>(store: Store<D>): Result<Nothing, errors.Error> {
+    return store.storage.close(store.log)
+}
+
+test "a torn tail at every byte offset keeps the complete prefix" {
+    let log = Bytes()
+    log.addBytes(encode(PUT, "a", "1"))
+    log.addBytes(encode(DELETE, "a", ""))
+    log.addBytes(encode(PUT, "b", "2"))
+    let complete = log.length
+    log.addBytes(encode(PUT, "c", "three"))
+    for cut in complete..log.length {
+        let entries: Map<Text, Text> = Map()
+        expect(replay(log.slice(0, cut), entries) == complete)
+        expect(entries.length == 1)
+    }
+}
+
+test "a flipped bit stops replay at the damaged record" {
+    let log = encode(PUT, "a", "1")
+    let first = log.length
+    log.addBytes(encode(PUT, "b", "2"))
+    log[first + HEADER + 3] = log[first + HEADER + 3] ^ 1
+    let entries: Map<Text, Text> = Map()
+    expect(replay(log, entries) == first)
+}

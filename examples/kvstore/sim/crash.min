@@ -1,0 +1,57 @@
+// One universe: a random workload on a simulated disk, an optional write
+// whose sync fails, a power loss that tears unsynced sectors, then recovery.
+// Every acknowledged write must survive, and nothing else may appear.
+use "simulation" as sim
+use "disk" as disk
+use "../src/store.min" as store
+
+public function universe(world: sim.World): Text {
+    let storage = disk.simulated(world)
+    let opened = store.open(storage, "/db")
+    if opened is Err(problem) { return "first open failed: " + problem.describe() }
+    let db = opened.unwrap()
+    let model: Map<Text, Text> = Map()
+    let steps = 1 + sim.choose(world, 24)
+    for step in 0..steps {
+        let action = sim.choose(world, 8)
+        let key = "k" + Text(sim.choose(world, 6))
+        if action == 0 {
+            if store.compact(db) is Err(problem) { return "compaction failed: " + problem.describe() }
+        } else if action == 1 {
+            if store.delete(db, key) is Err(problem) { return "delete failed: " + problem.describe() }
+            model.remove(key)
+        } else {
+            let value = "v" + Text(step) + "-" + "x".repeat(sim.choose(world, 40))
+            if store.put(db, key, value) is Err(problem) { return "put failed: " + problem.describe() }
+            model[key] = value
+        }
+    }
+    // A write that reaches the log but whose sync fails is never acknowledged:
+    // after the crash it may be present or absent, but never damaged.
+    let doubtful = sim.choose(world, 2) == 1
+    if doubtful {
+        sim.injectError(world, sim.SYNC, -5)
+        if store.put(db, "doubt", "maybe") is Ok() { return "a put succeeded although its sync failed" }
+    }
+    let log = sim.openFile(world, store.logPath("/db"), false)
+    let tearing = sim.choose(world, 4)
+    if log > 0 && tearing > 0 { sim.persistSectors(world, log, [16, 64, 512][tearing - 1]) }
+    sim.crash(world)
+
+    let reopened = store.open(disk.simulated(world), "/db")
+    if reopened is Err(problem) { return "recovery failed: " + problem.describe() }
+    let recovered = reopened.unwrap()
+    for key in model {
+        match store.get(recovered, key) {
+            Some(value) { if value != model[key] { return "acknowledged \(key) came back as \(value)" } }
+            None { return "lost acknowledged \(key)" }
+        }
+    }
+    for key in store.keys(recovered) {
+        if !model.has(key) {
+            if key != "doubt" || !doubtful { return "\(key) appeared after the crash" }
+            if store.get(recovered, key).unwrap() != "maybe" { return "the unacknowledged write came back damaged" }
+        }
+    }
+    return ""
+}

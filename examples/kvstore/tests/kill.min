@@ -1,0 +1,67 @@
+// Kill a writer process with SIGKILL mid-stream, then recover with the real
+// file system: every acknowledged write must be there, in order.
+use "workers" as workers
+use "system" as system
+use "process" as process
+use "random" as random
+use "files" as files
+use "text" as text
+use "disk" as disk
+use "../src/store.min" as store
+
+constant DIRECTORY = "target/kill-test-store"
+constant KILL = 9   // SIGKILL is 9 on Linux and macOS
+
+function ensure(condition: Boolean, message: Text) {
+    if !condition { fail(message) }
+}
+
+function valueFor(index: Integer): Text { return "value-\(index)-" + "x".repeat(index % 97) }
+
+function writer() {
+    let db = store.open(disk.host(), DIRECTORY).unwrap()
+    let first = store.keys(db).length
+    workers.replyMessage(Bytes(Text(process.processId()))).unwrap()
+    let index = first
+    while true {
+        store.put(db, "key\(index)", valueFor(index)).unwrap()
+        workers.replyMessage(Bytes(Text(index))).unwrap()
+        index += 1
+    }
+}
+
+function round(number: Integer) {
+    let worker = workers.startSelf("writer").unwrap()
+    let pid = -1
+    let acknowledged = -1
+    let target = 20 + random.bytes(1)[0]
+    while acknowledged < target {
+        match worker.receive(-1).unwrap() {
+            Some(message) {
+                let value = text.integer(text.decodeOrStop(message)).unwrap()
+                if pid < 0 { pid = value } else { acknowledged = value }
+            }
+            None { fail("the writer exited early") }
+        }
+    }
+    system.sendSignal(pid, KILL)
+    let _ = worker.close()
+    let db = store.open(disk.host(), DIRECTORY).unwrap()
+    let count = store.keys(db).length
+    ensure(count >= acknowledged + 1, "fewer keys than acknowledged writes")
+    for index in 0..count {
+        ensure(store.get(db, "key\(index)") == Some(valueFor(index)), "key\(index) is missing or damaged")
+    }
+    print("round \(number): \(acknowledged + 1) acknowledged, \(count) recovered, \(db.recoveredTail) torn bytes cut")
+    store.close(db).unwrap()
+}
+
+match workers.currentMode() {
+    Some(mode) { writer() }
+    None {
+        let _ = files.deleteFile(store.logPath(DIRECTORY))
+        let _ = files.deleteFile(store.snapshotPath(DIRECTORY))
+        for number in 0..3 { round(number) }
+        print("kill test passed")
+    }
+}

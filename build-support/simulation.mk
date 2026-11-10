@@ -43,3 +43,9 @@ check-determinism-runtime:
 
 check check-portable: check-simulation check-simulation-neodb check-simulation-cli check-determinism-runtime
 check-sanitize: check-simulation-sanitize
+
+.PHONY: check-example-kvstore
+check-example-kvstore: build/minyarc build/minyar-default-runtime.o build/minyar-default-runtime-release.ll build/tooling/tools/project-cli build/tooling/tools/clang-driver build/minyar-module-build
+	MINYAR_CLANG="$(LLVM_CC)" python3 "tests/example-kvstore.py"
+
+check check-portable: check-example-kvstore
