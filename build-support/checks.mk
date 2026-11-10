@@ -655,6 +655,7 @@ build/tooling/tests/runtime-numeric: TOOL_NATIVE = runtime/native/sha256.c
 build/tooling/tests/runtime-numeric: TOOL_LIBS = $(TOOL_CRYPTO)
 build/tooling/tests/runtime-numeric: runtime/native/sha256.c
 check-runtime-numeric: build/minyarc build/tooling/tests/runtime-numeric
+	python3 tools/generate-pow10-table.py --check runtime/minyar_pow10_table.h
 	$(LIMITED) ./build/tooling/tests/runtime-numeric --mode native
 
 check-runtime-numeric-sanitize: build/minyarc build/tooling/tests/runtime-numeric

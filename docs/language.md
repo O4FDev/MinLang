@@ -219,8 +219,13 @@ print(Integer(-7.9))   // -7
 ```
 
 Exact integral Floats strictly inside ±2^53 format directly as decimal digits
-followed by `.0`, without calling the C formatting or parsing libraries.
-Zero retains its sign. Other finite values keep the shortest-roundtrip rule.
+followed by `.0`. Zero retains its sign. Other finite values use the shortest
+digits that read back as the same value; when several spellings of that length
+qualify, the one nearest the value (ties to even) is printed. The runtime finds
+them with integer arithmetic only (Russ Cox's [unrounded
+scaling](https://research.swtch.com/fp)), so neither the C library, the locale
+nor the floating-point rounding mode affects the output, and freestanding builds
+print the same text as hosted ones.
 
 Integer and Float never mix implicitly; convert with `Float(integer)` or
 `Integer(float)`. `Integer` truncates toward zero and stops if the Float is NaN

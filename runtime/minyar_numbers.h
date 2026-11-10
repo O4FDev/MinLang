@@ -35,53 +35,11 @@ void minyar_check_integer_division(long long left, long long right) {
 }
 
 /* Float text uses the shortest decimal digits that read back as the same
- * value. Plain notation is used for ordinary magnitudes and always keeps a
- * point, so a printed Float cannot be mistaken for an Integer. */
-static _Bool adjacent_float_decimal(char *scientific, double value, int direction) {
-    char candidate[40];
-    memcpy(candidate, scientific, strlen(scientific) + 1);
-    char *first = candidate + (*candidate == '-');
-    char *exponent_start = strchr(candidate, 'e');
-    int exponent = atoi(exponent_start + 1);
-    _Bool carried = 1;
-    for (char *digit = exponent_start; digit > first;) {
-        digit--;
-        if (*digit == '.')
-            continue;
-        if (direction > 0) {
-            if (*digit < '9') {
-                (*digit)++;
-                carried = 0;
-                break;
-            }
-            *digit = '0';
-        } else {
-            if (*digit > '0') {
-                (*digit)--;
-                carried = 0;
-                break;
-            }
-            *digit = '9';
-        }
-    }
-    if (carried) {
-        /* 9.99 -> 1.00e+1: preserve the significant-digit budget. */
-        *first = '1';
-        exponent++;
-    } else if (*first == '0') {
-        /* 1.00 -> 9.99e-1: the grid becomes finer below a decimal power. */
-        for (char *digit = first; digit < exponent_start; digit++)
-            if (*digit != '.')
-                *digit = '9';
-        exponent--;
-    }
-    snprintf(exponent_start, sizeof(candidate) - (size_t)(exponent_start - candidate), "e%+d",
-             exponent);
-    if (strtod(candidate, NULL) != value)
-        return 0;
-    memcpy(scientific, candidate, strlen(candidate) + 1);
-    return 1;
-}
+ * value (the nearest such decimal, ties to even), computed by
+ * minyar_float_scale.h with integer arithmetic only. Plain notation is used
+ * for ordinary magnitudes and always keeps a point, so a printed Float cannot
+ * be mistaken for an Integer. */
+#include "minyar_float_scale.h"
 
 static size_t float_copy_spelling(char *out, size_t capacity, const char *text, size_t length) {
     if (capacity) {
@@ -115,45 +73,20 @@ static size_t format_float(double value, char *out, size_t capacity) {
     }
     uint64_t encoding;
     memcpy(&encoding, &value, sizeof(encoding));
-    /* At normal powers of two above the smallest normal, the predecessor gap
-     * is half the successor gap. The closest rounded decimal can sit outside
-     * that asymmetric interval while an adjacent decimal lies inside it. For
-     * all other finite nonzero values the rounding interval is symmetric, so
-     * a more distant decimal cannot rescue a rejected closest candidate. */
-    _Bool asymmetric =
-        (encoding & UINT64_C(0xfffffffffffff)) == 0 && ((encoding >> 52) & UINT64_C(0x7ff)) > 1;
-    char scientific[40];
-    int precision = 1;
-    /* A decimal of at most 15 significant digits survives a trip through the
-     * nearest normal double and back at 15 digits (DBL_DIG). So when the
-     * shortest correctly rounded spelling has p <= 15 digits, the 15-digit
-     * spelling is that one padded with zeros, which are trimmed below; when it
-     * does not round-trip, the answer has 16 or 17 digits. This gives the same
-     * spelling as trying every precision from 1. Subnormals have fewer bits and
-     * powers of two may take an adjacent decimal, so they keep the full search. */
-    if (!asymmetric && ((encoding >> 52) & UINT64_C(0x7ff)) != 0) { /* normal: NaN and infinities returned above */
-        snprintf(scientific, sizeof(scientific), "%.14e", value);
-        precision = strtod(scientific, NULL) == value ? 18 : 16;
-    }
-    for (; precision <= 17; precision++) {
-        snprintf(scientific, sizeof(scientific), "%.*e", precision - 1, value);
-        if (precision == 17 || strtod(scientific, NULL) == value ||
-            (asymmetric && (adjacent_float_decimal(scientific, value, 1) ||
-                            adjacent_float_decimal(scientific, value, -1))))
-            break;
-    }
-    char digits[24];
-    size_t digit_count = 0;
-    const char *cursor = scientific;
-    int negative = *cursor == '-';
-    if (negative)
-        cursor++;
-    for (; *cursor && *cursor != 'e'; cursor++)
-        if (*cursor >= '0' && *cursor <= '9')
-            digits[digit_count++] = *cursor;
-    int exponent = atoi(cursor + 1);
-    while (digit_count > 1 && digits[digit_count - 1] == '0')
-        digit_count--;
+    int power;
+    uint64_t decimal = float_shortest(encoding, &power);
+    /* At most 17 digits, written from the right; float_shortest leaves no
+     * trailing zeros. */
+    char spelled[24];
+    char *first = spelled + sizeof(spelled);
+    do {
+        *--first = (char)('0' + decimal % 10);
+        decimal /= 10;
+    } while (decimal);
+    const char *digits = first;
+    size_t digit_count = (size_t)(spelled + sizeof(spelled) - first);
+    int negative = (encoding >> 63) != 0;
+    int exponent = power + (int)digit_count - 1;
     size_t length = 0;
 #define FLOAT_PUT(character)                                                                       \
     do {                                                                                           \
@@ -189,10 +122,14 @@ static size_t format_float(double value, char *out, size_t capacity) {
                 FLOAT_PUT(digits[i]);
         else
             FLOAT_PUT('0');
-        char suffix[8];
-        snprintf(suffix, sizeof(suffix), "e%+d", exponent);
-        for (const char *piece = suffix; *piece; piece++)
-            FLOAT_PUT(*piece);
+        FLOAT_PUT('e');
+        FLOAT_PUT(exponent < 0 ? '-' : '+');
+        int magnitude = exponent < 0 ? -exponent : exponent;
+        if (magnitude >= 100)
+            FLOAT_PUT((char)('0' + magnitude / 100));
+        if (magnitude >= 10)
+            FLOAT_PUT((char)('0' + magnitude / 10 % 10));
+        FLOAT_PUT((char)('0' + magnitude % 10));
     }
 #undef FLOAT_PUT
     if (capacity)

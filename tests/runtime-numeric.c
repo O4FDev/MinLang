@@ -38,22 +38,29 @@ static double from_bits(uint64_t bits) {
 }
 
 static void bounded_output(void) {
-    struct {
-        const char *text;
-        double value;
-        int direction;
+    /* Decimal carries and borrows across a power of ten, and powers of two
+     * whose nearest shortest decimal lies outside their skewed interval. */
+    static const struct {
+        uint64_t bits;
         const char *expected;
-    } decimal_transitions[] = {{"9.9e+0", 10.0, 1, "1.0e+1"},
-                               {"1.0e+1", 9.9, -1, "9.9e+0"},
-                               {"-9.9e+0", -10.0, 1, "-1.0e+1"},
-                               {"-1.00e+0", -0.999, -1, "-9.99e-1"}};
-    for (size_t index = 0; index < sizeof(decimal_transitions) / sizeof(*decimal_transitions);
-         index++) {
-        char scientific[40];
-        strcpy(scientific, decimal_transitions[index].text);
-        assert(adjacent_float_decimal(scientific, decimal_transitions[index].value,
-                                      decimal_transitions[index].direction));
-        assert(!strcmp(scientific, decimal_transitions[index].expected));
+    } spellings[] = {{UINT64_C(0x4024000000000000), "10.0"},
+                     {UINT64_C(0x4023cccccccccccd), "9.9"},
+                     {UINT64_C(0xc024000000000000), "-10.0"},
+                     {UINT64_C(0xbfeff7ced916872b), "-0.999"},
+                     {UINT64_C(0x4580000000000000), "6.189700196426902e+26"},
+                     {UINT64_C(0x0010000000000000), "2.2250738585072014e-308"},
+                     {UINT64_C(0x000fffffffffffff), "2.225073858507201e-308"},
+                     {UINT64_C(0x7fefffffffffffff), "1.7976931348623157e+308"},
+                     {UINT64_C(0x3fb999999999999a), "0.1"},
+                     {UINT64_C(0x3fd5555555555555), "0.3333333333333333"}};
+    for (size_t index = 0; index < sizeof(spellings) / sizeof(*spellings); index++) {
+        char text[48];
+        format_float(from_bits(spellings[index].bits), text, sizeof(text));
+        if (strcmp(text, spellings[index].expected)) {
+            fprintf(stderr, "%016llx: expected %s, got %s\n", (unsigned long long)spellings[index].bits,
+                    spellings[index].expected, text);
+            abort();
+        }
     }
     const double values[] = {
         0.0, -0.0, 42.0, -42.0, 9007199254740991.0, -9007199254740991.0,
@@ -88,7 +95,14 @@ static void exact_integer_budget(void) {
         char text[48];
         format_float((double)value, text, sizeof(text));
     }
-    printf("{\"formatted\":2001,\"snprintf_calls\":%llu,\"strtod_calls\":%llu}\n", format_calls,
+    /* Non-integers, subnormals and extremes use integer arithmetic too. */
+    uint64_t bits = UINT64_C(0x9e3779b97f4a7c15);
+    for (int index = 0; index < 2001; index++) {
+        char text[48];
+        bits = bits * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
+        format_float(from_bits(bits), text, sizeof(text));
+    }
+    printf("{\"formatted\":4002,\"snprintf_calls\":%llu,\"strtod_calls\":%llu}\n", format_calls,
            parse_calls);
     fflush(stdout);
     assert(parse_calls == 0);

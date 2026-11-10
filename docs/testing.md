@@ -709,8 +709,12 @@ with ASan/UBSan. `check-unicode-case-data` regenerates the compact mapping and
 property tables from the pinned sources and rejects stale generated contents.
 
 `check-runtime-numeric` also requires zero `snprintf` and `strtod` calls when
-formatting the 2,001 exact Float integers from −1,000 through 1,000. Its bounded
-buffer probes include the integral fast path near ±2^53, signed zero and specials.
+formatting the 2,001 exact Float integers from −1,000 through 1,000 and 2,001
+pseudo-random bit patterns. Its bounded buffer probes include the integral fast
+path near ±2^53, signed zero and specials, and golden spellings cover decimal
+carries and a power of two whose shortest decimal is not the correctly rounded
+one at that length (2^89). It first checks `runtime/minyar_pow10_table.h`
+against `tools/generate-pow10-table.py`.
 
 `make check-result-network` exercises typed sockets, TLS, workers and HTTP at
 O0/O2 with the ownership oracle. Loopback peers cover nonblocking accept,
