@@ -22,8 +22,9 @@ every dependency and a `v` + `package.version` tag at HEAD. The release is named
 `git@host:owner/repo` URLs); pass `HOST/OWNER/REPO` when the origin is something
 else. It reads committed blobs, applies the source security policy, then downloads
 that tag from the host exactly as `minyar add` would and refuses unless the host
-serves the same commit and source checksum. Only then is the record merged into the
-index directory, which is created if needed. The description comes from
+serves the same commit and source checksum. It then checks that copy as consumers
+will build it (committed files only, Git dependencies resolved from manifests).
+Only then is the record merged into the index directory, which is created if needed. The description comes from
 `package.description` in `Minyar.toml`, or `--description TEXT`; one of them is
 required, because a published record cannot change. Publishing
 the same release again changes nothing; a different record for a published version

@@ -128,8 +128,8 @@ minyar build --locked --offline
 minyar update                  # newest release within each dependency's major version
 ```
 
-`update [NAME]` moves Git dependencies to their newest release with the same major
-version (a branch dependency to its current commit), rewrites their minimum in
+`update [NAME]` moves Git dependencies to their newest release (recorded in the
+configured package index, if any) with the same major version (a branch dependency to its current commit), rewrites their minimum in
 `Minyar.toml` and the lock, and names any newer major version together with the
 `minyar add HOST/OWNER/REPO@vX.0.0` command that would adopt it. Crossing a major
 version is always that explicit `add`; exact commit pins never move.

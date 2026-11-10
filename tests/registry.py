@@ -261,6 +261,17 @@ def check_share_workflow(launcher, base_env, root):
     run([launcher, "uninstall", "tool", "--root", prefix], env, work)
     assert not (prefix / "bin/tool").exists()
 
+    manifest = library / "Minyar.toml"
+    manifest.write_text(manifest.read_text().replace('version = "1.0.0"', 'version = "1.0.1"'))
+    (library / "src/geometry.min").write_text('public function surface(width: Integer, height: Integer): Integer { return "wide" }\n')
+    git("commit", "--quiet", "--all", "-m", "fix(geometry): a release that does not compile")
+    git("tag", "v1.0.1")
+    git("push", "--quiet", "origin", "main", "v1.0.1")
+    before = (public / "index.json").read_bytes()
+    run([launcher, "publish", "--registry", public], env, library, "Checking  geometry v1.0.1 as consumers will build it")
+    assert (public / "index.json").read_bytes() == before, "a release that does not compile was recorded"
+    assert "Current  geometry v1.0.0" in run([launcher, "update"], shared, consumer), "update must ignore Git tags the configured index does not record"
+
     impostor = dict(index["packages"][0], repository="example.com/impostor/geometry")
     write_index(public / "index.json", {"schema": 1, "packages": [index["packages"][0], impostor]})
     run([launcher, "add", "geometry"], shared, consumer, "more than one repository publishes a package named geometry")

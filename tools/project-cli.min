@@ -522,6 +522,20 @@ function install(graph: project.Graph, options: Options) {
     finishInstallation(staging)
     print("Installed " + destination + "\nAdd " + directory + " to PATH.")
 }
+// Before a release is recorded, check it the way a consumer's build will see it: only its committed files,
+// its own Git dependencies resolved from their manifests (a library's lock does not travel to consumers).
+function checkRelease(source: git.Source, options: Options) {
+    let work = host.temporaryDirectory("", "minyar-publish-check-")
+    let root = host.resolveName(work) + "/release"
+    require([host.which("cp"), "-R", source.root, root], "")
+    if host.isFile(root + "/Minyar.lock") { files.remove(root + "/Minyar.lock") }
+    let graph = project.resolveWith(root, false, false)
+    let package = graph.packages[0]
+    system.writeStandardError("  Checking  " + package.name + " v" + package.version + " as consumers will build it\n")
+    compile(graph, options, project.entry(package), "", true)
+    if project.isBinary(package) && project.hasLibrary(package) { compile(graph, options, project.library(package), "", true) }
+    host.release(work)
+}
 // HOST/OWNER/REPO[@REVISION] from its Git host, or NAME[@VERSION] through the package index; downloaded,
 // checked against the source policy and, when an index is configured, against its release record.
 function remoteSource(specification: Text, options: Options): git.Source {
@@ -641,6 +655,7 @@ function update(package: project.Manifest, options: Options) {
     let only = ""
     if options.positionals.length == 1 { only = options.positionals[0] }
     if only != "" && !host.listed(package.dependencies, only) { host.stop("dependency not found: " + only) }
+    let catalog = registry.optional(false)
     let names: List<Text> = []
     let sources: List<git.Source> = []
     let report: List<Text> = []
@@ -657,9 +672,13 @@ function update(package: project.Manifest, options: Options) {
         let chosen = current
         if git.semver(current) {
             let newest = current
-            for release in git.releases(repository) {
-                if git.compare(release.tag, newest) > 0 { newest = release.tag }
-                if git.compatible(release.tag, current) && git.compare(release.tag, chosen) > 0 { chosen = release.tag }
+            // With a package index configured, only its recorded releases are candidates (builds verify them).
+            let tags: List<Text> = []
+            if catalog.origin != "" { for value in catalog.entries { if value.repository == repository { tags.add("v" + value.version) } } }
+            else { for release in git.releases(repository) { tags.add(release.tag) } }
+            for tag in tags {
+                if git.compare(tag, newest) > 0 { newest = tag }
+                if git.compatible(tag, current) && git.compare(tag, chosen) > 0 { chosen = tag }
             }
             if git.compare(newest, chosen) > 0 { notes.add("      Note  " + name + " " + newest + " is a new major version and may break this project: minyar add " + repository + "@" + newest) }
         } else if git.hexadecimal(current, 40) {
@@ -755,7 +774,7 @@ function dispatch() {
             return
         }
         if options.description == "" && package.description == "" { host.stop("add a one-line description = \"...\" under [package] in Minyar.toml, or pass --description, before publishing; a published release record cannot change") }
-        publish.confirmHosted(entry)
+        checkRelease(publish.confirmHosted(entry), options)
         let directory = host.resolveName(location)
         let added = registry.publish(directory, [entry])
         let verb = " Published"
