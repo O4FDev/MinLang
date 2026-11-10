@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""heavy CMD...: run CMD holding one of MINYAR_HEAVY_SLOTS (default 3) build slots of this shared machine.
+First come, first served: each waiter takes a numbered ticket and only the oldest live ticket may take a free slot.
+Locks live in $MINYAR_RUN_DIR/locks. `light` is the same queue mechanism with its own slots for short commands."""
+import fcntl, os, platform, subprocess, sys, time
+run = os.environ.get("MINYAR_RUN_DIR") or sys.exit("heavy: set MINYAR_RUN_DIR (tools/run/start.sh writes it)")
+d = os.path.join(run, "locks")
+kind = os.environ.get("HEAVY_KIND", "heavy")
+slots = int(os.environ.get("HEAVY_SLOTS") or os.environ.get("MINYAR_HEAVY_SLOTS", "3"))
+os.makedirs(d, exist_ok=True)
+fds = [os.open(os.path.join(d, f"{kind}-{i}.lock"), os.O_CREAT | os.O_RDWR) for i in range(slots)]
+tdir = os.path.join(d, "tickets-" + kind)
+os.makedirs(tdir, exist_ok=True)
+mine = f"{time.time_ns():020d}-{os.getpid()}"
+open(os.path.join(tdir, mine), "w").close()
+
+
+def first():
+    for t in sorted(os.listdir(tdir)):
+        if t == mine:
+            return True
+        try:
+            os.kill(int(t.rsplit("-", 1)[1]), 0)
+            return False
+        except (OSError, ValueError):  # a dead waiter's ticket
+            try:
+                os.remove(os.path.join(tdir, t))
+            except OSError:
+                pass
+    return True
+
+
+got = None
+try:
+    while got is None:
+        if first():
+            for fd in fds:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    got = fd
+                    break
+                except OSError:
+                    pass
+        if got is None:
+            time.sleep(1)
+finally:
+    try:
+        os.remove(os.path.join(tdir, mine))
+    except OSError:
+        pass
+env = dict(os.environ)
+# Optional per-machine toolchain settings, e.g. MINYAR_RUN_SDKROOT on a macOS whose newest SDK breaks local links.
+for key in ("SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "MINYAR_LINK_PARTITIONS"):
+    if os.environ.get("MINYAR_RUN_" + key) and platform.system() == "Darwin":
+        env.setdefault(key, os.environ["MINYAR_RUN_" + key])
+sys.exit(subprocess.call(sys.argv[1:], env=env))
