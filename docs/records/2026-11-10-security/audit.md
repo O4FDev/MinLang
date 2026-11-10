@@ -80,9 +80,9 @@ maintainer can decide.
    stopped` in a normal build, an allocator report under ASan) rather than
    through a size check. It is not memory-unsafe; a checked message for sizes
    above the addressable range would be clearer.
-3. **`library/zstd.min`** reserves its whole output limit in the same way as
-   finding 2. No network path in the library uses it; the frame header carries
-   the content size, which a fix can use.
+3. **`library/zstd.min`** reserved its whole output limit in the same way as
+   finding 2. No network path in the library uses it; it now grows its output
+   the same way, with the same regression in `tests/compression.min`.
 4. **HTTP/1.1 chunked bodies near both limits**: a request whose header block
    and one chunk together exceed `maxHeaderBytes + maxBodyBytes` cannot be
    buffered, and the server then drops the connection without a status. It is a

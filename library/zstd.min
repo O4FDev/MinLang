@@ -24,6 +24,7 @@ function finish(code: Integer, output: Bytes): Result {
     return Result { code: code; value: output }
 }
 function failure(code: Integer): Result { return Result { code: code; value: Bytes() } }
+function firstCapacity(input: Bytes, maxOutput: Integer): Integer { return min(maxOutput, max(4096, input.length * 4)) }
 public record CCtx { private state: List<Integer> }
 public record DCtx { private state: List<Integer> }
 public record CDict { private state: List<Integer> }
@@ -59,8 +60,17 @@ public function compressWith(owner: CCtx, input: Bytes, level: Integer, maxOutpu
 public function decompressWith(owner: DCtx, input: Bytes, maxOutput: Integer): Result {
     if maxOutput < 0 || maxOutput > MAX_OUTPUT { return failure(INVALID) }
     if !isOpenDCtx(owner) { return failure(CLOSED) }
-    let output = Bytes(maxOutput)
-    return finish(decompressInto(owner, input, output), output)
+    // Output space is zeroed, so reserving maxOutput at once would cost its full
+    // size for every call, however small the data. Start near the input's size
+    // and retry larger only when the data needs the room (see deflate.decompress).
+    let capacity = firstCapacity(input, maxOutput)
+    while true {
+        let output = Bytes(capacity)
+        let code = decompressInto(owner, input, output)
+        if code != LIMIT || capacity >= maxOutput { return finish(code, output) }
+        capacity = min(maxOutput, capacity * 4)
+    }
+    return failure(INVALID)
 }
 public function compress(input: Bytes, level: Integer, maxOutput: Integer): Result {
     if maxOutput < 0 || maxOutput > MAX_OUTPUT { return failure(INVALID) }
@@ -91,8 +101,14 @@ public function compressDictionary(owner: CCtx, dictionary: CDict, input: Bytes,
 public function decompressDictionary(owner: DCtx, dictionary: DDict, input: Bytes, maxOutput: Integer): Result {
     if maxOutput < 0 || maxOutput > MAX_OUTPUT { return failure(INVALID) }
     if !isOpenDCtx(owner) || !isOpenDDict(dictionary) { return failure(CLOSED) }
-    let output = Bytes(maxOutput)
-    return finish(decompressDictionaryInto(owner, dictionary, input, output), output)
+    let capacity = firstCapacity(input, maxOutput)
+    while true {
+        let output = Bytes(capacity)
+        let code = decompressDictionaryInto(owner, dictionary, input, output)
+        if code != LIMIT || capacity >= maxOutput { return finish(code, output) }
+        capacity = min(maxOutput, capacity * 4)
+    }
+    return failure(INVALID)
 }
 // Managed context with caller-owned raw memory; same four data arguments as neo-vm's shim.
 // Source/destination signed addresses must describe live readable/writable nonoverlapping regions.
