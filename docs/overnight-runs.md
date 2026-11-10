@@ -80,9 +80,9 @@ gate VM.
 - **Stale gate logs.** A gate whose VM run never started could be judged from
   the previous gate's log. The train now deletes the log first and accepts it
   only if its first line names the commit under test.
-- **Build output was committed by accident.** dx committed
-  `examples/bytecode-vm/target` and removed it in a later landing. Nothing
-  rejected it.
+- **Build output was committed by accident.** dx committed the `target/`
+  build directory of the bytecode-vm example and removed it in a later
+  landing. Nothing rejected it.
 - **A memory cap blocked compiler changes.** `scripts/with-limits.sh` caps
   address space at 768 MiB on Linux. The compiler's ThinLTO link peaked at
   764 to 766 MiB VmPeak under it; about 330 MiB of the uncapped 908 MiB peak
