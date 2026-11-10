@@ -36,4 +36,6 @@ check-thread-runtime-tsan: build/tooling/tests/thread-runtime-ir build/tooling/t
 # The threaded fixtures have no native Windows qualification yet (WS7 owns that run).
 ifeq ($(filter Windows_NT,$(OS))$(filter MSYS% MINGW% CYGWIN%,$(shell uname -s)),)
 check check-portable: check-thread-runtime
+# The thread runtime under ThreadSanitizer and under ASan/UBSan; no gate ran either before 2026-11-10.
+check-sanitize: check-thread-runtime-tsan check-thread-runtime-sanitize
 endif
