@@ -16,14 +16,16 @@ git push origin main v0.1.0
 minyar publish --registry ../public
 ```
 
-`publish` requires a clean Git tree, a library export, Git sources for every
-dependency and a `v` + `package.version` tag at HEAD. The release is named after the origin remote (`https://`, `ssh://` or
+`publish` requires a clean Git tree, a library (`src/NAME.min`) or a program
+(`src/main.min`, installed by others with `minyar install NAME`), Git sources for
+every dependency and a `v` + `package.version` tag at HEAD. The release is named after the origin remote (`https://`, `ssh://` or
 `git@host:owner/repo` URLs); pass `HOST/OWNER/REPO` when the origin is something
 else. It reads committed blobs, applies the source security policy, then downloads
 that tag from the host exactly as `minyar add` would and refuses unless the host
 serves the same commit and source checksum. Only then is the record merged into the
 index directory, which is created if needed. The description comes from
-`package.description` in `Minyar.toml`, or `--description TEXT`. Publishing
+`package.description` in `Minyar.toml`, or `--description TEXT`; one of them is
+required, because a published record cannot change. Publishing
 the same release again changes nothing; a different record for a published version
 is refused. `publish` does not upload, create a repository, change remotes or
 execute package code. Git clean, smudge and process filters are disabled during the

@@ -35,6 +35,10 @@ minyar update                                  # later: newest v0.x.y release
 minyar build --release && minyar install --release
 ```
 
+Programs are shared the same way: publish an application package, and anyone can
+run `minyar install NAME` (or `minyar install HOST/OWNER/REPO`) to build and install
+it from its verified source.
+
 Commit `Minyar.toml` and `Minyar.lock` in the application. The lock pins every
 package's commit and source checksum; `--locked --offline` rebuilds exactly that.
 A package index is optional: `add HOST/OWNER/REPO` works with any public Git host.

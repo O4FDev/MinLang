@@ -300,8 +300,17 @@ marker. Symlinked targets and existing unowned directories are rejected.
 ```sh
 minyar install --release
 minyar install --path ../hello --release --root ~/.local
+minyar install github.com/O4FDev/lanterns@v0.2.0   # someone else's program
+minyar install lanterns                             # by name, from a package index
 minyar uninstall hello --root ~/.local
 ```
+
+With a package source, `install` downloads that program's Git release (or the
+newest release of the one repository publishing NAME in the configured index),
+applies the same source policy and checksums as `minyar add`, builds a release
+from a private copy using the program's own `Minyar.lock` as its starting
+dependency list (`--locked` requires it to be complete), and installs it. Nothing
+from the package runs during installation.
 
 The installation prefix defaults to `$MINYAR_HOME` or `$HOME/.minyar`. Executables
 go in its `bin` directory; add that directory to `PATH`. Existing binaries require

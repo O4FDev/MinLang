@@ -49,7 +49,8 @@ function help() {
       publish [REPO]              Record a tagged release in a local package index
                                   (--dry-run prints the record instead)
       registry build|serve        Build or serve a local package index
-      install                     Build and install this project's binary
+      install [SOURCE]            Build and install this project's binary, or a
+                                  program from HOST/OWNER/REPO[@REV] or NAME[@VERSION]
       uninstall NAME              Remove a binary installed by Minyar
 
     Toolchains
@@ -158,7 +159,7 @@ function parse(): Options {
         else if option == "--force" { allowed = options.command == "install" }
         else if option == "--dry-run" { allowed = options.command == "publish" || options.command == "patch" }
         else if option == "--description" { allowed = options.command == "publish" }
-        else if option == "--registry" { allowed = host.listed(["search", "info", "add", "publish"], options.command) }
+        else if option == "--registry" { allowed = host.listed(["search", "info", "add", "publish", "install"], options.command) }
         else if option == "--watch" { allowed = options.command == "run" }
         else if option == "--hot" { allowed = options.command == "run" || options.command == "build" }
         else if option == "--undo" { allowed = options.command == "patch" }
@@ -519,6 +520,54 @@ function install(graph: project.Graph, options: Options) {
     finishInstallation(staging)
     print("Installed " + destination + "\nAdd " + directory + " to PATH.")
 }
+// HOST/OWNER/REPO[@REVISION] from its Git host, or NAME[@VERSION] through the package index; downloaded,
+// checked against the source policy and, when an index is configured, against its release record.
+function remoteSource(specification: Text, options: Options): git.Source {
+    let pieces = specification.split("@")
+    if pieces.length > 2 { host.stop("usage: minyar " + options.command + " HOST/OWNER/PACKAGE[@revision] or NAME[@version]") }
+    let revision = "latest"
+    if pieces.length == 2 { revision = pieces[1] }
+    if !git.validRevision(revision) { host.stop("invalid Git revision: " + revision) }
+    let location = options.registry
+    if location == "" { location = system.getenv("MINYAR_REGISTRY") }
+    let index = registry.Index { entries: []; origin: "" }
+    let repository = ""
+    if !host.hasText(pieces[0], "/") {
+        // A bare name comes from the package index; manifests and locks still record its Git source.
+        if location == "" {
+            let alternative = ""
+            if options.command == "add" { alternative = ", minyar add " + pieces[0] + " --path DIR for a local library" }
+            host.stop(pieces[0] + " is not a Git package path; use minyar " + options.command + " HOST/OWNER/" + pieces[0] + alternative + ", or set MINYAR_REGISTRY to a package index to use package names")
+        }
+        index = registry.loadWith(location, options.offline)
+        let version = ""
+        if pieces.length == 2 { version = revision }
+        let release = registry.lookup(index, pieces[0], version)
+        repository = release.repository
+        revision = "v" + release.version
+    } else {
+        repository = git.repository(pieces[0])
+        if location != "" { index = registry.loadWith(location, options.offline) }
+    }
+    let fetched = git.fetch(repository, revision, "", "", options.offline)
+    registry.verify(index, fetched)
+    return fetched
+}
+// minyar install SOURCE: build someone else's program from its verified source and install it. The source is
+// copied out of the shared package cache, resolved with its own lock as the starting point, built with the
+// release profile, and installed exactly as a local `minyar install` would.
+function installRemote(options: Options) {
+    if options.manifest != "" || options.path != "" { host.stop("install takes a package source or --path, not both") }
+    let source = remoteSource(options.positionals[0], options)
+    let package = project.read(source.root)
+    if !project.isBinary(package) { host.stop(package.name + " is a library, not a program; use it from a project with minyar add " + options.positionals[0]) }
+    let work = host.temporaryDirectory("", "minyar-install-")
+    let root = host.resolveName(work) + "/" + package.name
+    require([host.which("cp"), "-R", source.root, root], "")
+    options.release = true
+    install(project.resolveWith(root, options.locked, options.offline), options)
+    host.release(work)
+}
 function modify(package: project.Manifest, options: Options) {
     if options.positionals.length != 1 { host.stop("usage: minyar " + options.command + " NAME" ) }
     let name = options.positionals[0]
@@ -527,29 +576,12 @@ function modify(package: project.Manifest, options: Options) {
     let remoteRoot = ""
     let fetched = git.Source { repository: ""; revision: ""; commit: ""; checksum: ""; root: "" }
     if options.command == "add" && options.path == "" {
-        let pieces = name.split("@")
-        if pieces.length > 2 { host.stop("usage: minyar add HOST/OWNER/PACKAGE[@revision], NAME[@version] or NAME --path DIR") }
-        revision = "latest"
-        if pieces.length == 2 { revision = pieces[1] }
-        if !git.validRevision(revision) { host.stop("invalid Git revision: " + revision) }
-        let index = registry.Index { entries: []; origin: "" }
-        if !host.hasText(pieces[0], "/") {
-            // A bare name comes from the package index; the manifest and lock still record its Git source.
-            let location = options.registry
-            if location == "" { location = system.getenv("MINYAR_REGISTRY") }
-            if location == "" { host.stop(pieces[0] + " is not a Git package path; use minyar add HOST/OWNER/" + pieces[0] + ", minyar add " + pieces[0] + " --path DIR for a local library, or set MINYAR_REGISTRY to a package index to add packages by name") }
-            index = registry.loadWith(location, options.offline)
-            let version = ""
-            if pieces.length == 2 { version = revision }
-            let release = registry.lookup(index, pieces[0], version)
-            repository = release.repository
-            revision = "v" + release.version
-        } else { repository = git.repository(pieces[0]) }
-        fetched = git.fetch(repository, revision, "", "", options.offline)
-        registry.verify(index, fetched)
+        fetched = remoteSource(name, options)
+        repository = fetched.repository
         let source = fetched
         let dependency = project.read(source.root)
         name = dependency.name
+        if !project.hasLibrary(dependency) && project.isBinary(dependency) { host.stop(name + " is a program, not a library; install it with minyar install " + options.positionals[0]) }
         if !project.hasLibrary(dependency) { host.stop("dependency needs a library export at src/" + name + ".min") }
         revision = source.revision
         remoteRoot = source.root
@@ -683,6 +715,11 @@ function dispatch() {
         documentation.fromDirectory(compiler(), options.path, outputDirectory(host.resolveName("."), "doc"), options.release)
         return
     }
+    if options.command == "install" && options.positionals.length > 0 {
+        if options.positionals.length != 1 { host.stop("usage: minyar install [HOST/OWNER/PACKAGE[@revision] | NAME[@version]] [--root DIR] [--force]") }
+        installRemote(options)
+        return
+    }
     if options.command == "uninstall" {
         if options.positionals.length != 1 || !project.validName(options.positionals[0]) { host.stop("usage: minyar uninstall NAME [--root DIR]") }
         let directory = installation(options)
@@ -710,6 +747,7 @@ function dispatch() {
             system.writeStandardError("   Dry run  " + entry.name + " v" + entry.version + " · " + entry.checksum + "\nNothing was published. " + next + "\n")
             return
         }
+        if options.description == "" && package.description == "" { host.stop("add a one-line description = \"...\" under [package] in Minyar.toml, or pass --description, before publishing; a published release record cannot change") }
         publish.confirmHosted(entry)
         let directory = host.resolveName(location)
         let added = registry.publish(directory, [entry])

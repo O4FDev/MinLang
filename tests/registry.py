@@ -240,6 +240,27 @@ def check_share_workflow(launcher, base_env, root):
     run([launcher, "update", "absent"], shared, consumer, "dependency not found")
     assert "Added  geometry v1.0.0" in run([launcher, "add", "geometry@1.0.0"], shared, consumer)
 
+    tool = work / "tool"
+    run([launcher, "new", tool], env, work)
+    (tool / "Minyar.toml").write_text((tool / "Minyar.toml").read_text() + 'geometry = { git = "example.com/shapes/geometry", rev = "v0.1.1" }\n')
+    (tool / "src/main.min").write_text('use "geometry" as geometry\nprint("tiles: " + Text(geometry.square(4)))\n')
+    run([launcher, "build"], shared, tool)
+    tool_hosted = mirror / "example.com/shapes/tool.git"
+    run(["git", "init", "--quiet", "--bare", tool_hosted], env, root)
+    for arguments in (["init", "--quiet", "--initial-branch=main"], ["add", "."], ["commit", "--quiet", "-m", "feat(tool): tiles"], ["tag", "v0.1.0"],
+                      ["remote", "add", "origin", "https://example.com/shapes/tool"], ["config", "remote.origin.pushurl", str(tool_hosted)], ["push", "--quiet", "origin", "main", "v0.1.0"]):
+        run(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Minyar tests", "-c", "user.email=tests@example.invalid", "-C", tool, *arguments], env, root)
+    run([launcher, "publish", "--registry", public], env, tool, "add a one-line description")
+    assert "Published  tool v0.1.0" in run([launcher, "publish", "--registry", public, "--description", "Counts tiles."], env, tool), "programs can be published"
+    run([launcher, "add", "tool"], shared, consumer, "tool is a program, not a library; install it with minyar install tool")
+    prefix = work / "installed programs"
+    installed = run([launcher, "install", "tool", "--root", prefix], shared, work)
+    assert "Installed" in installed and "tiles: 16\n" == run([prefix / "bin/tool"], env, work), installed
+    run([launcher, "install", "example.com/shapes/tool", "--root", prefix], shared, work, "already exists; use --force")
+    run([launcher, "install", "example.com/shapes/geometry", "--root", prefix], shared, work, "geometry is a library, not a program")
+    run([launcher, "uninstall", "tool", "--root", prefix], env, work)
+    assert not (prefix / "bin/tool").exists()
+
     impostor = dict(index["packages"][0], repository="example.com/impostor/geometry")
     write_index(public / "index.json", {"schema": 1, "packages": [index["packages"][0], impostor]})
     run([launcher, "add", "geometry"], shared, consumer, "more than one repository publishes a package named geometry")
