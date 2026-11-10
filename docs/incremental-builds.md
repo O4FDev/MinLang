@@ -23,7 +23,9 @@ or an interchange format for downloads. Individual artifacts are capped at
 Graphs containing constants, native function bodies, or standard-library
 package imports currently use the ordinary full frontend. They compile with the
 same behavior as a direct build, including after constant values or imports
-change, but publish no new incremental module state. Removing those constructs
+change, but publish no new incremental module state. They emit the same LLVM as
+a direct build at about the same cost; `make check-module-fallback-scaling`
+checks both with 2,000 functions. Removing those constructs
 restores ordinary cache reuse. This conservative fallback prevents stale
 constant values and missing native declarations while value-bearing interfaces
 are designed.

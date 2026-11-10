@@ -998,6 +998,12 @@ long long minyar_runtime_resultFindFrom(MinyarText *text, MinyarText *pattern, l
     return text->character_offsets ? start + text_scalar_count(text->bytes + byte, found - byte) : found;
 }
 
+/* scopeFindFrom in compiler/stages/scope-ownership.min: the same search for the
+ * ownership lowering, whose tests also compile that file on its own. */
+long long minyar_runtime_scopeFindFrom(MinyarText *text, MinyarText *pattern, long long start) {
+    return minyar_runtime_resultFindFrom(text, pattern, start);
+}
+
 /* compilerAppendIntegers and compilerFillIntegers in compiler/stages/source.min
  * append source[start, end), or count copies of value, to target. Both take a
  * CompilerIntegers record; this field order is their ABI. */

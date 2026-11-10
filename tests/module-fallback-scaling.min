@@ -1,0 +1,83 @@
+// A module-state build of a graph that falls back to the full front end
+// (it imports a standard-library package) must cost about what a direct
+// build costs and emit the same LLVM. The graph has thousands of functions
+// with scope cells, and a global whose source line holds non-ASCII Text: the
+// trace string table near the end of the module repeats that line. The
+// ownership lowering once cut such a module by searching a fresh tail of it
+// per function, and a tail holding non-ASCII Text was indexed again by each
+// search (65 s instead of 2 s on a 117k-line project). CPU is compared as a
+// ratio of interleaved medians, so a loaded or slow host does not change the
+// verdict; quadratic work does.
+use "io" as io
+use "process" as processInfo
+use "../tools/testing.min" as test
+use "./performance-support.min" as metrics
+use "json" as json
+
+constant FUNCTIONS = 2000
+constant RUNS = 3
+constant MAX_RATIO = 2.0
+
+function source(): Text {
+    let parts: List<Text> = ["use \"text\" as utf8\n\nglobal GREETINGS: List<Text> = [\"héllo…\"]\n\n"]
+    for index in 0..FUNCTIONS {
+        parts.add("function piece" + Text(index) + "(n: Integer): Integer {\n")
+        parts.add("    let items: List<Text> = []\n")
+        parts.add("    items.add(GREETINGS[0] + Text(n))\n")
+        parts.add("    let joined = items[0] + \"ü" + Text(index) + "\"\n")
+        parts.add("    return joined.length + utf8.decodeOrStop(Bytes(joined)).length\n}\n")
+    }
+    parts.add("\nlet total = 0\n")
+    for index in 0..FUNCTIONS { parts.add("total = total + piece" + Text(index) + "(" + Text(index % 7) + ")\n") }
+    parts.add("print(total)\n")
+    return metrics.joined(parts, "")
+}
+
+function cpu(outcome: metrics.Outcome, label: Text): Float {
+    test.check(outcome.ok, label + ": " + outcome.error)
+    let value = json.member(outcome.value, "cpu_ms")
+    test.check(value.kind != json.NULL, label + ": CPU time unavailable")
+    return value.number
+}
+
+function median(values: List<Float>): Float {
+    let sorted: List<Float> = []
+    for value in values {
+        let position = sorted.length
+        sorted.add(value)
+        while position > 0 && sorted[position - 1] > value {
+            sorted[position] = sorted[position - 1]
+            position -= 1
+        }
+        sorted[position] = value
+    }
+    return sorted[sorted.length / 2]
+}
+
+function main(): Integer {
+    test.check(processInfo.argumentCount() == 0, "usage: module-fallback-scaling")
+    let work = test.scratch()
+    let root = test.lines(metrics.capture(["/bin/pwd", "-P"], work + "/root").output)[0]
+    let entry = work + "/main.min"
+    io.writeTextFile(entry, source())
+    let library = root + "/library"
+    let direct = [root + "/build/minyarc", entry, work + "/direct.ll", "--scope-owners", "--library", library]
+    let module = [root + "/build/minyar-module-build", root + "/build/minyarc-modules", entry, work + "/module.ll", work + "/cache", "--scope-owners", "--library", library]
+    let directCpu: List<Float> = []
+    let moduleCpu: List<Float> = []
+    for run in 0..RUNS {
+        let order = ["direct", "module"]
+        if run % 2 != 0 { order = ["module", "direct"] }
+        for label in order {
+            if label == "direct" { directCpu.add(cpu(metrics.timed(direct, work + "/direct.log", 600), "direct build")) }
+            else { moduleCpu.add(cpu(metrics.timed(module, work + "/module.log", 600), "module-state build")) }
+        }
+    }
+    test.check(io.readTextFile(work + "/direct.ll") == io.readTextFile(work + "/module.ll"), "module-state fallback LLVM differs from the direct build")
+    let directMedian = median(directCpu)
+    let moduleMedian = median(moduleCpu)
+    print("module-fallback-scaling: direct " + Text(directMedian) + " ms, module-state " + Text(moduleMedian) + " ms CPU (median of " + Text(RUNS) + ")")
+    test.check(moduleMedian <= directMedian * MAX_RATIO, "module-state fallback build costs more than " + Text(MAX_RATIO) + "x the direct build")
+    test.removeTree(work)
+    return 0
+}

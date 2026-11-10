@@ -138,6 +138,11 @@ function scopeSSAName(value: Text): Boolean {
 // read names in place: a split per line would persist in the arena.
 function scopeNextReference(line: Text, start: Integer): Integer { native "runtime" }
 function scopeNameEnd(line: Text, start: Integer): Integer { native "runtime" }
+// The position of pattern at or after start in text, or -1 (Text characters).
+// Searching by position keeps a scan of a whole module linear: a fresh tail
+// slice of non-ASCII Text has no character index, so searching one would
+// index the rest of the module again.
+function scopeFindFrom(text: Text, pattern: Text, start: Integer): Integer { native "runtime" }
 
 // Borrows one coalescing rule may drop. Each candidate owns width consecutive
 // names: its borrowed value, the raw i64 it came from and, for publication,
@@ -709,28 +714,30 @@ function scopeCheckDeclaration(line: Text) {
 }
 
 // The declare lines of text, found without splitting text into lines.
+// Searches continue from a position in text (scopeFindFrom).
 function scopeCheckDeclarations(text: Text) {
     if text.find("@minyar_rc_scope_") < 0 { return }
-    let rest = text
-    if scopeStarts(rest, "declare ") {
-        let end = rest.find("\n")
-        if end < 0 { end = rest.length }
-        scopeCheckDeclaration(rest.slice(0, end))
+    if scopeStarts(text, "declare ") {
+        let end = scopeFindFrom(text, "\n", 0)
+        if end < 0 { end = text.length }
+        scopeCheckDeclaration(text.slice(0, end))
     }
-    let found = rest.find("\ndeclare ")
+    let found = scopeFindFrom(text, "\ndeclare ", 0)
     while found >= 0 {
-        rest = rest.slice(found + 1, rest.length)
-        let end = rest.find("\n")
-        if end < 0 { end = rest.length }
-        scopeCheckDeclaration(rest.slice(0, end))
-        found = rest.find("\ndeclare ")
+        let start = found + 1
+        let end = scopeFindFrom(text, "\n", start)
+        if end < 0 { end = text.length }
+        scopeCheckDeclaration(text.slice(start, end))
+        found = scopeFindFrom(text, "\ndeclare ", start)
     }
 }
 
 // Code between the compiler's functions: runtime declarations, literals,
 // constant initializers, closures, bridges and tables. It is cut where each
 // definition starts; only stretches that call minyar_rc_enter are split into
-// lines and lowered, the rest pass through as views.
+// lines and lowered, the rest pass through as views. A module build passes
+// the whole module here, so the cuts are found by position (see above): the
+// work stays linear in the module's size.
 function lowerScopeGap(text: Text, output: List<Text>, body: List<Text>, bodyStarts: List<Integer>, budget: Integer) {
     scopeCheckDeclarations(text)
     let enter = "\n  call void @minyar_rc_enter("
@@ -739,18 +746,15 @@ function lowerScopeGap(text: Text, output: List<Text>, body: List<Text>, bodySta
         return
     }
     let start = 0
-    let rest = text
-    let found = rest.find("\ndefine ")
-    while start < text.length {
-        let end = text.length
-        if found >= 0 { end = start + found + 1 }
+    let length = text.length
+    let found = scopeFindFrom(text, "\ndefine ", 0)
+    while start < length {
+        let end = length
+        if found >= 0 { end = found + 1 }
         let stretch = text.slice(start, end)
         if stretch.find(enter) >= 0 { lowerScopeText(stretch, output, body, bodyStarts, budget) } else { output.add(stretch) }
         start = end
-        if found >= 0 {
-            rest = text.slice(start, text.length)
-            found = rest.find("\ndefine ")
-        }
+        if found >= 0 { found = scopeFindFrom(text, "\ndefine ", start) }
     }
 }
 

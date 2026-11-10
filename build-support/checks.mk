@@ -519,6 +519,16 @@ check-incremental-module-performance: build/minyarc build/minyarc-modules build/
 
 check: check-incremental-module-performance
 
+.PHONY: check-module-fallback-scaling
+build/tooling/tests/module-fallback-scaling.ll: tests/performance-support.min experiments/memory/study-support.min experiments/memory/measurement-stats.min
+build/tooling/tests/module-fallback-scaling: TOOL_RUNTIME = build/testing/cycle-runtime.o
+build/tooling/tests/module-fallback-scaling: TOOL_NATIVE = tests/performance-resources.c
+build/tooling/tests/module-fallback-scaling: build/testing/cycle-runtime.o tests/performance-resources.c
+check-module-fallback-scaling: build/minyarc build/minyarc-modules build/minyar-module-build build/tooling/tests/module-fallback-scaling
+	$(LIMITED) ./build/tooling/tests/module-fallback-scaling
+
+check check-portable: check-module-fallback-scaling
+
 .PHONY: check-incremental-modules-sanitize
 check-incremental-modules-sanitize: build/minyarc-modules-sanitize build/minyar-module-build-sanitize build/minyarc-modules build/minyar-module-build build/minyar-runtime.o build/minyar-runtime-sanitize.o build/ownership-runtime.o build/minyarc-callbacks-sanitize build/module-compiler-stage2.ll build/minyar-compiler-runtime.ll build/tooling/tests/incremental-modules build/tooling/tests/incremental-module-driver build/tooling/tests/incremental-module-delta build/tooling/tests/incremental-module-artifacts build/tooling/tests/incremental-module-regressions build/tooling/tests/regressions build/tooling/tests/ownership build/tooling/tests/recursive-data
 	ASAN_OPTIONS=detect_leaks=0 MINYAR_TEST_COMPILER=./build/minyarc-modules-sanitize MINYAR_MODULE_CALLBACK_COMPILER=./build/minyarc-callbacks-sanitize $(SANITIZER_LIMITED) ./build/tooling/tests/incremental-modules
