@@ -125,6 +125,9 @@ check: check-conformance
 check-memory: build/minyarc build/minyar-runtime.o build/tooling/tests/memory
 	$(LIMITED) ./build/tooling/tests/memory
 
+# The memory suite costs under two CPU-seconds, so it gates every commit.
+check-portable: check-memory
+
 check-runtime-unit: build/runtime-unit
 	$(LIMITED) ./build/runtime-unit
 
