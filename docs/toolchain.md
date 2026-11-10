@@ -87,11 +87,27 @@ export LLVM_CC="$MINYAR_CLANG"
 ./minyar --doctor
 ```
 
+On ARM64 Ubuntu, install the same packages, then download and verify the ARM64
+archive instead; extract it exactly as above:
+
+```sh
+test "$(uname -m)" = aarch64
+minyar_llvm_dir="$HOME/.cache/minyar/toolchains/llvm-23.1.3"
+minyar_download_dir="$(mktemp -d)"
+minyar_archive="$minyar_download_dir/LLVM-23.1.3-Linux-ARM64.tar.zst"
+curl --fail --location --retry 3 \
+  'https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.3/LLVM-23.1.3-Linux-ARM64.tar.zst' \
+  -o "$minyar_archive" &&
+printf '%s  %s\n' \
+  '1154f37ec15b5654fcb8cc3a8a2352a4cc4eef44bdff7ddd47fb10ea85c82f01' \
+  "$minyar_archive" | sha256sum --check
+```
+
 LLVM package repositories can advance within a release branch. Packages named
 `*-23` alone do not establish the required patch version: `--doctor` must report
-23.1.3 and pass its link checks. ARM64 Linux needs a matching native toolchain;
-the X64 archive is not an ARM64 installation. Other distributions need their
-equivalent C development, Make and zsh packages.
+23.1.3 and pass its link checks. The X64 and ARM64 archives are not
+interchangeable. Other distributions need their equivalent C development, Make
+and zsh packages.
 
 ## Compiler selection and verification
 
@@ -185,4 +201,4 @@ explicitly. Paths containing spaces, apostrophes or commas are supported.
 LLVM derives cache keys from the LLVM version, input modules, imports/exports
 and code generation configuration. Deleting the cache is safe; the next link
 rebuilds its objects. See LLVM's [ThinLTO cache and pruning options](https://clang.llvm.org/docs/ThinLTO.html#incremental)
-and [cache key implementation](https://github.com/llvm/llvm-project/blob/llvmorg-23.1.2/llvm/lib/LTO/LTO.cpp).
+and [cache key implementation](https://github.com/llvm/llvm-project/blob/llvmorg-23.1.3/llvm/lib/LTO/LTO.cpp).
