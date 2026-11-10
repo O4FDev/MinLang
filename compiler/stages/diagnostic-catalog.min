@@ -9,7 +9,73 @@ function diagnosticEnds(message: Text, suffix: Text): Boolean {
     return message.length >= suffix.length && message.slice(message.length - suffix.length, message.length) == suffix
 }
 
+// The quoted name in a message such as "unknown type 'u64'", or "".
+function diagnosticQuotedName(message: Text, prefix: Text): Text {
+    if !diagnosticBegins(message, prefix) { return "" }
+    let rest = message.slice(prefix.length, message.length)
+    let close = rest.find("'")
+    if close < 0 { return "" }
+    return rest.slice(0, close)
+}
+
+function diagnosticStatementWord(word: Text): Boolean {
+    return word == "if" || word == "return" || word == "break" || word == "continue" || word == "while" || word == "for" || word == "let"
+}
+
+function diagnosticWordIn(word: Text, words: List<Text>): Boolean {
+    let index = 0
+    while index < words.length {
+        if words[index] == word { return true }
+        index = index + 1
+    }
+    return false
+}
+
+// Spellings carried over from Rust, C, Go, Swift, Zig, Python and TypeScript.
+// A translation names the Minyar form directly, so it replaces spelling advice.
+function diagnosticHabit(message: Text): Text {
+    let value = diagnosticQuotedName(message, "I can't find a value named '")
+    let called = diagnosticQuotedName(message, "I can't find a function named '")
+    let word = value
+    if word == "" { word = called }
+    if diagnosticWordIn(word, ["fn", "func", "def", "fun"]) { return "declare a function as `function name(value: Integer): Integer { ... }`; a method is `function Record.name(...) { ... }`" }
+    if diagnosticWordIn(word, ["struct", "class"]) { return "declare a record as `record Point { x: Integer; y: Integer }` and its methods as `function Point.name(...) { ... }`" }
+    if diagnosticWordIn(word, ["enum", "union"]) { return "declare a choice as `choice Shape { Circle(radius: Float); Empty }` and read it with match" }
+    if diagnosticWordIn(word, ["impl", "trait", "interface", "protocol", "extension"]) { return "write methods as `function Record.name(...)` in the record's module; shared behavior is a `capability` with `conform Record to Capability`" }
+    if diagnosticWordIn(word, ["var", "val", "const", "mut"]) { return "declare a binding with `let name = value` (it can be reassigned) or `constant name = value` (it cannot)" }
+    if diagnosticWordIn(word, ["nil", "null", "NULL", "nullptr", "undefined"]) { return "Minyar has no null; use Maybe<T> with `None` and `Some(value)`, and read it with match or `if value is Some(item)`" }
+    if diagnosticWordIn(word, ["println", "printf", "puts", "console", "eprintln"]) { return "use print(value); it writes the value and a newline to standard output" }
+    if diagnosticWordIn(word, ["panic", "abort", "unreachable", "todo"]) { return "stop the program with fail(\"what went wrong\"); it prints a stack trace" }
+    if diagnosticWordIn(word, ["assert", "assert_eq", "require"]) { return "inside a test block use expect(condition); elsewhere use a requires(...) contract on the function or `if !(condition) { fail(\"...\") }`" }
+    if word == "expect" { return "expect(condition) works only inside a `test \"name\" { ... }` block; in a tests/*.min program or ordinary code write `if !(condition) { fail(\"what went wrong\") }`" }
+    if diagnosticWordIn(word, ["len", "sizeof", "size"]) { return "use the `.length` property, as in `values.length`; sizeOf(Record) is the byte size of a native C-layout record" }
+    let type = diagnosticQuotedName(message, "unknown type '")
+    if diagnosticWordIn(type, ["u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "usize", "isize", "int", "uint", "long", "short", "byte", "size_t", "uintptr_t", "int32_t", "int64_t", "uint8_t", "uint32_t", "uint64_t", "Int", "UInt", "Int64", "Int32", "UInt8", "UInt16", "UInt32", "UInt64"]) { return "Minyar has one whole-number type, Integer: signed 64-bit with checked overflow. Fixed-width fields exist only in `record Name native \"c\"` layouts, and Bytes reads and writes them with methods such as getUInt32 and setUInt32" }
+    if diagnosticWordIn(type, ["f32", "f64", "double", "float", "Double", "Float64", "Float32"]) { return "use Float, an IEEE 754 double; math.toFloat32 rounds to single precision" }
+    if diagnosticWordIn(type, ["bool", "Bool"]) { return "use Boolean" }
+    if diagnosticWordIn(type, ["String", "str", "string", "char*"]) { return "use Text, which holds UTF-8; keep arbitrary bytes in Bytes" }
+    if diagnosticWordIn(type, ["char", "rune", "Char"]) { return "use Character, one Unicode scalar value" }
+    if diagnosticWordIn(type, ["Vec", "Array", "ArrayList", "slice", "Slice", "VecDeque", "array"]) { return "use List<T>, a growable shared list; use Bytes for packed bytes" }
+    if diagnosticWordIn(type, ["HashMap", "BTreeMap", "Dictionary", "dict", "map"]) { return "use Map<Key, Value>" }
+    if diagnosticWordIn(type, ["HashSet", "BTreeSet"]) { return "use Set<Item>" }
+    if diagnosticWordIn(type, ["Option", "Optional"]) { return "use Maybe<T> with `Some(value)` and `None`" }
+    if diagnosticWordIn(type, ["void", "unit", "()", "Void"]) { return "use Nothing, or leave out the return type" }
+    if diagnosticWordIn(type, ["&", "*", "&mut", "Box", "Rc", "Arc", "RefCell", "Cell", "ptr"]) { return "Minyar has no reference or pointer types: records, Lists, Maps, Sets and Bytes are already shared references, so pass them directly" }
+    let mapMethod = diagnosticQuotedName(message, "this Map has no method named '")
+    if mapMethod != "" { return "iterate a Map with `for key in map { ... }`; read with map[key] or map.getOr(key, fallback), write with map[key] = value, and use has, remove and clear" }
+    let setMethod = diagnosticQuotedName(message, "this Set has no method named '")
+    if setMethod != "" { return "a Set has add, contains, remove and clear; iterate it with `for item in set { ... }`" }
+    let method = diagnosticQuotedName(message, "this value has no method named '")
+    if diagnosticWordIn(method, ["push", "append", "push_back", "pushBack"]) { return "add an element to a List with values.add(value)" }
+    let field = diagnosticQuotedName(message, "this value does not provide a field named '")
+    if diagnosticWordIn(field, ["size", "len", "count", "Count", "Length"]) { return "use `.length` for the number of elements in Text, Lists, Bytes, Maps and Sets" }
+    return ""
+}
+
 function diagnosticCode(message: Text): Text {
+    if diagnosticBegins(message, "a match expression arm must produce a value") || diagnosticBegins(message, "an arm of a match that produces a value") || message.find("is a statement, so it cannot be used as a value") >= 0 { return "E0207" }
+    if message == "a Result expression must be handled or bound" { return "E0412" }
+    if diagnosticBegins(message, "let pattern can miss") { return "E0601" }
     if diagnosticBegins(message, "Protocol ownership:") || diagnosticBegins(message, "protocol primitives ") || diagnosticBegins(message, "protocol completion ") || diagnosticBegins(message, "a protocol completion ") || diagnosticBegins(message, "opaque protocol completion ") { return "E0801" }
     if message == "a declaration is missing its '{ ... }' body" || message == "callback is missing its body" { return "E0202" }
     if message == "a declaration is missing its closing '}'" || message == "callback body is missing its closing brace" { return "E0202" }
@@ -25,7 +91,7 @@ function diagnosticCode(message: Text): Text {
     if diagnosticBegins(message, "unknown type") || diagnosticBegins(message, "I can't find a record named") || (diagnosticBegins(message, "module '") && message.find("has no record named") >= 0) { return "E0303" }
     if message.find("private to its module") >= 0 { return "E0307" }
     if diagnosticBegins(message, "record '") && diagnosticEnds(message, "' has private fields, so only its own module can create one") { return "E0307" }
-    if message.find("has no field named") >= 0 { return "E0304" }
+    if message.find("has no field named") >= 0 || message.find("does not provide a field named") >= 0 { return "E0304" }
     if message.find("has no method named") >= 0 { return "E0305" }
     if diagnosticBegins(message, "unknown case") || (diagnosticBegins(message, "choice '") && message.find("has no case") >= 0) { return "E0306" }
     if diagnosticBegins(message, "match is missing cases") || diagnosticBegins(message, "match must handle") { return "E0601" }
@@ -87,7 +153,7 @@ function diagnosticArgumentCount(name: Text, expected: Integer, received: Intege
 }
 
 function diagnosticCodes(): List<Text> {
-    return ["E0001", "E0101", "E0102", "E0103", "E0104", "E0105", "E0201", "E0202", "E0203", "E0204", "E0205", "E0206", "E0301", "E0302", "E0303", "E0304", "E0305", "E0306", "E0307", "E0401", "E0402", "E0403", "E0404", "E0405", "E0406", "E0407", "E0408", "E0409", "E0410", "E0411", "E0501", "E0502", "E0601", "E0602", "E0603", "E0701", "E0801", "E0901"]
+    return ["E0001", "E0101", "E0102", "E0103", "E0104", "E0105", "E0201", "E0202", "E0203", "E0204", "E0205", "E0206", "E0207", "E0301", "E0302", "E0303", "E0304", "E0305", "E0306", "E0307", "E0401", "E0402", "E0403", "E0404", "E0405", "E0406", "E0407", "E0408", "E0409", "E0410", "E0411", "E0412", "E0501", "E0502", "E0601", "E0602", "E0603", "E0701", "E0801", "E0901"]
 }
 
 function diagnosticTitle(code: Text): Text {
@@ -103,6 +169,7 @@ function diagnosticTitle(code: Text): Text {
     if code == "E0204" { return "A control-flow statement is in the wrong place" }
     if code == "E0205" { return "A native function body is invalid" }
     if code == "E0206" { return "The program has two entry points" }
+    if code == "E0207" { return "A statement is used where a value is expected" }
     if code == "E0301" { return "A value name could not be found" }
     if code == "E0302" { return "A function name could not be found" }
     if code == "E0303" { return "A type name could not be found" }
@@ -121,6 +188,7 @@ function diagnosticTitle(code: Text): Text {
     if code == "E0409" { return "Nothing cannot be stored in a binding" }
     if code == "E0410" { return "Iteration or indexing needs a supported value" }
     if code == "E0411" { return "These collections cannot be compared with == or !=" }
+    if code == "E0412" { return "A Result is ignored" }
     if code == "E0501" { return "A name is declared more than once" }
     if code == "E0502" { return "A function name is reserved" }
     if code == "E0601" { return "A match leaves some cases unhandled" }
@@ -133,6 +201,10 @@ function diagnosticTitle(code: Text): Text {
 }
 
 function diagnosticRepair(code: Text, message: Text): Text {
+    if code == "E0207" && message.find("'if'") >= 0 { return "choose a value with `match condition { true { first } false { second } }`, or declare the binding first and assign it inside each branch" }
+    if code == "E0207" { return "a match that produces a value needs one expression in each arm. To leave early from one case, check it as a statement first: `if result is Err(problem) { print(problem); return 1 }`, then read `result.unwrap()`. Otherwise use the match as a statement and assign a binding inside each arm" }
+    if code == "E0412" { return "handle it with match or `if value is Err(problem) { ... }`, pass the error on with try, stop on failure with .unwrap() or .expect(\"why\"), or discard it deliberately with `let _ = ...`" }
+    if diagnosticBegins(message, "let pattern can miss") { return "let only accepts patterns that always match; Minyar has no let-else. Use `if value is Pattern { ... }` or match, or bind the value and test the failing case first" }
     if code == "E0901" { return "keep host effects out of what a deterministic function or callback reaches: read them in the caller, or use the simulation World" }
     if code == "E0801" { return "complete or transfer each token exactly once on every normal path; keep tokens in direct local bindings and use the protocol library primitives" }
     if message == "try requires a Result-returning function" || diagnosticBegins(message, "try requires a Result-returning function; found ") { return "use try inside a function returning Result, or handle this Result with match" }
@@ -217,6 +289,7 @@ function diagnosticLesson(code: Text): Text {
     if code == "E0204" { return "Control-flow words act on the surrounding structure. break and continue need a loop; else follows an if branch; return leaves a function. A top-level program can finish with exit(status).\n\n```minyar\nfor index in 0..3 {\n    if index == 2 { break }\n    print(index)\n}\n```" }
     if code == "E0205" { return "A native declaration links a library function to its host implementation. Its body contains only native and the library name. It cannot be the program's main function. The host must supply the corresponding symbol.\n\n```minyar\npublic function clockTicks(): Integer { native \"clock\" }\n```" }
     if code == "E0206" { return "A program starts in one place: either its top-level statements or function main(). Move the top-level work into main, or remove main and keep the top-level form.\n\n```minyar\nfunction main() {\n    print(\"The harbour wakes.\")\n}\n```" }
+    if code == "E0207" { return "if, return, break, continue and loops are statements: they do things but produce no value. A match used as a value holds exactly one expression in each arm, and an if cannot stand where a value is expected. To leave a function early from one case, test that case as a statement first; to choose between two values, match on the Boolean.\n\n```minyar\nfunction parsePort(text: Text): Result<Integer, Text> {\n    if text == \"\" { return Err(\"no port given\") }\n    return Ok(8080)\n}\n\nfunction main(): Integer {\n    let parsed = parsePort(\"8080\")\n    if parsed is Err(problem) {\n        print(problem)\n        return 1\n    }\n    let port = parsed.unwrap()\n    let kind = match port < 1024 { true { \"privileged\" } false { \"unprivileged\" } }\n    print(kind)\n    return 0\n}\n```" }
     if code == "E0301" { return "A value is visible only in its scope, after its local declaration. Check the spelling first. A name declared inside a function or a branch is not available outside that body.\n\n```minyar\nlet lantern = \"a warm light\"\nprint(lantern)\n```" }
     if code == "E0302" { return "Check the function name and the module alias before it. An imported function must be declared public in its own module. Functions can be declared later in the same module.\n\n```minyar\nfunction portrait(name: Text): Text { return \"A portrait of \" + name }\nprint(portrait(\"Ada\"))\n```" }
     if code == "E0303" { return "A type names a kind of value, such as Integer, Text, a record, or a choice. Use the exact spelling and capitalisation. Imported types use their module alias and must be public.\n\n```minyar\nrecord Window { title: Text }\nlet window: Window = Window { title: \"Dawn\" }\nprint(window.title)\n```" }
@@ -235,6 +308,7 @@ function diagnosticLesson(code: Text): Text {
     if code == "E0409" { return "A function without a result type returns Nothing. Such a call performs an action rather than producing a stored value. Call it directly as a statement, or return a meaningful value from the function.\n\n```minyar\nfunction lightWindow() { print(\"A warm light.\") }\nlightWindow()\n```" }
     if code == "E0410" { return "A for loop needs an iterable value, such as a range or a collection. A collection position needs an Integer. Check whether you intended to use the collection itself, its length, or one element.\n\n```minyar\nlet windows = [\"Dawn\", \"Harbour\"]\nfor index in 0..windows.length { print(windows[index]) }\n```" }
     if code == "E0411" { return "Lists and Bytes do not provide == or !=. Comparing their stored addresses would not compare their contents. Compare their lengths first, then corresponding elements.\n\n```minyar\nfunction same(left: List<Integer>, right: List<Integer>): Boolean {\n    if left.length != right.length { return false }\n    for index in 0..left.length {\n        if left[index] != right[index] { return false }\n    }\n    return true\n}\nprint(same([1, 2], [1, 2]))\n```" }
+    if code == "E0412" { return "A Result carries an error that the caller must decide about, so a Result cannot be dropped silently. Handle both cases with match, pass the error to your caller with try, stop the program on failure with unwrap() or expect(message), or discard it explicitly with `let _ =` when the failure truly does not matter.\n\n```minyar\nfunction save(name: Text): Result<Nothing, Text> {\n    if name == \"\" { return Err(\"no name\") }\n    return Ok()\n}\n\nfunction saveBoth(): Result<Nothing, Text> {\n    try save(\"first\")\n    return save(\"second\")\n}\n\nmatch saveBoth() {\n    Ok() { print(\"saved\") }\n    Err(problem) { print(problem) }\n}\nlet _ = save(\"\")\n```" }
     if code == "E0501" { return "Two declarations in the same namespace need different names. A record literal supplies each field once; a choice match handles each case once. Remove the repeated item or rename it to express a different role.\n\n```minyar\nrecord Window { title: Text; light: Integer }\nlet window = Window { title: \"Dawn\"; light: 3 }\nprint(window.title)\n```" }
     if code == "E0502" { return "Some function names belong to built-in operations. Choose a descriptive name for your own function so calls have one clear meaning. A local binding may still use an ordinary contextual name.\n\n```minyar\nfunction printLocal(message: Text) { print(message) }\nprintLocal(\"The harbour is home.\")\n```" }
     if code == "E0601" { return "A match must handle every possible case. Add the missing named arms when each case needs its own behavior, or an else arm when all remaining cases share one behavior. Result needs both Ok and Err.\n\n```minyar\nchoice Weather { Clear; Rain(drops: Integer) }\nlet weather: Weather = Rain(3)\nmatch weather {\n    Clear { print(\"The stars are out.\") }\n    Rain(drops) { print(drops) }\n}\n```" }
