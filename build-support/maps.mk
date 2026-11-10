@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-maps check-maps-sanitize bench-maps bench-maps-baseline
 MAP_FRONTENDS = build/minyarc build/minyarc-modules build/minyarc-callbacks build/minyarc-errors
 MAP_SANITIZED_FRONTENDS = $(addsuffix -sanitize,$(MAP_FRONTENDS))

@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-calldepth check-calldepth-sanitize check-calldepth-profiles check-calldepth-launcher check-calldepth-reporting check-calldepth-reporting-sanitize check-calldepth-hooks check-calldepth-hooks-sanitize
 build/tooling/tests/calldepth: TOOL_NATIVE = tests/sha256-test-native.c
 build/tooling/tests/calldepth: TOOL_LIBS = $(TOOL_CRYPTO)

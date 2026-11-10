@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 # All safe ownership controls run only on Linux. No Docker call.
 # Readiness records bootstrap success; the phony gate verifies all inputs anew.
 # Order-only setup sources do not repair a valid cache after source-only edits.

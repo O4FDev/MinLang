@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-files check-files-sanitize
 FILES_TEST_SOURCES = tests/files-focused.min tests/files-test-path.h tests/files-ranges.c tests/files-prepare.c tests/files-eventloop.min runtime/native/files.c library/files.min
 # Sparse offset controls write beyond 4 GiB; allow 8 GiB logical file sizes here.

@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-net-additions check-net-additions-sanitize check-files-system check-files-system-sanitize
 .PHONY: check-neodb-review check-neodb-review-sanitize
 check-neodb-review: build/tooling/tests/neodb-review

@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 NATIVE_HOST_SOURCES = scripts/native-host.min
 NATIVE_SWIFT_SOURCES = $(NATIVE_HOST_SOURCES) scripts/native_project.min scripts/macos-app.min scripts/native-swift.min
 MACOS_GATE_SOURCES = $(NATIVE_HOST_SOURCES) tests/macos-native-gate.min

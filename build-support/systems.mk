@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-sys-native check-sys-native-sanitize check-sys-files check-sys-files-sanitize
 .PHONY: check-checksums-encoding check-checksums-encoding-sanitize check-time-civil check-time-civil-sanitize
 .PHONY: check-io-lines check-io-lines-sanitize

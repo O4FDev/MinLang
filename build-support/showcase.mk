@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-showcase check-showcase-daybook check-showcase-tideboard check-showcase-lantern-trail
 
 SHOWCASE_DEPS = build/minyarc build/minyar-default-runtime.o build/minyar-default-runtime-release.ll build/tooling/tools/clang-driver

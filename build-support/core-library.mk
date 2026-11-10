@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-octal-literals check-octal-literals-sanitize check-reserved-names check-reserved-names-sanitize
 
 check-octal-literals: build/minyarc build/minyar-runtime.o build/tooling/tests/octal-literals

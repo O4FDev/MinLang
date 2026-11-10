@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: completionio-neodb-linux check-completionio-neodb-kernel check-completionio-neodb-sanitize
 
 NEODB_COMPLETION_MODULES = tests/fixtures/neodb-simulation/src/storage/wal.min \

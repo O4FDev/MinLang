@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-mobile check-mobile-tools check-mobile-bridge check-mobile-gallery check-mobile-sanitize check-mobile-ios check-mobile-ios-provider check-mobile-ios-smoke-build check-mobile-ios-simulator check-mobile-android
 .PHONY: check-mobile-android-transport check-mobile-android-transport-sanitize check-mobile-android-host check-mobile-android-host-sanitize check-mobile-android-java
 

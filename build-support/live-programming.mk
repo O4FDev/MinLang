@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 build/tooling/tools/live-build-cli build/tooling/tests/live-transform: TOOL_NATIVE = tools/clang-driver-host.c
 build/tooling/tools/live-build-cli build/tooling/tests/live-transform: tools/clang-driver-host.c
 

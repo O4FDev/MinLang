@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 # Portable networking foundations have their own gates so protocol tests can
 # grow without mixing native desktop prerequisites into the portable suite.
 .PHONY: check-errors-values check-net check-net-loop check-net-connect check-net-connect-sanitize check-net-paths check-net-paths-sanitize check-os-net-stack check-os-net-stack-sanitize

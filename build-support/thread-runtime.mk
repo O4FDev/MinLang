@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-thread-ordinary check-thread-runtime-ir check-thread-domain check-thread-buffers check-thread-runtime check-thread-runtime-sanitize check-thread-runtime-tsan
 build/tooling/tests/thread-runtime.ll: tests/thread-port-support.min
 build/tooling/tests/thread-runtime-ir.ll: tests/thread-port-support.min

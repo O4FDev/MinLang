@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-completionio check-completionio-native check-completionio-kernel check-completionio-sanitize
 
 COMPLETIONIO_INPUTS = runtime/native/completionio.c runtime/minyar_native.h

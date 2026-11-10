@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-thread-compiler check-thread-effects check-thread-language check-thread-language-sanitize check-thread-tsan-control
 .PHONY: check-thread-scaling-protocol
 .PHONY: check-thread-language-tsan

@@ -1,3 +1,8 @@
+# The Makefile asks for the host system once; a rule file read on its own
+# (the build-wiring probes) asks itself.
+ifeq ($(origin MINYAR_HOST_SYSTEM),undefined)
+MINYAR_HOST_SYSTEM := $(shell uname -s)
+endif
 .PHONY: check-system-services check-system-services-sanitize check-system-process check-system-process-sanitize
 .PHONY: check-system-process-boundary
 build/tooling/tests/system-process-boundary build/tooling/tests/system-services-test build/tooling/tests/system-process-test: build/tooling/tools/clang-driver
