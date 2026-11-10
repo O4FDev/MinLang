@@ -35,6 +35,25 @@ The 768-digit bound and nonzero-tail technique also appear in the
 [rust-lexical implementation notes](https://raw.githubusercontent.com/Alexhuszagh/rust-lexical/main/lexical-parse-float/docs/Algorithm.md).
 This implementation uses a separate quotient/remainder algorithm.
 
+## Short decimals
+
+A lexeme whose retained coefficient has at most 19 digits (any number of
+leading zeros, no discarded nonzero tail) fits one 64-bit word `d`, and its
+value is `d * 10^p`. The helper first rounds it with Russ Cox's unrounded
+scaling ([article](https://research.swtch.com/fp),
+[proof](https://research.swtch.com/fp-proof)), shared with Float printing in
+`runtime/minyar_float_scale.h`: `d` is left-justified and multiplied by a
+128-bit power of ten from `runtime/minyar_pow10_table.h`, keeping the integer
+part, a half bit and a sticky bit, and the result rounds to nearest even. Only
+integer arithmetic is used. Results that would overflow, scales outside the
+table and subnormals more than 63 bits below the significand return to the
+exact path below, so infinity and every boundary keep one implementation of
+their rounding. This is the same table-based approach as
+[Eisel–Lemire](https://arxiv.org/abs/2101.11408), with one multiplication in
+most cases.
+
+## Exact division
+
 The decimal magnitude is the number of significant digits plus the decimal
 exponent, not the scientific exponent. Magnitudes above 309 overflow; those
 below -323 round to zero. The boundary magnitudes require exact conversion.
@@ -62,17 +81,20 @@ digits, the numerator needs at most 2658 bits and the denominator at most
 has a checked margin. The helper scans the entire input and uses bounded
 integer work and about 2.1 KiB of arithmetic storage. It makes no allocation.
 The surrounding JSON parser still allocates spelling Text and result trees.
-This is an exact compact converter, not a claim to match table-based fast
-parsers such as [Eisel–Lemire and its 2022 follow-up](https://arxiv.org/abs/2212.06644).
+The exact converter is the fallback for long, overflowing and deeply
+subnormal lexemes; short ones take the table-based path above.
 
 ## Evidence and limits
 
-`make check-json-numbers` generates 708 exact-rational oracles and compares
+`make check-json-numbers` generates 1,118 exact-rational oracles and compares
 decoded bits, without using a host Float parser to calculate expectations.
 The oracle binary-searches ordered binary64 dyadics and compares exact
 midpoints; it differs from the implementation's quotient/remainder method.
 Cases cover signed zero, subnormals, even/odd ties, the normal boundary,
-overflow, 20,001-zero exponent cancellation and 10,000-digit suffixes. Corrupt expected
+overflow, 20,001-zero exponent cancellation and 10,000-digit suffixes. Short
+coefficients of 1–19 digits cover every third decimal exponent from −345 to
+309, and 64 random exact midpoints with 16–19-digit spellings test ties to
+even with their neighbours one unit away. Corrupt expected
 bits must fail both the C probe and the public-API harness with the expected
 diagnostic.
 

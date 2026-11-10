@@ -8,6 +8,7 @@
  * and a nonzero-tail bit: a discarded suffix can affect rounding only when
  * the retained prefix is exactly a midpoint. Powers and scaled remainders
  * need at most 3732 bits; 128 base-2^30 limbs leave a checked margin. */
+#include "minyar_float_scale.h"
 enum { DECIMAL_LIMBS = 128, DECIMAL_DIGITS = 800 };
 #define DECIMAL_MASK UINT32_C(0x3fffffff)
 typedef struct {
@@ -199,6 +200,13 @@ double minyar_runtime_jsonNumber(const MinyarText *text) {
     if (magnitude < -323)
         return decimal_float(0, negative);
     int power = (int)magnitude - (int)input.kept;
+    /* At most 19 significant digits fit one word: round them with one
+     * unrounded scaling (minyar_float_scale.h). Overflow and scales outside
+     * that fast path fall through to the exact division below. */
+    uint64_t short_value, short_bits;
+    if (input.kept <= 19 && !input.sticky && decimal_u64(&input.value, &short_value) &&
+        float_parse_short(short_value, power, &short_bits))
+        return decimal_float(short_bits, negative);
     DecimalNatural numerator = input.value, denominator = {{1}, 1};
     if (power >= 0) {
         for (int i = 0; i < power; i++)

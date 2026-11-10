@@ -115,6 +115,18 @@ def corpus():
             power = rng.randrange(-330, 316) - count
             source = coefficient + "e" + str(power)
             cases.extend([source, "-" + source, coefficient + "000e" + str(power - 3)])
+    # Up to 19 significant digits take the unrounded-scaling path: cover every
+    # decimal exponent band, and exact binary64 midpoints with short spellings
+    # (ties to even) with their neighbours one unit away.
+    for power in range(-345, 311, 3):
+        digits = rng.randrange(1, 20)
+        coefficient = str(rng.randrange(10 ** (digits - 1), 10 ** digits))
+        cases.append(coefficient + "e" + str(power))
+    for _ in range(64):
+        mantissa, shift = rng.randrange(1 << 52, 1 << 53), rng.randrange(0, 11)
+        middle = Fraction(2 * mantissa + 1) * Fraction(2) ** (shift - 1)
+        unit = Fraction(1, 2) if shift == 0 else Fraction(1)
+        cases.extend(decimal(middle + delta) for delta in (-unit, 0, unit))
     # Huge exponents must saturate only after the complete lexeme is validated.
     cases.extend(["0e" + "9" * 10000, "-0e-" + "9" * 10000,
                   "1e" + "9" * 10000, "1e-" + "9" * 10000])
@@ -186,7 +198,7 @@ def run(command, *, environment=None, expected=0, diagnostic=None):
 def verify(destination, sanitize):
     header = Path("runtime/minyar_decimal.h").resolve()
     cases = [(source, rounded(source)) for source in corpus()]
-    assert len(cases) == 708
+    assert len(cases) == 1118
     rows = [f"{bits:016x}\t{source}\n" for source, bits in cases]
     fixture = destination / "cases.tsv"
     fixture.write_text("".join(rows))
