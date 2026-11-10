@@ -11,7 +11,7 @@ GREEN: 4 affected check(s) passed in 41 s. Run the full gate (tools/fast-gate.sh
 RED: 1 of 9 failed: check-suite-catalogue
 ```
 
-`--plan` prints the selection without running the selected checks; it still builds stale outputs for the content cut-off unless `--no-cutoff` is given. `--only PATH...` limits the
+`--plan` (or `make dev-check-plan ONLY=PATH`) prints the selection without running the selected checks; it still builds stale outputs for the content cut-off unless `--no-cutoff` is given. `--only PATH...` limits the
 claim to some changed paths or directories; the verdict then names how many
 other changed paths it did not cover. `--jobs N` (default 4) is passed to the
 check runner. The command exits 0 for green, 1 for red, 2 when it cannot
@@ -36,7 +36,7 @@ Selection comes from recorded dependencies, not from a list of areas:
    `strace -f --seccomp-bpf -e trace=%file,%process` and records, for every
    check, each path its processes opened, stat'ed or executed (failed lookups
    included, since a file created there changes behaviour), and each directory
-   they listed. Processes are attributed to the check whose `make -j1 check-x`
+   they listed. Processes are attributed to the check whose `make -j1 check-<name>`
    started them. The check's own Make parse (Makefile, `.mk`, `.d` includes and
    `$(shell ...)` run while parsing) is excluded; step 4 compares Make itself.
    The index also keeps the base tree's content hashes, every Make rule and
@@ -85,7 +85,7 @@ and the compiler's LLVM IR with entry-instrumented IR profile counters
 (`-fprofile-generate -mllvm -pgo-instrument-entry`), every link gets the
 profile runtime plus a small object that also writes the profile on `_exit`,
 `abort` and fatal signals, and a `make` shim on `PATH` sends the profiles of
-each `make -j1 check-x` to that check's directory. A process killed with
+each `make -j1 check-<name>` to that check's directory. A process killed with
 SIGKILL loses its counts; LLVM 23's function-entry-only and continuous modes
 produced unreadable profiles for runtime-linked programs and are not used. The index also keeps a function
 snapshot of `compiler/**/*.min` and `runtime/**/*.{c,h}`. IR and assembly emitted

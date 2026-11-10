@@ -38,6 +38,19 @@ This saves `build/performance-baseline.json`. Later runs fail when measurements
 exceed the configured tolerance. Compare runs on the same host with the same
 build configuration.
 
+## Manual benchmarks
+
+No gate runs these targets; run them when a change touches what they measure.
+
+- `make bench-maps`: Map operations (`tests/maps-bench.min`).
+- `make bench-maps-baseline` and `make benchmark-text-basics`: compare with
+  `build/minyarc-baseline`, a compiler built from the baseline control
+  source. The Text benchmark writes `build/text-basics-benchmark.json` and
+  `build/text-find-prefixes-benchmark.json`.
+- `make bench-formats`: `bench-compression`, `bench-sha256` and `bench-tar`.
+- `make bench-httpserver`: the HTTP server against axum
+  (`benchmarks/httpserver/`).
+
 ## Absolute compiler budget
 
 `check-budget` enforces 75 million retired instructions and 17 MiB peak memory,

@@ -1208,8 +1208,9 @@ The combined candidate includes three maintained checks in `make check`:
 
 The stack test shares `experiments/memory/production-live-oracle.c`, an existing
 maintained fixture. It has no dependency on the archived stack experiments.
-For an individual instrumentation mode use
-`python3 tests/stack-ownership.py --mode native` or `--mode sanitize`.
+For one configuration run its own target,
+`make check-stack-ownership-PROFILE-BUDGET-MODE`, for example
+`make check-stack-ownership-system-32-native` or `-lazy-8-sanitize`.
 The Linux correctness runner includes these three checks and both compiler
 fixed points. Correctness under virtualization or instruction translation is
 not a latency measurement on native deployment hardware.
