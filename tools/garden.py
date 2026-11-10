@@ -10,8 +10,9 @@ can be compared. Sections (docs/garden.md explains each and what to do about it)
   leftovers  tracked agent artefacts: logs, backups, scratch files, dated notes outside docs/records
   local      ignored files at the top of this working tree (old saves, notes, scratch output)
   todos      TODO/FIXME markers, and dated ones `TODO(YYYY-MM-DD)` past their date
-  checks     slowest checks (build/tooling/check-durations) and checks that both passed and failed
-             or timed out in the check-runner logs given with --check-log
+  checks     slowest checks (build/tooling/check-durations), checks CI lists as known failures
+             (tools/ci-known-failures.txt), and checks that both passed and failed or timed out in the
+             check-runner logs given with --check-log
   deps       pinned toolchain and vendored versions with their age; --online compares upstream tags
 
 `make garden` and `./minyar dev garden` run it. It only reads the tree, except --online, which runs
@@ -425,6 +426,13 @@ def check_checks(report, logs, slowest, history):
     for wall, label in rows[:slowest]:
         share = 100.0 * wall / total if total else 0
         report.add("checks", label, f"slow: {wall / 1000:.0f}s wall, {share:.1f}% of all check time in {source}")
+    known = ROOT / "tools" / "ci-known-failures.txt"
+    if known.exists():
+        for number, line in enumerate(read(known).splitlines(), 1):
+            name, _, cause = line.partition("#")
+            if name.strip():
+                report.add("checks", f"tools/ci-known-failures.txt:{number}",
+                           f"{name.strip()} fails in CI: {cause.strip()}")
     for label, seen in sorted(outcomes.items()):
         if "timeout" in seen:
             report.add("checks", label, "timed out (" + ", ".join(sorted(seen)) + " across the logs)")

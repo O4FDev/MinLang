@@ -53,6 +53,8 @@ another checkout.
   checks that timed out, and checks that both passed and failed. A check that
   does both on the same tree is flaky. A slow check slows every agent that
   runs the gate, so make it faster or run it less often.
+  Every line of `tools/ci-known-failures.txt` is listed too: a check that
+  fails on v2 today. Fix one and delete its line.
 - `deps`: the pinned LLVM, vendored libraries and the Swift toolchain, with
   how long ago each pin changed. `--online` runs `git ls-remote` against each
   upstream repository and names newer releases. Update a pin and its
@@ -69,6 +71,24 @@ repository or in a generated project.
 - Nightly CI: the `garden` job in `.github/workflows/fuzz-nightly.yml` runs
   `make check-garden`. It fails on docs drift or tracked leftovers and writes
   the full report, with `--online` pin checks, to the job summary.
+
+## CI
+
+`.github/workflows/ci.yml` runs the full suite on every push: `make check`
+plus `check-portable` on Linux in 10 shards, the macOS-only checks, the
+sanitizers in 3 macOS shards, and the other check-linux groups.
+`tools/ci-shard.py` splits a Make aggregate into shards. It uses check times
+measured on the runners (`tools/ci-times.tsv`). Refresh them with
+`python3 tools/ci-shard.py --record-times LOG...` when shards drift apart. Each
+shard runs `make check-in-parallel`, the same runner as the landing gate.
+
+A job fails when a check fails that `tools/ci-known-failures.txt` does not
+list, or when the build fails. It works like `land.sh`, which compares a gate
+with the base's failures. The job summary still shows every listed failure.
+It also shows every listed check that now passes, so its line can go. The
+list is debt with a cause on each line. Never add a line to make your own
+change pass. A push to a branch waits for the run before it, so every v2
+landing gets a result. Coverage floors run nightly.
 
 ## Layout
 
