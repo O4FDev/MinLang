@@ -1035,9 +1035,12 @@ program and the `tests/codegen`, `tests/miscompiles` and `tests/runtime`
 programs. Each is linked with `build/minyar-default-runtime-release.ll`, so each
 runtime call is checked against the C definition it reaches, and checked as
 emitted and after the O2 pipeline. Any "Undefined behavior" report fails: it
-catches false claims to LLVM such as a call-site ABI attribute (`zeroext`) that
-differs from the definition, a signature that differs from the runtime's, or a
-null or misaligned access the optimizer exposes. It needs `opt` and `llvm-link`
+catches false claims to LLVM such as a C definition that relies on an argument
+extension (`zeroext`) the call site does not promise, a signature that differs
+from the runtime's, or a null or misaligned access the optimizer exposes. A
+Boolean passed to C is always `i1 zeroext` because the IR is target-independent;
+AAPCS64 Linux does not require that extension, so Lint's report of the reverse
+mismatch there is ignored, as are post-O2 alignments LLVM raised itself. It needs `opt` and `llvm-link`
 from the pinned LLVM (or `MINYAR_LLVM_BIN`).
 
 `make check-miscompiles` (part of `check-portable`) runs every

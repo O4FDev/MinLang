@@ -20,6 +20,7 @@ MINYAR_LINT_RUNTIME name others.
 """
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,25 @@ def findings(stderr):
         else:
             current = None
     return reports
+
+
+def harmless_extension(report):
+    """A call site that extends a narrow integer argument the C definition does not ask to be extended.
+
+    Minyar's IR is target-independent, so a Boolean argument to C is always passed `i1 zeroext`: Darwin's and the
+    x86-64 System V C ABIs require the caller to extend it, AAPCS64 (Linux on ARM) does not, and Clang marks the
+    definition accordingly. Extending when the callee does not rely on it is harmless; the opposite (the definition
+    relies on an extension the call site does not promise) is the real error and is still reported."""
+    match = re.match(r"Undefined behavior: ABI attribute (zeroext|signext) not present on both function and call-site", report[0])
+    if not match or len(report) < 2:
+        return False
+    call = re.search(r"@[^(\s]+\((.*)\)", report[1])
+    if not call:
+        return False
+    arguments = call.group(1)
+    narrow = len(re.findall(r"\bi(?:1|8|16) ", arguments))
+    extended = len(re.findall(r"\bi(?:1|8|16) (?:noundef )?" + match.group(1) + r"\b", arguments))
+    return narrow > 0 and narrow == extended
 
 
 def main():
@@ -100,6 +120,8 @@ def main():
                 # which code generation also gives the global, while Lint measures them against the ABI
                 # alignment. Our own alignment claims are the emitted ones, checked above.
                 if label == "O2" and report[0] == MISALIGNED:
+                    continue
+                if harmless_extension(report):
                     continue
                 reports.append((label, report))
             if checked.returncode:
