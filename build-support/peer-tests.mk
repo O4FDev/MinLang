@@ -19,13 +19,13 @@ peer_program = $(if $(filter %.py,$(1)),python3 $(1),./build/tooling/$(basename 
 peer_program_artifact = $(if $(filter %.min,$(1)),build/tooling/$(basename $(1)))
 define PEER_SUITE_CHECKS
 .PHONY: check-peer-regressions-$(2) check-peer-optimizations-$(2) check-peer-sanitize-$(2)
-check-peer-regressions-$(2): check-peer-manifest $(call peer_program_artifact,$(1)) $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
+check-peer-regressions-$(2): $(call peer_program_artifact,$(1)) $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
 	MINYAR_PEER_GATE=check-peer-regressions $$(LIMITED) $(call peer_program,$(1))
 
-check-peer-optimizations-$(2): check-peer-manifest $(call peer_program_artifact,$(1)) $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
+check-peer-optimizations-$(2): $(call peer_program_artifact,$(1)) $(call peer_driver_artifacts,$(1)) build/minyar-runtime.o $(PEER_FEATURE_ARTIFACTS)
 	MINYAR_PEER_GATE=check-peer-optimizations MINYAR_TEST_EXTENDED_OPT=1 $$(LIMITED) $(call peer_program,$(1))
 
-check-peer-sanitize-$(2): check-peer-manifest $(call peer_program_artifact,$(1)) $(call peer_driver_artifacts,$(1)) build/minyarc-sanitize build/minyar-runtime-sanitize.o $(PEER_FEATURE_ARTIFACTS) $(PEER_FEATURE_SANITIZE_ARTIFACTS)
+check-peer-sanitize-$(2): $(call peer_program_artifact,$(1)) $(call peer_driver_artifacts,$(1)) build/minyarc-sanitize build/minyar-runtime-sanitize.o $(PEER_FEATURE_ARTIFACTS) $(PEER_FEATURE_SANITIZE_ARTIFACTS)
 	MINYAR_PEER_GATE=check-peer-sanitize ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/minyar-runtime-sanitize.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $$(SANITIZER_LIMITED) $(call peer_program,$(1))
 endef
 $(foreach suite,$(PEER_SUITES),$(eval $(call PEER_SUITE_CHECKS,$(suite),$(call peer_suite_name,$(suite)))))
@@ -92,8 +92,12 @@ build/tooling/tests/peer-manifest: TOOL_RUNTIME = build/testing/cycle-runtime.o
 build/tooling/tests/peer-manifest: build/testing/cycle-runtime.o
 # The peer review ledger (tests/data/peer, decisions by past review runs) is bookkeeping, not compiler
 # behaviour, so its audit runs in the full `check` only and no longer gates each peer suite.
-check-peer-manifest: check-suite-catalogue build/tooling/tests/peer-manifest
+# The manifest is bookkeeping (every catalogued peer case is wired to a gate). It runs beside the peer suites in each
+# gate instead of before them, so a catalogue mistake cannot stop the suites that test the compiler from running.
+check-peer-manifest: build/tooling/tests/peer-manifest
 	./build/tooling/tests/peer-manifest
+
+check check-portable check-ownership: check-peer-manifest
 
 check: check-peer-audit
 
@@ -128,7 +132,7 @@ check-peer-regressions check-peer-optimizations check-peer-sanitize:
 # Ownership selects driver regressions independently of PEER_SUITES; each
 # suite's selection is its own phony child, and only the Rust/Go/Zig selection
 # runs the incremental driver.
-PEER_OWNERSHIP_ARTIFACTS = check-peer-manifest $(PEER_BASE_ARTIFACTS) build/minyarc-sanitize build/ownership-runtime.o $(PEER_FEATURE_ARTIFACTS) $(PEER_FEATURE_SANITIZE_ARTIFACTS)
+PEER_OWNERSHIP_ARTIFACTS = $(PEER_BASE_ARTIFACTS) build/minyarc-sanitize build/ownership-runtime.o $(PEER_FEATURE_ARTIFACTS) $(PEER_FEATURE_SANITIZE_ARTIFACTS)
 PEER_OWNERSHIP_RUN = MINYAR_PEER_GATE=check-peer-ownership ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 MINYAR_TEST_COMPILER=./build/minyarc-sanitize MINYAR_TEST_RUNTIME=./build/ownership-runtime.o MINYAR_TEST_LINK_FLAGS=-fsanitize=address,undefined $(SANITIZER_LIMITED)
 .PHONY: check-peer-ownership-regressions check-peer-ownership-cpp-java-js check-peer-ownership-rust-go-zig check-peer-ownership-python-swift-ruby-lua
 check-peer-ownership: check-peer-ownership-regressions check-peer-ownership-cpp-java-js check-peer-ownership-rust-go-zig check-peer-ownership-python-swift-ruby-lua
