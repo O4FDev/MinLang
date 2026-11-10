@@ -148,6 +148,13 @@ must run anywhere). An explicit level also applies to debug builds. A
 `--target`, `-march` or `-mcpu` in `MINYAR_CLANG_FLAGS` (a cross build) keeps
 that choice. Other architectures ignore the setting.
 
+Release builds use ThinLTO, so the CPU must also reach the LTO code generator.
+Linux's lld receives it from Clang. Apple's linker does not, so on macOS the
+driver adds `-Wl,-mcpu,CPU` with the CPU Clang selects for C under the same
+flags (`apple-m1` on Apple silicon, the chosen level on Intel Macs); an explicit
+`-Wl,-mcpu,...` in `MINYAR_CLANG_FLAGS` is kept instead. The compiler's own
+ThinLTO link on macOS gets the same option from `tools/toolchain.sh`.
+
 ## Compiler ThinLTO cache on Linux
 
 Source builds and first-use bootstrap cache compiler ThinLTO backend objects

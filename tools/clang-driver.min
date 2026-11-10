@@ -14,10 +14,37 @@ function linkerChosen(options: List<Text>): Boolean {
     for option in options { if option.startsWith("-fuse-ld=") || option.startsWith("--ld-path=") { return true } }
     return false
 }
+// The CPU Clang compiles C for under these flags: apple-m1 on Apple silicon,
+// or the -march/-mcpu/--target choice. Empty when Clang names none.
+function clangTargetCpu(clang: Text, linkFlags: List<Text>): Text {
+    let command = [clang]
+    for item in compileFlags(linkFlags) { command.add(item) }
+    for item in ["-###", "-c", "-x", "c", "/dev/null", "-o", "/dev/null"] { command.add(item) }
+    let probe = host.capture(command, 60)
+    if probe.status != 0 { return "" }
+    let marker = "\"-target-cpu\" \""
+    let at = probe.errors.find(marker)
+    if at < 0 { return "" }
+    let rest = probe.errors.slice(at + marker.length, probe.errors.length)
+    let end = rest.find("\"")
+    if end <= 0 { return "" }
+    return rest.slice(0, end)
+}
 public function ltoFlags(clang: Text, linkFlags: List<Text>): List<Text> {
     let lto = ["-flto=thin"]
     let platform = host.hostName()
-    if platform == "Darwin" || linkerChosen(linkFlags) { return lto }
+    if platform == "Darwin" {
+        // Apple's linkers give the LTO backend no CPU: Clang records its choice
+        // only as attributes on the C functions it compiles. Minyar's IR has no
+        // such attributes, and the runtime IR has them removed so that it follows
+        // the program, so without -mcpu the whole program would be compiled for
+        // the architecture's generic CPU (ARMv8.0 on Apple silicon).
+        for option in linkFlags { if option.startsWith("-Wl,-mcpu,") || option == "-mcpu" { return lto } }
+        let cpu = clangTargetCpu(clang, linkFlags)
+        if cpu != "" { lto.add("-Wl,-mcpu," + cpu) }
+        return lto
+    }
+    if linkerChosen(linkFlags) { return lto }
     if platform == "Linux" {
         let linker = host.strip(host.captureOutput([clang, "-print-prog-name=ld.lld"], 10))
         lto.add("-fuse-ld=" + host.pinnedLld(linker))

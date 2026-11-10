@@ -618,7 +618,14 @@ do not justify changing the default optimization level.
 
 Runtime LLVM must keep the documented stripping of `target-cpu`,
 `target-features` and `tune-cpu`, so generic generated callers remain compatible
-with runtime inlining. `make check-release-build` captures the actual temporary
+with runtime inlining. Neither the generated IR nor the stripped runtime
+names a CPU, so both compile for the CPU the LTO backend is given. Linux lld
+receives Clang's `-march`/`-mcpu` choice itself; Apple's linkers receive none,
+and without one the whole program would be compiled for the architecture's
+generic CPU (ARMv8.0 on Apple silicon: no LSE atomics, generic scheduling). On
+macOS the driver therefore passes `-Wl,-mcpu,CPU`, where CPU is what Clang picks
+for C under the same flags (`apple-m1` by default). On the 22 `benchmarks/compare`
+programs this cut retired instructions by 1.4% (geometric mean; matrix 25.9%). `make check-release-build` captures the actual temporary
 release runtime before cleanup, checks those attributes are absent, and verifies
 a generic length wrapper inlines against that captured module. That last probe
 tests single-module optimization; release execution separately exercises the

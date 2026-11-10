@@ -223,7 +223,18 @@ lto_flags() {
     shift
     lto="'-flto=thin'"
     _system=$(host_system)
-    [ "$_system" != Darwin ] || return 0
+    if [ "$_system" = Darwin ]; then
+        # Apple's linkers give the LTO backend no CPU: Clang records its choice
+        # only as attributes on C functions, and Minyar's IR (like the runtime IR,
+        # whose attributes are removed) has none, so name the CPU Clang chose.
+        for _option in "$@"; do
+            case $_option in -Wl,-mcpu,*) return 0 ;; esac
+        done
+        _cpu=$("$_clang" "$@" -### -c -x c /dev/null -o /dev/null 2>&1 |
+            sed -n 's/.*"-target-cpu" "\([A-Za-z0-9._+-]*\)".*/\1/p' | sed -n 1p) || _cpu=
+        if [ -n "$_cpu" ]; then lto="$lto '-Wl,-mcpu,$_cpu'"; fi
+        return 0
+    fi
     for _option in "$@"; do
         case $_option in -fuse-ld=*|--ld-path=*) return 0 ;; esac
     done
