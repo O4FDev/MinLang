@@ -86,7 +86,8 @@ day/night cycle with torch lighting, and saving.
 
 Mouse to look, WASD to move, Space to jump, Shift to sprint, F to fly, left
 click to break, right click to place, middle click to pick a block, 1-9 or
-the scroll wheel to choose, T to speed up time, and Escape to pause. It uses
+the scroll wheel to choose, T to speed up time, and Escape to pause. Saves go
+to `~/.local/share/minyarcraft` (or `$XDG_DATA_HOME/minyarcraft`). It uses
 the standard `graphics` package, which needs GLFW (`brew install glfw` on
 macOS). Programs never write or link C themselves.
 
