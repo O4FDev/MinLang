@@ -13,9 +13,10 @@ import subprocess
 import tarfile
 import tempfile
 
-LLVM_VERSION = "23.1.3"
 MINIMUM = (14, 0)
 ROOT = Path(__file__).resolve().parent.parent
+# The pinned LLVM release, from its one authoritative copy (tools/toolchain.sh).
+LLVM_VERSION = re.search(r"^llvm_version=(\S+)$", (ROOT / "tools/toolchain.sh").read_text(), re.M).group(1)
 EXECUTABLES = [
     "minyarc", "minyarc-modules", "minyar-module-build",
     "tooling/tools/clang-driver", "tooling/scripts/macos-app",
@@ -60,7 +61,7 @@ def copy(source, destination):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--llvm", required=True, type=Path, help="native LLVM 23.1.3 prefix (clang, lld, dsymutil, lib/clang)")
+    parser.add_argument("--llvm", required=True, type=Path, help=f"native LLVM {LLVM_VERSION} prefix (clang, lld, dsymutil, lib/clang)")
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "build/releases")
     parser.add_argument("--no-build", action="store_true", help="audit and package already built release artifacts")

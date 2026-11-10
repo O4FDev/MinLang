@@ -1043,6 +1043,10 @@ AAPCS64 Linux does not require that extension, so Lint's report of the reverse
 mismatch there is ignored, as are post-O2 alignments LLVM raised itself. It needs `opt` and `llvm-link`
 from the pinned LLVM (or `MINYAR_LLVM_BIN`).
 
+`make check-llvm-pin` (part of `check-portable`) checks every copy of the pinned
+LLVM version and archive digests against the `llvm_*` lines of
+`tools/toolchain.sh`; see [changing the pinned LLVM release](toolchain.md#changing-the-pinned-llvm-release).
+
 `make check-miscompiles` (part of `check-portable`) runs every
 `tests/miscompiles/<name>.min` once compiled, linked at -O0, -O1 and -O2, and
 requires `<name>.stdout` at all three levels. Add a fixture there for any
@@ -1302,6 +1306,7 @@ with nothing else running; a pass on that retry is reported as flaky.
 
 `--matrix` runs `--tier all` plus every other Linux group in one run:
 
+<!-- llvm-pin: not the pin. These CI groups build with other LLVM releases on purpose. -->
 | group | what it runs |
 |---|---|
 | `correctness` | the tiered main suite, the fixed points, runtime units, GCC bootstrap and native graphics |
@@ -1313,6 +1318,7 @@ with nothing else running; a pass on that retry is reported as flaky.
 | `leaks` | the LeakSanitizer replay, as soon as the checks it replays have passed |
 | `formatting` | `scripts/format.min` with the pinned clang-format |
 
+<!-- llvm-pin: not the pin. These CI groups build with other LLVM releases on purpose. -->
 Each toolchain variant (LLVM 22, LLVM 23, clang-18) builds in its own copy of
 the source snapshot, so variants build and run at the same time as the main
 checks. A target shared by two groups runs once. CI runs the same runner,

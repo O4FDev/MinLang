@@ -14,7 +14,8 @@ import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
-LLVM_VERSION = "23.1.3"
+# The pinned LLVM release, from its one authoritative copy (tools/toolchain.sh).
+LLVM_VERSION = re.search(r"^llvm_version=(\S+)$", (ROOT / "tools/toolchain.sh").read_text(), re.M).group(1)
 EXECUTABLES = [
     "minyarc", "minyarc-modules", "minyar-module-build",
     "tooling/tools/clang-driver",
@@ -90,7 +91,7 @@ def dependencies(binary, environment):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--llvm", type=Path, required=True, help="native LLVM 23.1.3 prefix")
+    parser.add_argument("--llvm", type=Path, required=True, help=f"native LLVM {LLVM_VERSION} prefix")
     parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path, default=ROOT / "build/releases")
     parser.add_argument("--minimum-glibc", default="2.39", help="declared ABI floor, audited against every bundled ELF")

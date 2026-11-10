@@ -202,3 +202,29 @@ LLVM derives cache keys from the LLVM version, input modules, imports/exports
 and code generation configuration. Deleting the cache is safe; the next link
 rebuilds its objects. See LLVM's [ThinLTO cache and pruning options](https://clang.llvm.org/docs/ThinLTO.html#incremental)
 and [cache key implementation](https://github.com/llvm/llvm-project/blob/llvmorg-23.1.3/llvm/lib/LTO/LTO.cpp).
+
+## Changing the pinned LLVM release
+
+The `llvm_*` lines at the top of `tools/toolchain.sh` are the one authoritative
+copy of the pinned release: its version and the SHA-256 of each archive the
+recipes, CI and tools download. The launcher, the Make build and the packaging
+scripts read them. Places that cannot read them at run time (CI workflows, these
+docs, test fixtures that imitate the pinned Clang) keep literal copies, and
+`make check-llvm-pin` (part of `check-portable`, `tools/llvm-pin.py`) fails when
+any of them names another version, `clang-NN` major or archive digest. A line
+that names another LLVM on purpose, such as a test that an older Clang is
+rejected, carries the comment `llvm-pin: not the pin`; records of past
+measurements and the independently pinned browser Clang are exempt.
+
+To move to another release, take the SHA-256 of each archive from the release's
+GitHub assets and verify it on download, then:
+
+```sh
+$EDITOR tools/toolchain.sh          # llvm_version and the four llvm_sha256_* lines
+python3 tools/llvm-pin.py --write   # rewrites every literal copy
+python3 tools/llvm-pin.py           # must report that every copy matches
+git diff --stat
+```
+
+Every machine that builds Minyar then needs that release installed, as in the
+recipes above.

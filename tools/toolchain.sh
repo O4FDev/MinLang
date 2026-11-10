@@ -1,7 +1,14 @@
 #!/bin/sh
 set -eu
 
+# The pinned LLVM release: the one authoritative copy of its version and archive SHA-256s. Every other mention in
+# the tree (CI, docs, scripts, test fixtures) is checked against these lines by `make check-llvm-pin`, and
+# `python3 tools/llvm-pin.py --write` rewrites them after these lines change. See docs/toolchain.md.
 llvm_version=23.1.3
+llvm_sha256_macos_arm64=3dcfd88aec10be204a24037bcb0dc0ad777882e9dbe8ac60e2639060d8a794b1
+llvm_sha256_linux_x64=14d2f701eb68fb799001bdea6231048f3990690fa2f406d563555ff8f744daba
+llvm_sha256_linux_arm64=1154f37ec15b5654fcb8cc3a8a2352a4cc4eef44bdff7ddd47fb10ea85c82f01
+llvm_sha256_source=c44186a7762ed28954be72e5ff6df9808e0779d4f1bf014ecc4e7e211d31ee34
 tab=$(printf '\t')
 cr=$(printf '\r')
 newline='
@@ -171,7 +178,7 @@ default_clang() {
     if [ -n "${MINYAR_BUNDLED_CLANG-}" ]; then printf '%s\n' "$MINYAR_BUNDLED_CLANG"
     elif [ -n "${HOME-}" ] && [ -x "$cached_clang" ]; then printf '%s\n' "$cached_clang"
     elif [ "$(host_system)" = Darwin ]; then printf '%s\n' clang
-    else printf '%s\n' clang-23
+    else printf '%s\n' "clang-${llvm_version%%.*}"
     fi
 }
 
