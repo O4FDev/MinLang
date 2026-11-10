@@ -52,6 +52,12 @@ else
 TEST_CLANG ?= $(LLVM_CC)
 TEST_CLANG_PREREQUISITES =
 endif
+# Harnesses compile and link every fixture with MINYAR_TEST_CLANG and fall back to the first `clang` on PATH. Recipes
+# that do not pass it must still get the pinned Clang: on macOS PATH's clang is Apple's, whose ASan runtime cannot link
+# an object LLVM_CC instrumented (___asan_version_mismatch_check). The real Clang, never the cache wrapper.
+ifeq ($(origin MINYAR_TEST_CLANG),undefined)
+export MINYAR_TEST_CLANG := $(LLVM_CC)
+endif
 # Labs that run a real redis-server print a SKIP line instead of failing on hosts without one
 # (scripts/needs-command.sh; MINYAR_REQUIRE_LAB_TOOLS=1 makes a missing server a failure).
 NEEDS_REDIS = sh scripts/needs-command.sh redis-server $@ "these labs run a real Redis (Debian/Ubuntu: apt-get install redis-server)"
