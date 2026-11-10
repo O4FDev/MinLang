@@ -13,6 +13,8 @@ use "system" as system
 use "text" as utf8
 
 constant PARTITIONS = 32
+// Partition compiles in flight at once; the objects do not depend on it.
+constant JOBS = 4
 
 public record Split { partitions: List<Text>; error: Text }
 record Chunk { name: Text; text: Text; declaration: Text; partition: Integer }
@@ -225,30 +227,62 @@ public function split(llvm: Text): Split {
     return result
 }
 
+record Compile { handle: Integer; staging: Text; object: Text }
+// Waits for the oldest running compile and publishes its object. Returns the
+// first failure's exit status (0 while every compile succeeds).
+function finish(running: List<Compile>, failure: Integer): Integer {
+    let job = running[0]
+    for index in 1..running.length { running[index - 1] = running[index] }
+    running.pop()
+    let status = system.wait(job.handle)
+    let code = 0
+    if status.state == system.SIGNALED { code = 128 + status.signal }
+    else if status.state != system.EXITED { code = 1 }
+    else { code = status.exitCode }
+    if code != 0 {
+        if failure == 0 { return code }
+        return failure
+    }
+    if failure == 0 && files.rename(job.staging + "/part.o", job.object) != 0 { host.stop(host.osError(files.lastError(), job.object)) }
+    host.release(job.staging)
+    return failure
+}
+
 // Objects for `program` (LLVM before debug metadata), compiled by `compile`
 // and cached in `cache`; objects the link no longer uses are removed. With
 // `debug`, each partition gets its own debug metadata for `source`. Empty when
 // the program cannot be split; the caller then links it whole.
+// Missing partitions compile JOBS at a time: each Clang starts
+// as soon as its partition is written, so preparing the next partition's text
+// overlaps the compiles. Objects and their order do not depend on the count.
 public function objects(program: Text, cache: Text, identity: Text, compile: List<Text>, debug: Boolean, source: Text, variables: Boolean, opaqueRecords: Boolean): List<Text> {
     let parts = split(program)
     if parts.error != "" { return [] }
     host.makeDirectories(cache)
+    let jobs = JOBS
+    let running: List<Compile> = []
+    let started = Map<Text, Boolean>()
+    let failure = 0
     let used: List<Text> = []
     for index in 0..parts.partitions.length {
         let key = host.hashBytes(Bytes(identity + "\n" + parts.partitions[index]))
         let object = cache + "/" + key + ".o"
         used.add(key + ".o")
-        if host.isFile(object) { continue }
+        if host.isFile(object) || started.has(key) || failure != 0 { continue }
+        started[key] = true
         let staging = host.temporaryDirectory(cache, "partition-")
         let text = parts.partitions[index]
         if debug { text = debugInfo.program(text, source, variables, opaqueRecords) }
         host.writeBytes(staging + "/part.ll", Bytes(text))
         let command = host.copied(compile)
         for item in ["-c", staging + "/part.ll", "-o", staging + "/part.o"] { command.add(item) }
-        host.runWithTerminalDiagnostics(command)
-        if files.rename(staging + "/part.o", object) != 0 { host.stop(host.osError(files.lastError(), object)) }
-        host.release(staging)
+        if running.length >= jobs { failure = finish(running, failure) }
+        let handle = system.spawn(command[0], command, system.environment(), "")
+        if handle <= 0 { host.stop(host.osError(handle, command[0])) }
+        running.add(Compile { handle: handle; staging: staging; object: object })
     }
+    while running.length > 0 { failure = finish(running, failure) }
+    if failure != 0 { host.leave(failure) }
     for name in files.list(cache) {
         if name.endsWith(".o") && !host.listed(used, name) { files.remove(cache + "/" + name) }
     }
